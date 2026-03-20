@@ -1,0 +1,15 @@
+[package]
+name = "cubos_sql_cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for cubos_sql migrations"
+
+[[bin]]
+name = "cubos_sql"
+path = "src/main.rs"
+
+[dependencies]
+cubos_sql = { path = "../cubos_sql" }
+cubos_sql_core = { path = "../cubos_sql_core" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }

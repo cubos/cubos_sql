@@ -1,0 +1,14 @@
+[package]
+name = "cubos_sql_macros"
+version = "0.1.0"
+edition = "2021"
+description = "Proc macros for cubos_sql"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+cubos_sql_core = { path = "../cubos_sql_core" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

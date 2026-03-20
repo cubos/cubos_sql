@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "cubos_sql",
+    "cubos_sql_core",
+    "cubos_sql_macros",
+    "cubos_sql_cli",
+]
