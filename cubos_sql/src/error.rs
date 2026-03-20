@@ -9,4 +9,10 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("pool error: {0}")]
+    Pool(String),
+
+    #[error("query returned no rows")]
+    NoRows,
 }

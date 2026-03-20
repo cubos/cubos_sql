@@ -112,10 +112,8 @@ fn is_pg_ident_quoted(s: &str) -> bool {
     // Ensure no unescaped double quotes (consecutive `""` are fine)
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
-        if c == '"' {
-            if chars.next() != Some('"') {
-                return false;
-            }
+        if c == '"' && chars.next() != Some('"') {
+            return false;
         }
     }
     true
@@ -201,6 +199,15 @@ pub enum ConfigError {
     InvalidTable { table: String, reason: String },
 }
 
+impl std::str::FromStr for Config {
+    type Err = ConfigError;
+
+    fn from_str(content: &str) -> Result<Self, Self::Err> {
+        let cargo: CargoToml = toml::from_str(content)?;
+        Ok(cargo.package.metadata.cubos_sql)
+    }
+}
+
 impl Config {
     /// Load config from a `Cargo.toml` file.
     pub fn from_cargo_toml(path: &Path) -> Result<Self, ConfigError> {
@@ -208,13 +215,7 @@ impl Config {
             path: path.to_owned(),
             source: e,
         })?;
-        Self::from_str(&content)
-    }
-
-    /// Parse config from a TOML string (the contents of a Cargo.toml).
-    pub fn from_str(content: &str) -> Result<Self, ConfigError> {
-        let cargo: CargoToml = toml::from_str(content)?;
-        Ok(cargo.package.metadata.cubos_sql)
+        content.parse()
     }
 
     /// Resolve the migrations path relative to a base directory.
@@ -230,6 +231,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     const VALID_TOML: &str = r#"
 [package]

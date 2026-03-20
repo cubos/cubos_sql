@@ -12,3 +12,4 @@
 pub mod config;
 pub mod lexer;
 pub mod param;
+pub mod type_map;

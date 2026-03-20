@@ -56,8 +56,7 @@ impl MigrationSource {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
 
-            if file_name.ends_with(".down.sql") {
-                let base_name = &file_name[..file_name.len() - ".down.sql".len()];
+            if let Some(base_name) = file_name.strip_suffix(".down.sql") {
                 let sql = std::fs::read_to_string(&entry_path)?;
                 down_files.insert(base_name.to_string(), sql);
             } else if file_name.ends_with(".sql") {

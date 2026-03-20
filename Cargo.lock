@@ -311,6 +311,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "cubos_sql_core",
+ "cubos_sql_macros",
  "deadpool-postgres",
  "serde",
  "serde_json",
@@ -320,6 +321,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
@@ -347,9 +349,15 @@ name = "cubos_sql_macros"
 version = "0.1.0"
 dependencies = [
  "cubos_sql_core",
+ "fs2",
+ "postgres",
  "proc-macro2",
  "quote",
+ "serde",
+ "serde_json",
+ "sha2",
  "syn",
+ "tempfile",
 ]
 
 [[package]]
@@ -539,6 +547,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -1251,6 +1269,20 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "postgres"
+version = "0.19.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c48ece1c6cda0db61b058c1721378da76855140e9214339fa1317decacb176"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "futures-util",
+ "log",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "postgres-protocol"
@@ -2214,6 +2246,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

@@ -4,32 +4,46 @@
 //!
 //! - **Migration runner** ([`migrate`]) — apply, revert, and inspect database migrations
 //!   with advisory-lock protection and optional transaction wrapping.
-//! - **Connection pool** — coming soon (via `deadpool-postgres`).
-//! - **Query execution** — coming soon (integrates with the `query!` proc macro).
+//! - **Executor trait** ([`Executor`]) — abstraction over pooled clients and transactions,
+//!   used by the `query!` macro.
 //!
-//! # Example: running migrations
+//! # Pool setup
+//!
+//! Create a `deadpool_postgres::Pool` directly — this crate implements
+//! [`Executor`] for `deadpool_postgres::Object` (the pooled client):
 //!
 //! ```rust,no_run
-//! use cubos_sql::migrate::{MigrationSource, run};
-//! use cubos_sql_core::config::MigrationsConfig;
-//! use std::path::Path;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use deadpool_postgres::{Config, Runtime};
+//! use tokio_postgres::NoTls;
 //!
-//! # async fn example() -> Result<(), cubos_sql::Error> {
-//! let source = MigrationSource::from_dir(Path::new("./migrations"))?;
-//! let config = MigrationsConfig::default();
+//! let mut cfg = Config::new();
+//! cfg.host = Some("localhost".into());
+//! cfg.dbname = Some("mydb".into());
+//! cfg.user = Some("postgres".into());
+//! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 //!
-//! let (client, connection) =
-//!     tokio_postgres::connect("host=localhost dbname=mydb", tokio_postgres::NoTls).await?;
-//! tokio::spawn(connection);
-//! let mut client = client;
-//!
-//! let applied: Vec<String> = run(&mut client, &source, &config).await?;
-//! println!("Applied {} migration(s)", applied.len());
+//! let client = pool.get().await?;
+//! // `client` implements `cubos_sql::Executor` — pass it to `query!`
 //! # Ok(())
 //! # }
 //! ```
 
 pub mod error;
+pub mod executor;
 pub mod migrate;
+mod pool; // Executor impls for deadpool types
 
 pub use error::Error;
+pub use executor::Executor;
+
+/// Re-export the `query!` macro from `cubos_sql_macros`.
+pub use cubos_sql_macros::query;
+
+/// Re-exports used by the `query!` macro generated code.
+/// Not part of the public API — do not rely on these directly.
+#[doc(hidden)]
+pub mod __private {
+    pub use serde_json;
+    pub use tokio_postgres;
+}
