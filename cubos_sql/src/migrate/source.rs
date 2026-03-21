@@ -1,34 +1,73 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-/// A migration read from disk.
+/// A single migration read from disk.
+///
+/// Each migration corresponds to a `NNNN_description.sql` file, with an optional
+/// `NNNN_description.down.sql` companion for rollbacks.
 #[derive(Debug, Clone)]
 pub struct Migration {
-    /// Numeric prefix, e.g. "0001".
+    /// Numeric prefix extracted from the filename, e.g. `"0001"`.
+    /// Used for ordering migrations.
     pub version: String,
-    /// Full name without extension, e.g. "0001_create_users".
+    /// Full name without extension, e.g. `"0001_create_users"`.
+    /// This is the key used in the tracking table.
     pub name: String,
-    /// SQL content of the (up) file.
+    /// SQL content of the up migration file.
     pub sql: String,
-    /// SQL content of the down file (optional). Read from `name.down.sql`.
+    /// SQL content of the down migration file, if `NNNN_description.down.sql` exists.
     pub down_sql: Option<String>,
-    /// If true, this migration should not run inside a transaction.
-    /// Detected by the `-- no-transaction` comment on the first line.
+    /// If `true`, this migration should run outside a transaction.
+    /// Set automatically when the first line of the SQL file is `-- no-transaction`.
     pub no_transaction: bool,
 }
 
-/// Migration source from a directory.
+/// A collection of migrations read from a directory on disk.
+///
+/// Construct with [`from_dir`](MigrationSource::from_dir), then pass to
+/// [`run`](super::run), [`status`](super::status), or [`revert`](super::revert).
+///
+/// # Expected directory layout
+///
+/// ```text
+/// migrations/
+///   0001_create_users.sql
+///   0001_create_users.down.sql   # optional rollback
+///   0002_add_email.sql
+///   0003_create_index.sql
+/// ```
+///
+/// - Up files: `NNNN_description.sql` (numeric prefix + underscore + description).
+/// - Down files: `NNNN_description.down.sql` (same base name, `.down.sql` suffix).
+/// - Non-`.sql` files and subdirectories are ignored.
+/// - Migrations are sorted by numeric prefix.
 #[derive(Debug)]
 pub struct MigrationSource {
     migrations: Vec<Migration>,
 }
 
 impl MigrationSource {
-    /// Reads and sorts migrations from a directory.
+    /// Reads and sorts all migrations from the given directory.
     ///
-    /// Files must follow the `NNNN_name.sql` format (numeric prefix followed by `_`).
-    /// Files named `NNNN_name.down.sql` are read as optional down migrations.
-    /// Sorted by numeric prefix.
+    /// Scans for `*.sql` files matching the `NNNN_description.sql` naming convention,
+    /// pairs them with optional `.down.sql` files, and returns them sorted by version.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Migration`](crate::Error::Migration) if the directory does not exist
+    ///   or a file does not match the expected naming format.
+    /// - [`Error::Io`](crate::Error::Io) if reading a file fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use cubos_sql::migrate::MigrationSource;
+    /// use std::path::Path;
+    ///
+    /// let source = MigrationSource::from_dir(Path::new("./migrations"))
+    ///     .expect("failed to read migrations");
+    /// println!("Found {} migrations", source.migrations().len());
+    /// ```
     pub fn from_dir(path: &Path) -> Result<Self, crate::Error> {
         if !path.is_dir() {
             return Err(crate::Error::Migration(format!(
@@ -37,8 +76,7 @@ impl MigrationSource {
             )));
         }
 
-        let mut entries: Vec<_> = std::fs::read_dir(path)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
 
         // Collect down files first: "0001_create_users.down.sql" -> key "0001_create_users"
@@ -68,12 +106,9 @@ impl MigrationSource {
 
         for entry in up_entries {
             let path = entry.path();
-            let file_stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| {
-                    crate::Error::Migration(format!("invalid file name: {}", path.display()))
-                })?;
+            let file_stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+                crate::Error::Migration(format!("invalid file name: {}", path.display()))
+            })?;
 
             let (version, _description) = parse_migration_name(file_stem, &path)?;
 
@@ -99,12 +134,14 @@ impl MigrationSource {
         Ok(Self { migrations })
     }
 
-    /// Returns a slice of the migrations in order.
+    /// Returns all migrations in version order.
     pub fn migrations(&self) -> &[Migration] {
         &self.migrations
     }
 
-    /// Find a migration by name.
+    /// Finds a migration by its full name (e.g. `"0001_create_users"`).
+    ///
+    /// Returns `None` if no migration with that name exists in this source.
     pub fn find(&self, name: &str) -> Option<&Migration> {
         self.migrations.iter().find(|m| m.name == name)
     }
@@ -112,10 +149,7 @@ impl MigrationSource {
 
 /// Parses a migration file stem like "0001_create_users" into ("0001", "create_users").
 /// Returns an error if the format is invalid.
-fn parse_migration_name(
-    stem: &str,
-    file_path: &Path,
-) -> Result<(String, String), crate::Error> {
+fn parse_migration_name(stem: &str, file_path: &Path) -> Result<(String, String), crate::Error> {
     let underscore_pos = stem.find('_').ok_or_else(|| {
         crate::Error::Migration(format!(
             "migration file does not follow NNNN_description.sql format: {}",
@@ -249,7 +283,11 @@ mod tests {
     fn ignores_non_sql_files() {
         let dir = create_temp_dir();
 
-        fs::write(dir.path().join("0001_create_users.sql"), "CREATE TABLE users();").unwrap();
+        fs::write(
+            dir.path().join("0001_create_users.sql"),
+            "CREATE TABLE users();",
+        )
+        .unwrap();
         fs::write(dir.path().join("README.md"), "# Migrations").unwrap();
 
         let source = MigrationSource::from_dir(dir.path()).unwrap();

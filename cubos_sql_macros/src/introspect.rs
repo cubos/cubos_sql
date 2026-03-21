@@ -62,7 +62,11 @@ pub enum IntrospectError {
     /// A PostgreSQL protocol/network error.
     Postgres(postgres::Error),
     /// The query returned a column whose OID is not in the supported type map.
-    UnknownType { oid: u32, column: String },
+    UnknownType {
+        oid: u32,
+        column: String,
+        pg_name: String,
+    },
     /// Nullability detection failed (non-fatal; caller may default to non-nullable).
     NullabilityCheck(String),
 }
@@ -71,8 +75,21 @@ impl std::fmt::Display for IntrospectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IntrospectError::Postgres(e) => write!(f, "postgres error: {}", e),
-            IntrospectError::UnknownType { oid, column } => {
-                write!(f, "unsupported PostgreSQL type OID {} for column '{}'", oid, column)
+            IntrospectError::UnknownType {
+                oid,
+                column,
+                pg_name,
+            } => {
+                write!(
+                    f,
+                    "unsupported PostgreSQL type '{}' (OID {}) for column '{}'. \
+                     Supported types: {}. \
+                     If this is a custom type, consider using a domain over a supported base type.",
+                    pg_name,
+                    oid,
+                    column,
+                    type_map::supported_type_names(),
+                )
             }
             IntrospectError::NullabilityCheck(msg) => {
                 write!(f, "nullability check failed: {}", msg)
@@ -102,6 +119,10 @@ impl From<postgres::Error> for IntrospectError {
 
 /// Name used for the prepared statement in `pg_prepared_statements`.
 const STMT_NAME: &str = "__cubos_sql_stmt";
+
+/// Length of the `PREPARE __cubos_sql_stmt AS ` prefix prepended to user SQL.
+/// Used by error position adjustment in query_macro.
+pub const PREPARE_PREFIX_LEN: usize = "PREPARE __cubos_sql_stmt AS ".len();
 
 /// OID of the built-in `jsonb` type in PostgreSQL.
 const JSONB_OID: u32 = 3802;
@@ -190,6 +211,7 @@ fn build_params(
             .ok_or_else(|| IntrospectError::UnknownType {
                 oid: effective_oid,
                 column: format!("$param({})", pg_type.name()),
+                pg_name: pg_type.name().to_owned(),
             })?;
 
         params.push(ParamInfo {
@@ -221,6 +243,7 @@ fn build_columns(
             .ok_or_else(|| IntrospectError::UnknownType {
                 oid: effective_oid,
                 column: col_name.clone(),
+                pg_name: pg_type.name().to_owned(),
             })?;
 
         // Nullability: use the view-based result, default to non-nullable when
@@ -299,8 +322,7 @@ fn detect_nullability(
 
         // If ALL matching columns are NOT NULL → not nullable.
         // If no matches or any match is nullable → assume nullable.
-        let nullable = rows.is_empty()
-            || !rows.iter().all(|r| r.get::<_, bool>(0));
+        let nullable = rows.is_empty() || !rows.iter().all(|r| r.get::<_, bool>(0));
         map.insert(name.to_owned(), nullable);
     }
 
@@ -328,7 +350,8 @@ mod tests {
                 age INT, \
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
             );",
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = cubos_sql_core::config::Config {
             database: cubos_sql_core::config::DatabaseConfig {
@@ -353,7 +376,8 @@ mod tests {
             &mut client,
             "SELECT id, name, email FROM users WHERE age > $1",
             &domains,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(info.params.len(), 1, "should have 1 parameter");
         assert_eq!(info.params[0].rust_type, "i32");
@@ -377,11 +401,7 @@ mod tests {
         let mut client = setup_pg();
 
         let domains = HashMap::new();
-        let info = introspect_query(
-            &mut client,
-            "SELECT id, age FROM users",
-            &domains,
-        ).unwrap();
+        let info = introspect_query(&mut client, "SELECT id, age FROM users", &domains).unwrap();
 
         assert_eq!(info.columns.len(), 2);
         // id is NOT NULL
@@ -400,7 +420,8 @@ mod tests {
             &mut client,
             "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, created_at",
             &domains,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(info.params.len(), 2, "should have 2 parameters");
         assert_eq!(info.params[0].rust_type, "String"); // name is TEXT
@@ -419,11 +440,7 @@ mod tests {
         let mut client = setup_pg();
 
         let domains = HashMap::new();
-        let info = introspect_query(
-            &mut client,
-            "SELECT id, name FROM users",
-            &domains,
-        ).unwrap();
+        let info = introspect_query(&mut client, "SELECT id, name FROM users", &domains).unwrap();
 
         assert_eq!(info.params.len(), 0);
         assert_eq!(info.columns.len(), 2);
@@ -439,11 +456,7 @@ mod tests {
         let _ = client.batch_execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS mood mood");
 
         let domains = HashMap::new();
-        let result = introspect_query(
-            &mut client,
-            "SELECT mood FROM users",
-            &domains,
-        );
+        let result = introspect_query(&mut client, "SELECT mood FROM users", &domains);
 
         assert!(result.is_err(), "should fail on unknown type");
     }

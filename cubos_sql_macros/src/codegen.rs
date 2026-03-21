@@ -57,6 +57,20 @@ pub fn generate(
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
+    if lex_output.spreads.is_empty() {
+        generate_regular(lex_output, query_info, executor_expr, assignments)
+    } else {
+        generate_spread(lex_output, query_info, executor_expr, assignments)
+    }
+}
+
+/// Generate code for a regular query (no spreads).
+fn generate_regular(
+    lex_output: &LexOutput,
+    query_info: &QueryInfo,
+    executor_expr: &syn::Expr,
+    assignments: &[ParamAssignment],
+) -> Result<TokenStream, syn::Error> {
     // ------------------------------------------------------------------
     // 1. Build the output struct definition (always generated, even when
     //    there are no columns — an empty struct is valid and consistent).
@@ -166,6 +180,292 @@ pub fn generate(
 }
 
 // ---------------------------------------------------------------------------
+// Spread query code generation
+// ---------------------------------------------------------------------------
+
+/// Generate code for a query with one or more `$..spread` bulk inserts.
+///
+/// Supports both struct mode (`$..items { a, b }` → `.a`, `.b` access)
+/// and tuple mode (`$..items` → `.0`, `.1` access).
+///
+/// Since the number of items is unknown at compile time, the generated code
+/// builds the SQL string dynamically at runtime, expanding placeholders for
+/// each spread based on the slice length.
+fn generate_spread(
+    lex_output: &LexOutput,
+    query_info: &QueryInfo,
+    executor_expr: &syn::Expr,
+    assignments: &[ParamAssignment],
+) -> Result<TokenStream, syn::Error> {
+    let output_struct = build_output_struct(&query_info.columns)?;
+    let row_mapping = build_row_mapping(&query_info.columns)?;
+    let num_regular_params = lex_output.params.len();
+    let num_spreads = lex_output.spreads.len();
+
+    // ── Regular param fields ────────────────────────────────────────────
+    let mut regular_param_fields = TokenStream::new();
+    let mut regular_param_inits = TokenStream::new();
+    let mut regular_param_pushes = TokenStream::new();
+    for (idx, param) in lex_output.params.iter().enumerate() {
+        let field_name = format_ident!("p{}", idx);
+        let param_info = query_info.params.get(idx);
+        let field_type: syn::Type = if let Some(pi) = param_info {
+            if pi.domain_rust_type.is_some() {
+                parse_str("::cubos_sql::__private::serde_json::Value")?
+            } else {
+                parse_str::<syn::Type>(&pi.rust_type)?
+            }
+        } else {
+            parse_str("::cubos_sql::__private::serde_json::Value")?
+        };
+        let value_expr = resolve_param_value(
+            &param.name,
+            param_info.and_then(|p| p.domain_rust_type.as_deref()),
+            assignments,
+        )?;
+        regular_param_fields.extend(quote! { #field_name: #field_type, });
+        regular_param_inits.extend(quote! { #field_name: #value_expr, });
+        regular_param_pushes.extend(quote! {
+            __params.push(Box::new(self.#field_name.clone())
+                as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+        });
+    }
+
+    // ── Per-spread: generics, fields, inits, push exprs, SQL pieces ────
+    let mut spread_generic_types = Vec::new();
+    let mut spread_struct_fields = TokenStream::new();
+    let mut spread_struct_inits = TokenStream::new();
+    let mut spread_empty_checks = TokenStream::new();
+    let mut spread_param_pushes = TokenStream::new();
+    let mut spread_size_args = TokenStream::new();
+    let mut spread_size_params = TokenStream::new();
+
+    // SQL pieces: the text between spread offsets
+    let mut sql_pieces: Vec<&str> = Vec::new();
+    let mut fields_per_row_lits = Vec::new();
+    let mut last_offset = 0;
+
+    // Track which introspected param index we're at for spread columns
+    let mut spread_param_offset = num_regular_params;
+
+    for (si, spread) in lex_output.spreads.iter().enumerate() {
+        let fields = spread.fields.as_ref().expect("spread must have fields");
+        let col_count = fields.len();
+        let type_ident = format_ident!("__S{}", si);
+        let field_ident = format_ident!("__spread_{}", si);
+        let size_ident = format_ident!("__size_{}", si);
+
+        spread_generic_types.push(type_ident.clone());
+
+        // SQL piece before this spread
+        sql_pieces.push(&lex_output.sql[last_offset..spread.offset]);
+        last_offset = spread.offset;
+        fields_per_row_lits.push(proc_macro2::Literal::usize_unsuffixed(col_count));
+
+        // Struct field + init (all spreads share the '__s lifetime)
+        spread_struct_fields.extend(quote! {
+            #field_ident: &'__s [#type_ident],
+        });
+
+        // Resolve spread value expression
+        let spread_value_expr: TokenStream = {
+            let assignment = assignments.iter().find(|a| a.name == spread.name);
+            match assignment {
+                Some(ParamAssignment { expr: Some(e), .. }) => quote! { #e },
+                _ => {
+                    let ident = format_ident!("{}", spread.name);
+                    quote! { #ident }
+                }
+            }
+        };
+        spread_struct_inits.extend(quote! {
+            #field_ident: &(#spread_value_expr)[..],
+        });
+
+        // Empty check
+        spread_empty_checks.extend(quote! {
+            if self.#field_ident.is_empty() { __any_empty = true; }
+        });
+
+        // Size args for __build_spread_sql call
+        spread_size_args.extend(quote! { self.#field_ident.len(), });
+        spread_size_params.extend(quote! { #size_ident: usize, });
+
+        // Param push expressions: iterate spread items and push field values
+        let mut item_pushes = TokenStream::new();
+        for ci in 0..col_count {
+            let param_idx = spread_param_offset + ci;
+            let param_info = query_info.params.get(param_idx);
+            let is_domain = param_info
+                .map(|pi| pi.domain_rust_type.is_some())
+                .unwrap_or(false);
+
+            let accessor_ident = format_ident!("{}", fields[ci]);
+            let accessor: TokenStream = quote! { __item.#accessor_ident };
+
+            if is_domain {
+                item_pushes.extend(quote! {
+                    __params.push(
+                        Box::new(::cubos_sql::__private::serde_json::to_value(&#accessor)
+                            .expect("failed to serialize domain type to JSON"))
+                            as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>
+                    );
+                });
+            } else {
+                item_pushes.extend(quote! {
+                    __params.push(
+                        Box::new(#accessor.clone())
+                            as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>
+                    );
+                });
+            }
+        }
+
+        spread_param_pushes.extend(quote! {
+            for __item in self.#field_ident.iter() {
+                #item_pushes
+            }
+        });
+
+        spread_param_offset += col_count;
+    }
+
+    // Final SQL piece (after last spread)
+    sql_pieces.push(&lex_output.sql[last_offset..]);
+
+    // ── Generate the __build_spread_sql function body ────────────────────
+    // It takes one size arg per spread and builds the SQL dynamically.
+    let num_regular_lit = proc_macro2::Literal::usize_unsuffixed(num_regular_params);
+    let mut sql_builder_body = TokenStream::new();
+    sql_builder_body.extend(quote! {
+        let mut __sql = String::new();
+        let mut __p: usize = #num_regular_lit + 1;
+    });
+
+    for si in 0..num_spreads {
+        let piece = sql_pieces[si];
+        let fpr = &fields_per_row_lits[si];
+        let size_ident = format_ident!("__size_{}", si);
+        sql_builder_body.extend(quote! {
+            __sql.push_str(#piece);
+            for __r in 0..#size_ident {
+                if __r > 0 { __sql.push_str(", "); }
+                __sql.push('(');
+                for __c in 0..#fpr {
+                    if __c > 0 { __sql.push_str(", "); }
+                    __sql.push('$');
+                    __sql.push_str(&__p.to_string());
+                    __p += 1;
+                }
+                __sql.push(')');
+            }
+        });
+    }
+    // Final piece
+    let final_piece = sql_pieces[num_spreads];
+    sql_builder_body.extend(quote! {
+        __sql.push_str(#final_piece);
+        __sql
+    });
+
+    // ── Capacity estimate ───────────────────────────────────────────────
+    let mut capacity_expr = quote! { #num_regular_lit };
+    for si in 0..num_spreads {
+        let field_ident = format_ident!("__spread_{}", si);
+        let fpr = &fields_per_row_lits[si];
+        capacity_expr.extend(quote! { + self.#field_ident.len() * #fpr });
+    }
+
+    // ── Method body (shared logic) ──────────────────────────────────────
+    // Generate a macro-like token block for the common query execution preamble
+    let query_preamble = quote! {
+        let mut __any_empty = false;
+        #spread_empty_checks
+        let __sql = __build_spread_sql(#spread_size_args);
+        let mut __params: Vec<Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>>
+            = Vec::with_capacity(#capacity_expr);
+        #regular_param_pushes
+        #spread_param_pushes
+        let __params_ref: Vec<&(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync)>
+            = __params.iter().map(|p| p.as_ref()).collect();
+    };
+
+    // ── Assemble the full block ─────────────────────────────────────────
+    let ts = quote! {
+        {
+            #[derive(Debug)]
+            #[allow(non_camel_case_types)]
+            struct __cubos_sql_output {
+                #output_struct
+            }
+
+            #[allow(non_camel_case_types)]
+            struct __cubos_sql_query<'__e, '__s, __E: cubos_sql::Executor, #(#spread_generic_types,)*> {
+                __executor: &'__e __E,
+                #spread_struct_fields
+                #regular_param_fields
+            }
+
+            fn __build_spread_sql(#spread_size_params) -> String {
+                #sql_builder_body
+            }
+
+            impl<'__e, '__s, __E: cubos_sql::Executor, #(#spread_generic_types,)*>
+                __cubos_sql_query<'__e, '__s, __E, #(#spread_generic_types,)*>
+            {
+                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__cubos_sql_output>, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Ok(::std::vec::Vec::new());
+                    }
+                    let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
+                    ::std::result::Result::Ok(__rows.into_iter().map(|__row| {
+                        __cubos_sql_output { #row_mapping }
+                    }).collect())
+                }
+
+                async fn fetch_one(self) -> ::std::result::Result<__cubos_sql_output, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Err(cubos_sql::Error::NoRows);
+                    }
+                    let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
+                    let __row = __rows.into_iter().next().ok_or_else(|| cubos_sql::Error::NoRows)?;
+                    ::std::result::Result::Ok(__cubos_sql_output { #row_mapping })
+                }
+
+                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__cubos_sql_output>, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Ok(::std::option::Option::None);
+                    }
+                    let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
+                    ::std::result::Result::Ok(__rows.into_iter().next().map(|__row| {
+                        __cubos_sql_output { #row_mapping }
+                    }))
+                }
+
+                async fn execute(self) -> ::std::result::Result<u64, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Ok(0);
+                    }
+                    cubos_sql::Executor::execute(self.__executor, &__sql, &__params_ref).await
+                }
+            }
+
+            __cubos_sql_query {
+                __executor: &#executor_expr,
+                #spread_struct_inits
+                #regular_param_inits
+            }
+        }
+    };
+
+    Ok(ts)
+}
+
+// ---------------------------------------------------------------------------
 // Helper: output struct fields
 // ---------------------------------------------------------------------------
 
@@ -236,7 +536,11 @@ fn build_param_fields(
         };
 
         // Resolve the value expression for this parameter.
-        let value_expr: TokenStream = resolve_param_value(&param.name, param_info.and_then(|p| p.domain_rust_type.as_deref()), assignments)?;
+        let value_expr: TokenStream = resolve_param_value(
+            &param.name,
+            param_info.and_then(|p| p.domain_rust_type.as_deref()),
+            assignments,
+        )?;
 
         defs.extend(quote! {
             #field_name: #field_type,
@@ -277,7 +581,9 @@ fn resolve_param_value(
 
     // Wrap domain types so they are stored as JSON values.
     if domain_rust_type.is_some() {
-        Ok(quote! { ::cubos_sql::__private::serde_json::to_value(&#raw_expr).unwrap() })
+        Ok(
+            quote! { ::cubos_sql::__private::serde_json::to_value(&#raw_expr).expect("failed to serialize domain type to JSON") },
+        )
     } else {
         Ok(raw_expr)
     }
@@ -371,14 +677,15 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
             Ok(quote! {
                 {
                     let __json_val = __row.get::<_, ::std::option::Option<::cubos_sql::__private::serde_json::Value>>(#idx_lit);
-                    __json_val.map(|__v| ::cubos_sql::__private::serde_json::from_value::<#domain_type>(__v).unwrap())
+                    __json_val.map(|__v| ::cubos_sql::__private::serde_json::from_value::<#domain_type>(__v)
+                        .expect(concat!("failed to deserialize domain type: ", stringify!(#domain_type))))
                 }
             })
         } else {
             Ok(quote! {
                 ::cubos_sql::__private::serde_json::from_value::<#domain_type>(
                     __row.get::<_, ::cubos_sql::__private::serde_json::Value>(#idx_lit)
-                ).unwrap()
+                ).expect(concat!("failed to deserialize domain type: ", stringify!(#domain_type)))
             })
         }
     } else {
@@ -394,5 +701,225 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
                 __row.get::<_, #base_type>(#idx_lit)
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::introspect::{ColumnInfo, ParamInfo, QueryInfo};
+    use cubos_sql_core::lexer::lex;
+
+    fn make_query_info(param_types: &[&str], columns: Vec<ColumnInfo>) -> QueryInfo {
+        QueryInfo {
+            params: param_types
+                .iter()
+                .map(|t| ParamInfo {
+                    pg_type_oid: 0,
+                    rust_type: t.to_string(),
+                    domain_rust_type: None,
+                })
+                .collect(),
+            columns,
+        }
+    }
+
+    fn make_column(name: &str, rust_type: &str, nullable: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            pg_type_oid: 0,
+            rust_type: rust_type.to_string(),
+            nullable,
+            domain_rust_type: None,
+        }
+    }
+
+    fn parse_executor_expr() -> syn::Expr {
+        syn::parse_str::<syn::Expr>("pool").unwrap()
+    }
+
+    #[test]
+    fn regular_query_no_spread_code() {
+        let lo = lex("SELECT id, name FROM users WHERE age > $min_age").unwrap();
+        let qi = make_query_info(
+            &["i32"],
+            vec![
+                make_column("id", "i64", false),
+                make_column("name", "String", false),
+            ],
+        );
+        let executor = parse_executor_expr();
+        let assignments = vec![ParamAssignment {
+            name: "min_age".into(),
+            expr: Some(syn::parse_str("25").unwrap()),
+        }];
+
+        let ts = generate(&lo, &qi, &executor, &assignments).unwrap();
+        let code = ts.to_string();
+
+        assert!(code.contains("fetch_all"), "should have fetch_all method");
+        assert!(code.contains("fetch_one"), "should have fetch_one method");
+        assert!(code.contains("execute"), "should have execute method");
+        assert!(
+            !code.contains("__spread"),
+            "regular query should not have spread code"
+        );
+        assert!(
+            !code.contains("__build_spread_sql"),
+            "regular query should not have spread SQL builder"
+        );
+    }
+
+    #[test]
+    fn spread_generates_dynamic_sql_builder() {
+        let lo =
+            lex("INSERT INTO users (name, email) VALUES $..new_users { name, email }").unwrap();
+        assert_eq!(lo.spreads.len(), 1);
+        assert_eq!(lo.spreads[0].name, "new_users");
+
+        let qi = make_query_info(&["String", "String"], vec![]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            code.contains("__build_spread_sql"),
+            "spread query should have SQL builder fn"
+        );
+        assert!(
+            code.contains("__spread"),
+            "spread query should have __spread field"
+        );
+        assert!(code.contains("is_empty"), "should handle empty spread case");
+    }
+
+    #[test]
+    fn spread_has_all_four_methods() {
+        let lo = lex("INSERT INTO t (x) VALUES $..data { x }").unwrap();
+        let qi = make_query_info(&["i32"], vec![]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(code.contains("fetch_all"), "should have fetch_all");
+        assert!(code.contains("fetch_one"), "should have fetch_one");
+        assert!(
+            code.contains("fetch_optional"),
+            "should have fetch_optional"
+        );
+        assert!(code.contains("execute"), "should have execute");
+    }
+
+    #[test]
+    fn spread_with_returning_has_output_struct() {
+        let lo =
+            lex("INSERT INTO users (name, email) VALUES $..users { name, email } RETURNING id")
+                .unwrap();
+        let qi = make_query_info(&["String", "String"], vec![make_column("id", "i64", false)]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        // Output struct should have the id field from RETURNING.
+        assert!(
+            code.contains("__cubos_sql_output"),
+            "should define output struct"
+        );
+        assert!(
+            code.contains("__row"),
+            "should have row mapping for RETURNING columns"
+        );
+    }
+
+    #[test]
+    fn spread_with_regular_params() {
+        let lo = lex(
+            "INSERT INTO items (org_id, name) SELECT $org_id, name FROM (VALUES $..items { name }) AS t(name)",
+        )
+        .unwrap();
+        assert_eq!(lo.params.len(), 1);
+        assert_eq!(lo.spreads.len(), 1);
+
+        let qi = make_query_info(&["i64", "String"], vec![]);
+        let executor = parse_executor_expr();
+        let assignments = vec![ParamAssignment {
+            name: "org_id".into(),
+            expr: Some(syn::parse_str("42i64").unwrap()),
+        }];
+
+        let ts = generate(&lo, &qi, &executor, &assignments).unwrap();
+        let code = ts.to_string();
+
+        // Should have both regular param field and spread.
+        assert!(code.contains("p0"), "should have regular param p0");
+        assert!(code.contains("__spread"), "should have spread");
+    }
+
+    #[test]
+    fn spread_sql_prefix_and_suffix() {
+        let lo =
+            lex("INSERT INTO users (name, email) VALUES $..users { name, email } RETURNING id")
+                .unwrap();
+        let qi = make_query_info(&["String", "String"], vec![make_column("id", "i64", false)]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        // The SQL prefix should include everything before the spread offset.
+        assert!(
+            code.contains("INSERT INTO users (name, email) VALUES"),
+            "SQL prefix should be in generated code"
+        );
+        // The suffix should include RETURNING.
+        assert!(
+            code.contains("RETURNING id"),
+            "SQL suffix should be in generated code"
+        );
+    }
+
+    #[test]
+    fn spread_empty_fetch_all_returns_empty_vec() {
+        let lo = lex("INSERT INTO t (x) VALUES $..data { x }").unwrap();
+        let qi = make_query_info(&["i32"], vec![]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        // The generated code should check is_empty and return early with
+        // an empty Vec for fetch_all.
+        assert!(
+            code.contains("Vec :: new"),
+            "fetch_all empty should return empty vec"
+        );
+    }
+
+    #[test]
+    fn multiple_spreads_generates_multiple_fields() {
+        let lo = lex(
+            "WITH a AS (INSERT INTO t1 (x) VALUES $..s1 { x }) \
+             INSERT INTO t2 (y) VALUES $..s2 { y }",
+        )
+        .unwrap();
+        assert_eq!(lo.spreads.len(), 2);
+
+        let qi = make_query_info(&["i32", "String"], vec![]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(code.contains("__spread_0"), "should have __spread_0");
+        assert!(code.contains("__spread_1"), "should have __spread_1");
+        assert!(code.contains("__S0"), "should have generic __S0");
+        assert!(code.contains("__S1"), "should have generic __S1");
+        assert!(
+            code.contains("__build_spread_sql"),
+            "should have SQL builder"
+        );
     }
 }

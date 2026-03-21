@@ -34,15 +34,14 @@ pub fn put(path: &Path, info: &QueryInfo) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string(info)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string(info).map_err(std::io::Error::other)?;
     fs::write(path, json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::introspect::{QueryInfo, ColumnInfo, ParamInfo};
+    use crate::introspect::{ColumnInfo, ParamInfo, QueryInfo};
 
     #[test]
     fn cache_round_trip() {

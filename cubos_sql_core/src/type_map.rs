@@ -1,7 +1,46 @@
-//! Maps PostgreSQL type OIDs to Rust type information.
+//! Maps PostgreSQL type OIDs and names to Rust types.
 //!
-//! Used by the proc macro to generate correctly-typed output and parameter code
-//! without needing a runtime HashMap allocation.
+//! This module is used by the proc macro at compile time to determine the Rust
+//! types for query parameters and output columns. Users do not interact with
+//! this module directly, but the mapping table below shows which PostgreSQL
+//! types are supported and what Rust types they map to.
+//!
+//! # Supported type mappings
+//!
+//! | PostgreSQL type | OID   | Rust type                       |
+//! |-----------------|-------|---------------------------------|
+//! | `bool`          | 16    | `bool`                          |
+//! | `bytea`         | 17    | `Vec<u8>`                       |
+//! | `name`          | 19    | `String`                        |
+//! | `int8`          | 20    | `i64`                           |
+//! | `int2`          | 21    | `i16`                           |
+//! | `int4`          | 23    | `i32`                           |
+//! | `text`          | 25    | `String`                        |
+//! | `oid`           | 26    | `u32`                           |
+//! | `json`          | 114   | `serde_json::Value`             |
+//! | `float4`        | 700   | `f32`                           |
+//! | `float8`        | 701   | `f64`                           |
+//! | `bool[]`        | 1000  | `Vec<bool>`                     |
+//! | `int2[]`        | 1005  | `Vec<i16>`                      |
+//! | `int4[]`        | 1007  | `Vec<i32>`                      |
+//! | `text[]`        | 1009  | `Vec<String>`                   |
+//! | `int8[]`        | 1016  | `Vec<i64>`                      |
+//! | `float4[]`      | 1021  | `Vec<f32>`                      |
+//! | `float8[]`      | 1022  | `Vec<f64>`                      |
+//! | `char` (bpchar) | 1042  | `String`                        |
+//! | `varchar`       | 1043  | `String`                        |
+//! | `date`          | 1082  | `chrono::NaiveDate`             |
+//! | `time`          | 1083  | `chrono::NaiveTime`             |
+//! | `timestamp`     | 1114  | `chrono::NaiveDateTime`         |
+//! | `timestamptz`   | 1184  | `chrono::DateTime<chrono::Utc>` |
+//! | `uuid`          | 2950  | `uuid::Uuid`                    |
+//! | `uuid[]`        | 2951  | `Vec<uuid::Uuid>`               |
+//! | `jsonb`         | 3802  | `serde_json::Value`             |
+//! | `jsonb[]`       | 3807  | `Vec<serde_json::Value>`        |
+//!
+//! Columns with `CREATE DOMAIN ... AS JSONB` are handled separately via the
+//! [domain mapping configuration](crate::config) and are deserialized into
+//! user-defined Rust structs instead of `serde_json::Value`.
 
 /// Static type information for a single PostgreSQL type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +125,18 @@ static PG_TYPES: &[PgTypeInfo] = &[
         rust_param_type: "f64",
     },
     PgTypeInfo {
+        oid: 1000,
+        pg_name: "boolarray",
+        rust_output_type: "Vec<bool>",
+        rust_param_type: "Vec<bool>",
+    },
+    PgTypeInfo {
+        oid: 1005,
+        pg_name: "int2array",
+        rust_output_type: "Vec<i16>",
+        rust_param_type: "Vec<i16>",
+    },
+    PgTypeInfo {
         oid: 1007,
         pg_name: "int4array",
         rust_output_type: "Vec<i32>",
@@ -102,6 +153,18 @@ static PG_TYPES: &[PgTypeInfo] = &[
         pg_name: "int8array",
         rust_output_type: "Vec<i64>",
         rust_param_type: "Vec<i64>",
+    },
+    PgTypeInfo {
+        oid: 1021,
+        pg_name: "float4array",
+        rust_output_type: "Vec<f32>",
+        rust_param_type: "Vec<f32>",
+    },
+    PgTypeInfo {
+        oid: 1022,
+        pg_name: "float8array",
+        rust_output_type: "Vec<f64>",
+        rust_param_type: "Vec<f64>",
     },
     PgTypeInfo {
         oid: 1042,
@@ -122,6 +185,12 @@ static PG_TYPES: &[PgTypeInfo] = &[
         rust_param_type: "chrono::NaiveDate",
     },
     PgTypeInfo {
+        oid: 1083,
+        pg_name: "time",
+        rust_output_type: "chrono::NaiveTime",
+        rust_param_type: "chrono::NaiveTime",
+    },
+    PgTypeInfo {
         oid: 1114,
         pg_name: "timestamp",
         rust_output_type: "chrono::NaiveDateTime",
@@ -140,24 +209,51 @@ static PG_TYPES: &[PgTypeInfo] = &[
         rust_param_type: "uuid::Uuid",
     },
     PgTypeInfo {
+        oid: 2951,
+        pg_name: "uuidarray",
+        rust_output_type: "Vec<uuid::Uuid>",
+        rust_param_type: "Vec<uuid::Uuid>",
+    },
+    PgTypeInfo {
         oid: 3802,
         pg_name: "jsonb",
         rust_output_type: "serde_json::Value",
         rust_param_type: "serde_json::Value",
     },
+    PgTypeInfo {
+        oid: 3807,
+        pg_name: "jsonbarray",
+        rust_output_type: "Vec<serde_json::Value>",
+        rust_param_type: "Vec<serde_json::Value>",
+    },
 ];
 
-/// Returns type information for the given PostgreSQL OID, or `None` if the
-/// OID is not in the supported set.
+/// Returns type information for the given PostgreSQL OID.
+///
+/// Returns `None` if the OID does not correspond to a supported type.
+/// See the [module-level documentation](self) for the full list of supported
+/// OIDs.
 pub fn from_oid(oid: u32) -> Option<&'static PgTypeInfo> {
     PG_TYPES.iter().find(|t| t.oid == oid)
 }
 
-/// Returns type information for the given PostgreSQL type name (case-insensitive),
-/// or `None` if the name is not in the supported set.
+/// Returns type information for the given PostgreSQL type name (case-insensitive).
+///
+/// Returns `None` if the name does not match any supported type.
 pub fn from_name(name: &str) -> Option<&'static PgTypeInfo> {
     let lower = name.to_ascii_lowercase();
     PG_TYPES.iter().find(|t| t.pg_name == lower.as_str())
+}
+
+/// Returns a comma-separated list of all supported PostgreSQL type names.
+///
+/// Useful for error messages that need to list what types are available.
+pub fn supported_type_names() -> String {
+    PG_TYPES
+        .iter()
+        .map(|t| t.pg_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -293,6 +389,48 @@ mod tests {
     fn from_oid_textarray() {
         let info = from_oid(1009).expect("textarray OID 1009 must be present");
         assert_eq!(info.rust_output_type, "Vec<String>");
+    }
+
+    #[test]
+    fn from_oid_time() {
+        let info = from_oid(1083).expect("time OID 1083 must be present");
+        assert_eq!(info.rust_output_type, "chrono::NaiveTime");
+    }
+
+    #[test]
+    fn from_oid_boolarray() {
+        let info = from_oid(1000).expect("boolarray OID 1000 must be present");
+        assert_eq!(info.rust_output_type, "Vec<bool>");
+    }
+
+    #[test]
+    fn from_oid_int2array() {
+        let info = from_oid(1005).expect("int2array OID 1005 must be present");
+        assert_eq!(info.rust_output_type, "Vec<i16>");
+    }
+
+    #[test]
+    fn from_oid_float4array() {
+        let info = from_oid(1021).expect("float4array OID 1021 must be present");
+        assert_eq!(info.rust_output_type, "Vec<f32>");
+    }
+
+    #[test]
+    fn from_oid_float8array() {
+        let info = from_oid(1022).expect("float8array OID 1022 must be present");
+        assert_eq!(info.rust_output_type, "Vec<f64>");
+    }
+
+    #[test]
+    fn from_oid_uuidarray() {
+        let info = from_oid(2951).expect("uuidarray OID 2951 must be present");
+        assert_eq!(info.rust_output_type, "Vec<uuid::Uuid>");
+    }
+
+    #[test]
+    fn from_oid_jsonbarray() {
+        let info = from_oid(3807).expect("jsonbarray OID 3807 must be present");
+        assert_eq!(info.rust_output_type, "Vec<serde_json::Value>");
     }
 
     #[test]

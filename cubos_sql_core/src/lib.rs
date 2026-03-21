@@ -1,13 +1,16 @@
-//! Shared core crate for the `cubos_sql` ecosystem.
+//! Internal shared core for the `cubos_sql` ecosystem.
 //!
-//! This crate provides foundational types and utilities used by both the runtime
-//! (`cubos_sql`) and the proc macro (`cubos_sql_macros`) crates:
+//! **Users should depend on the `cubos_sql` crate, not on `cubos_sql_core`
+//! directly.** This crate contains foundational types and utilities shared
+//! between the runtime (`cubos_sql`) and the proc macro (`cubos_sql_macros`).
 //!
-//! - **Config parser** ([`config`]) — reads `[package.metadata.cubos_sql]` from `Cargo.toml`.
-//! - **SQL lexer** ([`lexer`]) — tokenizes SQL templates, rewriting named parameters
-//!   (`$name`) and spread parameters (`$..items`) into positional placeholders.
-//! - **Parameter types** ([`param`]) — data structures representing extracted parameters
-//!   and the lexer output.
+//! # Modules
+//!
+//! - [`config`] -- Parses `[package.metadata.cubos_sql]` from `Cargo.toml`.
+//! - [`lexer`] -- Tokenizes SQL templates, rewriting `$name` parameters and
+//!   `$..spread` parameters into positional placeholders.
+//! - [`param`] -- Data structures for extracted parameters and lexer output.
+//! - [`type_map`] -- Maps PostgreSQL type OIDs and names to Rust types.
 
 pub mod config;
 pub mod lexer;

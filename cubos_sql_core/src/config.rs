@@ -1,8 +1,39 @@
+//! Configuration types for `cubos_sql`.
+//!
+//! The configuration is read from the `[package.metadata.cubos_sql]` section
+//! of the consumer's `Cargo.toml`. A complete example:
+//!
+//! ```toml
+//! [package]
+//! name = "my-app"
+//! version = "0.1.0"
+//! edition = "2021"
+//!
+//! [package.metadata.cubos_sql.database]
+//! docker_image = "postgres:16"   # Docker image for compile-time PG (default: "postgres")
+//! migrations = "./migrations"    # path to SQL migration files (required)
+//!
+//! [package.metadata.cubos_sql.migrations]
+//! table = "public._migrations"   # tracking table name (default: "public._migrations")
+//! lock_id = 713705               # advisory lock ID (default: 713705)
+//! use_transaction = true         # wrap each migration in a transaction (default: true)
+//!
+//! [package.metadata.cubos_sql.domains]
+//! user_preferences = "crate::domains::UserPreferences"
+//! order_metadata = "crate::domains::OrderMetadata"
+//! ```
+//!
+//! Only `[package.metadata.cubos_sql.database].migrations` is required; all
+//! other fields have sensible defaults.
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Top-level configuration for `cubos_sql`, read from `[package.metadata.cubos_sql]` in `Cargo.toml`.
+///
+/// Load this from a `Cargo.toml` file with [`Config::from_cargo_toml`], or
+/// parse a TOML string directly via [`str::parse`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Database-related settings (Docker image, migrations path).
@@ -15,7 +46,10 @@ pub struct Config {
     pub domains: HashMap<String, String>,
 }
 
-/// Database configuration section.
+/// Database-related configuration.
+///
+/// Specifies the Docker image used for the compile-time PostgreSQL container
+/// and the path to the SQL migration files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     /// Docker image to use for the compile-time PostgreSQL container.
@@ -33,6 +67,9 @@ impl DatabaseConfig {
 }
 
 /// Configuration for the migration runner behavior.
+///
+/// Controls how migrations are tracked and executed. All fields have defaults,
+/// so this entire section can be omitted from `Cargo.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MigrationsConfig {
     /// Fully qualified table name for tracking applied migrations.
@@ -80,11 +117,9 @@ impl MigrationsConfig {
     /// Accepts `name` or `schema.name`, where each part matches `[a-zA-Z_][a-zA-Z0-9_]*`.
     /// This prevents SQL injection since the table name is interpolated into queries.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_qualified_name(&self.table).map_err(|msg| {
-            ConfigError::InvalidTable {
-                table: self.table.clone(),
-                reason: msg,
-            }
+        validate_qualified_name(&self.table).map_err(|msg| ConfigError::InvalidTable {
+            table: self.table.clone(),
+            reason: msg,
         })
     }
 }
@@ -136,10 +171,7 @@ fn validate_qualified_name(name: &str) -> Result<(), String> {
 
     for part in &parts {
         if !is_pg_ident(part) {
-            return Err(format!(
-                "'{}' is not a valid PostgreSQL identifier",
-                part
-            ));
+            return Err(format!("'{}' is not a valid PostgreSQL identifier", part));
         }
     }
 
@@ -184,6 +216,8 @@ struct Metadata {
 }
 
 /// Errors that can occur when loading or parsing the `cubos_sql` configuration.
+///
+/// Returned by [`Config::from_cargo_toml`] and [`MigrationsConfig::validate`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read {path}: {source}")]
@@ -350,49 +384,73 @@ migrations = "/opt/migrations"
 
     #[test]
     fn validate_unqualified_table() {
-        let config = MigrationsConfig { table: "_migrations".into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: "_migrations".into(),
+            ..Default::default()
+        };
         config.validate().unwrap();
     }
 
     #[test]
     fn validate_qualified_table() {
-        let config = MigrationsConfig { table: "my_schema._migrations".into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: "my_schema._migrations".into(),
+            ..Default::default()
+        };
         config.validate().unwrap();
     }
 
     #[test]
     fn validate_quoted_table() {
-        let config = MigrationsConfig { table: r#""my-schema"."my-migrations""#.into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: r#""my-schema"."my-migrations""#.into(),
+            ..Default::default()
+        };
         config.validate().unwrap();
     }
 
     #[test]
     fn validate_mixed_quoted_unquoted() {
-        let config = MigrationsConfig { table: r#"public."my-migrations""#.into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: r#"public."my-migrations""#.into(),
+            ..Default::default()
+        };
         config.validate().unwrap();
     }
 
     #[test]
     fn validate_rejects_sql_injection() {
-        let config = MigrationsConfig { table: "public; DROP TABLE users --".into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: "public; DROP TABLE users --".into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_empty() {
-        let config = MigrationsConfig { table: "".into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: "".into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_too_many_parts() {
-        let config = MigrationsConfig { table: "a.b.c".into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: "a.b.c".into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_empty_quoted() {
-        let config = MigrationsConfig { table: r#""""#.into(), ..Default::default() };
+        let config = MigrationsConfig {
+            table: r#""""#.into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 }

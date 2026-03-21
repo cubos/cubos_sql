@@ -1,0 +1,23 @@
+{
+  "name": "cubos-sql",
+  "displayName": "cubos_sql",
+  "description": "SQL syntax highlighting inside cubos_sql query! macros",
+  "version": "0.1.0",
+  "publisher": "cubos",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "grammars": [
+      {
+        "injectTo": ["source.rust"],
+        "scopeName": "inline.sql.cubos-sql",
+        "path": "./syntaxes/cubos-sql.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.sql": "sql"
+        }
+      }
+    ]
+  }
+}

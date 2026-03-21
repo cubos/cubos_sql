@@ -1,4 +1,169 @@
-// Stub — CLI implementation comes in Phase 5
-fn main() {
-    eprintln!("cubos_sql CLI not yet implemented");
+use std::fs;
+use std::path::Path;
+use std::process;
+
+use chrono::Utc;
+use clap::Parser;
+use cubos_sql::migrate::{self, MigrationSource};
+use cubos_sql_core::config::Config;
+
+/// Entry point for `cargo sql`.
+///
+/// When invoked as `cargo sql migrate run`, Cargo calls `cargo-sql sql migrate run`.
+/// The outer `Sql` subcommand absorbs that injected `sql` token.
+#[derive(Parser)]
+#[command(name = "cargo", bin_name = "cargo", about = "cubos_sql database tools")]
+struct Cli {
+    #[command(subcommand)]
+    command: CargoSubcommand,
+}
+
+#[derive(clap::Subcommand)]
+enum CargoSubcommand {
+    /// cubos_sql database tools
+    Sql {
+        #[command(subcommand)]
+        command: Commands,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    /// Run database migrations
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum MigrateAction {
+    /// Apply all pending migrations
+    Run,
+    /// Show migration status
+    Status,
+    /// Revert a migration (defaults to the last applied)
+    Revert {
+        /// Name of migration to revert (defaults to last applied)
+        name: Option<String>,
+        /// Force revert even without a .down.sql file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Create a new empty migration file
+    Create {
+        /// Migration name (e.g., "add_users_table")
+        name: String,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    if let Err(e) = run(cli).await {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let CargoSubcommand::Sql { command } = cli.command;
+    match command {
+        Commands::Migrate { action } => handle_migrate(action).await,
+    }
+}
+
+async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_cargo_toml(Path::new("./Cargo.toml"))?;
+    let migrations_dir = config.migrations_dir(Path::new("."));
+
+    // Handle actions that don't require a database connection
+    if let MigrateAction::Create { name } = &action {
+        let timestamp = Utc::now().format("%Y%m%d%H%M%S");
+        fs::create_dir_all(&migrations_dir)?;
+
+        let up_file = migrations_dir.join(format!("{timestamp}_{name}.sql"));
+        let down_file = migrations_dir.join(format!("{timestamp}_{name}.down.sql"));
+
+        fs::write(&up_file, "")?;
+        fs::write(&down_file, "")?;
+
+        println!("Created {}", up_file.display());
+        println!("Created {}", down_file.display());
+        return Ok(());
+    }
+
+    // Actions below require a database connection
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL environment variable must be set")?;
+
+    let source = MigrationSource::from_dir(&migrations_dir)?;
+
+    let (mut client, connection) =
+        tokio_postgres::connect(&database_url, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Database connection error: {e}");
+        }
+    });
+
+    match action {
+        MigrateAction::Run => {
+            let applied = migrate::run(&mut client, &source, &config.migrations).await?;
+            if applied.is_empty() {
+                println!("No pending migrations");
+            } else {
+                for name in &applied {
+                    println!("Applying {name}... done");
+                }
+                println!("Applied {} migration(s)", applied.len());
+            }
+        }
+        MigrateAction::Status => {
+            let statuses = migrate::status(&client, &source, &config.migrations).await?;
+            if statuses.is_empty() {
+                println!("No migrations found");
+            } else {
+                for s in &statuses {
+                    if s.applied {
+                        let ts = s
+                            .applied_at
+                            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                            .unwrap_or_default();
+                        println!("  \u{2713} {:<30} (applied {ts})", s.name);
+                    } else {
+                        println!("  \u{00b7} {:<30} (pending)", s.name);
+                    }
+                }
+            }
+        }
+        MigrateAction::Revert { name, force } => {
+            let revert_name = match name {
+                Some(n) => n,
+                None => {
+                    // Find the last applied migration
+                    let statuses = migrate::status(&client, &source, &config.migrations).await?;
+                    statuses
+                        .iter()
+                        .rev()
+                        .find(|s| s.applied)
+                        .map(|s| s.name.clone())
+                        .ok_or("No applied migrations to revert")?
+                }
+            };
+            migrate::revert(
+                &mut client,
+                &source,
+                &revert_name,
+                force,
+                &config.migrations,
+            )
+            .await?;
+            println!("Reverting {revert_name}... done");
+        }
+        MigrateAction::Create { .. } => unreachable!(),
+    }
+
+    Ok(())
 }

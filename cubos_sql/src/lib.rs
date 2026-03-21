@@ -1,16 +1,242 @@
-//! Main runtime crate for `cubos_sql` — typed PostgreSQL access with compile-time verification.
+//! Typed PostgreSQL access with compile-time query verification.
 //!
-//! This crate provides:
+//! `cubos_sql` checks your SQL queries against a real PostgreSQL schema at compile time,
+//! generating type-safe Rust code with zero runtime overhead. Write plain SQL, get full
+//! type safety.
 //!
-//! - **Migration runner** ([`migrate`]) — apply, revert, and inspect database migrations
-//!   with advisory-lock protection and optional transaction wrapping.
-//! - **Executor trait** ([`Executor`]) — abstraction over pooled clients and transactions,
-//!   used by the `query!` macro.
+//! # Philosophy
+//!
+//! - **Postgres-only** -- no abstraction over multiple databases. Embraces PostgreSQL
+//!   features like `JSONB`, advisory locks, and `CREATE DOMAIN`.
+//! - **SQL-native** -- write real SQL, not a Rust DSL. The `query!` macro takes a SQL
+//!   string and verifies it at compile time.
+//! - **Compile-time checked** -- the proc macro spins up a Docker container, runs your
+//!   migrations, and introspects every query. Type mismatches are caught before your code
+//!   ships.
+//! - **Human-friendly syntax** -- use `$name` for parameters instead of `$1`. Use
+//!   `$..spread` for bulk inserts. Get named fields on output structs, not positional
+//!   indices.
+//!
+//! # Quick start
+//!
+//! Add to your `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! cubos_sql = "0.1"
+//! deadpool-postgres = "0.14"
+//! tokio-postgres = "0.7"
+//! tokio = { version = "1", features = ["full"] }
+//!
+//! [package.metadata.cubos_sql.database]
+//! migrations = "./migrations"
+//! ```
+//!
+//! Create `migrations/0001_create_users.sql`:
+//!
+//! ```sql
+//! CREATE TABLE users (
+//!     id    SERIAL PRIMARY KEY,
+//!     name  TEXT NOT NULL,
+//!     email TEXT NOT NULL UNIQUE
+//! );
+//! ```
+//!
+//! Use it:
+//!
+//! ```rust,ignore
+//! use cubos_sql::query;
+//!
+//! let users = query!(pool, "SELECT id, name, email FROM users")
+//!     .fetch_all()
+//!     .await?;
+//!
+//! for user in &users {
+//!     println!("{}: {} ({})", user.id, user.name, user.email);
+//! }
+//! ```
+//!
+//! That's it. The macro spins up a Docker Postgres container at compile time,
+//! runs your migrations, and type-checks every query.
+//!
+//! # Configuration
+//!
+//! The only required configuration is the migrations path. All other settings
+//! have sensible defaults:
+//!
+//! ```toml
+//! [package.metadata.cubos_sql.database]
+//! migrations = "./migrations"             # required
+//! docker_image = "postgres"               # optional, default: "postgres"
+//!
+//! [package.metadata.cubos_sql.migrations]
+//! table = "public._migrations"            # optional, tracking table name
+//! lock_id = 713705                        # optional, advisory lock ID
+//! use_transaction = true                  # optional, wrap each migration in a tx
+//!
+//! [package.metadata.cubos_sql.domains]
+//! user_preferences = "crate::UserPrefs"   # optional, JSONB domain mappings
+//! ```
+//!
+//! # The `query!` macro
+//!
+//! The macro verifies your SQL at compile time and generates an anonymous struct
+//! for the result columns. It supports four terminal methods:
+//!
+//! ```rust,ignore
+//! use cubos_sql::query;
+//!
+//! # async fn example(pool: &deadpool_postgres::Pool) -> Result<(), cubos_sql::Error> {
+//! // fetch_all -- returns Vec<Row>. Use for SELECT queries expecting multiple rows.
+//! let users = query!(pool, "SELECT id, name FROM users")
+//!     .fetch_all()
+//!     .await?;
+//!
+//! // fetch_one -- returns a single Row. Returns Error::NoRows if empty.
+//! let user = query!(pool, "SELECT id, name FROM users WHERE id = $id", id = 1)
+//!     .fetch_one()
+//!     .await?;
+//!
+//! // fetch_optional -- returns Option<Row>. Use when the row might not exist.
+//! let maybe_user = query!(pool, "SELECT id, name FROM users WHERE id = $id", id = 42)
+//!     .fetch_optional()
+//!     .await?;
+//!
+//! // execute -- returns u64 (number of affected rows). Use for INSERT/UPDATE/DELETE.
+//! let rows_affected = query!(pool, "DELETE FROM users WHERE id = $id", id = 1)
+//!     .execute()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Named parameters
+//!
+//! Parameters use `$name` syntax in SQL. You can provide values with explicit
+//! assignment or rely on scope capture (like closures):
+//!
+//! ```rust,ignore
+//! use cubos_sql::query;
+//!
+//! # async fn example(pool: &deadpool_postgres::Pool) -> Result<(), cubos_sql::Error> {
+//! // Explicit assignment
+//! let user = query!(
+//!     pool,
+//!     "SELECT id, name FROM users WHERE email = $email",
+//!     email = "alice@example.com"
+//! )
+//!     .fetch_one()
+//!     .await?;
+//!
+//! // Scope capture -- if a variable `email` is in scope, just use $email
+//! let email = "alice@example.com".to_string();
+//! let user = query!(
+//!     pool,
+//!     "SELECT id, name FROM users WHERE email = $email"
+//! )
+//!     .fetch_one()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Bulk insert with `$..spread`
+//!
+//! Insert multiple rows in a single statement using the spread syntax. The macro
+//! expands `$..items { field1, field2 }` into a multi-row `VALUES` clause:
+//!
+//! ```rust,ignore
+//! use cubos_sql::query;
+//!
+//! # struct NewUser { name: String, email: String }
+//! # async fn example(pool: &deadpool_postgres::Pool) -> Result<(), cubos_sql::Error> {
+//! let new_users = vec![
+//!     NewUser { name: "Alice".into(), email: "alice@example.com".into() },
+//!     NewUser { name: "Bob".into(),   email: "bob@example.com".into() },
+//! ];
+//!
+//! let rows_affected = query!(
+//!     pool,
+//!     "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
+//! )
+//!     .execute()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Domain types (JSONB)
+//!
+//! Map PostgreSQL `CREATE DOMAIN ... AS JSONB` types to Rust structs that
+//! implement `serde::Serialize` and `serde::Deserialize`. Configure the mapping
+//! in `Cargo.toml`:
+//!
+//! ```toml
+//! [package.metadata.cubos_sql.domains]
+//! user_preferences = "crate::domains::UserPreferences"
+//! ```
+//!
+//! Then the `query!` macro automatically serializes and deserializes through the
+//! mapped Rust type instead of raw `serde_json::Value`.
+//!
+//! # Transactions
+//!
+//! The [`Executor`] trait is implemented for `tokio_postgres::Transaction`, so you
+//! can pass a transaction directly to `query!`:
+//!
+//! ```rust,ignore
+//! use cubos_sql::query;
+//!
+//! # async fn example(pool: &deadpool_postgres::Pool) -> Result<(), cubos_sql::Error> {
+//! let mut client = pool.get().await.map_err(|e| cubos_sql::Error::Pool(e.to_string()))?;
+//! let tx = client.transaction().await?;
+//!
+//! query!(&tx, "INSERT INTO users (name, email) VALUES ($name, $email)",
+//!     name = "Charlie", email = "charlie@example.com")
+//!     .execute()
+//!     .await?;
+//!
+//! query!(&tx, "UPDATE users SET name = $name WHERE email = $email",
+//!     name = "Charles", email = "charlie@example.com")
+//!     .execute()
+//!     .await?;
+//!
+//! tx.commit().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Migrations (programmatic API)
+//!
+//! Use the [`migrate`] module to run migrations at application startup:
+//!
+//! ```rust,no_run
+//! use cubos_sql::migrate::{MigrationSource, run};
+//! use cubos_sql_core::config::MigrationsConfig;
+//! use std::path::Path;
+//!
+//! # async fn example() -> Result<(), cubos_sql::Error> {
+//! // Connect directly with tokio-postgres for migrations
+//! let (mut client, connection) =
+//!     tokio_postgres::connect("host=localhost dbname=mydb user=postgres", tokio_postgres::NoTls).await?;
+//! tokio::spawn(connection);
+//!
+//! let source = MigrationSource::from_dir(Path::new("./migrations"))?;
+//! let config = MigrationsConfig::default();
+//! let applied = run(&mut client, &source, &config).await?;
+//! println!("Applied {} migrations", applied.len());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! See the [`migrate`] module for details on [`migrate::status`] and [`migrate::revert`].
 //!
 //! # Pool setup
 //!
-//! Create a `deadpool_postgres::Pool` directly — this crate implements
-//! [`Executor`] for `deadpool_postgres::Object` (the pooled client):
+//! Create a `deadpool_postgres::Pool` from a connection URL. This crate
+//! implements [`Executor`] for both `deadpool_postgres::Pool` (acquires a
+//! connection per query) and `deadpool_postgres::Object` (the pooled
+//! connection):
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,16 +244,63 @@
 //! use tokio_postgres::NoTls;
 //!
 //! let mut cfg = Config::new();
-//! cfg.host = Some("localhost".into());
-//! cfg.dbname = Some("mydb".into());
-//! cfg.user = Some("postgres".into());
+//! cfg.url = Some(std::env::var("DATABASE_URL")?);
 //! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 //!
-//! let client = pool.get().await?;
-//! // `client` implements `cubos_sql::Executor` — pass it to `query!`
+//! // Pass `&pool` directly to query! -- acquires a connection automatically
+//! // Or get a dedicated connection: pool.get().await?
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # The `Executor` trait
+//!
+//! The [`Executor`] trait abstracts over connection types. It is implemented for:
+//!
+//! | Type | Behavior |
+//! |------|----------|
+//! | `deadpool_postgres::Pool` | Acquires a connection from the pool per query |
+//! | `deadpool_postgres::Object` | Uses the already-acquired pooled connection |
+//! | `tokio_postgres::Client` | Uses the raw client directly |
+//! | `tokio_postgres::Transaction<'_>` | Executes within the transaction |
+//!
+//! You do not call `Executor` methods directly -- the `query!` macro generates code
+//! that is generic over any `Executor` implementation.
+//!
+//! # Type mapping
+//!
+//! The following PostgreSQL types are supported and mapped to Rust types automatically:
+//!
+//! | PostgreSQL type | Rust type |
+//! |-----------------|-----------|
+//! | `bool` | `bool` |
+//! | `int2` / `smallint` | `i16` |
+//! | `int4` / `integer` | `i32` |
+//! | `int8` / `bigint` | `i64` |
+//! | `float4` / `real` | `f32` |
+//! | `float8` / `double precision` | `f64` |
+//! | `text` | `String` |
+//! | `varchar` / `char(n)` | `String` |
+//! | `bytea` | `Vec<u8>` |
+//! | `uuid` | `uuid::Uuid` |
+//! | `date` | `chrono::NaiveDate` |
+//! | `time` | `chrono::NaiveTime` |
+//! | `timestamp` | `chrono::NaiveDateTime` |
+//! | `timestamptz` | `chrono::DateTime<chrono::Utc>` |
+//! | `json` | `serde_json::Value` |
+//! | `jsonb` | `serde_json::Value` |
+//! | `oid` | `u32` |
+//! | `bool[]` | `Vec<bool>` |
+//! | `int2[]` | `Vec<i16>` |
+//! | `int4[]` | `Vec<i32>` |
+//! | `int8[]` | `Vec<i64>` |
+//! | `float4[]` | `Vec<f32>` |
+//! | `float8[]` | `Vec<f64>` |
+//! | `text[]` | `Vec<String>` |
+//! | `uuid[]` | `Vec<uuid::Uuid>` |
+//! | `jsonb[]` | `Vec<serde_json::Value>` |
+//!
+//! Nullable columns (no `NOT NULL` constraint) are wrapped in `Option<T>`.
 
 pub mod error;
 pub mod executor;
@@ -38,6 +311,9 @@ pub use error::Error;
 pub use executor::Executor;
 
 /// Re-export the `query!` macro from `cubos_sql_macros`.
+///
+/// See the [`macro@query`] documentation for full syntax, examples, and
+/// configuration details.
 pub use cubos_sql_macros::query;
 
 /// Re-exports used by the `query!` macro generated code.

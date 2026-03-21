@@ -5,10 +5,15 @@ use tokio_postgres::Row;
 
 use crate::executor::Executor;
 
-/// Implement `Executor` for `deadpool_postgres::Pool` directly.
+/// [`Executor`] implementation for `deadpool_postgres::Pool`.
 ///
-/// Each call acquires a connection from the pool, runs the query, and returns
-/// the connection automatically.
+/// Each method call acquires a connection from the pool, executes the query,
+/// and returns the connection to the pool when done. This is the most convenient
+/// way to run queries -- just pass `&pool` to `query!` and connection management
+/// is handled automatically.
+///
+/// If the pool is exhausted (no available connections), methods return
+/// [`Error::Pool`](crate::Error::Pool).
 impl Executor for deadpool_postgres::Pool {
     async fn query<'a>(
         &'a self,
@@ -35,7 +40,11 @@ impl Executor for deadpool_postgres::Pool {
     }
 }
 
-/// Implement `Executor` for `deadpool_postgres::Object` (the pooled client).
+/// [`Executor`] implementation for `deadpool_postgres::Object` (the pooled connection).
+///
+/// Delegates directly to the inner `tokio_postgres::Client` via `Deref`. Use this
+/// when you need to hold a connection across multiple queries (e.g., to run them on
+/// the same connection) without using a transaction.
 impl Executor for deadpool_postgres::Object {
     async fn query<'a>(
         &'a self,

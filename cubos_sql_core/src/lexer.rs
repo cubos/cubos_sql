@@ -1,26 +1,56 @@
+//! SQL template lexer for `cubos_sql`.
+//!
+//! This module provides the [`lex`] function, which takes a SQL string
+//! containing `$name` parameters and `$..spread` syntax and produces a
+//! [`LexOutput`] with the SQL rewritten to use PostgreSQL positional
+//! placeholders (`$1`, `$2`, ...).
+//!
+//! The lexer is **not** a full SQL parser. It tracks just enough state to
+//! distinguish between normal SQL context and string literals, comments,
+//! dollar-quoted strings, and quoted identifiers. Parameters are only
+//! extracted in normal context -- `$name` inside a string literal or comment
+//! is left untouched.
+
 use crate::param::{LexOutput, Param, SpreadParam};
 
+/// An error produced when the lexer encounters invalid SQL syntax.
+///
+/// All variants include the byte `position` where the problem was detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexError {
+    /// A single-quoted string literal was opened but never closed.
     UnclosedString { position: usize },
+    /// A `/* ... */` block comment was opened but never closed.
     UnclosedBlockComment { position: usize },
+    /// A dollar-quoted string (`$$...$$` or `$tag$...$tag$`) was opened but
+    /// never closed.
     UnclosedDollarQuote { tag: String, position: usize },
+    /// A double-quoted identifier (`"..."`) was opened but never closed.
     UnclosedQuotedIdentifier { position: usize },
 }
 
 impl std::fmt::Display for LexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnclosedString { position } => write!(f, "unclosed string literal at byte {position}"),
-            Self::UnclosedBlockComment { position } => write!(f, "unclosed block comment at byte {position}"),
-            Self::UnclosedDollarQuote { tag, position } => write!(f, "unclosed dollar-quote ${tag}$ at byte {position}"),
-            Self::UnclosedQuotedIdentifier { position } => write!(f, "unclosed quoted identifier at byte {position}"),
+            Self::UnclosedString { position } => {
+                write!(f, "unclosed string literal at byte {position}")
+            }
+            Self::UnclosedBlockComment { position } => {
+                write!(f, "unclosed block comment at byte {position}")
+            }
+            Self::UnclosedDollarQuote { tag, position } => {
+                write!(f, "unclosed dollar-quote ${tag}$ at byte {position}")
+            }
+            Self::UnclosedQuotedIdentifier { position } => {
+                write!(f, "unclosed quoted identifier at byte {position}")
+            }
         }
     }
 }
 
 impl std::error::Error for LexError {}
 
+/// Internal state machine states for the lexer.
 enum LexState {
     Normal,
     StringLiteral(usize),
@@ -46,6 +76,31 @@ fn read_ident(chars: &[char], start: usize) -> &[char] {
     &chars[start..end]
 }
 
+/// Lex a SQL template string, extracting named and spread parameters.
+///
+/// Rewrites `$name` placeholders to positional PostgreSQL placeholders
+/// (`$1`, `$2`, ...) and removes `$..spread` tokens, recording their byte
+/// offsets for later expansion by the code generator.
+///
+/// Parameters inside string literals, comments, dollar-quoted strings, and
+/// quoted identifiers are ignored.
+///
+/// # Errors
+///
+/// Returns a [`LexError`] if the SQL contains an unclosed string literal,
+/// block comment, dollar-quoted string, or quoted identifier.
+///
+/// # Examples
+///
+/// ```
+/// use cubos_sql_core::lexer::lex;
+///
+/// let output = lex("SELECT * FROM users WHERE id = $id AND name = $name").unwrap();
+/// assert_eq!(output.sql, "SELECT * FROM users WHERE id = $1 AND name = $2");
+/// assert_eq!(output.params.len(), 2);
+/// assert_eq!(output.params[0].name, "id");
+/// assert_eq!(output.params[1].name, "name");
+/// ```
 pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
@@ -54,7 +109,8 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
     let mut params: Vec<Param> = Vec::new();
     let mut spreads: Vec<SpreadParam> = Vec::new();
     // Map from param name to its 1-based positional index
-    let mut param_indices: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut param_indices: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut i = 0;
     let byte_offsets: Vec<usize> = sql.char_indices().map(|(idx, _)| idx).collect();
 
@@ -101,8 +157,13 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                     while fi < len && chars[fi].is_ascii_whitespace() {
                                         fi += 1;
                                     }
-                                    if fi >= len { break; }
-                                    if chars[fi] == '}' { fi += 1; break; }
+                                    if fi >= len {
+                                        break;
+                                    }
+                                    if chars[fi] == '}' {
+                                        fi += 1;
+                                        break;
+                                    }
                                     if is_ident_start(chars[fi]) {
                                         let fc = read_ident(&chars, fi);
                                         fields.push(fc.iter().collect::<String>());
@@ -118,10 +179,18 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                     }
                                 }
                                 // Don't emit spread token — just record the offset
-                                spreads.push(SpreadParam { name, fields: Some(fields), offset: out_offset });
+                                spreads.push(SpreadParam {
+                                    name,
+                                    fields: Some(fields),
+                                    offset: out_offset,
+                                });
                                 i = fi;
                             } else {
-                                spreads.push(SpreadParam { name, fields: None, offset: out_offset });
+                                spreads.push(SpreadParam {
+                                    name,
+                                    fields: None,
+                                    offset: out_offset,
+                                });
                                 i = after_ident;
                             }
                         } else {
@@ -186,7 +255,9 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 }
                 if i >= len {
                     if let LexState::StringLiteral(_) = state {
-                        return Err(LexError::UnclosedString { position: start_pos });
+                        return Err(LexError::UnclosedString {
+                            position: start_pos,
+                        });
                     }
                 }
             }
@@ -217,7 +288,10 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 i += 1;
                 if i >= len {
                     if let LexState::DollarQuote(_, _) = state {
-                        return Err(LexError::UnclosedDollarQuote { tag, position: start_pos });
+                        return Err(LexError::UnclosedDollarQuote {
+                            tag,
+                            position: start_pos,
+                        });
                     }
                 }
             }
@@ -241,7 +315,9 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 }
                 if i >= len {
                     if let LexState::BlockComment(_) = state {
-                        return Err(LexError::UnclosedBlockComment { position: start_pos });
+                        return Err(LexError::UnclosedBlockComment {
+                            position: start_pos,
+                        });
                     }
                 }
             }
@@ -254,7 +330,9 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 i += 1;
                 if i >= len {
                     if let LexState::QuotedIdentifier(_) = state {
-                        return Err(LexError::UnclosedQuotedIdentifier { position: start_pos });
+                        return Err(LexError::UnclosedQuotedIdentifier {
+                            position: start_pos,
+                        });
                     }
                 }
             }
@@ -264,12 +342,23 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
     match &state {
         LexState::Normal | LexState::LineComment => {}
         LexState::StringLiteral(p) => return Err(LexError::UnclosedString { position: *p }),
-        LexState::DollarQuote(tag, p) => return Err(LexError::UnclosedDollarQuote { tag: tag.clone(), position: *p }),
+        LexState::DollarQuote(tag, p) => {
+            return Err(LexError::UnclosedDollarQuote {
+                tag: tag.clone(),
+                position: *p,
+            })
+        }
         LexState::BlockComment(p) => return Err(LexError::UnclosedBlockComment { position: *p }),
-        LexState::QuotedIdentifier(p) => return Err(LexError::UnclosedQuotedIdentifier { position: *p }),
+        LexState::QuotedIdentifier(p) => {
+            return Err(LexError::UnclosedQuotedIdentifier { position: *p })
+        }
     }
 
-    Ok(LexOutput { sql: out, params, spreads })
+    Ok(LexOutput {
+        sql: out,
+        params,
+        spreads,
+    })
 }
 
 #[cfg(test)]
@@ -389,7 +478,10 @@ mod tests {
         let out = lex("INSERT INTO t VALUES $..items { name, email, age }").unwrap();
         assert_eq!(out.spreads.len(), 1);
         assert_eq!(out.spreads[0].name, "items");
-        assert_eq!(out.spreads[0].fields, Some(vec!["name".into(), "email".into(), "age".into()]));
+        assert_eq!(
+            out.spreads[0].fields,
+            Some(vec!["name".into(), "email".into(), "age".into()])
+        );
         assert_eq!(out.sql, "INSERT INTO t VALUES ");
     }
 

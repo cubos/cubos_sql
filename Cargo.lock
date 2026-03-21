@@ -328,10 +328,12 @@ dependencies = [
 name = "cubos_sql_cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "cubos_sql",
  "cubos_sql_core",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

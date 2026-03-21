@@ -179,10 +179,7 @@ fn is_container_running(container_id: &str) -> bool {
     Command::new("docker")
         .args(["inspect", "-f", "{{.State.Running}}", container_id])
         .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout).trim() == "true"
-        })
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
         .unwrap_or(false)
 }
 
@@ -207,13 +204,15 @@ fn get_mapped_port(container_id: &str) -> Result<u16, DockerError> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().next().ok_or_else(|| {
-        DockerError::Docker("docker port returned empty output".to_string())
-    })?;
+    let line = stdout
+        .lines()
+        .next()
+        .ok_or_else(|| DockerError::Docker("docker port returned empty output".to_string()))?;
 
-    let port_str = line.trim().rsplit(':').next().ok_or_else(|| {
-        DockerError::Docker(format!("unexpected docker port output: {}", line))
-    })?;
+    let port_str =
+        line.trim().rsplit(':').next().ok_or_else(|| {
+            DockerError::Docker(format!("unexpected docker port output: {}", line))
+        })?;
 
     port_str.trim().parse::<u16>().map_err(|e| {
         DockerError::Docker(format!("failed to parse port '{}': {}", port_str.trim(), e))
@@ -260,7 +259,10 @@ pub fn run_migrations(info: &ContainerInfo, migrations_dir: &Path) -> Result<(),
     let mut client = None;
     for _ in 0..5 {
         match postgres::Client::connect(&conn_str, postgres::NoTls) {
-            Ok(c) => { client = Some(c); break; }
+            Ok(c) => {
+                client = Some(c);
+                break;
+            }
             Err(_) => thread::sleep(Duration::from_millis(500)),
         }
     }
@@ -369,11 +371,14 @@ fn ensure_container_inner(
                 Ok(port) => {
                     // Update port in state in case it changed (shouldn't, but be safe).
                     if port != state.port {
-                        let _ = write_state(sp, &ContainerState {
-                            container_id: state.container_id.clone(),
-                            port,
-                            ready: true,
-                        });
+                        let _ = write_state(
+                            sp,
+                            &ContainerState {
+                                container_id: state.container_id.clone(),
+                                port,
+                                ready: true,
+                            },
+                        );
                     }
                     return Ok(ContainerInfo {
                         host: "127.0.0.1".to_string(),
@@ -439,11 +444,14 @@ fn ensure_container_inner(
     }
 
     // Write state with ready=false BEFORE migrating.
-    write_state(sp, &ContainerState {
-        container_id: container_id.clone(),
-        port: 0,
-        ready: false,
-    })?;
+    write_state(
+        sp,
+        &ContainerState {
+            container_id: container_id.clone(),
+            port: 0,
+            ready: false,
+        },
+    )?;
 
     // Wait for PostgreSQL to be ready.
     if let Err(e) = wait_for_postgres(&container_id) {
@@ -478,11 +486,14 @@ fn ensure_container_inner(
     }
 
     // Success — mark as ready.
-    write_state(sp, &ContainerState {
-        container_id,
-        port,
-        ready: true,
-    })?;
+    write_state(
+        sp,
+        &ContainerState {
+            container_id,
+            port,
+            ready: true,
+        },
+    )?;
 
     Ok(info)
 }
@@ -496,7 +507,8 @@ mod tests {
         std::fs::write(
             dir.path().join("0001_create_users.sql"),
             "CREATE TABLE test_users (id SERIAL PRIMARY KEY, name TEXT NOT NULL);",
-        ).unwrap();
+        )
+        .unwrap();
         dir
     }
 
@@ -601,7 +613,8 @@ mod tests {
         std::fs::write(
             mig_dir.path().join("0001_bad.sql"),
             "THIS IS NOT VALID SQL!!!",
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = test_config(mig_dir.path());
 
@@ -613,6 +626,9 @@ mod tests {
         let hash = hash_migrations_dir(mig_dir.path()).unwrap();
         let base = cubos_sql_dir(mig_dir.path());
         let sp = state_path(&base, &hash);
-        assert!(!sp.exists(), "state file should be cleaned up after failure");
+        assert!(
+            !sp.exists(),
+            "state file should be cleaned up after failure"
+        );
     }
 }

@@ -10,9 +10,8 @@ async fn connect_to_container(
 ) -> tokio_postgres::Client {
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let conn_str = format!(
-        "host={host} port={port} user=postgres password=postgres dbname=postgres"
-    );
+    let conn_str =
+        format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
     let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
     tokio::spawn(async move {
         if let Err(e) = conn.await {
