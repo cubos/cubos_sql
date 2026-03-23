@@ -1,0 +1,4 @@
+# Keep query cache files (*.json) for offline builds.
+# Ignore ephemeral container state and lock files.
+*/container.json
+*/lock

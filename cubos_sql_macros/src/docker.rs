@@ -103,12 +103,9 @@ pub fn hash_migrations_dir(path: &Path) -> Result<String, DockerError> {
         })?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext == "sql")
-                .unwrap_or(false)
+            let path = entry.path();
+            let name = path.to_string_lossy();
+            name.ends_with(".sql") && !name.ends_with(".down.sql")
         })
         .collect();
 
@@ -520,6 +517,8 @@ mod tests {
             },
             migrations: cubos_sql_core::config::MigrationsConfig::default(),
             domains: std::collections::HashMap::new(),
+            enums: std::collections::HashMap::new(),
+            types: std::collections::HashMap::new(),
         }
     }
 

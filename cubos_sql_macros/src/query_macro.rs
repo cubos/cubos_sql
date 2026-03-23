@@ -1,11 +1,11 @@
-//! Parsing and orchestration for the `query!` proc macro.
+//! Parsing and orchestration for the `sql!` proc macro.
 //!
 //! Parses the macro input, drives the lexer, Docker container, introspection,
 //! and code generation pipeline.  Results are cached per query+migration hash
 //! inside the `.cubos_sql/` directory.
 
+use std::cell::RefCell;
 use std::path::Path;
-use std::sync::Mutex;
 
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
@@ -14,53 +14,74 @@ use syn::{Expr, Ident, LitStr, Token};
 use crate::codegen::{self, ParamAssignment};
 
 // ---------------------------------------------------------------------------
-// Connection cache
+// Connection cache (thread-local)
 // ---------------------------------------------------------------------------
 
 /// Cached connection to the compile-time PostgreSQL container.
-/// Reused across `query!` invocations within the same build process.
-static CACHED_CLIENT: Mutex<Option<CachedConnection>> = Mutex::new(None);
-
+/// Reused across `sql!` invocations within the same build process.
+/// Uses `thread_local!` because `postgres::Client` is not `Send`.
 struct CachedConnection {
     client: postgres::Client,
     connection_string: String,
 }
 
-fn get_or_connect(
+thread_local! {
+    static CACHED_CLIENT: RefCell<Option<CachedConnection>> = const { RefCell::new(None) };
+}
+
+/// Run a closure with a mutable reference to the cached `postgres::Client`.
+///
+/// Connects (or reconnects) if the connection string changed or the connection
+/// is dead, then passes `&mut Client` to `f`. On error from `f`, the cached
+/// connection is dropped so the next call gets a fresh one.
+fn with_client<T>(
     conn_str: &str,
-) -> Result<std::sync::MutexGuard<'static, Option<CachedConnection>>, syn::Error> {
-    let mut guard = CACHED_CLIENT.lock().map_err(|_| {
-        syn::Error::new(Span::call_site(), "failed to acquire connection lock")
-    })?;
+    f: impl FnOnce(&mut postgres::Client) -> Result<T, syn::Error>,
+) -> Result<T, syn::Error> {
+    CACHED_CLIENT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
 
-    let needs_connect = match guard.as_ref() {
-        Some(cached) => cached.connection_string != conn_str,
-        None => true,
-    };
+        let needs_connect = match borrow.as_mut() {
+            Some(cached) => {
+                if cached.connection_string != conn_str {
+                    true
+                } else {
+                    cached.client.simple_query("").is_err()
+                }
+            }
+            None => true,
+        };
 
-    if needs_connect {
-        let client =
-            postgres::Client::connect(conn_str, postgres::NoTls).map_err(|e| {
+        if needs_connect {
+            let client = postgres::Client::connect(conn_str, postgres::NoTls).map_err(|e| {
                 syn::Error::new(
                     Span::call_site(),
                     format!("failed to connect to compile-time PG: {e}"),
                 )
             })?;
 
-        *guard = Some(CachedConnection {
-            client,
-            connection_string: conn_str.to_string(),
-        });
-    }
+            *borrow = Some(CachedConnection {
+                client,
+                connection_string: conn_str.to_string(),
+            });
+        }
 
-    Ok(guard)
+        let cached = borrow.as_mut().unwrap();
+        let result = f(&mut cached.client);
+
+        if result.is_err() {
+            *borrow = None;
+        }
+
+        result
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Macro input parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed representation of `query!(executor, "SQL", param = value, ...)`.
+/// Parsed representation of `sql!(executor, "SQL", param = value, ...)`.
 pub struct QueryInput {
     pub executor: Expr,
     pub sql: LitStr,
@@ -107,7 +128,7 @@ impl Parse for QueryInput {
 // Orchestration
 // ---------------------------------------------------------------------------
 
-/// Execute the full `query!` pipeline and return the generated `TokenStream`.
+/// Execute the full `sql!` pipeline and return the generated `TokenStream`.
 pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
     let sql_str = input.sql.value();
 
@@ -117,14 +138,8 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
 
     // Validate that all assignments match SQL params.
     for assignment in &input.assignments {
-        if !lex_output
-            .params
-            .iter()
-            .any(|p| p.name == assignment.name)
-            && !lex_output
-                .spreads
-                .iter()
-                .any(|s| s.name == assignment.name)
+        if !lex_output.params.iter().any(|p| p.name == assignment.name)
+            && !lex_output.spreads.iter().any(|s| s.name == assignment.name)
         {
             let available: Vec<String> = lex_output
                 .params
@@ -147,7 +162,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         }
     }
 
-    // Validate spread constraints: field mapping is mandatory.
+    // Validate spread constraints: field mapping is mandatory, fields must be unique.
     for spread in &lex_output.spreads {
         if spread.fields.is_none() {
             return Err(syn::Error::new(
@@ -157,6 +172,17 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
                     spread.name, spread.name,
                 ),
             ));
+        }
+        if let Some(fields) = &spread.fields {
+            let mut seen = std::collections::HashSet::new();
+            for field in fields {
+                if !seen.insert(field.as_str()) {
+                    return Err(syn::Error::new(
+                        input.sql.span(),
+                        format!("duplicate field '{}' in $..{} spread", field, spread.name,),
+                    ));
+                }
+            }
         }
     }
 
@@ -185,8 +211,38 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     };
 
     let cubos_dir = crate::docker::cubos_sql_dir(manifest_path);
-    let cache_path =
-        crate::cache::query_cache_path(&cubos_dir, &migration_hash, &introspection_sql);
+
+    // Hash the type-mapping config so cache invalidates when domains/enums/types change.
+    let config_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut domains: Vec<_> = config.domains.iter().collect();
+        domains.sort();
+        for (k, v) in &domains {
+            h.update(k.as_bytes());
+            h.update(v.as_bytes());
+        }
+        let mut enums: Vec<_> = config.enums.iter().collect();
+        enums.sort();
+        for (k, v) in &enums {
+            h.update(k.as_bytes());
+            h.update(v.as_bytes());
+        }
+        let mut types: Vec<_> = config.types.iter().collect();
+        types.sort();
+        for (k, v) in &types {
+            h.update(k.as_bytes());
+            h.update(v.as_bytes());
+        }
+        format!("{:x}", h.finalize())
+    };
+
+    let cache_path = crate::cache::query_cache_path(
+        &cubos_dir,
+        &migration_hash,
+        &introspection_sql,
+        &config_hash,
+    );
 
     let query_info = if let Some(cached) = crate::cache::get(&cache_path) {
         cached
@@ -194,24 +250,42 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         // 4. Cache miss — ensure Docker container is running.
         let (container_info, _) =
             crate::docker::ensure_container(&config, manifest_path).map_err(|e| {
+                let msg = e.to_string();
+                let hint = if msg.contains("not found") || msg.contains("No such file") {
+                    "\nhint: is Docker installed and in your PATH?"
+                } else if msg.contains("Cannot connect")
+                    || msg.contains("connection refused")
+                    || msg.contains("Is the docker daemon running")
+                {
+                    "\nhint: is the Docker daemon running? Try `docker info`."
+                } else if msg.contains("permission denied") {
+                    "\nhint: does your user have permission to use Docker? Try `sudo usermod -aG docker $USER`."
+                } else {
+                    ""
+                };
                 syn::Error::new(
                     Span::call_site(),
-                    format!("failed to start compile-time PG container: {e}"),
+                    format!("failed to start compile-time PG container: {e}{hint}"),
                 )
             })?;
 
         // 5. Connect (or reuse cached connection) and introspect.
         let conn_str = container_info.connection_string();
-        let mut guard = get_or_connect(&conn_str)?;
-        let client = &mut guard.as_mut().unwrap().client;
+        let sql_span = input.sql.span();
 
-        let info =
-            crate::introspect::introspect_query(client, &introspection_sql, &config.domains)
-                .map_err(|e| {
-                *guard = None;
+        let info = with_client(&conn_str, |client| {
+            crate::introspect::introspect_query(
+                client,
+                &introspection_sql,
+                &config.domains,
+                &config.enums,
+                &config.types,
+            )
+            .map_err(|e| {
                 let msg = format_introspect_error(&e, &introspection_sql);
-                syn::Error::new(input.sql.span(), msg)
-            })?;
+                syn::Error::new(sql_span, msg)
+            })
+        })?;
 
         let _ = crate::cache::put(&cache_path, &info);
         info
@@ -267,10 +341,7 @@ fn build_spread_sample_sql(lex_output: &cubos_sql_core::param::LexOutput) -> Str
 // ---------------------------------------------------------------------------
 
 /// Format an introspection error with SQL position info when available.
-fn format_introspect_error(
-    e: &crate::introspect::IntrospectError,
-    sql: &str,
-) -> String {
+fn format_introspect_error(e: &crate::introspect::IntrospectError, sql: &str) -> String {
     match e {
         crate::introspect::IntrospectError::Postgres(pg_err) => {
             if let Some(db_err) = pg_err.as_db_error() {
@@ -284,9 +355,8 @@ fn format_introspect_error(
                 if let Some(pos) = db_err.position() {
                     use postgres::error::ErrorPosition;
                     if let ErrorPosition::Original(p) = pos {
-                        let adjusted = (*p as usize).saturating_sub(
-                            crate::introspect::PREPARE_PREFIX_LEN,
-                        );
+                        let adjusted =
+                            (*p as usize).saturating_sub(crate::introspect::PREPARE_PREFIX_LEN);
                         msg.push_str(&format_sql_position(sql, adjusted));
                     }
                 }
@@ -363,10 +433,8 @@ mod tests {
 
     #[test]
     fn sample_sql_multiple_spreads() {
-        let lo = lex(
-            "WITH a AS (INSERT INTO t1 (x) VALUES $..s1 { x }) \
-             INSERT INTO t2 (y) VALUES $..s2 { y }",
-        )
+        let lo = lex("WITH a AS (INSERT INTO t1 (x) VALUES $..s1 { x }) \
+             INSERT INTO t2 (y) VALUES $..s2 { y }")
         .unwrap();
         let sample = build_spread_sample_sql(&lo);
         assert!(sample.contains("VALUES ($1)"));

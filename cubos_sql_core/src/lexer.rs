@@ -17,6 +17,7 @@ use crate::param::{LexOutput, Param, SpreadParam};
 ///
 /// All variants include the byte `position` where the problem was detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LexError {
     /// A single-quoted string literal was opened but never closed.
     UnclosedString { position: usize },
@@ -56,7 +57,8 @@ enum LexState {
     StringLiteral(usize),
     DollarQuote(String, usize),
     LineComment,
-    BlockComment(usize),
+    /// Block comment with nesting depth and start position of the outermost `/*`.
+    BlockComment(usize, usize),
     QuotedIdentifier(usize),
 }
 
@@ -112,17 +114,20 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
     let mut param_indices: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut i = 0;
-    let byte_offsets: Vec<usize> = sql.char_indices().map(|(idx, _)| idx).collect();
+    // Track byte position incrementally (avoids a separate Vec<usize> allocation).
+    let char_byte_lens: Vec<u8> = sql.chars().map(|c| c.len_utf8() as u8).collect();
+    let byte_offset_of =
+        |idx: usize, lens: &[u8]| -> usize { lens[..idx].iter().map(|&b| b as usize).sum() };
 
     while i < len {
         match &state {
             LexState::Normal => {
                 if chars[i] == '\'' {
-                    state = LexState::StringLiteral(byte_offsets[i]);
+                    state = LexState::StringLiteral(byte_offset_of(i, &char_byte_lens));
                     out.push('\'');
                     i += 1;
                 } else if chars[i] == '"' {
-                    state = LexState::QuotedIdentifier(byte_offsets[i]);
+                    state = LexState::QuotedIdentifier(byte_offset_of(i, &char_byte_lens));
                     out.push('"');
                     i += 1;
                 } else if chars[i] == '-' && i + 1 < len && chars[i + 1] == '-' {
@@ -131,12 +136,12 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                     out.push('-');
                     i += 2;
                 } else if chars[i] == '/' && i + 1 < len && chars[i + 1] == '*' {
-                    state = LexState::BlockComment(byte_offsets[i]);
+                    state = LexState::BlockComment(1, byte_offset_of(i, &char_byte_lens));
                     out.push('/');
                     out.push('*');
                     i += 2;
                 } else if chars[i] == '$' {
-                    let pos = byte_offsets[i];
+                    let pos = byte_offset_of(i, &char_byte_lens);
                     // Check for spread: $..
                     if i + 2 < len && chars[i + 1] == '.' && chars[i + 2] == '.' {
                         let ident_start = i + 3;
@@ -302,19 +307,30 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 }
                 i += 1;
             }
-            LexState::BlockComment(start_pos) => {
+            LexState::BlockComment(depth, start_pos) => {
+                let depth = *depth;
                 let start_pos = *start_pos;
-                if chars[i] == '*' && i + 1 < len && chars[i + 1] == '/' {
+                if chars[i] == '/' && i + 1 < len && chars[i + 1] == '*' {
+                    // Nested block comment
+                    out.push('/');
+                    out.push('*');
+                    state = LexState::BlockComment(depth + 1, start_pos);
+                    i += 2;
+                } else if chars[i] == '*' && i + 1 < len && chars[i + 1] == '/' {
                     out.push('*');
                     out.push('/');
-                    state = LexState::Normal;
+                    if depth == 1 {
+                        state = LexState::Normal;
+                    } else {
+                        state = LexState::BlockComment(depth - 1, start_pos);
+                    }
                     i += 2;
                 } else {
                     out.push(chars[i]);
                     i += 1;
                 }
                 if i >= len {
-                    if let LexState::BlockComment(_) = state {
+                    if let LexState::BlockComment(_, _) = state {
                         return Err(LexError::UnclosedBlockComment {
                             position: start_pos,
                         });
@@ -323,11 +339,21 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
             }
             LexState::QuotedIdentifier(start_pos) => {
                 let start_pos = *start_pos;
-                out.push(chars[i]);
                 if chars[i] == '"' {
-                    state = LexState::Normal;
+                    if i + 1 < len && chars[i + 1] == '"' {
+                        // Escaped double-quote inside quoted identifier
+                        out.push('"');
+                        out.push('"');
+                        i += 2;
+                    } else {
+                        out.push('"');
+                        state = LexState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
                 }
-                i += 1;
                 if i >= len {
                     if let LexState::QuotedIdentifier(_) = state {
                         return Err(LexError::UnclosedQuotedIdentifier {
@@ -348,7 +374,9 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 position: *p,
             })
         }
-        LexState::BlockComment(p) => return Err(LexError::UnclosedBlockComment { position: *p }),
+        LexState::BlockComment(_, p) => {
+            return Err(LexError::UnclosedBlockComment { position: *p })
+        }
         LexState::QuotedIdentifier(p) => {
             return Err(LexError::UnclosedQuotedIdentifier { position: *p })
         }

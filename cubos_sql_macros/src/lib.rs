@@ -1,6 +1,6 @@
 //! Proc macro crate for `cubos_sql`.
 //!
-//! This crate provides the [`query!`] macro, which performs compile-time
+//! This crate provides the [`sql!`] macro, which performs compile-time
 //! verification of SQL queries against a real PostgreSQL schema. Users should
 //! depend on the `cubos_sql` crate (which re-exports this macro) rather than
 //! depending on `cubos_sql_macros` directly.
@@ -15,7 +15,7 @@ mod query_macro;
 
 /// Compile-time verified SQL query with named parameters.
 ///
-/// The `query!` macro lets you write raw SQL with `$named` parameters and get
+/// The `sql!` macro lets you write raw SQL with `$named` parameters and get
 /// full compile-time type checking. At build time it spins up a PostgreSQL
 /// container, runs your migrations, and introspects every query to ensure
 /// column names, parameter types, and result types are all correct. The
@@ -25,13 +25,13 @@ mod query_macro;
 /// # Syntax
 ///
 /// ```text
-/// query!(executor, "SQL query text", param1 = value1, param2 = value2, ...)
+/// sql!(executor, "SQL text", param1 = value1, param2 = value2, ...)
 /// ```
 ///
 /// The full grammar is:
 ///
 /// ```text
-/// query!(
+/// sql!(
 ///     <executor>,
 ///     "<SQL with $param and $..spread { field1, field2 } placeholders>",
 ///     [name = expr, ...]
@@ -57,7 +57,7 @@ mod query_macro;
 /// ## Explicit assignment
 ///
 /// ```text
-/// query!(pool, "SELECT * FROM users WHERE id = $user_id", user_id = 42)
+/// sql!(pool, "SELECT * FROM users WHERE id = $user_id", user_id = 42)
 /// ```
 ///
 /// ## Scope capture
@@ -68,7 +68,7 @@ mod query_macro;
 /// ```text
 /// let min_age = 25;
 /// let limit = 10;
-/// query!(pool,
+/// sql!(pool,
 ///     "SELECT id, name FROM users WHERE age > $min_age LIMIT $limit"
 /// )
 /// ```
@@ -79,7 +79,7 @@ mod query_macro;
 /// deduplicated automatically -- only one value is needed:
 ///
 /// ```text
-/// query!(pool,
+/// sql!(pool,
 ///     "SELECT * FROM t WHERE a = $x OR b = $x",
 ///     x = 42
 /// )
@@ -104,26 +104,26 @@ mod query_macro;
 ///
 /// ```text
 /// // fetch_all -- returns Vec<Row>
-/// let users = query!(pool,
+/// let users = sql!(pool,
 ///     "SELECT id, name, email FROM users WHERE age > $min_age",
 ///     min_age = 25
 /// ).fetch_all().await?;
 /// // users: Vec<{ id: i64, name: String, email: String }>
 ///
 /// // fetch_one -- returns Row, errors if no rows
-/// let user = query!(pool,
+/// let user = sql!(pool,
 ///     "SELECT id, name FROM users WHERE id = $user_id",
 ///     user_id = 1_i64
 /// ).fetch_one().await?;
 ///
 /// // fetch_optional -- returns Option<Row>
-/// let maybe_user = query!(pool,
+/// let maybe_user = sql!(pool,
 ///     "SELECT id, name FROM users WHERE email = $email",
 ///     email = "alice@example.com"
 /// ).fetch_optional().await?;
 ///
 /// // execute -- returns u64 rows affected
-/// let deleted = query!(pool,
+/// let deleted = sql!(pool,
 ///     "DELETE FROM orders WHERE user_id = $user_id AND total_cents = 0",
 ///     user_id = 1_i64
 /// ).execute().await?;
@@ -141,7 +141,7 @@ mod query_macro;
 ///     NewUser { name: "Bob".into(),   email: "bob@x.com".into(),   age: 25 },
 /// ];
 ///
-/// let inserted = query!(pool,
+/// let inserted = sql!(pool,
 ///     "INSERT INTO users (name, email, age)
 ///      VALUES $..new_users { name, email, age }
 ///      RETURNING id, name"
@@ -154,7 +154,7 @@ mod query_macro;
 ///
 /// ```text
 /// // Only insert name and email (age gets DEFAULT)
-/// query!(pool,
+/// sql!(pool,
 ///     "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
 /// ).execute().await?;
 /// ```
@@ -162,7 +162,7 @@ mod query_macro;
 /// Multiple spreads are supported (e.g. in CTEs):
 ///
 /// ```text
-/// query!(pool,
+/// sql!(pool,
 ///     "WITH a AS (INSERT INTO t1 VALUES $..items_a { x, y } RETURNING id),
 ///          b AS (INSERT INTO t2 VALUES $..items_b { z } RETURNING id)
 ///      SELECT * FROM a, b"
@@ -188,7 +188,7 @@ mod query_macro;
 ///
 /// ```text
 /// // Reading: preferences is deserialized to UserPreferences
-/// let user = query!(pool,
+/// let user = sql!(pool,
 ///     "SELECT id, preferences FROM users WHERE id = $id",
 ///     id = 1_i64
 /// ).fetch_one().await?;
@@ -196,7 +196,7 @@ mod query_macro;
 ///
 /// // Writing: prefs is serialized to JSONB automatically
 /// let prefs = UserPreferences { theme: "dark".into(), locale: "en".into(), notifications: true };
-/// query!(pool,
+/// sql!(pool,
 ///     "UPDATE users SET preferences = $prefs WHERE id = $user_id",
 ///     user_id = 1_i64
 /// ).execute().await?;
@@ -207,7 +207,7 @@ mod query_macro;
 ///
 /// # Executor types
 ///
-/// The first argument to `query!` can be any type implementing
+/// The first argument to `sql!` can be any type implementing
 /// `cubos_sql::Executor`:
 ///
 /// - `deadpool_postgres::Pool` (or `&Pool`)
@@ -220,14 +220,14 @@ mod query_macro;
 ///
 /// ```text
 /// let tx = pool.begin().await?;
-/// query!(tx, "INSERT INTO orders (...) VALUES (...)").execute().await?;
-/// query!(tx, "UPDATE users SET ...").execute().await?;
+/// sql!(tx, "INSERT INTO orders (...) VALUES (...)").execute().await?;
+/// sql!(tx, "UPDATE users SET ...").execute().await?;
 /// tx.commit().await?;
 /// ```
 ///
 /// # Compile-time behavior
 ///
-/// When you run `cargo build`, each `query!` invocation triggers the
+/// When you run `cargo build`, each `sql!` invocation triggers the
 /// following pipeline:
 ///
 /// 1. **Configuration** -- reads `[package.metadata.cubos_sql]` from your
@@ -251,20 +251,20 @@ mod query_macro;
 ///
 /// ```text
 /// // Invalid column name
-/// query!(pool, "SELECT nonexistent FROM users").fetch_all().await?;
+/// sql!(pool, "SELECT nonexistent FROM users").fetch_all().await?;
 /// // error: column "nonexistent" does not exist in table "users"
 ///
 /// // Type mismatch
 /// let age: &str = "not a number";
-/// query!(pool, "SELECT id FROM users WHERE age > $age").fetch_all().await?;
+/// sql!(pool, "SELECT id FROM users WHERE age > $age").fetch_all().await?;
 /// // error: expected INT, got &str
 ///
 /// // Missing field mapping on spread
-/// query!(pool, "INSERT INTO users (name, email) VALUES $..items");
+/// sql!(pool, "INSERT INTO users (name, email) VALUES $..items");
 /// // error: $..items requires explicit field mapping: $..items { field1, field2 }
 /// ```
 #[proc_macro]
-pub fn query(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+pub fn sql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as query_macro::QueryInput);
     match query_macro::expand(input) {
         Ok(ts) => ts.into(),

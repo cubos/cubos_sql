@@ -15,4 +15,6 @@ cubos_sql_core = { path = "../cubos_sql_core" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tokio-postgres = "0.7"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 chrono = "0.4"

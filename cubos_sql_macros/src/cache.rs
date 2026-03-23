@@ -10,17 +10,26 @@ use std::path::{Path, PathBuf};
 
 use crate::introspect::QueryInfo;
 
-/// Returns the cache file path for a query, given the migration hash and SQL.
-pub fn query_cache_path(target_dir: &Path, migration_hash: &str, sql: &str) -> PathBuf {
+/// Returns the cache file path for a query.
+///
+/// The path incorporates the migration hash, the SQL text, and a config hash
+/// (covering `[domains]`, `[enums]`, `[types]`) so that changes to type
+/// mappings correctly invalidate cached introspection results.
+pub fn query_cache_path(
+    target_dir: &Path,
+    migration_hash: &str,
+    sql: &str,
+    config_hash: &str,
+) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
+    hasher.update(config_hash.as_bytes());
     let query_hash = format!("{:x}", hasher.finalize());
 
     target_dir
-        .join("cubos_sql")
         .join(migration_hash)
         .join("queries")
-        .join(format!("{}.json", &query_hash[..16]))
+        .join(format!("{}.json", &query_hash[..32]))
 }
 
 /// Try to read a cached `QueryInfo` from disk.
@@ -46,13 +55,14 @@ mod tests {
     #[test]
     fn cache_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = query_cache_path(dir.path(), "abc123", "SELECT 1");
+        let path = query_cache_path(dir.path(), "abc123", "SELECT 1", "");
 
         let info = QueryInfo {
             params: vec![ParamInfo {
                 pg_type_oid: 23,
                 rust_type: "i32".to_string(),
                 domain_rust_type: None,
+                enum_rust_type: None,
             }],
             columns: vec![ColumnInfo {
                 name: "id".to_string(),
@@ -60,6 +70,7 @@ mod tests {
                 rust_type: "i64".to_string(),
                 nullable: false,
                 domain_rust_type: None,
+                enum_rust_type: None,
             }],
         };
 
@@ -76,11 +87,13 @@ mod tests {
     #[test]
     fn different_queries_different_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let p1 = query_cache_path(dir.path(), "hash1", "SELECT 1");
-        let p2 = query_cache_path(dir.path(), "hash1", "SELECT 2");
-        let p3 = query_cache_path(dir.path(), "hash2", "SELECT 1");
-        assert_ne!(p1, p2);
-        assert_ne!(p1, p3);
+        let p1 = query_cache_path(dir.path(), "hash1", "SELECT 1", "cfg1");
+        let p2 = query_cache_path(dir.path(), "hash1", "SELECT 2", "cfg1");
+        let p3 = query_cache_path(dir.path(), "hash2", "SELECT 1", "cfg1");
+        let p4 = query_cache_path(dir.path(), "hash1", "SELECT 1", "cfg2");
+        assert_ne!(p1, p2, "different SQL → different path");
+        assert_ne!(p1, p3, "different migration hash → different path");
+        assert_ne!(p1, p4, "different config hash → different path");
     }
 
     #[test]

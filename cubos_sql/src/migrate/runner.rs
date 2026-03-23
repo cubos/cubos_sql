@@ -79,14 +79,15 @@ pub async fn run(
     let result = run_inner(client, source, config).await;
 
     // Always release lock, even if run_inner failed.
-    // If release itself fails, prefer returning the original error.
     let release = release_lock(client, config).await;
-    match result {
-        Ok(v) => {
-            release?;
-            Ok(v)
+    match (&result, release) {
+        (Ok(_), Ok(_)) => result,
+        (Ok(_), Err(rel_err)) => Err(rel_err),
+        (Err(_), Err(rel_err)) => {
+            eprintln!("cubos_sql: failed to release advisory lock: {rel_err}");
+            result
         }
-        Err(e) => Err(e),
+        (Err(_), Ok(_)) => result,
     }
 }
 
@@ -191,14 +192,17 @@ pub async fn status(
         )
         .await?;
 
-    let applied: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> = rows
-        .iter()
-        .map(|row| {
-            let name: String = row.get(0);
-            let applied_at: chrono::DateTime<chrono::Utc> = row.get(1);
-            (name, applied_at)
-        })
-        .collect();
+    let mut applied: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row
+            .try_get(0)
+            .map_err(|e| crate::Error::Migration(format!("failed to read migration name: {e}")))?;
+        let applied_at: chrono::DateTime<chrono::Utc> = row
+            .try_get(1)
+            .map_err(|e| crate::Error::Migration(format!("failed to read applied_at: {e}")))?;
+        applied.insert(name, applied_at);
+    }
 
     let statuses = source
         .migrations()
@@ -267,12 +271,14 @@ pub async fn revert(
     let result = revert_inner(client, source, name, force, config).await;
 
     let release = release_lock(client, config).await;
-    match result {
-        Ok(v) => {
-            release?;
-            Ok(v)
+    match (&result, release) {
+        (Ok(_), Ok(_)) => result,
+        (Ok(_), Err(rel_err)) => Err(rel_err),
+        (Err(_), Err(rel_err)) => {
+            eprintln!("cubos_sql: failed to release advisory lock: {rel_err}");
+            result
         }
-        Err(e) => Err(e),
+        (Err(_), Ok(_)) => result,
     }
 }
 

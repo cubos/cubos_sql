@@ -100,6 +100,22 @@ async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error:
 
     let source = MigrationSource::from_dir(&migrations_dir)?;
 
+    let use_tls = database_url.contains("sslmode=require")
+        || database_url.contains("sslmode=prefer")
+        || database_url.contains("sslmode=verify");
+
+    if use_tls {
+        let tls_connector = native_tls::TlsConnector::builder().build()?;
+        let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
+        let (mut client, connection) = tokio_postgres::connect(&database_url, tls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Database connection error: {e}");
+            }
+        });
+        return run_migrate_action(action, &mut client, &source, &config).await;
+    }
+
     let (mut client, connection) =
         tokio_postgres::connect(&database_url, tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
@@ -108,9 +124,18 @@ async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error:
         }
     });
 
+    run_migrate_action(action, &mut client, &source, &config).await
+}
+
+async fn run_migrate_action(
+    action: MigrateAction,
+    client: &mut tokio_postgres::Client,
+    source: &MigrationSource,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         MigrateAction::Run => {
-            let applied = migrate::run(&mut client, &source, &config.migrations).await?;
+            let applied = migrate::run(client, source, &config.migrations).await?;
             if applied.is_empty() {
                 println!("No pending migrations");
             } else {
@@ -121,7 +146,7 @@ async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error:
             }
         }
         MigrateAction::Status => {
-            let statuses = migrate::status(&client, &source, &config.migrations).await?;
+            let statuses = migrate::status(client, source, &config.migrations).await?;
             if statuses.is_empty() {
                 println!("No migrations found");
             } else {
@@ -143,7 +168,7 @@ async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error:
                 Some(n) => n,
                 None => {
                     // Find the last applied migration
-                    let statuses = migrate::status(&client, &source, &config.migrations).await?;
+                    let statuses = migrate::status(client, source, &config.migrations).await?;
                     statuses
                         .iter()
                         .rev()
@@ -152,14 +177,7 @@ async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error:
                         .ok_or("No applied migrations to revert")?
                 }
             };
-            migrate::revert(
-                &mut client,
-                &source,
-                &revert_name,
-                force,
-                &config.migrations,
-            )
-            .await?;
+            migrate::revert(client, source, &revert_name, force, &config.migrations).await?;
             println!("Reverting {revert_name}... done");
         }
         MigrateAction::Create { .. } => unreachable!(),

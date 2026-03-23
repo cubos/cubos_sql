@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
+            "timeout": 30,
+            "statusMessage": "Running cargo fmt..."
+          },
+          {
+            "type": "command",
+            "command": "cargo check 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
+            "timeout": 120,
+            "statusMessage": "Running cargo check..."
+          },
+          {
+            "type": "command",
+            "command": "cargo test 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
+            "timeout": 120,
+            "statusMessage": "Running cargo test..."
+          },
+          {
+            "type": "command",
+            "command": "cargo clippy --fix --allow-dirty --allow-staged -- -D warnings 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
+            "timeout": 120,
+            "statusMessage": "Running cargo clippy..."
+          }
+        ]
+      }
+    ]
+  }
+}

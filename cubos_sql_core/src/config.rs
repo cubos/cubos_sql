@@ -21,7 +21,17 @@
 //! [package.metadata.cubos_sql.domains]
 //! user_preferences = "crate::domains::UserPreferences"
 //! order_metadata = "crate::domains::OrderMetadata"
+//!
+//! [package.metadata.cubos_sql.types]
+//! "public.citext" = "String"                   # custom PG type → Rust type
+//! "extensions.ltree" = "String"                # schema-qualified lookup
+//! citext = "String"                            # also works without schema
 //! ```
+//!
+//! Custom types in `[types]` are looked up by `schema.name` (or just `name`)
+//! in `pg_catalog` at compile time. The mapped Rust type must implement
+//! `tokio_postgres::types::ToSql + FromSql`. Array versions (`type[]`) are
+//! supported automatically as `Vec<RustType>`.
 //!
 //! Only `[package.metadata.cubos_sql.database].migrations` is required; all
 //! other fields have sensible defaults.
@@ -44,6 +54,15 @@ pub struct Config {
     /// Custom JSONB domain mappings: PostgreSQL domain name to Rust type path.
     #[serde(default)]
     pub domains: HashMap<String, String>,
+    /// Custom enum mappings: PostgreSQL enum type name to Rust type path.
+    /// The Rust type must implement `ToString` + `FromStr` for serialization.
+    #[serde(default)]
+    pub enums: HashMap<String, String>,
+    /// Custom type mappings: `"schema.type_name"` or `"type_name"` to Rust type path.
+    /// The Rust type must implement `tokio_postgres::types::ToSql` + `FromSql`.
+    /// Array versions are supported automatically as `Vec<RustType>`.
+    #[serde(default)]
+    pub types: HashMap<String, String>,
 }
 
 /// Database-related configuration.
@@ -179,6 +198,7 @@ fn validate_qualified_name(name: &str) -> Result<(), String> {
 }
 
 /// Splits a qualified name like `schema.name` or `"my schema"."my table"` into parts.
+/// Handles escaped double-quotes (`""`) inside quoted identifiers.
 fn split_qualified_name(name: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
@@ -188,6 +208,11 @@ fn split_qualified_name(name: &str) -> Vec<&str> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Escaped double-quote inside quoted identifier — skip both
+                i += 2;
+                continue;
+            }
             in_quote = !in_quote;
         } else if bytes[i] == b'.' && !in_quote {
             parts.push(&name[start..i]);
@@ -219,6 +244,7 @@ struct Metadata {
 ///
 /// Returned by [`Config::from_cargo_toml`] and [`MigrationsConfig::validate`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("failed to read {path}: {source}")]
     Io {
@@ -237,8 +263,19 @@ impl std::str::FromStr for Config {
     type Err = ConfigError;
 
     fn from_str(content: &str) -> Result<Self, Self::Err> {
-        let cargo: CargoToml = toml::from_str(content)?;
-        Ok(cargo.package.metadata.cubos_sql)
+        let cargo: CargoToml = toml::from_str(content).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("missing field")
+                && (msg.contains("metadata") || msg.contains("cubos_sql"))
+            {
+                ConfigError::MissingSection
+            } else {
+                ConfigError::Parse(e)
+            }
+        })?;
+        let config = cargo.package.metadata.cubos_sql;
+        config.migrations.validate()?;
+        Ok(config)
     }
 }
 

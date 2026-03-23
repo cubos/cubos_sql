@@ -8,7 +8,7 @@
 //!
 //! - **Postgres-only** -- no abstraction over multiple databases. Embraces PostgreSQL
 //!   features like `JSONB`, advisory locks, and `CREATE DOMAIN`.
-//! - **SQL-native** -- write real SQL, not a Rust DSL. The `query!` macro takes a SQL
+//! - **SQL-native** -- write real SQL, not a Rust DSL. The `sql!` macro takes a SQL
 //!   string and verifies it at compile time.
 //! - **Compile-time checked** -- the proc macro spins up a Docker container, runs your
 //!   migrations, and introspects every query. Type mismatches are caught before your code
@@ -47,7 +47,7 @@
 //! ```rust,ignore
 //! use cubos_sql::query;
 //!
-//! let users = query!(pool, "SELECT id, name, email FROM users")
+//! let users = sql!(pool, "SELECT id, name, email FROM users")
 //!     .fetch_all()
 //!     .await?;
 //!
@@ -78,7 +78,18 @@
 //! user_preferences = "crate::UserPrefs"   # optional, JSONB domain mappings
 //! ```
 //!
-//! # The `query!` macro
+//! # `.gitignore`
+//!
+//! The `sql!` macro creates a `.cubos_sql/` directory in your project root to
+//! cache Docker container state and query introspection results. Add it to your
+//! `.gitignore`:
+//!
+//! ```text
+//! # cubos_sql compile-time cache
+//! .cubos_sql/
+//! ```
+//!
+//! # The `sql!` macro
 //!
 //! The macro verifies your SQL at compile time and generates an anonymous struct
 //! for the result columns. It supports four terminal methods:
@@ -88,22 +99,22 @@
 //!
 //! # async fn example(pool: &deadpool_postgres::Pool) -> Result<(), cubos_sql::Error> {
 //! // fetch_all -- returns Vec<Row>. Use for SELECT queries expecting multiple rows.
-//! let users = query!(pool, "SELECT id, name FROM users")
+//! let users = sql!(pool, "SELECT id, name FROM users")
 //!     .fetch_all()
 //!     .await?;
 //!
 //! // fetch_one -- returns a single Row. Returns Error::NoRows if empty.
-//! let user = query!(pool, "SELECT id, name FROM users WHERE id = $id", id = 1)
+//! let user = sql!(pool, "SELECT id, name FROM users WHERE id = $id", id = 1)
 //!     .fetch_one()
 //!     .await?;
 //!
 //! // fetch_optional -- returns Option<Row>. Use when the row might not exist.
-//! let maybe_user = query!(pool, "SELECT id, name FROM users WHERE id = $id", id = 42)
+//! let maybe_user = sql!(pool, "SELECT id, name FROM users WHERE id = $id", id = 42)
 //!     .fetch_optional()
 //!     .await?;
 //!
 //! // execute -- returns u64 (number of affected rows). Use for INSERT/UPDATE/DELETE.
-//! let rows_affected = query!(pool, "DELETE FROM users WHERE id = $id", id = 1)
+//! let rows_affected = sql!(pool, "DELETE FROM users WHERE id = $id", id = 1)
 //!     .execute()
 //!     .await?;
 //! # Ok(())
@@ -120,7 +131,7 @@
 //!
 //! # async fn example(pool: &deadpool_postgres::Pool) -> Result<(), cubos_sql::Error> {
 //! // Explicit assignment
-//! let user = query!(
+//! let user = sql!(
 //!     pool,
 //!     "SELECT id, name FROM users WHERE email = $email",
 //!     email = "alice@example.com"
@@ -130,7 +141,7 @@
 //!
 //! // Scope capture -- if a variable `email` is in scope, just use $email
 //! let email = "alice@example.com".to_string();
-//! let user = query!(
+//! let user = sql!(
 //!     pool,
 //!     "SELECT id, name FROM users WHERE email = $email"
 //! )
@@ -155,7 +166,7 @@
 //!     NewUser { name: "Bob".into(),   email: "bob@example.com".into() },
 //! ];
 //!
-//! let rows_affected = query!(
+//! let rows_affected = sql!(
 //!     pool,
 //!     "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
 //! )
@@ -176,13 +187,13 @@
 //! user_preferences = "crate::domains::UserPreferences"
 //! ```
 //!
-//! Then the `query!` macro automatically serializes and deserializes through the
+//! Then the `sql!` macro automatically serializes and deserializes through the
 //! mapped Rust type instead of raw `serde_json::Value`.
 //!
 //! # Transactions
 //!
 //! The [`Executor`] trait is implemented for `tokio_postgres::Transaction`, so you
-//! can pass a transaction directly to `query!`:
+//! can pass a transaction directly to `sql!`:
 //!
 //! ```rust,ignore
 //! use cubos_sql::query;
@@ -191,12 +202,12 @@
 //! let mut client = pool.get().await.map_err(|e| cubos_sql::Error::Pool(e.to_string()))?;
 //! let tx = client.transaction().await?;
 //!
-//! query!(&tx, "INSERT INTO users (name, email) VALUES ($name, $email)",
+//! sql!(&tx, "INSERT INTO users (name, email) VALUES ($name, $email)",
 //!     name = "Charlie", email = "charlie@example.com")
 //!     .execute()
 //!     .await?;
 //!
-//! query!(&tx, "UPDATE users SET name = $name WHERE email = $email",
+//! sql!(&tx, "UPDATE users SET name = $name WHERE email = $email",
 //!     name = "Charles", email = "charlie@example.com")
 //!     .execute()
 //!     .await?;
@@ -233,10 +244,11 @@
 //!
 //! # Pool setup
 //!
-//! Create a `deadpool_postgres::Pool` from a connection URL. This crate
-//! implements [`Executor`] for both `deadpool_postgres::Pool` (acquires a
-//! connection per query) and `deadpool_postgres::Object` (the pooled
-//! connection):
+//! `cubos_sql` does **not** create or manage connection pools — that is the
+//! application's responsibility. This crate implements [`Executor`] for common
+//! pool types so you can pass them directly to `sql!`.
+//!
+//! ## With `deadpool-postgres` (default feature: `deadpool`)
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -247,24 +259,32 @@
 //! cfg.url = Some(std::env::var("DATABASE_URL")?);
 //! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 //!
-//! // Pass `&pool` directly to query! -- acquires a connection automatically
+//! // Pass `&pool` directly to sql! -- acquires a connection automatically
 //! // Or get a dedicated connection: pool.get().await?
 //! # Ok(())
 //! # }
+//! ```
+//!
+//! ## With `bb8-postgres` (feature: `bb8`)
+//!
+//! ```toml
+//! cubos_sql = { version = "0.1", default-features = false, features = ["bb8"] }
+//! bb8-postgres = "0.9"
 //! ```
 //!
 //! # The `Executor` trait
 //!
 //! The [`Executor`] trait abstracts over connection types. It is implemented for:
 //!
-//! | Type | Behavior |
-//! |------|----------|
-//! | `deadpool_postgres::Pool` | Acquires a connection from the pool per query |
-//! | `deadpool_postgres::Object` | Uses the already-acquired pooled connection |
-//! | `tokio_postgres::Client` | Uses the raw client directly |
-//! | `tokio_postgres::Transaction<'_>` | Executes within the transaction |
+//! | Type | Feature | Behavior |
+//! |------|---------|----------|
+//! | `deadpool_postgres::Pool` | `deadpool` (default) | Acquires a connection per query |
+//! | `deadpool_postgres::Object` | `deadpool` (default) | Uses the pooled connection |
+//! | `bb8::Pool<PostgresConnectionManager<Tls>>` | `bb8` | Acquires a connection per query |
+//! | `tokio_postgres::Client` | always | Uses the raw client directly |
+//! | `tokio_postgres::Transaction<'_>` | always | Executes within the transaction |
 //!
-//! You do not call `Executor` methods directly -- the `query!` macro generates code
+//! You do not call `Executor` methods directly -- the `sql!` macro generates code
 //! that is generic over any `Executor` implementation.
 //!
 //! # Type mapping
@@ -305,21 +325,27 @@
 pub mod error;
 pub mod executor;
 pub mod migrate;
-mod pool; // Executor impls for deadpool types
+mod pool; // Executor impls for pool types (deadpool, bb8)
 
 pub use error::Error;
 pub use executor::Executor;
 
-/// Re-export the `query!` macro from `cubos_sql_macros`.
+/// Re-export the `sql!` macro from `cubos_sql_macros`.
 ///
-/// See the [`macro@query`] documentation for full syntax, examples, and
+/// See the [`macro@sql`] documentation for full syntax, examples, and
 /// configuration details.
-pub use cubos_sql_macros::query;
+pub use cubos_sql_macros::sql;
 
-/// Re-exports used by the `query!` macro generated code.
+// Re-export rust_decimal so generated code can reference it.
+pub use rust_decimal;
+
+/// Re-exports used by the `sql!` macro generated code.
 /// Not part of the public API — do not rely on these directly.
 #[doc(hidden)]
 pub mod __private {
+    pub use chrono;
+    pub use rust_decimal;
     pub use serde_json;
     pub use tokio_postgres;
+    pub use uuid;
 }

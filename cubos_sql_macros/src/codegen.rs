@@ -11,6 +11,77 @@ use syn::parse_str;
 use crate::introspect::{ColumnInfo, QueryInfo};
 use cubos_sql_core::param::LexOutput;
 
+/// Rust keywords that cannot be used as identifiers without the `r#` prefix.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "yield", "abstract", "become", "box", "do", "final",
+    "macro", "override", "priv", "try", "typeof", "unsized", "virtual",
+];
+
+/// Sanitize a SQL column name into a valid Rust identifier.
+///
+/// Replaces non-alphanumeric characters with `_`, ensures the name starts with
+/// a letter or `_`, and escapes Rust keywords with `r#`.
+fn make_field_ident(name: &str) -> proc_macro2::Ident {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let sanitized = if sanitized.is_empty() {
+        "_unnamed".to_string()
+    } else if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("_{sanitized}")
+    } else {
+        sanitized
+    };
+
+    if RUST_KEYWORDS.contains(&sanitized.as_str()) {
+        proc_macro2::Ident::new_raw(&sanitized, proc_macro2::Span::call_site())
+    } else {
+        format_ident!("{}", sanitized)
+    }
+}
+
+/// Qualify external crate types so the generated code references them through
+/// `cubos_sql::__private::` instead of requiring the consumer to declare them
+/// as direct dependencies.
+fn qualify_rust_type(rust_type: &str) -> String {
+    rust_type
+        .replace("chrono::", "::cubos_sql::__private::chrono::")
+        .replace("uuid::", "::cubos_sql::__private::uuid::")
+        .replace("rust_decimal::", "::cubos_sql::__private::rust_decimal::")
+        .replace("serde_json::", "::cubos_sql::__private::serde_json::")
+}
+
+/// If the SQL is a SELECT-like query, wrap it in a subquery with `LIMIT 1`
+/// so that `fetch_one` / `fetch_optional` don't fetch all rows.
+///
+/// Returns `None` for DML (INSERT/UPDATE/DELETE) where subquery wrapping is
+/// not valid SQL.
+fn wrap_with_limit(sql: &str) -> Option<String> {
+    let upper = sql.trim_start().to_uppercase();
+    if upper.starts_with("SELECT")
+        || upper.starts_with("WITH")
+        || upper.starts_with("VALUES")
+        || upper.starts_with("TABLE")
+    {
+        Some(format!(
+            "SELECT * FROM ({sql}) AS __cubos_sql_limit LIMIT 1"
+        ))
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -95,9 +166,10 @@ fn generate_regular(
     let row_mapping = build_row_mapping(&query_info.columns)?;
 
     // ------------------------------------------------------------------
-    // 5. The SQL string literal.
+    // 5. The SQL string literal (+ limited variant for fetch_one/optional).
     // ------------------------------------------------------------------
     let sql_str = &lex_output.sql;
+    let sql_limited = wrap_with_limit(sql_str).unwrap_or_else(|| sql_str.clone());
 
     // ------------------------------------------------------------------
     // 6. Assemble the full block.
@@ -105,7 +177,7 @@ fn generate_regular(
     let ts = quote! {
         {
             // ----- output type -----
-            #[derive(Debug)]
+            #[derive(Debug, Clone)]
             #[allow(non_camel_case_types)]
             struct __cubos_sql_output {
                 #output_struct
@@ -126,17 +198,17 @@ fn generate_regular(
                         #sql_str,
                         &[#params_slice],
                     ).await?;
-                    ::std::result::Result::Ok(__rows.into_iter().map(|__row| {
-                        __cubos_sql_output {
+                    __rows.into_iter().map(|__row| {
+                        ::std::result::Result::Ok(__cubos_sql_output {
                             #row_mapping
-                        }
-                    }).collect())
+                        })
+                    }).collect()
                 }
 
                 async fn fetch_one(self) -> ::std::result::Result<__cubos_sql_output, cubos_sql::Error> {
                     let __rows = cubos_sql::Executor::query(
                         self.__executor,
-                        #sql_str,
+                        #sql_limited,
                         &[#params_slice],
                     ).await?;
                     let __row = __rows.into_iter().next()
@@ -149,14 +221,15 @@ fn generate_regular(
                 async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__cubos_sql_output>, cubos_sql::Error> {
                     let __rows = cubos_sql::Executor::query(
                         self.__executor,
-                        #sql_str,
+                        #sql_limited,
                         &[#params_slice],
                     ).await?;
-                    ::std::result::Result::Ok(__rows.into_iter().next().map(|__row| {
-                        __cubos_sql_output {
+                    match __rows.into_iter().next() {
+                        Some(__row) => ::std::result::Result::Ok(Some(__cubos_sql_output {
                             #row_mapping
-                        }
-                    }))
+                        })),
+                        None => ::std::result::Result::Ok(None),
+                    }
                 }
 
                 async fn execute(self) -> ::std::result::Result<u64, cubos_sql::Error> {
@@ -213,7 +286,7 @@ fn generate_spread(
             if pi.domain_rust_type.is_some() {
                 parse_str("::cubos_sql::__private::serde_json::Value")?
             } else {
-                parse_str::<syn::Type>(&pi.rust_type)?
+                parse_str::<syn::Type>(&qualify_rust_type(&pi.rust_type))?
             }
         } else {
             parse_str("::cubos_sql::__private::serde_json::Value")?
@@ -221,6 +294,7 @@ fn generate_spread(
         let value_expr = resolve_param_value(
             &param.name,
             param_info.and_then(|p| p.domain_rust_type.as_deref()),
+            param_info.and_then(|p| p.enum_rust_type.as_deref()),
             assignments,
         )?;
         regular_param_fields.extend(quote! { #field_name: #field_type, });
@@ -307,7 +381,8 @@ fn generate_spread(
                 item_pushes.extend(quote! {
                     __params.push(
                         Box::new(::cubos_sql::__private::serde_json::to_value(&#accessor)
-                            .expect("failed to serialize domain type to JSON"))
+                            .map_err(|e| cubos_sql::Error::Serialize(
+                                format!("failed to serialize domain type to JSON: {e}")))?)
                             as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>
                     );
                 });
@@ -393,7 +468,7 @@ fn generate_spread(
     // ── Assemble the full block ─────────────────────────────────────────
     let ts = quote! {
         {
-            #[derive(Debug)]
+            #[derive(Debug, Clone)]
             #[allow(non_camel_case_types)]
             struct __cubos_sql_output {
                 #output_struct
@@ -419,9 +494,9 @@ fn generate_spread(
                         return ::std::result::Result::Ok(::std::vec::Vec::new());
                     }
                     let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
-                    ::std::result::Result::Ok(__rows.into_iter().map(|__row| {
-                        __cubos_sql_output { #row_mapping }
-                    }).collect())
+                    __rows.into_iter().map(|__row| {
+                        ::std::result::Result::Ok(__cubos_sql_output { #row_mapping })
+                    }).collect()
                 }
 
                 async fn fetch_one(self) -> ::std::result::Result<__cubos_sql_output, cubos_sql::Error> {
@@ -440,9 +515,10 @@ fn generate_spread(
                         return ::std::result::Result::Ok(::std::option::Option::None);
                     }
                     let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
-                    ::std::result::Result::Ok(__rows.into_iter().next().map(|__row| {
-                        __cubos_sql_output { #row_mapping }
-                    }))
+                    match __rows.into_iter().next() {
+                        Some(__row) => ::std::result::Result::Ok(Some(__cubos_sql_output { #row_mapping })),
+                        None => ::std::result::Result::Ok(None),
+                    }
                 }
 
                 async fn execute(self) -> ::std::result::Result<u64, cubos_sql::Error> {
@@ -481,7 +557,7 @@ fn build_output_struct(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error
     let mut fields = TokenStream::new();
 
     for col in columns {
-        let field_name = format_ident!("{}", col.name);
+        let field_name = make_field_ident(&col.name);
         let field_type = column_rust_type(col)?;
 
         fields.extend(quote! {
@@ -527,7 +603,7 @@ fn build_param_fields(
             if pi.domain_rust_type.is_some() {
                 parse_str("::cubos_sql::__private::serde_json::Value")?
             } else {
-                parse_str::<syn::Type>(&pi.rust_type)?
+                parse_str::<syn::Type>(&qualify_rust_type(&pi.rust_type))?
             }
         } else {
             // Fallback: use a generic ToSql-compatible type; this should not
@@ -539,6 +615,7 @@ fn build_param_fields(
         let value_expr: TokenStream = resolve_param_value(
             &param.name,
             param_info.and_then(|p| p.domain_rust_type.as_deref()),
+            param_info.and_then(|p| p.enum_rust_type.as_deref()),
             assignments,
         )?;
 
@@ -561,29 +638,27 @@ fn build_param_fields(
 fn resolve_param_value(
     param_name: &str,
     domain_rust_type: Option<&str>,
+    enum_rust_type: Option<&str>,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
-    // Find the matching assignment by name.
     let assignment = assignments.iter().find(|a| a.name == param_name);
 
-    // Determine the raw value expression.
     let raw_expr: TokenStream = match assignment {
-        Some(ParamAssignment { expr: Some(e), .. }) => {
-            // Explicit expression provided by the caller.
-            quote! { #e }
-        }
+        Some(ParamAssignment { expr: Some(e), .. }) => quote! { #e },
         Some(ParamAssignment { expr: None, .. }) | None => {
-            // Scope capture: use the parameter name as a variable reference.
             let ident = format_ident!("{}", param_name);
             quote! { #ident }
         }
     };
 
-    // Wrap domain types so they are stored as JSON values.
     if domain_rust_type.is_some() {
-        Ok(
-            quote! { ::cubos_sql::__private::serde_json::to_value(&#raw_expr).expect("failed to serialize domain type to JSON") },
-        )
+        Ok(quote! {
+            ::cubos_sql::__private::serde_json::to_value(&#raw_expr)
+                .map_err(|e| cubos_sql::Error::Serialize(format!("failed to serialize domain type to JSON: {e}")))?
+        })
+    } else if enum_rust_type.is_some() {
+        // Enum params: convert to String via ToString
+        Ok(quote! { (#raw_expr).to_string() })
     } else {
         Ok(raw_expr)
     }
@@ -619,7 +694,7 @@ fn build_row_mapping(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error> 
     let mut mappings = TokenStream::new();
 
     for (idx, col) in columns.iter().enumerate() {
-        let field_name = format_ident!("{}", col.name);
+        let field_name = make_field_ident(&col.name);
         let get_expr = column_get_expr(col, idx)?;
 
         mappings.extend(quote! {
@@ -640,12 +715,13 @@ fn build_row_mapping(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error> 
 /// `Option<T>`.
 fn column_rust_type(col: &ColumnInfo) -> Result<syn::Type, syn::Error> {
     // The concrete inner type: domain type takes priority over the base type.
-    let inner_type_str = col
-        .domain_rust_type
-        .as_deref()
-        .unwrap_or(col.rust_type.as_str());
+    // Domain/enum types are user-provided paths; base types need qualification.
+    let inner_type_str = match col.domain_rust_type.as_deref() {
+        Some(domain) => domain.to_string(),
+        None => qualify_rust_type(&col.rust_type),
+    };
 
-    let inner_type: syn::Type = parse_str(inner_type_str)?;
+    let inner_type: syn::Type = parse_str(&inner_type_str)?;
 
     if col.nullable {
         // Wrap in Option<T>.
@@ -669,28 +745,57 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
     let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
 
     if let Some(domain_type_str) = &col.domain_rust_type {
-        // Domain column: Postgres stores it as JSONB; we read a
-        // `serde_json::Value` and then deserialize into the domain type.
         let domain_type: syn::Type = parse_str(domain_type_str)?;
 
         if col.nullable {
             Ok(quote! {
                 {
                     let __json_val = __row.get::<_, ::std::option::Option<::cubos_sql::__private::serde_json::Value>>(#idx_lit);
-                    __json_val.map(|__v| ::cubos_sql::__private::serde_json::from_value::<#domain_type>(__v)
-                        .expect(concat!("failed to deserialize domain type: ", stringify!(#domain_type))))
+                    match __json_val {
+                        Some(__v) => Some(::cubos_sql::__private::serde_json::from_value::<#domain_type>(__v)
+                            .map_err(|e| cubos_sql::Error::Deserialize(
+                                format!("failed to deserialize {}: {e}", stringify!(#domain_type))))?),
+                        None => None,
+                    }
                 }
             })
         } else {
             Ok(quote! {
                 ::cubos_sql::__private::serde_json::from_value::<#domain_type>(
                     __row.get::<_, ::cubos_sql::__private::serde_json::Value>(#idx_lit)
-                ).expect(concat!("failed to deserialize domain type: ", stringify!(#domain_type)))
+                ).map_err(|e| cubos_sql::Error::Deserialize(
+                    format!("failed to deserialize {}: {e}", stringify!(#domain_type))))?
+            })
+        }
+    } else if let Some(enum_type_str) = &col.enum_rust_type {
+        // Enum column: read as String from PG, parse into the mapped Rust type.
+        let enum_type: syn::Type = parse_str(enum_type_str)?;
+
+        if col.nullable {
+            Ok(quote! {
+                {
+                    let __str_val = __row.get::<_, ::std::option::Option<String>>(#idx_lit);
+                    match __str_val {
+                        Some(__v) => Some(__v.parse::<#enum_type>()
+                            .map_err(|e| cubos_sql::Error::Deserialize(
+                                format!("failed to parse enum {}: {e}", stringify!(#enum_type))))?),
+                        None => None,
+                    }
+                }
+            })
+        } else {
+            Ok(quote! {
+                {
+                    let __str_val = __row.get::<_, String>(#idx_lit);
+                    __str_val.parse::<#enum_type>()
+                        .map_err(|e| cubos_sql::Error::Deserialize(
+                            format!("failed to parse enum {}: {e}", stringify!(#enum_type))))?
+                }
             })
         }
     } else {
         // Plain column.
-        let base_type: syn::Type = parse_str(&col.rust_type)?;
+        let base_type: syn::Type = parse_str(&qualify_rust_type(&col.rust_type))?;
 
         if col.nullable {
             Ok(quote! {
@@ -718,6 +823,7 @@ mod tests {
                     pg_type_oid: 0,
                     rust_type: t.to_string(),
                     domain_rust_type: None,
+                    enum_rust_type: None,
                 })
                 .collect(),
             columns,
@@ -731,6 +837,7 @@ mod tests {
             rust_type: rust_type.to_string(),
             nullable,
             domain_rust_type: None,
+            enum_rust_type: None,
         }
     }
 
@@ -900,10 +1007,8 @@ mod tests {
 
     #[test]
     fn multiple_spreads_generates_multiple_fields() {
-        let lo = lex(
-            "WITH a AS (INSERT INTO t1 (x) VALUES $..s1 { x }) \
-             INSERT INTO t2 (y) VALUES $..s2 { y }",
-        )
+        let lo = lex("WITH a AS (INSERT INTO t1 (x) VALUES $..s1 { x }) \
+             INSERT INTO t2 (y) VALUES $..s2 { y }")
         .unwrap();
         assert_eq!(lo.spreads.len(), 2);
 
