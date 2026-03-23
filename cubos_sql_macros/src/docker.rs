@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires Docker
+
     fn ensure_container_starts_and_reuses() {
         let mig_dir = test_migrations_dir();
         let config = test_config(mig_dir.path());
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires Docker
+
     fn recovery_from_not_ready_container() {
         let mig_dir = test_migrations_dir();
         let config = test_config(mig_dir.path());
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires Docker
+
     fn migration_failure_cleans_up() {
         let mig_dir = tempfile::tempdir().unwrap();
         std::fs::write(

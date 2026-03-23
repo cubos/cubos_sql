@@ -15,4 +15,5 @@
 pub mod config;
 pub mod lexer;
 pub mod param;
+pub mod query_info;
 pub mod type_map;

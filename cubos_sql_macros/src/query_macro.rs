@@ -78,6 +78,87 @@ fn with_client<T>(
 }
 
 // ---------------------------------------------------------------------------
+// Static analyzer integration
+// ---------------------------------------------------------------------------
+
+/// Cached schema snapshot (avoids re-reading + deserializing JSON per `sql!` call).
+struct CachedSnapshot {
+    snapshot: cubos_sql_analyzer::schema::SchemaSnapshot,
+    path: String,
+}
+
+thread_local! {
+    static CACHED_SNAPSHOT: RefCell<Option<CachedSnapshot>> = const { RefCell::new(None) };
+}
+
+/// Load a schema snapshot, using a thread-local cache to avoid repeated IO + deserialization.
+fn load_snapshot(snapshot_path: &Path) -> Option<cubos_sql_analyzer::schema::SchemaSnapshot> {
+    let path_str = snapshot_path.to_string_lossy().to_string();
+
+    CACHED_SNAPSHOT.with(|cell| {
+        let borrow = cell.borrow();
+        if let Some(cached) = borrow.as_ref() {
+            if cached.path == path_str {
+                return Some(cached.snapshot.clone());
+            }
+        }
+        drop(borrow);
+
+        let content = std::fs::read_to_string(snapshot_path).ok()?;
+        let snapshot: cubos_sql_analyzer::schema::SchemaSnapshot =
+            serde_json::from_str(&content).ok()?;
+
+        cell.borrow_mut().replace(CachedSnapshot {
+            snapshot: snapshot.clone(),
+            path: path_str,
+        });
+
+        Some(snapshot)
+    })
+}
+
+/// Try to analyze the query statically from a cached schema snapshot.
+///
+/// Returns `Some(Ok(info))` on success, `None` to signal fallback.
+/// Does NOT require a live database connection.
+fn try_static_analyze_from_snapshot(
+    snapshot_path: &Path,
+    sql: &str,
+    config: &cubos_sql_core::config::Config,
+) -> Option<Result<cubos_sql_core::query_info::QueryInfo, syn::Error>> {
+    let snapshot = load_snapshot(snapshot_path)?;
+
+    let analyzer_config = cubos_sql_analyzer::resolve::AnalyzerConfig {
+        domains: config.domains.clone(),
+        enums: config.enums.clone(),
+        types: config.types.clone(),
+    };
+
+    match cubos_sql_analyzer::resolve::analyze(&snapshot, sql, &analyzer_config) {
+        Ok(info) => Some(Ok(info)),
+        Err(_) => None,
+    }
+}
+
+/// Export schema snapshot from a live connection and cache to disk.
+fn export_and_cache_snapshot(
+    client: &mut postgres::Client,
+    snapshot_path: &Path,
+) -> Result<(), syn::Error> {
+    let snapshot = cubos_sql_analyzer::export::export_schema(client)
+        .map_err(|e| syn::Error::new(Span::call_site(), format!("schema export failed: {e}")))?;
+
+    if let Some(parent) = snapshot_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string(&snapshot)
+        .map_err(|e| syn::Error::new(Span::call_site(), format!("schema serialize: {e}")))?;
+    std::fs::write(snapshot_path, json)
+        .map_err(|e| syn::Error::new(Span::call_site(), format!("schema write: {e}")))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Macro input parsing
 // ---------------------------------------------------------------------------
 
@@ -247,48 +328,73 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     let query_info = if let Some(cached) = crate::cache::get(&cache_path) {
         cached
     } else {
-        // 4. Cache miss — ensure Docker container is running.
-        let (container_info, _) =
-            crate::docker::ensure_container(&config, manifest_path).map_err(|e| {
-                let msg = e.to_string();
-                let hint = if msg.contains("not found") || msg.contains("No such file") {
-                    "\nhint: is Docker installed and in your PATH?"
-                } else if msg.contains("Cannot connect")
-                    || msg.contains("connection refused")
-                    || msg.contains("Is the docker daemon running")
-                {
-                    "\nhint: is the Docker daemon running? Try `docker info`."
-                } else if msg.contains("permission denied") {
-                    "\nhint: does your user have permission to use Docker? Try `sudo usermod -aG docker $USER`."
-                } else {
-                    ""
-                };
-                syn::Error::new(
-                    Span::call_site(),
-                    format!("failed to start compile-time PG container: {e}{hint}"),
-                )
-            })?;
+        // 4. Try static analyzer WITHOUT Docker (if schema snapshot exists).
+        let snapshot_path = cubos_dir.join(&migration_hash).join("schema.json");
+        let static_result = if snapshot_path.exists() {
+            try_static_analyze_from_snapshot(&snapshot_path, &introspection_sql, &config)
+        } else {
+            None
+        };
 
-        // 5. Connect (or reuse cached connection) and introspect.
-        let conn_str = container_info.connection_string();
-        let sql_span = input.sql.span();
+        if let Some(Ok(info)) = static_result {
+            let _ = crate::cache::put(&cache_path, &info);
+            info
+        } else {
+            // 5. Need Docker — ensure container is running.
+            let (container_info, _) =
+                crate::docker::ensure_container(&config, manifest_path).map_err(|e| {
+                    let msg = e.to_string();
+                    let hint = if msg.contains("not found") || msg.contains("No such file") {
+                        "\nhint: is Docker installed and in your PATH?"
+                    } else if msg.contains("Cannot connect")
+                        || msg.contains("connection refused")
+                        || msg.contains("Is the docker daemon running")
+                    {
+                        "\nhint: is the Docker daemon running? Try `docker info`."
+                    } else if msg.contains("permission denied") {
+                        "\nhint: does your user have permission to use Docker? Try `sudo usermod -aG docker $USER`."
+                    } else {
+                        ""
+                    };
+                    syn::Error::new(
+                        Span::call_site(),
+                        format!("failed to start compile-time PG container: {e}{hint}"),
+                    )
+                })?;
 
-        let info = with_client(&conn_str, |client| {
-            crate::introspect::introspect_query(
-                client,
-                &introspection_sql,
-                &config.domains,
-                &config.enums,
-                &config.types,
-            )
-            .map_err(|e| {
-                let msg = format_introspect_error(&e, &introspection_sql);
-                syn::Error::new(sql_span, msg)
-            })
-        })?;
+            let conn_str = container_info.connection_string();
+            let sql_span = input.sql.span();
 
-        let _ = crate::cache::put(&cache_path, &info);
-        info
+            // 6. Export schema snapshot if missing (for future Docker-free builds).
+            if !snapshot_path.exists() {
+                let _ = with_client(&conn_str, |client| {
+                    export_and_cache_snapshot(client, &snapshot_path)
+                });
+            }
+
+            // 7. Try static analyzer with (now available) snapshot.
+            let info =
+                try_static_analyze_from_snapshot(&snapshot_path, &introspection_sql, &config)
+                    .unwrap_or_else(|| {
+                        // 8. Final fallback: live introspection.
+                        with_client(&conn_str, |client| {
+                            crate::introspect::introspect_query(
+                                client,
+                                &introspection_sql,
+                                &config.domains,
+                                &config.enums,
+                                &config.types,
+                            )
+                            .map_err(|e| {
+                                let msg = format_introspect_error(&e, &introspection_sql);
+                                syn::Error::new(sql_span, msg)
+                            })
+                        })
+                    })?;
+
+            let _ = crate::cache::put(&cache_path, &info);
+            info
+        }
     };
 
     // 6. Generate typed Rust code.

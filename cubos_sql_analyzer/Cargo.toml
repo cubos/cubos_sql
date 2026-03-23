@@ -1,0 +1,16 @@
+[package]
+name = "cubos_sql_analyzer"
+version = "0.1.0"
+edition = "2021"
+description = "Static SQL type and nullability analyzer for cubos_sql"
+
+[dependencies]
+cubos_sql_core = { path = "../cubos_sql_core" }
+pg_query = "6"
+postgres = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

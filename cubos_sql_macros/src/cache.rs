@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::introspect::QueryInfo;
+use cubos_sql_core::query_info::QueryInfo;
 
 /// Returns the cache file path for a query.
 ///
@@ -50,7 +50,7 @@ pub fn put(path: &Path, info: &QueryInfo) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::introspect::{ColumnInfo, ParamInfo, QueryInfo};
+    use cubos_sql_core::query_info::{ColumnInfo, ParamInfo, QueryInfo};
 
     #[test]
     fn cache_round_trip() {

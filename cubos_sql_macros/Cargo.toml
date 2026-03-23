@@ -9,6 +9,7 @@ proc-macro = true
 
 [dependencies]
 cubos_sql_core = { path = "../cubos_sql_core" }
+cubos_sql_analyzer = { path = "../cubos_sql_analyzer" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
