@@ -11,7 +11,7 @@
 //! extracted in normal context -- `$name` inside a string literal or comment
 //! is left untouched.
 
-use crate::param::{LexOutput, Param, SpreadParam};
+use crate::param::{LexOutput, Param, SpreadField, SpreadParam};
 
 /// An error produced when the lexer encounters invalid SQL syntax.
 ///
@@ -171,8 +171,17 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                     }
                                     if is_ident_start(chars[fi]) {
                                         let fc = read_ident(&chars, fi);
-                                        fields.push(fc.iter().collect::<String>());
+                                        let field_name: String = fc.iter().collect();
                                         fi += fc.len();
+                                        // Check for nullable annotation `?` on field.
+                                        let field_nullable = fi < len && chars[fi] == '?';
+                                        if field_nullable {
+                                            fi += 1;
+                                        }
+                                        fields.push(SpreadField {
+                                            name: field_name,
+                                            nullable: field_nullable,
+                                        });
                                         while fi < len && chars[fi].is_ascii_whitespace() {
                                             fi += 1;
                                         }
@@ -220,17 +229,24 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                             out.push_str(&span);
                             i = after + 1;
                         } else {
-                            // Named param $ident — deduplicate
+                            // Named param $ident — check for nullable annotation `?`
+                            let nullable = after < len && chars[after] == '?';
+                            let consume_to = if nullable { after + 1 } else { after };
+
+                            // Deduplicate by name
                             let next_idx = if let Some(&idx) = param_indices.get(&ident) {
                                 idx
                             } else {
                                 let idx = param_indices.len() + 1;
                                 param_indices.insert(ident.clone(), idx);
-                                params.push(Param { name: ident });
+                                params.push(Param {
+                                    name: ident,
+                                    nullable,
+                                });
                                 idx
                             };
                             out.push_str(&format!("${next_idx}"));
-                            i = after;
+                            i = consume_to;
                         }
                     } else {
                         // Literal $ (e.g., $1 native PG placeholder)
@@ -553,5 +569,70 @@ mod tests {
     fn unclosed_block_comment_error() {
         let err = lex("SELECT /* unclosed").unwrap_err();
         assert!(matches!(err, LexError::UnclosedBlockComment { .. }));
+    }
+
+    #[test]
+    fn nullable_param() {
+        let out = lex("SELECT * FROM t WHERE age = $age?").unwrap();
+        assert_eq!(out.sql, "SELECT * FROM t WHERE age = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "age");
+        assert!(out.params[0].nullable);
+    }
+
+    #[test]
+    fn non_nullable_param_default() {
+        let out = lex("SELECT * FROM t WHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+        assert!(!out.params[0].nullable);
+    }
+
+    #[test]
+    fn mixed_nullable_params() {
+        let out = lex("SELECT * FROM t WHERE id = $id AND age = $age? AND name = $name").unwrap();
+        assert_eq!(
+            out.sql,
+            "SELECT * FROM t WHERE id = $1 AND age = $2 AND name = $3"
+        );
+        assert_eq!(out.params.len(), 3);
+        assert_eq!(out.params[0].name, "id");
+        assert!(!out.params[0].nullable);
+        assert_eq!(out.params[1].name, "age");
+        assert!(out.params[1].nullable);
+        assert_eq!(out.params[2].name, "name");
+        assert!(!out.params[2].nullable);
+    }
+
+    #[test]
+    fn nullable_param_deduplicated() {
+        let out = lex("SELECT * FROM t WHERE a = $x? OR b = $x?").unwrap();
+        assert_eq!(out.sql, "SELECT * FROM t WHERE a = $1 OR b = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "x");
+        assert!(out.params[0].nullable);
+    }
+
+    #[test]
+    fn spread_with_nullable_fields() {
+        let out = lex("INSERT INTO t VALUES $..items { name, email?, age }").unwrap();
+        assert_eq!(out.spreads.len(), 1);
+        let fields = out.spreads[0].fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "name");
+        assert!(!fields[0].nullable);
+        assert_eq!(fields[1].name, "email");
+        assert!(fields[1].nullable);
+        assert_eq!(fields[2].name, "age");
+        assert!(!fields[2].nullable);
+    }
+
+    #[test]
+    fn spread_all_nullable_fields() {
+        let out = lex("INSERT INTO t VALUES $..items { a?, b? }").unwrap();
+        let fields = out.spreads[0].fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert!(fields[0].nullable);
+        assert!(fields[1].nullable);
     }
 }

@@ -61,6 +61,7 @@ mod tests {
             params: vec![ParamInfo {
                 pg_type_oid: 23,
                 rust_type: "i32".to_string(),
+                nullable: false,
                 domain_rust_type: None,
                 enum_rust_type: None,
             }],

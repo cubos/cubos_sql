@@ -33,6 +33,10 @@ pub struct ParamInfo {
     pub pg_type_oid: u32,
     /// Rust type string (e.g. `"i64"`, `"String"`).
     pub rust_type: String,
+    /// Whether this parameter is nullable (`$foo?` syntax).
+    /// When true, the generated Rust type is `Option<T>`.
+    #[serde(default)]
+    pub nullable: bool,
     /// If this is a JSONB domain, the Rust type path from config.
     pub domain_rust_type: Option<String>,
     /// If this is a mapped enum type, the Rust type path from config.

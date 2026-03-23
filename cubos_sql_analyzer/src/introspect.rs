@@ -139,6 +139,7 @@ fn build_params(
         params.push(ParamInfo {
             pg_type_oid: resolved.effective_oid,
             rust_type,
+            nullable: false,
             domain_rust_type: resolved.domain_rust_type,
             enum_rust_type: resolved.enum_rust_type,
         });

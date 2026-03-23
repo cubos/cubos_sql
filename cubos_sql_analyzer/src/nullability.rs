@@ -2,11 +2,16 @@
 
 use std::collections::HashSet;
 
-/// Tracks which table aliases are on the nullable side of an outer JOIN.
+/// Tracks which table aliases are on the nullable side of an outer JOIN,
+/// and whether the current SELECT has a GROUP BY clause.
 #[derive(Debug, Clone, Default)]
 pub struct NullabilityContext {
     /// Aliases that are on the nullable side of some JOIN.
     nullable_aliases: HashSet<String>,
+    /// Whether the current SELECT has a GROUP BY clause.
+    /// When true, each group has ≥1 row, so aggregates with NOT NULL inputs
+    /// produce NOT NULL results.
+    pub has_group_by: bool,
 }
 
 impl NullabilityContext {

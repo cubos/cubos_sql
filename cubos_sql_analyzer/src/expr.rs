@@ -56,7 +56,7 @@ pub fn infer_expr(
             let type_oid = params.get(p.number);
             Ok(ExprType {
                 type_oid,
-                nullable: true,
+                nullable: params.is_nullable(p.number),
             })
         }
         node::Node::MinMaxExpr(mm) => Ok(ExprType {
@@ -204,9 +204,18 @@ fn infer_func_call(
     let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, func.agg_star)?;
 
     let nullable = if resolved.is_aggregate {
-        // COUNT(*) is never NULL. All other aggregates (SUM, AVG, etc.)
-        // return NULL for empty groups.
-        name != "count"
+        if name == "count" {
+            // COUNT is never NULL (returns 0 for empty input).
+            false
+        } else if null_ctx.has_group_by {
+            // With GROUP BY, each group has ≥1 row. Aggregates skip NULLs,
+            // so if all input args are NOT NULL, the result is NOT NULL.
+            // If any arg is nullable, all values in a group could be NULL → result NULL.
+            any_arg_nullable
+        } else {
+            // Without GROUP BY, non-COUNT aggregates return NULL for empty tables.
+            true
+        }
     } else if resolved.is_strict && resolved.schema == "pg_catalog" {
         // pg_catalog strict functions: non-null inputs → non-null output,
         // UNLESS the function is in the known exceptions list.
@@ -215,6 +224,12 @@ fn infer_func_call(
         } else {
             any_arg_nullable
         }
+    } else if !resolved.is_strict
+        && resolved.schema == "pg_catalog"
+        && functions::is_not_null_nonstrict(name)
+    {
+        // pg_catalog non-strict functions known to never return NULL.
+        false
     } else {
         // Non-strict, or non-pg_catalog: conservatively nullable.
         true
@@ -457,9 +472,19 @@ fn infer_sublink(
                 if let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref() {
                     let (cols, _) = crate::resolve::analyze_select(sel, snapshot, params)?;
                     if let Some(first) = cols.first() {
+                        // An aggregate SELECT without GROUP BY always returns
+                        // exactly 1 row. If the result column is NOT NULL
+                        // (e.g., COUNT), the scalar subquery is NOT NULL.
+                        let guaranteed_one_row =
+                            sel.group_clause.is_empty() && has_aggregate_target(&sel.target_list);
+                        let nullable = if guaranteed_one_row {
+                            first.nullable
+                        } else {
+                            true
+                        };
                         return Ok(ExprType {
                             type_oid: first.type_oid,
-                            nullable: true, // scalar subquery is always nullable
+                            nullable,
                         });
                     }
                 }
@@ -483,6 +508,88 @@ fn infer_sublink(
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Check if any target in a SELECT's target list contains an aggregate function call.
+/// Used to detect `SELECT COUNT(*) FROM ...` patterns (aggregate without GROUP BY
+/// guarantees exactly 1 row).
+fn has_aggregate_target(target_list: &[protobuf::Node]) -> bool {
+    target_list.iter().any(|node| {
+        if let Some(node::Node::ResTarget(res)) = node.node.as_ref() {
+            if let Some(val) = &res.val {
+                return node_contains_aggregate(val);
+            }
+        }
+        false
+    })
+}
+
+/// Recursively check if a node is or contains an aggregate function call.
+fn node_contains_aggregate(node: &protobuf::Node) -> bool {
+    match node.node.as_ref() {
+        Some(node::Node::FuncCall(func)) => {
+            // agg_star (COUNT(*)) or agg_order/agg_filter are aggregate indicators.
+            // Also check the function name for known aggregates.
+            if func.agg_star || func.agg_order.iter().len() > 0 {
+                return true;
+            }
+            let names = extract_string_fields(&func.funcname);
+            let name = names.last().map(|s| s.as_str()).unwrap_or("");
+            matches!(
+                name,
+                "count"
+                    | "sum"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "array_agg"
+                    | "string_agg"
+                    | "bool_and"
+                    | "bool_or"
+                    | "every"
+                    | "json_agg"
+                    | "jsonb_agg"
+                    | "json_object_agg"
+                    | "jsonb_object_agg"
+                    | "bit_and"
+                    | "bit_or"
+            )
+        }
+        // Don't recurse into subqueries — they have their own aggregation context.
+        Some(node::Node::SubLink(_)) => false,
+        // Recurse into expressions that may wrap an aggregate (e.g., COUNT(*) + 1).
+        Some(node::Node::AExpr(expr)) => {
+            expr.lexpr
+                .as_ref()
+                .is_some_and(|n| node_contains_aggregate(n))
+                || expr
+                    .rexpr
+                    .as_ref()
+                    .is_some_and(|n| node_contains_aggregate(n))
+        }
+        Some(node::Node::TypeCast(cast)) => cast
+            .arg
+            .as_ref()
+            .is_some_and(|n| node_contains_aggregate(n)),
+        Some(node::Node::CoalesceExpr(c)) => c.args.iter().any(node_contains_aggregate),
+        Some(node::Node::CaseExpr(c)) => {
+            c.args.iter().any(|n| {
+                if let Some(node::Node::CaseWhen(w)) = n.node.as_ref() {
+                    w.result
+                        .as_ref()
+                        .is_some_and(|r| node_contains_aggregate(r))
+                } else {
+                    false
+                }
+            }) || c
+                .defresult
+                .as_ref()
+                .is_some_and(|n| node_contains_aggregate(n))
+        }
+        Some(node::Node::BoolExpr(b)) => b.args.iter().any(node_contains_aggregate),
+        Some(node::Node::NullTest(t)) => t.arg.as_ref().is_some_and(|n| node_contains_aggregate(n)),
+        _ => false,
+    }
+}
 
 /// Extract string values from a list of nodes (used for ColumnRef.fields,
 /// FuncCall.funcname, AExpr.name, TypeName.names).

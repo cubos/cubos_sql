@@ -100,6 +100,12 @@ pub fn resolve_function(
         return Ok(make_resolved(f));
     }
 
+    // Phase 1b: match treating UNKNOWN args as compatible with any expected type.
+    // This handles untyped string literals like ', ' in string_agg(col, ', ').
+    if let Some(f) = find_unknown_compatible_match(&candidates, arg_types) {
+        return Ok(make_resolved(f));
+    }
+
     // Phase 2: match with implicit casts.
     if let Some(f) = find_cast_match(&candidates, arg_types, snapshot) {
         return Ok(make_resolved(f));
@@ -128,6 +134,33 @@ pub fn resolve_function(
     )))
 }
 
+/// Match candidates treating UNKNOWN (OID 705) args as compatible with any expected type.
+/// This handles untyped string literals (e.g., `', '` in `string_agg(col, ', ')`).
+/// Returns a match only if exactly one candidate matches (to avoid ambiguity).
+fn find_unknown_compatible_match<'a>(
+    candidates: &[&'a FunctionEntry],
+    arg_types: &[u32],
+) -> Option<&'a FunctionEntry> {
+    if !arg_types.contains(&oid::UNKNOWN) {
+        return None;
+    }
+    let matches: Vec<_> = candidates
+        .iter()
+        .filter(|f| {
+            f.arg_types.len() == arg_types.len()
+                && f.arg_types
+                    .iter()
+                    .zip(arg_types.iter())
+                    .all(|(&expected, &actual)| expected == actual || actual == oid::UNKNOWN)
+        })
+        .collect();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
 fn find_exact_match<'a>(
     candidates: &[&'a FunctionEntry],
     arg_types: &[u32],
@@ -151,7 +184,9 @@ fn find_cast_match<'a>(
                 .iter()
                 .zip(arg_types.iter())
                 .all(|(&expected, &actual)| {
-                    expected == actual || snapshot.has_implicit_cast(actual, expected)
+                    expected == actual
+                        || actual == oid::UNKNOWN
+                        || snapshot.has_implicit_cast(actual, expected)
                 })
         })
         .copied()
@@ -176,4 +211,62 @@ pub fn is_nullable_strict_exception(name: &str) -> bool {
 /// Returns true if an operator can return NULL with non-null inputs.
 pub fn is_nullable_operator(name: &str) -> bool {
     NULLABLE_PG_CATALOG_OPERATORS.contains(&name)
+}
+
+/// pg_catalog non-strict functions that are guaranteed to NEVER return NULL,
+/// regardless of input nullability. These are safe to mark as NOT NULL
+/// unconditionally.
+const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
+    // String concatenation: treats NULLs as empty strings.
+    "concat",
+    "concat_ws",
+    // sprintf-like formatting: NULL args become empty.
+    "format",
+    // Current time: no inputs, always returns a value.
+    "now",
+    "transaction_timestamp",
+    "statement_timestamp",
+    "clock_timestamp",
+    "timeofday",
+    "current_timestamp",
+    "current_date",
+    "localtime",
+    "localtimestamp",
+    // Session info: always returns a value.
+    "current_user",
+    "session_user",
+    "current_schema",
+    "current_database",
+    "current_catalog",
+    "inet_client_addr",
+    "inet_server_addr",
+    "pg_backend_pid",
+    "pg_postmaster_start_time",
+    "version",
+    // Random values: always return a value.
+    "random",
+    "gen_random_uuid",
+    "setseed",
+    // Sequence functions: return bigint or error, never NULL.
+    "nextval",
+    "currval",
+    "lastval",
+    "setval",
+    // Transaction ID.
+    "txid_current",
+    "txid_current_if_assigned",
+    // Array constructor: always returns an array (possibly empty).
+    "array_cat",
+    "array_append",
+    "array_prepend",
+    // COALESCE-like: handled as separate AST nodes, but if called as function:
+    "coalesce",
+    "greatest",
+    "least",
+];
+
+/// Returns true if a pg_catalog non-strict function is guaranteed to never
+/// return NULL.
+pub fn is_not_null_nonstrict(name: &str) -> bool {
+    NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS.contains(&name)
 }

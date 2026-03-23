@@ -125,6 +125,7 @@ fn try_static_analyze_from_snapshot(
     snapshot_path: &Path,
     sql: &str,
     config: &cubos_sql_core::config::Config,
+    lex_output: &cubos_sql_core::param::LexOutput,
 ) -> Option<Result<cubos_sql_core::query_info::QueryInfo, syn::Error>> {
     let snapshot = load_snapshot(snapshot_path)?;
 
@@ -132,6 +133,15 @@ fn try_static_analyze_from_snapshot(
         domains: config.domains.clone(),
         enums: config.enums.clone(),
         types: config.types.clone(),
+        param_nullability: {
+            let mut v: Vec<bool> = lex_output.params.iter().map(|p| p.nullable).collect();
+            for spread in &lex_output.spreads {
+                if let Some(fields) = &spread.fields {
+                    v.extend(fields.iter().map(|f| f.nullable));
+                }
+            }
+            v
+        },
     };
 
     match cubos_sql_analyzer::resolve::analyze(&snapshot, sql, &analyzer_config) {
@@ -257,10 +267,13 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         if let Some(fields) = &spread.fields {
             let mut seen = std::collections::HashSet::new();
             for field in fields {
-                if !seen.insert(field.as_str()) {
+                if !seen.insert(field.name.as_str()) {
                     return Err(syn::Error::new(
                         input.sql.span(),
-                        format!("duplicate field '{}' in $..{} spread", field, spread.name,),
+                        format!(
+                            "duplicate field '{}' in $..{} spread",
+                            field.name, spread.name,
+                        ),
                     ));
                 }
             }
@@ -331,7 +344,12 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         // 4. Try static analyzer WITHOUT Docker (if schema snapshot exists).
         let snapshot_path = cubos_dir.join(&migration_hash).join("schema.json");
         let static_result = if snapshot_path.exists() {
-            try_static_analyze_from_snapshot(&snapshot_path, &introspection_sql, &config)
+            try_static_analyze_from_snapshot(
+                &snapshot_path,
+                &introspection_sql,
+                &config,
+                &lex_output,
+            )
         } else {
             None
         };
@@ -373,31 +391,49 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
             }
 
             // 7. Try static analyzer with (now available) snapshot.
-            let info =
-                try_static_analyze_from_snapshot(&snapshot_path, &introspection_sql, &config)
-                    .unwrap_or_else(|| {
-                        // 8. Final fallback: live introspection.
-                        with_client(&conn_str, |client| {
-                            crate::introspect::introspect_query(
-                                client,
-                                &introspection_sql,
-                                &config.domains,
-                                &config.enums,
-                                &config.types,
-                            )
-                            .map_err(|e| {
-                                let msg = format_introspect_error(&e, &introspection_sql);
-                                syn::Error::new(sql_span, msg)
-                            })
-                        })
-                    })?;
+            let info = try_static_analyze_from_snapshot(
+                &snapshot_path,
+                &introspection_sql,
+                &config,
+                &lex_output,
+            )
+            .unwrap_or_else(|| {
+                // 8. Final fallback: live introspection.
+                with_client(&conn_str, |client| {
+                    crate::introspect::introspect_query(
+                        client,
+                        &introspection_sql,
+                        &config.domains,
+                        &config.enums,
+                        &config.types,
+                    )
+                    .map_err(|e| {
+                        let msg = format_introspect_error(&e, &introspection_sql);
+                        syn::Error::new(sql_span, msg)
+                    })
+                })
+            })?;
 
             let _ = crate::cache::put(&cache_path, &info);
             info
         }
     };
 
-    // 6. Generate typed Rust code.
+    // 6. Apply nullable annotations from lexer ($foo?, field?) to ParamInfo.
+    let mut query_info = query_info;
+    {
+        let mut nullable_flags: Vec<bool> = lex_output.params.iter().map(|p| p.nullable).collect();
+        for spread in &lex_output.spreads {
+            if let Some(fields) = &spread.fields {
+                nullable_flags.extend(fields.iter().map(|f| f.nullable));
+            }
+        }
+        for (pi, &nullable) in query_info.params.iter_mut().zip(nullable_flags.iter()) {
+            pi.nullable = nullable;
+        }
+    }
+
+    // 7. Generate typed Rust code.
     codegen::generate(
         &lex_output,
         &query_info,

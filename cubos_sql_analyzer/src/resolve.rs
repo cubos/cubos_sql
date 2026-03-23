@@ -20,6 +20,10 @@ pub struct AnalyzerConfig {
     pub domains: HashMap<String, String>,
     pub enums: HashMap<String, String>,
     pub types: HashMap<String, String>,
+    /// Nullable annotations from the lexer: maps 1-based param index → nullable.
+    /// Populated from `$foo?` syntax. Empty if no annotations.
+    #[allow(clippy::type_complexity)]
+    pub param_nullability: Vec<bool>,
 }
 
 /// Analyze a SQL query and return typed parameter and column information.
@@ -43,6 +47,11 @@ pub fn analyze(
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
     let mut params = ParamCollector::default();
+
+    // Seed nullable annotations from lexer ($foo? syntax).
+    for (i, &nullable) in config.param_nullability.iter().enumerate() {
+        params.set_nullable((i + 1) as i32, nullable);
+    }
 
     let (raw_columns, raw_params) = match stmt {
         node::Node::SelectStmt(sel) => analyze_select(sel, snapshot, &mut params)?,
@@ -69,7 +78,7 @@ pub fn analyze(
     };
     let params_info = param_list
         .into_iter()
-        .map(|(_, type_oid)| build_param_info(type_oid, snapshot, config))
+        .map(|(_, type_oid, nullable)| build_param_info(type_oid, nullable, snapshot, config))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(QueryInfo {
@@ -96,7 +105,7 @@ pub(crate) fn analyze_select(
     sel: &protobuf::SelectStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32)>>), AnalyzeError> {
+) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
     analyze_select_with_ctes(sel, snapshot, params, &HashMap::new())
 }
 
@@ -105,7 +114,7 @@ fn analyze_select_with_ctes(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32)>>), AnalyzeError> {
+) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
 
@@ -126,6 +135,7 @@ fn analyze_select_with_ctes(
 
     let mut scope = Scope::default();
     let mut null_ctx = NullabilityContext::default();
+    null_ctx.has_group_by = !sel.group_clause.is_empty();
 
     // Process FROM clause.
     process_from_clause(
@@ -156,7 +166,7 @@ fn analyze_insert(
     ins: &protobuf::InsertStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32)>>), AnalyzeError> {
+) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
     let relation = ins
         .relation
         .as_ref()
@@ -244,7 +254,7 @@ fn analyze_update(
     upd: &protobuf::UpdateStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32)>>), AnalyzeError> {
+) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
     let relation = upd
         .relation
         .as_ref()
@@ -307,7 +317,7 @@ fn analyze_delete(
     del: &protobuf::DeleteStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32)>>), AnalyzeError> {
+) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
     let relation = del
         .relation
         .as_ref()
@@ -345,7 +355,7 @@ fn analyze_set_operation(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32)>>), AnalyzeError> {
+) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
     let left = sel
         .larg
         .as_ref()
@@ -706,6 +716,7 @@ fn build_column_info(
 
 fn build_param_info(
     type_oid: u32,
+    nullable: bool,
     snapshot: &SchemaSnapshot,
     config: &AnalyzerConfig,
 ) -> Result<ParamInfo, AnalyzeError> {
@@ -715,6 +726,7 @@ fn build_param_info(
     Ok(ParamInfo {
         pg_type_oid: type_oid,
         rust_type,
+        nullable,
         domain_rust_type,
         enum_rust_type,
     })

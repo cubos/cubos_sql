@@ -89,6 +89,7 @@ fn default_config() -> AnalyzerConfig {
         domains: HashMap::new(),
         enums: HashMap::new(),
         types: HashMap::new(),
+        param_nullability: Vec::new(),
     }
 }
 
@@ -1337,8 +1338,10 @@ fn stress_aggregate_subquery_in_select() {
 
     assert_same_types(&static_info, &live_info, "aggregate in scalar subquery");
 
-    // Scalar subquery is always nullable regardless of COUNT
-    assert!(col(&static_info, "post_count").nullable);
+    // Static analyzer knows: aggregate without GROUP BY → exactly 1 row,
+    // and COUNT is NOT NULL → scalar subquery result is NOT NULL.
+    // Live introspect can't see this — always marks scalar subqueries nullable.
+    assert!(!col(&static_info, "post_count").nullable);
     assert!(col(&live_info, "post_count").nullable);
 }
 
@@ -1521,8 +1524,8 @@ fn torture_param_in_coalesce() {
     let live_info = live_introspect(&mut client, sql);
 
     assert_same_types(&static_info, &live_info, "param in COALESCE");
-    // Param is conservatively nullable → COALESCE of two nullable → nullable.
-    assert!(col(&static_info, "val").nullable);
+    // $1 is NOT NULL by default → COALESCE has a NOT NULL arg → NOT NULL.
+    assert!(!col(&static_info, "val").nullable);
 }
 
 #[test]
@@ -1623,6 +1626,418 @@ fn torture_deeply_nested_cte_union_join() {
     let info = static_analyze(&snapshot, sql);
     assert!(!col(&info, "val").nullable, "CTE UNION of NOT NULL");
     assert!(col(&info, "age").nullable, "LEFT JOIN + nullable col");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: scalar subquery + aggregate nullability
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn subquery_count_star_not_null() {
+    let (snapshot, mut client) = setup();
+    let sql = "SELECT u.name, \
+                      (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) as cnt \
+               FROM users u";
+    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
+    let live_info = live_introspect(&mut client, sql);
+
+    assert_same_types(&static_info, &live_info, "COUNT(*) scalar subquery");
+    // Static: aggregate without GROUP BY → guaranteed 1 row, COUNT is NOT NULL.
+    assert!(!col(&static_info, "cnt").nullable);
+    // Live: always marks scalar subquery nullable.
+    assert!(col(&live_info, "cnt").nullable);
+}
+
+#[test]
+fn subquery_count_plus_one_not_null() {
+    let (snapshot, _) = setup();
+    // COUNT(*) + 1 wraps the aggregate in an AExpr — must still detect it.
+    let sql = "SELECT u.name, \
+                      (SELECT COUNT(*) + 1 FROM posts p WHERE p.user_id = u.id) as cnt \
+               FROM users u";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "cnt").nullable);
+}
+
+#[test]
+fn subquery_count_cast_not_null() {
+    let (snapshot, _) = setup();
+    // COUNT(*)::int wraps aggregate in TypeCast.
+    let sql = "SELECT (SELECT COUNT(*)::int FROM posts) as cnt FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "cnt").nullable);
+}
+
+#[test]
+fn subquery_coalesce_sum_not_null() {
+    let (snapshot, _) = setup();
+    // COALESCE(SUM(rating), 0) — aggregate detected through COALESCE.
+    // SUM is nullable (empty group), but COALESCE with literal → NOT NULL.
+    // Also: aggregate without GROUP BY → guaranteed 1 row.
+    let sql = "SELECT (SELECT COALESCE(SUM(rating), 0) FROM comments) as total";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "total").nullable);
+}
+
+#[test]
+fn subquery_sum_nullable() {
+    let (snapshot, _) = setup();
+    // SUM without COALESCE: aggregate != COUNT → nullable result.
+    // Even though guaranteed 1 row, SUM itself returns NULL for empty input.
+    let sql = "SELECT (SELECT SUM(rating) FROM comments) as total";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "total").nullable);
+}
+
+#[test]
+fn subquery_with_group_by_still_nullable() {
+    let (snapshot, _) = setup();
+    // COUNT(*) with GROUP BY: subquery may return 0 rows → nullable.
+    let sql = "SELECT u.name, \
+                      (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id GROUP BY p.user_id) as cnt \
+               FROM users u";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "cnt").nullable);
+}
+
+#[test]
+fn subquery_non_aggregate_still_nullable() {
+    let (snapshot, _) = setup();
+    // Non-aggregate scalar subquery: may return 0 rows → nullable.
+    let sql = "SELECT u.name, \
+                      (SELECT p.title FROM posts p WHERE p.user_id = u.id LIMIT 1) as first_title \
+               FROM users u";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "first_title").nullable);
+}
+
+#[test]
+fn subquery_case_wrapping_count_not_null() {
+    let (snapshot, _) = setup();
+    // CASE WHEN ... THEN COUNT(*) ELSE 0 END — aggregate inside CASE with ELSE.
+    let sql = "SELECT (SELECT CASE WHEN true THEN COUNT(*) ELSE 0 END FROM posts) as cnt";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "cnt").nullable);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: aggregates with GROUP BY
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn agg_sum_with_group_by_not_null_input() {
+    let (snapshot, mut client) = setup();
+    // user_id is NOT NULL + GROUP BY → SUM guaranteed non-null.
+    let sql = "SELECT user_id, SUM(user_id) as total FROM posts GROUP BY user_id";
+    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
+    let live_info = live_introspect(&mut client, sql);
+
+    assert_same_types(&static_info, &live_info, "SUM with GROUP BY not-null input");
+    // Static: GROUP BY + NOT NULL input → NOT NULL.
+    assert!(!col(&static_info, "total").nullable);
+    // Live: always marks non-COUNT aggregates nullable.
+    assert!(col(&live_info, "total").nullable);
+}
+
+#[test]
+fn agg_sum_with_group_by_nullable_input() {
+    let (snapshot, _) = setup();
+    // rating is nullable + GROUP BY → SUM still nullable (all rows in group could be NULL).
+    let sql = "SELECT post_id, SUM(rating) as total FROM comments GROUP BY post_id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "total").nullable);
+}
+
+#[test]
+fn agg_min_max_with_group_by_not_null() {
+    let (snapshot, _) = setup();
+    // title is NOT NULL + GROUP BY → MIN/MAX are NOT NULL.
+    let sql = "SELECT user_id, MIN(title) as first_title, MAX(title) as last_title \
+               FROM posts GROUP BY user_id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "first_title").nullable);
+    assert!(!col(&info, "last_title").nullable);
+}
+
+#[test]
+fn agg_avg_with_group_by_not_null() {
+    let (snapshot, _) = setup();
+    // id is NOT NULL + GROUP BY → AVG is NOT NULL.
+    let sql = "SELECT user_id, AVG(id) as avg_id FROM posts GROUP BY user_id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "avg_id").nullable);
+}
+
+#[test]
+fn agg_count_with_group_by() {
+    let (snapshot, _) = setup();
+    // COUNT is always NOT NULL, with or without GROUP BY.
+    let sql = "SELECT user_id, COUNT(*) as cnt FROM posts GROUP BY user_id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "cnt").nullable);
+}
+
+#[test]
+fn agg_count_without_group_by() {
+    let (snapshot, _) = setup();
+    // COUNT without GROUP BY: still NOT NULL (returns 0).
+    let sql = "SELECT COUNT(*) as cnt FROM posts";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "cnt").nullable);
+}
+
+#[test]
+fn agg_sum_without_group_by_always_nullable() {
+    let (snapshot, _) = setup();
+    // SUM without GROUP BY: table could be empty → NULL.
+    // Even with NOT NULL input.
+    let sql = "SELECT SUM(id) as total FROM posts";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "total").nullable);
+}
+
+#[test]
+fn agg_mixed_nullability_with_group_by() {
+    let (snapshot, _) = setup();
+    // Mix of NOT NULL and nullable aggregates in same GROUP BY query.
+    let sql = "SELECT post_id, \
+                      COUNT(*) as cnt, \
+                      SUM(rating) as sum_rating, \
+                      MIN(author_name) as first_author, \
+                      MAX(rating) as max_rating \
+               FROM comments GROUP BY post_id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "cnt").nullable); // COUNT: always NOT NULL
+    assert!(col(&info, "sum_rating").nullable); // SUM(nullable): nullable
+    assert!(!col(&info, "first_author").nullable); // MIN(NOT NULL): NOT NULL
+    assert!(col(&info, "max_rating").nullable); // MAX(nullable): nullable
+}
+
+#[test]
+fn agg_with_group_by_and_left_join() {
+    let (snapshot, _) = setup();
+    // LEFT JOIN + GROUP BY: right-side columns are nullable from JOIN,
+    // so aggregate on them is nullable even with GROUP BY.
+    let sql = "SELECT u.id, COUNT(p.id) as post_count, MAX(p.title) as last_title \
+               FROM users u \
+               LEFT JOIN posts p ON p.user_id = u.id \
+               GROUP BY u.id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "post_count").nullable); // COUNT: always NOT NULL
+    assert!(col(&info, "last_title").nullable); // MAX(nullable from LEFT JOIN): nullable
+}
+
+#[test]
+fn agg_string_agg_with_group_by_not_null() {
+    let (snapshot, _) = setup();
+    // string_agg(NOT NULL, delimiter) with GROUP BY → NOT NULL.
+    // The literal ', ' has type UNKNOWN — resolved via UNKNOWN-compatible matching.
+    let sql = "SELECT post_id, string_agg(author_name, ', ') as authors \
+               FROM comments GROUP BY post_id";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "authors").nullable);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: UNKNOWN type resolution in function calls
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn unknown_literal_in_function_call() {
+    let (snapshot, mut client) = setup();
+    // ', ' is UNKNOWN type — should resolve string_agg(text, text) unambiguously.
+    let sql = "SELECT post_id, string_agg(author_name, ', ') as authors \
+               FROM comments GROUP BY post_id";
+    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
+    let live_info = live_introspect(&mut client, sql);
+    assert_same_types(&static_info, &live_info, "string_agg with UNKNOWN literal");
+}
+
+#[test]
+fn unknown_literal_in_replace() {
+    let (snapshot, _) = setup();
+    // replace(text, text, text) — two UNKNOWN literals.
+    let sql = "SELECT replace(name, 'foo', 'bar') as replaced FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert_eq!(col(&info, "replaced").rust_type, "String");
+    assert!(!col(&info, "replaced").nullable);
+}
+
+#[test]
+fn unknown_literal_in_position() {
+    let (snapshot, _) = setup();
+    // position(text in text) — UNKNOWN in first arg.
+    let sql = "SELECT position('x' in name) as pos FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "pos").nullable);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: function/operator nullability (strict, pg_catalog, exceptions)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn strict_pg_catalog_function_not_null() {
+    let (snapshot, _) = setup();
+    // length(text) is pg_catalog, strict, not in exceptions → NOT NULL with NOT NULL input.
+    let sql = "SELECT length(name) as len FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "len").nullable);
+}
+
+#[test]
+fn strict_pg_catalog_function_nullable_with_nullable_arg() {
+    let (snapshot, _) = setup();
+    // length(text) is strict: nullable input → nullable output.
+    let sql = "SELECT length(body) as len FROM posts";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "len").nullable);
+}
+
+#[test]
+fn strict_pg_catalog_upper_not_null() {
+    let (snapshot, _) = setup();
+    // upper(text) is pg_catalog, strict → NOT NULL with NOT NULL input.
+    let sql = "SELECT upper(name) as uname FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "uname").nullable);
+}
+
+#[test]
+fn operator_plus_not_null() {
+    let (snapshot, _) = setup();
+    // 1 + 1: both non-null, operator not in exceptions → NOT NULL.
+    let sql = "SELECT 1 + 1 as result";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "result").nullable);
+}
+
+#[test]
+fn operator_plus_nullable_arg() {
+    let (snapshot, _) = setup();
+    // age is nullable → result is nullable.
+    let sql = "SELECT age + 1 as next_age FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "next_age").nullable);
+}
+
+#[test]
+fn operator_concat_not_null() {
+    let (snapshot, _) = setup();
+    // || with two NOT NULL → NOT NULL.
+    let sql = "SELECT name || ' <' || email || '>' as display FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "display").nullable);
+}
+
+#[test]
+fn operator_concat_nullable_arg() {
+    let (snapshot, _) = setup();
+    // body is nullable → concat is nullable.
+    let sql = "SELECT title || body as combined FROM posts";
+    let info = static_analyze(&snapshot, sql);
+    assert!(col(&info, "combined").nullable);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: non-strict pg_catalog functions that never return NULL
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn nonstrict_concat_never_null() {
+    let (snapshot, _) = setup();
+    // concat is non-strict but never returns NULL (treats NULLs as '').
+    let sql = "SELECT concat(p.title, ' ', p.body) as full_text FROM posts p";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "full_text").nullable);
+}
+
+#[test]
+fn nonstrict_concat_ws_never_null() {
+    let (snapshot, _) = setup();
+    let sql = "SELECT concat_ws(', '::text, name, email) as combined FROM users";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "combined").nullable);
+}
+
+#[test]
+fn nonstrict_now_never_null() {
+    let (snapshot, _) = setup();
+    let sql = "SELECT now() as ts";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "ts").nullable);
+}
+
+#[test]
+fn nonstrict_random_never_null() {
+    let (snapshot, _) = setup();
+    let sql = "SELECT random() as r";
+    let info = static_analyze(&snapshot, sql);
+    assert!(!col(&info, "r").nullable);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: parameter nullability annotations
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn config_with_nullable(nullable: &[bool]) -> AnalyzerConfig {
+    AnalyzerConfig {
+        domains: HashMap::new(),
+        enums: HashMap::new(),
+        types: HashMap::new(),
+        param_nullability: nullable.to_vec(),
+    }
+}
+
+#[test]
+fn param_not_null_by_default() {
+    let (snapshot, _) = setup();
+    // $1 has no nullable annotation → NOT NULL.
+    // COALESCE(nullable_age, not_null_param) → NOT NULL.
+    let sql = "SELECT COALESCE(age, $1) as val FROM users";
+    let info = analyze(&snapshot, sql, &default_config()).unwrap();
+    assert!(!col(&info, "val").nullable);
+}
+
+#[test]
+fn param_nullable_annotation() {
+    let (snapshot, _) = setup();
+    // $1 has nullable annotation → nullable.
+    // COALESCE(nullable_age, nullable_param) → nullable.
+    let sql = "SELECT COALESCE(age, $1) as val FROM users";
+    let config = config_with_nullable(&[true]);
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert!(col(&info, "val").nullable);
+}
+
+#[test]
+fn param_nullable_propagates_to_param_info() {
+    let (snapshot, _) = setup();
+    let sql = "SELECT * FROM users WHERE id = $1 AND age = $2";
+    // $1 not nullable, $2 nullable
+    let config = config_with_nullable(&[false, true]);
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert!(!info.params[0].nullable);
+    assert!(info.params[1].nullable);
+}
+
+#[test]
+fn param_not_null_in_where_comparison() {
+    let (snapshot, _) = setup();
+    // $1 not null by default → comparison `id = $1` has both sides NOT NULL → NOT NULL.
+    let sql = "SELECT id = $1 as is_match FROM users";
+    let info = analyze(&snapshot, sql, &default_config()).unwrap();
+    assert!(!col(&info, "is_match").nullable);
+}
+
+#[test]
+fn param_nullable_in_where_comparison() {
+    let (snapshot, _) = setup();
+    // $1 nullable → comparison `id = $1?` has one nullable side → nullable.
+    let sql = "SELECT id = $1 as is_match FROM users";
+    let config = config_with_nullable(&[true]);
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert!(col(&info, "is_match").nullable);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

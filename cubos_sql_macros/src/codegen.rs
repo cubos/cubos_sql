@@ -374,7 +374,7 @@ fn generate_spread(
                 .map(|pi| pi.domain_rust_type.is_some())
                 .unwrap_or(false);
 
-            let accessor_ident = format_ident!("{}", fields[ci]);
+            let accessor_ident = format_ident!("{}", fields[ci].name);
             let accessor: TokenStream = quote! { __item.#accessor_ident };
 
             if is_domain {
@@ -598,17 +598,22 @@ fn build_param_fields(
 
         // Resolve the Rust type for this parameter from introspection.
         let param_info = query_info.params.get(idx);
-        let field_type: syn::Type = if let Some(pi) = param_info {
+        let is_nullable = param_info.map(|pi| pi.nullable).unwrap_or(false);
+        let inner_type_str = if let Some(pi) = param_info {
             // Domain types are serialized to serde_json::Value before sending.
             if pi.domain_rust_type.is_some() {
-                parse_str("::cubos_sql::__private::serde_json::Value")?
+                "::cubos_sql::__private::serde_json::Value".to_string()
             } else {
-                parse_str::<syn::Type>(&qualify_rust_type(&pi.rust_type))?
+                qualify_rust_type(&pi.rust_type)
             }
         } else {
-            // Fallback: use a generic ToSql-compatible type; this should not
-            // happen in practice since introspection covers all params.
-            parse_str("::cubos_sql::__private::serde_json::Value")?
+            "::cubos_sql::__private::serde_json::Value".to_string()
+        };
+
+        let field_type: syn::Type = if is_nullable {
+            parse_str(&format!("::std::option::Option<{inner_type_str}>"))?
+        } else {
+            parse_str(&inner_type_str)?
         };
 
         // Resolve the value expression for this parameter.
@@ -822,6 +827,7 @@ mod tests {
                 .map(|t| ParamInfo {
                     pg_type_oid: 0,
                     rust_type: t.to_string(),
+                    nullable: false,
                     domain_rust_type: None,
                     enum_rust_type: None,
                 })
