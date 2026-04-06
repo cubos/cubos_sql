@@ -58,10 +58,12 @@ mod tests {
             domains: HashMap::new(),
             enums: HashMap::new(),
             types: HashMap::new(),
-            use_static_analyzer: true,
+            analysis_mode: cubos_sql_core::config::AnalysisMode::Auto,
+            databases: HashMap::new(),
         };
 
-        let (info, _hash) = crate::docker::ensure_container(&config, &test_dir).unwrap();
+        let resolved = config.resolve(None).unwrap();
+        let (info, _hash) = crate::docker::ensure_container(&resolved, &test_dir).unwrap();
         postgres::Client::connect(&info.connection_string(), postgres::NoTls).unwrap()
     }
 

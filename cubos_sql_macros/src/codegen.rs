@@ -159,7 +159,7 @@ fn generate_regular(
     // 3. Build the `&[&(dyn ToSql + Sync)]` slice literal used in every
     //    method body.
     // ------------------------------------------------------------------
-    let params_slice = build_params_slice(lex_output);
+    let params_slice = build_params_slice(lex_output, query_info)?;
 
     // ------------------------------------------------------------------
     // 4. Row-mapping expression used in fetch methods.
@@ -168,9 +168,11 @@ fn generate_regular(
 
     // ------------------------------------------------------------------
     // 5. The SQL string literal (+ limited variant for fetch_one/optional).
+    //    Domain params get `::jsonb` cast, enum params get `::text` cast,
+    //    so tokio-postgres sends the base type OID that PG can coerce.
     // ------------------------------------------------------------------
-    let sql_str = &lex_output.sql;
-    let sql_limited = wrap_with_limit(sql_str).unwrap_or_else(|| sql_str.clone());
+    let sql_str = cast_params(lex_output, query_info);
+    let sql_limited = wrap_with_limit(&sql_str).unwrap_or_else(|| sql_str.clone());
 
     // ------------------------------------------------------------------
     // 6. fetch_value() — only when there is exactly one column.
@@ -364,32 +366,84 @@ fn generate_spread(
                 format!("could not infer type for parameter `${}`", param.name),
             )
         })?;
-        let field_type: syn::Type = if pi.domain_rust_type.is_some() {
-            parse_str("::cubos_sql::__private::serde_json::Value")?
+        let is_nullable = pi.nullable;
+        let is_domain = pi.domain_rust_type.is_some();
+        let is_enum = pi.enum_rust_type.is_some();
+
+        // The field type exposed to the user: domain/enum types use their Rust
+        // path directly; the internal serialization happens at push time.
+        let inner_type_str = if let Some(domain) = &pi.domain_rust_type {
+            domain.clone()
+        } else if let Some(enum_type) = &pi.enum_rust_type {
+            enum_type.clone()
         } else {
-            parse_str::<syn::Type>(&qualify_rust_type(&pi.rust_type))?
+            qualify_rust_type(&pi.rust_type)
         };
-        let value_expr = resolve_param_value(
-            &param.name,
-            pi.domain_rust_type.as_deref(),
-            pi.enum_rust_type.as_deref(),
-            assignments,
-        )?;
-        // For String fields, wrap with `.into()` so `&str` is accepted.
-        let is_string_field = pi.rust_type == "String"
-            && pi.domain_rust_type.is_none()
-            && pi.enum_rust_type.is_none();
+        let field_type: syn::Type = if is_nullable {
+            parse_str(&format!("::std::option::Option<{inner_type_str}>"))?
+        } else {
+            parse_str(&inner_type_str)?
+        };
+
+        // Value expression: accept the user's value directly (no conversion).
+        let value_expr = resolve_param_value(&param.name, assignments)?;
+        // For String fields (non-domain, non-enum), wrap with `.into()`.
+        let is_string_field = pi.rust_type == "String" && !is_domain && !is_enum;
         let value_expr = if is_string_field {
-            quote! { Into::<String>::into(#value_expr) }
+            if is_nullable {
+                quote! { (#value_expr).map(Into::<String>::into) }
+            } else {
+                quote! { Into::<String>::into(#value_expr) }
+            }
         } else {
             value_expr
         };
         regular_param_fields.extend(quote! { #field_name: #field_type, });
-        regular_param_inits.extend(quote! { #field_name: #value_expr, });
-        regular_param_pushes.extend(quote! {
-            __params.push(Box::new(self.#field_name.clone())
-                as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+        // Type-annotated let binding using the original parameter name so that
+        // any type mismatch error shows e.g. `let health: Option<HealthData> = ...`
+        // instead of an opaque `p0` field.
+        let param_ident = format_ident!("__{}", param.name);
+        regular_param_inits.extend(quote! {
+            #field_name: { let #param_ident: #field_type = #value_expr; #param_ident },
         });
+
+        // Push: domain types are serialized to JSON, enum types to String.
+        if is_domain {
+            if is_nullable {
+                regular_param_pushes.extend(quote! {
+                    __params.push(Box::new(match &self.#field_name {
+                        Some(__v) => Some(::cubos_sql::__private::serde_json::to_value(__v)
+                            .map_err(|e| cubos_sql::Error::Serialize(
+                                format!("failed to serialize domain type to JSON: {e}")))?),
+                        None => None,
+                    }) as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+                });
+            } else {
+                regular_param_pushes.extend(quote! {
+                    __params.push(Box::new(::cubos_sql::__private::serde_json::to_value(&self.#field_name)
+                        .map_err(|e| cubos_sql::Error::Serialize(
+                            format!("failed to serialize domain type to JSON: {e}")))?)
+                        as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+                });
+            }
+        } else if is_enum {
+            if is_nullable {
+                regular_param_pushes.extend(quote! {
+                    __params.push(Box::new(self.#field_name.as_ref().map(|__v| __v.to_string()))
+                        as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+                });
+            } else {
+                regular_param_pushes.extend(quote! {
+                    __params.push(Box::new(self.#field_name.to_string())
+                        as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+                });
+            }
+        } else {
+            regular_param_pushes.extend(quote! {
+                __params.push(Box::new(self.#field_name.clone())
+                    as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+            });
+        }
     }
 
     // ── Per-spread: generics, fields, inits, push exprs, SQL pieces ────
@@ -829,9 +883,12 @@ fn build_param_fields(
             )
         })?;
         let is_nullable = pi.nullable;
-        let inner_type_str = if pi.domain_rust_type.is_some() {
-            // Domain types are serialized to serde_json::Value before sending.
-            "::cubos_sql::__private::serde_json::Value".to_string()
+        let is_domain = pi.domain_rust_type.is_some();
+        let is_enum = pi.enum_rust_type.is_some();
+        let inner_type_str = if let Some(domain) = &pi.domain_rust_type {
+            domain.clone()
+        } else if let Some(enum_type) = &pi.enum_rust_type {
+            enum_type.clone()
         } else {
             qualify_rust_type(&pi.rust_type)
         };
@@ -843,19 +900,11 @@ fn build_param_fields(
         };
 
         // Resolve the value expression for this parameter.
-        let value_expr: TokenStream = resolve_param_value(
-            &param.name,
-            pi.domain_rust_type.as_deref(),
-            pi.enum_rust_type.as_deref(),
-            assignments,
-        )?;
+        let value_expr: TokenStream = resolve_param_value(&param.name, assignments)?;
 
-        // For String fields, wrap the value with `.into()` so that both
-        // `&str` and `String` are accepted transparently.
-        let needs_into = inner_type_str == "String"
-            && pi.domain_rust_type.is_none()
-            && pi.enum_rust_type.is_none();
-        let value_expr = if needs_into {
+        // For String fields (non-domain, non-enum), wrap with `.into()`.
+        let is_string_field = pi.rust_type == "String" && !is_domain && !is_enum;
+        let value_expr = if is_string_field {
             if is_nullable {
                 quote! { (#value_expr).map(Into::<String>::into) }
             } else {
@@ -869,8 +918,9 @@ fn build_param_fields(
             #field_name: #field_type,
         });
 
+        let param_ident = format_ident!("__{}", param.name);
         inits.extend(quote! {
-            #field_name: #value_expr,
+            #field_name: { let #param_ident: #field_type = #value_expr; #param_ident },
         });
     }
 
@@ -879,35 +929,63 @@ fn build_param_fields(
 
 /// Produces the value expression that will be stored in the query struct field.
 ///
-/// If `domain_rust_type` is `Some`, the user-supplied expression is wrapped
-/// with `serde_json::to_value(...)` so it is stored as a JSON value.
+/// Returns the raw user expression — domain/enum serialization happens at push
+/// time, not here.
 fn resolve_param_value(
     param_name: &str,
-    domain_rust_type: Option<&str>,
-    enum_rust_type: Option<&str>,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
     let assignment = assignments.iter().find(|a| a.name == param_name);
 
-    let raw_expr: TokenStream = match assignment {
-        Some(ParamAssignment { expr: Some(e), .. }) => quote! { #e },
+    match assignment {
+        Some(ParamAssignment { expr: Some(e), .. }) => Ok(quote! { #e }),
         Some(ParamAssignment { expr: None, .. }) | None => {
             let ident = format_ident!("{}", param_name);
-            quote! { #ident }
+            Ok(quote! { #ident })
         }
-    };
-
-    if domain_rust_type.is_some() {
-        Ok(quote! {
-            ::cubos_sql::__private::serde_json::to_value(&#raw_expr)
-                .map_err(|e| cubos_sql::Error::Serialize(format!("failed to serialize domain type to JSON: {e}")))?
-        })
-    } else if enum_rust_type.is_some() {
-        // Enum params: convert to String via ToString
-        Ok(quote! { (#raw_expr).to_string() })
-    } else {
-        Ok(raw_expr)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: cast domain/enum params in SQL
+// ---------------------------------------------------------------------------
+
+/// Rewrite the SQL to add type casts after each parameter placeholder.
+///
+/// Uses `ParamInfo::cast_type` (resolved from the base type after unwrapping
+/// domains) and the byte offsets recorded by the lexer. Parameters without
+/// a `cast_type` (unknown OIDs, custom types) are left uncast.
+fn cast_params(lex_output: &LexOutput, query_info: &QueryInfo) -> String {
+    let mut insertions: Vec<(usize, String)> = Vec::new();
+
+    for (idx, param) in lex_output.params.iter().enumerate() {
+        if let Some(pi) = query_info.params.get(idx)
+            && let Some(pg_type) = &pi.cast_type
+        {
+            let cast_str = format!("::{pg_type}");
+            for &offset in &param.sql_offsets {
+                insertions.push((offset, cast_str.clone()));
+            }
+        }
+    }
+
+    if insertions.is_empty() {
+        return lex_output.sql.clone();
+    }
+
+    insertions.sort_by_key(|(off, _)| *off);
+
+    let sql = &lex_output.sql;
+    let mut result = String::with_capacity(sql.len() + insertions.len() * 8);
+    let mut last = 0;
+    for (offset, cast_str) in &insertions {
+        result.push_str(&sql[last..*offset]);
+        result.push_str(cast_str);
+        last = *offset;
+    }
+    result.push_str(&sql[last..]);
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -917,17 +995,55 @@ fn resolve_param_value(
 /// Builds the comma-separated list of `&self.pN as &(dyn ToSql + Sync)` used
 /// inside the `&[...]` slice literal passed to `Executor::query` /
 /// `Executor::execute`.
-fn build_params_slice(lex_output: &LexOutput) -> TokenStream {
+fn build_params_slice(
+    lex_output: &LexOutput,
+    query_info: &QueryInfo,
+) -> Result<TokenStream, syn::Error> {
     let mut elems = TokenStream::new();
 
     for idx in 0..lex_output.params.len() {
         let field_name = format_ident!("p{}", idx);
-        elems.extend(quote! {
-            &self.#field_name as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
-        });
+        let pi = &query_info.params[idx];
+
+        if pi.domain_rust_type.is_some() {
+            if pi.nullable {
+                // Option<DomainType> → Option<serde_json::Value> → &dyn ToSql
+                elems.extend(quote! {
+                    &match &self.#field_name {
+                        Some(__v) => Some(::cubos_sql::__private::serde_json::to_value(__v)
+                            .map_err(|e| cubos_sql::Error::Serialize(
+                                format!("failed to serialize domain type to JSON: {e}")))?),
+                        None => None,
+                    } as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
+                });
+            } else {
+                elems.extend(quote! {
+                    &::cubos_sql::__private::serde_json::to_value(&self.#field_name)
+                        .map_err(|e| cubos_sql::Error::Serialize(
+                            format!("failed to serialize domain type to JSON: {e}")))?
+                        as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
+                });
+            }
+        } else if pi.enum_rust_type.is_some() {
+            if pi.nullable {
+                elems.extend(quote! {
+                    &self.#field_name.as_ref().map(|__v| __v.to_string())
+                        as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
+                });
+            } else {
+                elems.extend(quote! {
+                    &self.#field_name.to_string()
+                        as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
+                });
+            }
+        } else {
+            elems.extend(quote! {
+                &self.#field_name as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
+            });
+        }
     }
 
-    elems
+    Ok(elems)
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1187,7 @@ mod tests {
                     nullable: false,
                     domain_rust_type: None,
                     enum_rust_type: None,
+                    cast_type: None,
                 })
                 .collect(),
             columns,

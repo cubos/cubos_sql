@@ -19,6 +19,9 @@
 //! lock_id = 713705               # advisory lock ID (default: 713705)
 //! use_transaction = true         # wrap each migration in a transaction (default: true)
 //!
+//! [package.metadata.cubos_sql]
+//! analysis_mode = "auto"             # "static", "describe", or "auto" (default)
+//!
 //! [package.metadata.cubos_sql.domains]
 //! user_preferences = "crate::domains::UserPreferences"
 //! order_metadata = "crate::domains::OrderMetadata"
@@ -40,6 +43,41 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Controls how the `sql!` macro analyzes queries at compile time.
+///
+/// - `Static`: use only the static SQL analyzer (no Docker/introspection fallback).
+///   Compile errors if the analyzer cannot resolve the query.
+/// - `Describe`: use only live introspection via `DESCRIBE` (always requires Docker).
+/// - `Auto`: try the static analyzer first, fall back to `DESCRIBE` if it fails.
+///   This is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnalysisMode {
+    /// Static analyzer only — no Docker needed once the schema snapshot exists.
+    Static,
+    /// Live introspection only — always requires Docker.
+    Describe,
+    /// Static analyzer first, fall back to live introspection.
+    #[default]
+    Auto,
+}
+
+impl<'de> Deserialize<'de> for AnalysisMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "static" => Ok(AnalysisMode::Static),
+            "describe" => Ok(AnalysisMode::Describe),
+            "auto" => Ok(AnalysisMode::Auto),
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown analysis_mode '{s}': expected \"static\", \"describe\", or \"auto\""
+            ))),
+        }
+    }
+}
 
 /// Top-level configuration for `cubos_sql`, read from `[package.metadata.cubos_sql]` in `Cargo.toml`.
 ///
@@ -65,11 +103,42 @@ pub struct Config {
     /// Array versions are supported automatically as `Vec<RustType>`.
     #[serde(default)]
     pub types: HashMap<String, String>,
-    /// Whether to use the static SQL analyzer for type/nullability inference.
-    /// When `false`, falls back to introspection via `DESCRIBE`.
-    /// Default: `true`
-    #[serde(default = "Config::default_use_static_analyzer")]
-    pub use_static_analyzer: bool,
+    /// How the `sql!` macro analyzes queries at compile time.
+    /// `"static"` = static analyzer only, `"describe"` = live introspection only,
+    /// `"auto"` (default) = static first, fallback to describe.
+    #[serde(default)]
+    pub analysis_mode: AnalysisMode,
+    /// Named database configurations for multi-database support.
+    /// Each key maps to a complete database configuration.
+    /// Used with `sql!(db = name, ...)` syntax.
+    #[serde(default)]
+    pub databases: HashMap<String, DatabaseEntry>,
+}
+
+/// A named database entry for multi-database support.
+///
+/// Configured under `[package.metadata.cubos_sql.databases.<name>]` in `Cargo.toml`.
+/// Each entry has its own database settings, migrations, domain/enum/type mappings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseEntry {
+    /// Database-related settings (Docker image, migrations path).
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    /// Migration runner settings (tracking table, lock ID, transaction behavior).
+    #[serde(default)]
+    pub migrations: MigrationsConfig,
+    /// Custom JSONB domain mappings.
+    #[serde(default)]
+    pub domains: HashMap<String, String>,
+    /// Custom enum mappings.
+    #[serde(default)]
+    pub enums: HashMap<String, String>,
+    /// Custom type mappings.
+    #[serde(default)]
+    pub types: HashMap<String, String>,
+    /// How the `sql!` macro analyzes queries at compile time.
+    #[serde(default)]
+    pub analysis_mode: AnalysisMode,
 }
 
 /// Database-related configuration.
@@ -288,6 +357,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("invalid migration table name '{table}': {reason}")]
     InvalidTable { table: String, reason: String },
+    #[error("unknown database '{0}' — not found in [package.metadata.cubos_sql.databases]")]
+    UnknownDatabase(String),
 }
 
 impl std::str::FromStr for Config {
@@ -309,16 +380,13 @@ impl Default for Config {
             domains: HashMap::new(),
             enums: HashMap::new(),
             types: HashMap::new(),
-            use_static_analyzer: true,
+            analysis_mode: AnalysisMode::Auto,
+            databases: HashMap::new(),
         }
     }
 }
 
 impl Config {
-    fn default_use_static_analyzer() -> bool {
-        true
-    }
-
     /// Load config from a `Cargo.toml` file.
     pub fn from_cargo_toml(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
@@ -339,6 +407,92 @@ impl Config {
 
     /// Resolve extra migration paths relative to a base directory.
     /// These are migration directories from other crates, used only at compile time.
+    pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
+        self.database
+            .extra_migrations
+            .iter()
+            .map(|p| {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    base.join(p)
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve configuration for a specific database.
+    ///
+    /// - `None` returns the default (top-level) config.
+    /// - `Some("name")` looks up `[databases.name]` and returns an error if not found.
+    pub fn resolve(&self, db_name: Option<&str>) -> Result<ResolvedConfig<'_>, ConfigError> {
+        match db_name {
+            None => Ok(ResolvedConfig {
+                database: &self.database,
+                migrations: &self.migrations,
+                domains: qualify_keys(&self.domains),
+                enums: qualify_keys(&self.enums),
+                types: qualify_keys(&self.types),
+                analysis_mode: self.analysis_mode,
+            }),
+            Some(name) => {
+                let entry = self
+                    .databases
+                    .get(name)
+                    .ok_or_else(|| ConfigError::UnknownDatabase(name.to_string()))?;
+                Ok(ResolvedConfig {
+                    database: &entry.database,
+                    migrations: &entry.migrations,
+                    domains: qualify_keys(&entry.domains),
+                    enums: qualify_keys(&entry.enums),
+                    types: qualify_keys(&entry.types),
+                    analysis_mode: entry.analysis_mode,
+                })
+            }
+        }
+    }
+}
+
+/// A resolved view of a single database's configuration.
+///
+/// Returned by [`Config::resolve`]. Borrows database/migration settings from the
+/// parent [`Config`], but owns the type-mapping HashMaps because keys are normalized
+/// to always be schema-qualified (`schema.name`). Unqualified names default to `public.`.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig<'a> {
+    pub database: &'a DatabaseConfig,
+    pub migrations: &'a MigrationsConfig,
+    pub domains: HashMap<String, String>,
+    pub enums: HashMap<String, String>,
+    pub types: HashMap<String, String>,
+    pub analysis_mode: AnalysisMode,
+}
+
+/// Normalize type-mapping keys to always be schema-qualified.
+/// Keys that already contain a dot are left as-is; bare names get `public.` prefix.
+fn qualify_keys(map: &HashMap<String, String>) -> HashMap<String, String> {
+    map.iter()
+        .map(|(k, v)| {
+            if k.contains('.') {
+                (k.clone(), v.clone())
+            } else {
+                (format!("public.{k}"), v.clone())
+            }
+        })
+        .collect()
+}
+
+impl ResolvedConfig<'_> {
+    /// Resolve the migrations path relative to a base directory.
+    pub fn migrations_dir(&self, base: &Path) -> PathBuf {
+        if self.database.migrations.is_absolute() {
+            self.database.migrations.clone()
+        } else {
+            base.join(&self.database.migrations)
+        }
+    }
+
+    /// Resolve extra migration paths relative to a base directory.
     pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
         self.database
             .extra_migrations
@@ -459,7 +613,51 @@ edition = "2021"
         let config = Config::from_str(toml).unwrap();
         assert_eq!(config.database.docker_image, "postgres");
         assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
-        assert!(config.use_static_analyzer);
+        assert_eq!(config.analysis_mode, AnalysisMode::Auto);
+    }
+
+    #[test]
+    fn parse_analysis_mode_static() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql]
+analysis_mode = "static"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.analysis_mode, AnalysisMode::Static);
+    }
+
+    #[test]
+    fn parse_analysis_mode_describe() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql]
+analysis_mode = "describe"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.analysis_mode, AnalysisMode::Describe);
+    }
+
+    #[test]
+    fn parse_analysis_mode_invalid() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql]
+analysis_mode = "unknown"
+"#;
+        assert!(Config::from_str(toml).is_err());
     }
 
     #[test]
@@ -562,5 +760,198 @@ migrations = "/opt/migrations"
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parse_multi_db_config() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql.database]
+migrations = "./migrations/main"
+
+[package.metadata.cubos_sql.databases.analytics]
+[package.metadata.cubos_sql.databases.analytics.database]
+migrations = "./migrations/analytics"
+docker_image = "postgres:16"
+
+[package.metadata.cubos_sql.databases.analytics.migrations]
+table = "public._analytics_migrations"
+
+[package.metadata.cubos_sql.databases.analytics.domains]
+event_data = "crate::EventData"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(
+            config.database.migrations,
+            PathBuf::from("./migrations/main")
+        );
+        assert_eq!(config.databases.len(), 1);
+
+        let analytics = config.databases.get("analytics").unwrap();
+        assert_eq!(
+            analytics.database.migrations,
+            PathBuf::from("./migrations/analytics")
+        );
+        assert_eq!(analytics.database.docker_image, "postgres:16");
+        assert_eq!(analytics.migrations.table, "public._analytics_migrations");
+        assert_eq!(
+            analytics.domains.get("event_data").unwrap(),
+            "crate::EventData"
+        );
+    }
+
+    #[test]
+    fn resolve_default_db() {
+        let config = Config::from_str(MINIMAL_TOML).unwrap();
+        let resolved = config.resolve(None).unwrap();
+        assert_eq!(resolved.database.migrations, PathBuf::from("./migrations"));
+    }
+
+    #[test]
+    fn resolve_named_db() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql.database]
+migrations = "./migrations/main"
+
+[package.metadata.cubos_sql.databases.analytics.database]
+migrations = "./migrations/analytics"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        let resolved = config.resolve(Some("analytics")).unwrap();
+        assert_eq!(
+            resolved.database.migrations,
+            PathBuf::from("./migrations/analytics")
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_db_errors() {
+        let config = Config::from_str(MINIMAL_TOML).unwrap();
+        assert!(config.resolve(Some("nonexistent")).is_err());
+    }
+
+    #[test]
+    fn resolve_qualifies_unqualified_domain_keys() {
+        let config = Config::from_str(VALID_TOML).unwrap();
+        let resolved = config.resolve(None).unwrap();
+        // Unqualified "user_preferences" becomes "public.user_preferences"
+        assert_eq!(
+            resolved.domains.get("public.user_preferences").unwrap(),
+            "crate::domains::UserPreferences"
+        );
+        assert_eq!(
+            resolved.domains.get("public.order_metadata").unwrap(),
+            "crate::domains::OrderMetadata"
+        );
+        // Original unqualified key should not exist
+        assert!(resolved.domains.get("user_preferences").is_none());
+    }
+
+    #[test]
+    fn resolve_preserves_qualified_domain_keys() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql.database]
+migrations = "./migrations"
+
+[package.metadata.cubos_sql.domains]
+"whatsapp.health_data" = "crate::domains::HealthData"
+"whatsapp.qr_data" = "crate::domains::QrData"
+user_preferences = "crate::domains::UserPreferences"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        let resolved = config.resolve(None).unwrap();
+        // Schema-qualified keys are preserved as-is
+        assert_eq!(
+            resolved.domains.get("whatsapp.health_data").unwrap(),
+            "crate::domains::HealthData"
+        );
+        assert_eq!(
+            resolved.domains.get("whatsapp.qr_data").unwrap(),
+            "crate::domains::QrData"
+        );
+        // Unqualified key gets "public." prefix
+        assert_eq!(
+            resolved.domains.get("public.user_preferences").unwrap(),
+            "crate::domains::UserPreferences"
+        );
+    }
+
+    #[test]
+    fn resolve_qualifies_enum_and_type_keys() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql.database]
+migrations = "./migrations"
+
+[package.metadata.cubos_sql.enums]
+user_role = "crate::UserRole"
+"custom_schema.status" = "crate::Status"
+
+[package.metadata.cubos_sql.types]
+point = "crate::Point"
+"geo.polygon" = "crate::Polygon"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        let resolved = config.resolve(None).unwrap();
+
+        assert_eq!(
+            resolved.enums.get("public.user_role").unwrap(),
+            "crate::UserRole"
+        );
+        assert_eq!(
+            resolved.enums.get("custom_schema.status").unwrap(),
+            "crate::Status"
+        );
+
+        assert_eq!(resolved.types.get("public.point").unwrap(), "crate::Point");
+        assert_eq!(resolved.types.get("geo.polygon").unwrap(), "crate::Polygon");
+    }
+
+    #[test]
+    fn resolve_qualifies_named_db_keys() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql.database]
+migrations = "./migrations/main"
+
+[package.metadata.cubos_sql.databases.analytics.database]
+migrations = "./migrations/analytics"
+
+[package.metadata.cubos_sql.databases.analytics.domains]
+event_data = "crate::EventData"
+"stats.metric" = "crate::Metric"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        let resolved = config.resolve(Some("analytics")).unwrap();
+        assert_eq!(
+            resolved.domains.get("public.event_data").unwrap(),
+            "crate::EventData"
+        );
+        assert_eq!(
+            resolved.domains.get("stats.metric").unwrap(),
+            "crate::Metric"
+        );
     }
 }

@@ -68,6 +68,7 @@ mod tests {
                 nullable: false,
                 domain_rust_type: None,
                 enum_rust_type: None,
+                cast_type: Some("int4".to_string()),
             }],
             columns: vec![ColumnInfo {
                 name: "id".to_string(),

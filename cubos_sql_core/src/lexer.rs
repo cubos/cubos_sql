@@ -247,10 +247,14 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                 params.push(Param {
                                     name: ident,
                                     nullable,
+                                    sql_offsets: Vec::new(),
                                 });
                                 idx
                             };
-                            out.push_str(&format!("${next_idx}"));
+                            let placeholder = format!("${next_idx}");
+                            out.push_str(&placeholder);
+                            // Record the byte offset right after this placeholder.
+                            params[next_idx - 1].sql_offsets.push(out.len());
                             i = consume_to;
                         }
                     } else {

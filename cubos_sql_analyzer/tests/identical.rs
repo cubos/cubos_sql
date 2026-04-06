@@ -891,7 +891,7 @@ fn identical_enum_with_config_mapping() {
     let mut config = default_config();
     config
         .enums
-        .insert("user_role".into(), "crate::UserRole".into());
+        .insert("public.user_role".into(), "crate::UserRole".into());
     let sql = "SELECT id, role FROM users";
     let info = analyze(&snapshot, sql, &config).unwrap();
     assert_eq!(col(&info, "role").rust_type, "String");
@@ -909,7 +909,7 @@ fn identical_enum_param_with_config_mapping() {
     let mut config = default_config();
     config
         .enums
-        .insert("user_role".into(), "crate::UserRole".into());
+        .insert("public.user_role".into(), "crate::UserRole".into());
     let sql = "INSERT INTO users (name, email, role) VALUES ($1, $2, $3) RETURNING id";
     let info = analyze(&snapshot, sql, &config).unwrap();
     assert_eq!(info.params[2].rust_type, "String");
@@ -950,7 +950,7 @@ fn identical_domain_column_with_config() {
     let mut config = default_config();
     config
         .domains
-        .insert("user_prefs".into(), "crate::UserPrefs".into());
+        .insert("public.user_prefs".into(), "crate::UserPrefs".into());
     let sql = "SELECT id, preferences FROM users";
     let info = analyze(&snapshot, sql, &config).unwrap();
     assert_eq!(col(&info, "preferences").rust_type, "serde_json::Value");
@@ -985,7 +985,7 @@ fn identical_domain_param_with_config() {
     let mut config = default_config();
     config
         .domains
-        .insert("user_prefs".into(), "crate::UserPrefs".into());
+        .insert("public.user_prefs".into(), "crate::UserPrefs".into());
     let sql = "INSERT INTO users (name, email, preferences) VALUES ($1, $2, $3) RETURNING id";
     let info = analyze(&snapshot, sql, &config).unwrap();
     assert_eq!(info.params[2].rust_type, "serde_json::Value");
@@ -1004,4 +1004,78 @@ fn identical_domain_in_where() {
     let s = analyze(&snapshot, sql, &default_config()).unwrap();
     let l = live_introspect(&mut client, sql);
     assert_identical(&s, &l, "domain in WHERE");
+}
+
+#[test]
+#[ignore]
+fn identical_schema_qualified_domain_column_without_config() {
+    // whatsapp.health_data domain without config → unwraps to serde_json::Value
+    let (snapshot, mut client) = setup();
+    let sql = "SELECT channel_id, health FROM whatsapp.channels";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_same_types(&s, &l, "schema-qualified domain column without config");
+    assert_eq!(
+        col(&s, "health").rust_type,
+        "serde_json::Value",
+        "JSONB domain without config → serde_json::Value"
+    );
+    assert!(col(&s, "health").nullable, "health is nullable");
+}
+
+#[test]
+#[ignore]
+fn identical_schema_qualified_domain_column_with_config() {
+    // whatsapp.health_data with config → domain_rust_type is set
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .domains
+        .insert("whatsapp.health_data".into(), "crate::HealthData".into());
+    let sql = "SELECT channel_id, health FROM whatsapp.channels";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert_eq!(col(&info, "health").rust_type, "serde_json::Value");
+    assert_eq!(
+        col(&info, "health").domain_rust_type.as_deref(),
+        Some("crate::HealthData"),
+        "domain_rust_type should be set for schema-qualified domain"
+    );
+}
+
+#[test]
+#[ignore]
+fn identical_schema_qualified_domain_param_with_config() {
+    // INSERT param into whatsapp.health_data column with config
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .domains
+        .insert("whatsapp.health_data".into(), "crate::HealthData".into());
+    let sql = "INSERT INTO whatsapp.channels (channel_id, health, updated_at) \
+               VALUES ($1, $2, now())";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert_eq!(info.params[1].rust_type, "serde_json::Value");
+    assert_eq!(
+        info.params[1].domain_rust_type.as_deref(),
+        Some("crate::HealthData"),
+        "param domain_rust_type should be set for schema-qualified domain"
+    );
+}
+
+#[test]
+#[ignore]
+fn identical_schema_qualified_domain_unqualified_key_no_match() {
+    // Using unqualified "health_data" should NOT match whatsapp.health_data
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .domains
+        .insert("public.health_data".into(), "crate::WrongType".into());
+    let sql = "SELECT channel_id, health FROM whatsapp.channels";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    // Should NOT have domain_rust_type since "public.health_data" != "whatsapp.health_data"
+    assert!(
+        col(&info, "health").domain_rust_type.is_none(),
+        "public.health_data should not match whatsapp.health_data"
+    );
 }

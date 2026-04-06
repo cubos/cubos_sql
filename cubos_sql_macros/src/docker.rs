@@ -356,7 +356,7 @@ pub fn run_migrations(info: &ContainerInfo, migrations_dirs: &[&Path]) -> Result
 ///    → update state to `ready: true`.
 /// 5. On migration failure → remove container, delete state.
 pub fn ensure_container(
-    config: &cubos_sql_core::config::Config,
+    config: &cubos_sql_core::config::ResolvedConfig<'_>,
     manifest_dir: &Path,
 ) -> Result<(ContainerInfo, String), DockerError> {
     let migrations_dir = config.migrations_dir(manifest_dir);
@@ -391,7 +391,7 @@ pub fn ensure_container(
 }
 
 fn ensure_container_inner(
-    config: &cubos_sql_core::config::Config,
+    config: &cubos_sql_core::config::ResolvedConfig<'_>,
     migrations_dirs: &[&Path],
     base_dir: &Path,
     hash: &str,
@@ -557,7 +557,8 @@ mod tests {
             domains: std::collections::HashMap::new(),
             enums: std::collections::HashMap::new(),
             types: std::collections::HashMap::new(),
-            use_static_analyzer: true,
+            analysis_mode: cubos_sql_core::config::AnalysisMode::Auto,
+            databases: std::collections::HashMap::new(),
         }
     }
 
@@ -596,7 +597,8 @@ mod tests {
 
         // First call: should start a new container.
         // ensure_container uses cubos_sql_dir(manifest_dir) = mig_dir/.cubos_sql/
-        let (info1, hash1) = ensure_container(&config, mig_dir.path()).unwrap();
+        let (info1, hash1) =
+            ensure_container(&config.resolve(None).unwrap(), mig_dir.path()).unwrap();
         assert!(!hash1.is_empty());
         assert!(info1.port > 0);
 
@@ -607,7 +609,8 @@ mod tests {
         assert!(state.ready);
 
         // Second call: should reuse the container.
-        let (info2, hash2) = ensure_container(&config, mig_dir.path()).unwrap();
+        let (info2, hash2) =
+            ensure_container(&config.resolve(None).unwrap(), mig_dir.path()).unwrap();
         assert_eq!(hash1, hash2);
         assert_eq!(info1.port, info2.port);
 
@@ -622,7 +625,7 @@ mod tests {
         let config = test_config(mig_dir.path());
 
         // Start a container normally.
-        let (_, hash) = ensure_container(&config, mig_dir.path()).unwrap();
+        let (_, hash) = ensure_container(&config.resolve(None).unwrap(), mig_dir.path()).unwrap();
 
         // Simulate crash: mark state as not ready.
         let base = cubos_sql_dir(mig_dir.path());
@@ -633,7 +636,7 @@ mod tests {
         write_state(&sp, &state).unwrap();
 
         // Next call should detect not-ready, remove old container, start fresh.
-        let (info, _) = ensure_container(&config, mig_dir.path()).unwrap();
+        let (info, _) = ensure_container(&config.resolve(None).unwrap(), mig_dir.path()).unwrap();
         assert!(info.port > 0);
 
         let new_state = read_state(&sp).unwrap();
@@ -657,7 +660,7 @@ mod tests {
         let config = test_config(mig_dir.path());
 
         // Should fail.
-        let result = ensure_container(&config, mig_dir.path());
+        let result = ensure_container(&config.resolve(None).unwrap(), mig_dir.path());
         assert!(result.is_err());
 
         // State file should not exist (cleaned up after failure).

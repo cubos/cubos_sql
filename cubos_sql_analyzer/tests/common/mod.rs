@@ -17,7 +17,9 @@ pub use cubos_sql_core::query_info::{ColumnInfo, QueryInfo};
 pub const MIGRATION: &str = "\
     CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
     CREATE DOMAIN user_prefs AS JSONB;
-    CREATE TABLE IF NOT EXISTS users (\
+    CREATE SCHEMA whatsapp;
+    CREATE DOMAIN whatsapp.health_data AS JSONB;
+    CREATE TABLE users (\
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
         name TEXT NOT NULL, \
         email TEXT NOT NULL UNIQUE, \
@@ -26,23 +28,30 @@ pub const MIGRATION: &str = "\
         preferences user_prefs, \
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
     );\
-    CREATE TABLE IF NOT EXISTS posts (\
+    CREATE TABLE posts (\
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
         user_id BIGINT NOT NULL REFERENCES users(id), \
         title TEXT NOT NULL, \
         body TEXT, \
         published_at TIMESTAMPTZ\
     );\
-    CREATE TABLE IF NOT EXISTS comments (\
+    CREATE TABLE comments (\
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
         post_id BIGINT NOT NULL REFERENCES posts(id), \
         author_name TEXT NOT NULL, \
         content TEXT NOT NULL, \
         rating INT\
     );\
+    CREATE TABLE whatsapp.channels (\
+        channel_id BIGINT PRIMARY KEY, \
+        health whatsapp.health_data, \
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+    );\
 ";
 
-pub fn connect() -> postgres::Client {
+/// Connect to the shared PG container and return a base client (connected to
+/// the `cubos_sql` maintenance database).
+fn base_connect() -> postgres::Client {
     let search_dirs = [
         std::env::temp_dir()
             .join("cubos_sql_introspect_tests")
@@ -75,8 +84,42 @@ pub fn connect() -> postgres::Client {
         );
     });
 
-    let mut client =
-        postgres::Client::connect(&conn_str, postgres::NoTls).expect("Failed to connect");
+    postgres::Client::connect(&conn_str, postgres::NoTls).expect("Failed to connect")
+}
+
+/// Create a fresh database with a random name, run migrations, and return a
+/// client connected to it. Each test gets its own isolated DB so there are no
+/// conflicts from pre-existing types/tables.
+pub fn connect() -> postgres::Client {
+    let db_name = format!("test_{:016x}", rand::random::<u64>());
+
+    // Connect to the maintenance DB to create the test database.
+    let mut admin = base_connect();
+    admin
+        .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+        .expect("failed to create test database");
+    drop(admin);
+
+    // Build connection string for the new database.
+    let mut base = base_connect();
+    // Extract host/port from the admin connection by querying it.
+    let row = base
+        .query_one("SELECT inet_server_addr(), inet_server_port()", &[])
+        .unwrap();
+    let host: Option<std::net::IpAddr> = row.get(0);
+    let port: Option<i32> = row.get(1);
+    drop(base);
+
+    let host = host
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = port.unwrap_or(5432);
+
+    let conn_str =
+        format!("host={host} port={port} user=postgres password=postgres dbname={db_name}");
+
+    let mut client = postgres::Client::connect(&conn_str, postgres::NoTls)
+        .expect("Failed to connect to test DB");
     client.batch_execute(MIGRATION).unwrap();
     client
 }

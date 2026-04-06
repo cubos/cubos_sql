@@ -754,7 +754,7 @@ fn resolve_target_list(
         let name = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
-            infer_column_name(val).unwrap_or_else(|| format!("?column{i}?"))
+            infer_column_name(val).unwrap_or_else(|| format!("_column{i}_"))
         };
 
         columns.push(RawColumn {
@@ -816,12 +816,17 @@ fn build_param_info(
     let (rust_type, domain_rust_type, enum_rust_type) =
         resolve_rust_type(type_oid, snapshot, config)?;
 
+    // Resolve cast_type: unwrap domains to base type, then look up pg_name.
+    let base_oid = snapshot.unwrap_domain(type_oid);
+    let cast_type = type_map::from_oid(base_oid).map(|ti| ti.pg_name.to_string());
+
     Ok(ParamInfo {
         pg_type_oid: type_oid,
         rust_type,
         nullable,
         domain_rust_type,
         enum_rust_type,
+        cast_type,
     })
 }
 
@@ -834,7 +839,8 @@ fn resolve_rust_type(
     if let Some(te) = snapshot.get_type(type_oid) {
         match &te.kind {
             TypeKind::Domain { base_type_oid } => {
-                if let Some(rust_path) = config.domains.get(&te.name) {
+                let qualified_name = format!("{}.{}", te.schema, te.name);
+                if let Some(rust_path) = config.domains.get(&qualified_name) {
                     // JSONB domain.
                     return Ok((
                         "serde_json::Value".to_owned(),
@@ -846,7 +852,8 @@ fn resolve_rust_type(
                 return resolve_rust_type(*base_type_oid, snapshot, config);
             }
             TypeKind::Enum { .. } => {
-                let enum_rt = config.enums.get(&te.name).cloned();
+                let qualified_name = format!("{}.{}", te.schema, te.name);
+                let enum_rt = config.enums.get(&qualified_name).cloned();
                 return Ok(("String".to_owned(), None, enum_rt));
             }
             TypeKind::Array { element_type_oid } => {
@@ -857,12 +864,8 @@ fn resolve_rust_type(
         }
 
         // Check custom types config.
-        let qualified = format!("{}.{}", te.schema, te.name);
-        if let Some(rt) = config
-            .types
-            .get(&qualified)
-            .or_else(|| config.types.get(&te.name))
-        {
+        let qualified_name = format!("{}.{}", te.schema, te.name);
+        if let Some(rt) = config.types.get(&qualified_name) {
             return Ok((rt.clone(), None, None));
         }
     }

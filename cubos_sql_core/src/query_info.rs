@@ -42,6 +42,11 @@ pub struct ParamInfo {
     /// If this is a mapped enum type, the Rust type path from config.
     #[serde(default)]
     pub enum_rust_type: Option<String>,
+    /// PostgreSQL type name for explicit cast in the generated SQL
+    /// (e.g. `"jsonb"`, `"int8"`, `"text"`). `None` means no cast.
+    /// Resolved from the base type after unwrapping domains.
+    #[serde(default)]
+    pub cast_type: Option<String>,
 }
 
 /// Combined introspection result for a query.

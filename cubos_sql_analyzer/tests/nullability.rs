@@ -451,6 +451,38 @@ fn complex_boolean_with_nullable_input() {
 #[test]
 #[ignore] // requires PostgreSQL (Docker)
 
+fn exists_without_from() {
+    let (snapshot, _client) = setup();
+    // SELECT EXISTS(...) without FROM — always returns exactly 1 row, never NULL.
+    let sql = "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)";
+    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
+    assert_eq!(static_info.columns.len(), 1);
+    assert!(
+        !static_info.columns[0].nullable,
+        "EXISTS should be NOT NULL"
+    );
+    assert_eq!(static_info.columns[0].rust_type, "bool");
+}
+
+#[test]
+#[ignore] // requires PostgreSQL (Docker)
+
+fn exists_constant_without_from() {
+    let (snapshot, _client) = setup();
+    // SELECT EXISTS(SELECT 1) — pure constant, no table reference at all.
+    let sql = "SELECT EXISTS(SELECT 1)";
+    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
+    assert_eq!(static_info.columns.len(), 1);
+    assert!(
+        !static_info.columns[0].nullable,
+        "EXISTS should be NOT NULL"
+    );
+    assert_eq!(static_info.columns[0].rust_type, "bool");
+}
+
+#[test]
+#[ignore] // requires PostgreSQL (Docker)
+
 fn complex_exists_subquery() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT u.name, EXISTS(SELECT 1 FROM posts p WHERE p.user_id = u.id) as has_posts \

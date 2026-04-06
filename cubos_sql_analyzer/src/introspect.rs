@@ -136,12 +136,17 @@ fn build_params(
                 column: format!("$param({})", pg_type.name()),
                 pg_name: pg_type.name().to_owned(),
             })?;
+        // Resolve cast_type: unwrap domains to base type, then look up pg_name.
+        let base_oid = unwrap_domain_type(pg_type);
+        let cast_type = type_map::from_oid(base_oid).map(|ti| ti.pg_name.to_string());
+
         params.push(ParamInfo {
             pg_type_oid: resolved.effective_oid,
             rust_type,
             nullable: false,
             domain_rust_type: resolved.domain_rust_type,
             enum_rust_type: resolved.enum_rust_type,
+            cast_type,
         });
     }
     Ok(params)
@@ -235,9 +240,9 @@ fn resolve_type_inner(
 
     match pg_type.kind() {
         Kind::Domain(base_type) => {
-            let domain_name = pg_type.name();
+            let qualified_name = format!("{}.{}", pg_type.schema(), pg_type.name());
             if base_type.oid() == JSONB_OID
-                && let Some(rust_path) = domains.get(domain_name)
+                && let Some(rust_path) = domains.get(&qualified_name)
             {
                 return ResolvedType {
                     effective_oid: JSONB_OID,
@@ -249,12 +254,12 @@ fn resolve_type_inner(
             resolve_type_inner(base_type, domains, enums, custom_types, depth + 1)
         }
         Kind::Enum(_) => {
-            let enum_name = pg_type.name();
+            let qualified_name = format!("{}.{}", pg_type.schema(), pg_type.name());
             ResolvedType {
                 effective_oid: pg_type.oid(),
                 rust_type: Some("String".to_owned()),
                 domain_rust_type: None,
-                enum_rust_type: enums.get(enum_name).cloned(),
+                enum_rust_type: enums.get(&qualified_name).cloned(),
             }
         }
         Kind::Array(element_type) => {
@@ -276,10 +281,7 @@ fn resolve_type_inner(
                 };
             }
             let qualified_name = format!("{}.{}", pg_type.schema(), pg_type.name());
-            let custom_rt = custom_types
-                .get(&qualified_name)
-                .or_else(|| custom_types.get(pg_type.name()));
-            if let Some(rt) = custom_rt {
+            if let Some(rt) = custom_types.get(&qualified_name) {
                 return ResolvedType {
                     effective_oid: pg_type.oid(),
                     rust_type: Some(rt.clone()),
@@ -325,4 +327,18 @@ fn detect_nullability(
         map.insert(col.name().to_owned(), nullable);
     }
     map
+}
+
+/// Unwrap domain types to find the base type OID using the postgres crate's
+/// `Kind::Domain` information.
+fn unwrap_domain_type(pg_type: &postgres::types::Type) -> u32 {
+    let mut current = pg_type;
+    for _ in 0..32 {
+        if let Kind::Domain(base) = current.kind() {
+            current = base;
+        } else {
+            break;
+        }
+    }
+    current.oid()
 }

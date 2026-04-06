@@ -21,6 +21,10 @@ pub struct Param {
     /// - `Some(true)`: `$foo?` — force nullable (`Option<T>`).
     /// - `Some(false)`: `$foo!` — force non-nullable.
     pub nullable: Option<bool>,
+    /// Byte offsets in the output SQL immediately after each `$N` placeholder
+    /// for this parameter. Used by codegen to insert type casts (e.g., `::jsonb`).
+    /// A param referenced multiple times will have multiple offsets.
+    pub sql_offsets: Vec<usize>,
 }
 
 /// A field inside a spread parameter, with optional nullable annotation.
