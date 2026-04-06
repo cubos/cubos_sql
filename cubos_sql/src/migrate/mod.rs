@@ -60,5 +60,5 @@
 mod runner;
 mod source;
 
-pub use runner::{revert, run, status, MigrationStatus};
+pub use runner::{MigrationStatus, revert, run, status};
 pub use source::{Migration, MigrationSource};

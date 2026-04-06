@@ -10,6 +10,7 @@ extern crate proc_macro;
 mod cache;
 mod codegen;
 mod docker;
+mod from_row;
 mod introspect;
 mod query_macro;
 
@@ -267,6 +268,28 @@ mod query_macro;
 pub fn sql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as query_macro::QueryInput);
     match query_macro::expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Derive macro for `cubos_sql::FromRow`.
+///
+/// Generates an implementation that constructs the struct from a
+/// `tokio_postgres::Row` by extracting each field by column name.
+///
+/// ```rust,ignore
+/// #[derive(cubos_sql::FromRow)]
+/// struct User {
+///     id: i64,
+///     name: String,
+///     email: Option<String>,
+/// }
+/// ```
+#[proc_macro_derive(FromRow)]
+pub fn derive_from_row(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    match from_row::expand(input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

@@ -1,8 +1,12 @@
+#[cfg(feature = "deadpool")]
 use std::ops::Deref;
 
-use tokio_postgres::types::ToSql;
+#[cfg(any(feature = "deadpool", feature = "bb8"))]
 use tokio_postgres::Row;
+#[cfg(any(feature = "deadpool", feature = "bb8"))]
+use tokio_postgres::types::ToSql;
 
+#[cfg(any(feature = "deadpool", feature = "bb8"))]
 use crate::executor::Executor;
 
 // ── deadpool-postgres ────────────────────────────────────────────────────────
@@ -44,6 +48,37 @@ impl Executor for deadpool_postgres::Pool {
 /// the same connection) without using a transaction.
 #[cfg(feature = "deadpool")]
 impl Executor for deadpool_postgres::Object {
+    async fn query<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, crate::Error> {
+        Ok(self.deref().query(sql, params).await?)
+    }
+
+    async fn execute<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> Result<u64, crate::Error> {
+        Ok(self.deref().execute(sql, params).await?)
+    }
+}
+
+/// [`Executor`] implementation for `deadpool_postgres::Transaction`.
+///
+/// Delegates to the inner `tokio_postgres::Transaction` via `Deref`. This allows
+/// using `sql!` directly with a deadpool transaction:
+///
+/// ```rust,ignore
+/// let mut client = pool.get().await?;
+/// let tx = client.transaction().await?;
+/// sql!(&tx, "UPDATE users SET name = $name WHERE id = $id", name = "foo", id = 1)
+///     .execute().await?;
+/// tx.commit().await?;
+/// ```
+#[cfg(feature = "deadpool")]
+impl Executor for deadpool_postgres::Transaction<'_> {
     async fn query<'a>(
         &'a self,
         sql: &'a str,

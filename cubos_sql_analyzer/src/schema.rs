@@ -184,10 +184,10 @@ impl SchemaSnapshot {
         }
         for s in &self.search_path {
             let key = format!("{s}.{name}");
-            if let Some(oid) = self.table_by_name.get(&key) {
-                if let Some(entry) = self.tables.get(oid) {
-                    return Some(entry);
-                }
+            if let Some(oid) = self.table_by_name.get(&key)
+                && let Some(entry) = self.tables.get(oid)
+            {
+                return Some(entry);
             }
         }
         None
@@ -204,10 +204,10 @@ impl SchemaSnapshot {
         }
         for s in &self.search_path {
             let key = format!("{s}.{name}");
-            if let Some(oid) = self.type_by_name.get(&key) {
-                if let Some(entry) = self.types.get(oid) {
-                    return Some(entry);
-                }
+            if let Some(oid) = self.type_by_name.get(&key)
+                && let Some(entry) = self.types.get(oid)
+            {
+                return Some(entry);
             }
         }
         // Also check pg_catalog (builtins).

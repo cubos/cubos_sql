@@ -1,6 +1,45 @@
 //! Type coercion and common-type resolution.
 
-use crate::schema::SchemaSnapshot;
+use crate::schema::{CastContext, SchemaSnapshot};
+
+/// Describes the level of implicit coercion allowed in a given context.
+///
+/// Mirrors PostgreSQL's `CoercionContext` enum in `primnodes.h`.
+/// - `Implicit`: only casts registered as implicit in `pg_cast` are allowed
+///   (used inside operator/function argument matching).
+/// - `Assignment`: implicit **and** assignment casts are allowed
+///   (used for INSERT/UPDATE target columns, WHERE, LIMIT, OFFSET —
+///   matches PG's `COERCION_ASSIGNMENT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoercionContext {
+    Implicit,
+    Assignment,
+}
+
+/// Check whether a cast from `source` to `target` is permitted under
+/// the given coercion context, consulting the snapshot's cast catalog.
+pub fn can_coerce(
+    source: u32,
+    target: u32,
+    context: CoercionContext,
+    snapshot: &SchemaSnapshot,
+) -> bool {
+    if source == target {
+        return true;
+    }
+    // Unwrap domains before checking.
+    let source = snapshot.unwrap_domain(source);
+    let target_unwrapped = snapshot.unwrap_domain(target);
+    if source == target_unwrapped {
+        return true;
+    }
+    let key = format!("{source}:{target_unwrapped}");
+    matches!(
+        (context, snapshot.casts.get(&key)),
+        (_, Some(CastContext::Implicit))
+            | (CoercionContext::Assignment, Some(CastContext::Assignment))
+    )
+}
 
 /// Well-known OIDs for builtin types.
 pub mod oid {

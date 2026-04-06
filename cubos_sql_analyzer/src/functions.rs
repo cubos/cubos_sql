@@ -7,6 +7,8 @@ use crate::schema::{FunctionEntry, SchemaSnapshot};
 /// Resolved function call result.
 pub struct ResolvedFunction {
     pub return_type_oid: u32,
+    /// The resolved argument types from the matched function signature.
+    pub arg_types: Vec<u32>,
     pub schema: String,
     pub is_aggregate: bool,
     pub is_set_returning: bool,
@@ -81,6 +83,7 @@ pub fn resolve_function(
     if name == "count" && is_agg_star {
         return Ok(ResolvedFunction {
             return_type_oid: oid::INT8,
+            arg_types: vec![],
             schema: "pg_catalog".into(),
             is_aggregate: true,
             is_set_returning: false,
@@ -195,6 +198,7 @@ fn find_cast_match<'a>(
 fn make_resolved(f: &FunctionEntry) -> ResolvedFunction {
     ResolvedFunction {
         return_type_oid: f.agg_final_type_oid.unwrap_or(f.return_type_oid),
+        arg_types: f.arg_types.clone(),
         schema: f.schema.clone(),
         is_aggregate: f.is_aggregate,
         is_set_returning: f.is_set_returning,

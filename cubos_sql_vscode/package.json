@@ -1,13 +1,16 @@
 {
   "name": "cubos-sql",
   "displayName": "cubos_sql",
-  "description": "SQL syntax highlighting inside cubos_sql query! macros",
-  "version": "0.1.0",
+  "description": "SQL syntax highlighting inside cubos_sql sql! macros",
+  "version": "0.3.0",
   "publisher": "cubos",
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": ["Programming Languages"],
+  "configurationDefaults": {
+    "rust-analyzer.semanticHighlighting.strings.enable": false
+  },
   "contributes": {
     "grammars": [
       {

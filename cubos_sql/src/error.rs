@@ -25,9 +25,13 @@ pub enum Error {
     #[error("pool error: {0}")]
     Pool(String),
 
-    /// A `fetch_one()` call returned zero rows.
+    /// A `fetch_one()` / `fetch_value()` call returned zero rows.
     #[error("query returned no rows")]
     NoRows,
+
+    /// A `fetch_one()` / `fetch_value()` call returned more than one row.
+    #[error("query returned more than one row")]
+    TooManyRows,
 
     /// Failed to deserialize a domain/enum column value from a query result.
     #[error("deserialization error: {0}")]

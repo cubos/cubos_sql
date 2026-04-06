@@ -52,11 +52,13 @@ mod tests {
             database: cubos_sql_core::config::DatabaseConfig {
                 docker_image: "postgres".to_string(),
                 migrations: mig_path.clone(),
+                extra_migrations: Vec::new(),
             },
             migrations: cubos_sql_core::config::MigrationsConfig::default(),
             domains: HashMap::new(),
             enums: HashMap::new(),
             types: HashMap::new(),
+            use_static_analyzer: true,
         };
 
         let (info, _hash) = crate::docker::ensure_container(&config, &test_dir).unwrap();

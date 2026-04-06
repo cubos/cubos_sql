@@ -12,8 +12,10 @@ pub struct ParamCollector {
     constraints: HashMap<i32, u32>,
     /// All param numbers seen in the query (even if type not yet inferred).
     seen: HashSet<i32>,
-    /// Maps param number (1-based) → nullable annotation from `$foo?` syntax.
+    /// Maps param number (1-based) → nullable annotation.
     nullable: HashMap<i32, bool>,
+    /// Param numbers that have an explicit annotation from `$foo?` syntax (takes precedence).
+    explicit_nullable: HashSet<i32>,
 }
 
 impl ParamCollector {
@@ -31,9 +33,19 @@ impl ParamCollector {
         self.constraints.entry(param_num).or_insert(type_oid);
     }
 
-    /// Record the nullability annotation for a parameter.
+    /// Record an explicit nullability annotation for a parameter (from `$foo?` syntax).
+    /// Explicit annotations take precedence over inferred nullability.
     pub fn set_nullable(&mut self, param_num: i32, nullable: bool) {
         self.nullable.insert(param_num, nullable);
+        self.explicit_nullable.insert(param_num);
+    }
+
+    /// Infer nullability from column definition (e.g. INSERT/UPDATE into a nullable column).
+    /// Does NOT override explicit annotations from `$foo?` or `$foo!` syntax.
+    pub fn infer_nullable(&mut self, param_num: i32, nullable: bool) {
+        if !self.explicit_nullable.contains(&param_num) {
+            self.nullable.insert(param_num, nullable);
+        }
     }
 
     /// Get the nullable annotation for a parameter. Defaults to false (non-nullable).
@@ -54,19 +66,17 @@ impl ParamCollector {
     /// Returns `(param_number, type_oid, nullable)` tuples.
     /// Fails if any `$N` was referenced but its type could not be inferred.
     pub fn into_sorted(self) -> Result<Vec<(i32, u32, bool)>, AnalyzeError> {
-        // Check for params that were seen but not typed.
-        for &num in &self.seen {
-            if !self.constraints.contains_key(&num) {
-                return Err(AnalyzeError::Unsupported(format!(
-                    "could not infer type for parameter ${num}"
-                )));
-            }
-        }
-
+        // Params that were seen but not typed default to TEXT, matching PG's
+        // behavior (preferred type of the string category for unknown params).
         let mut params: Vec<(i32, u32, bool)> = self
-            .constraints
+            .seen
             .iter()
-            .map(|(&num, &oid)| {
+            .map(|&num| {
+                let oid = self
+                    .constraints
+                    .get(&num)
+                    .copied()
+                    .unwrap_or(crate::coerce::oid::TEXT);
                 let nullable = self.nullable.get(&num).copied().unwrap_or(false);
                 (num, oid, nullable)
             })

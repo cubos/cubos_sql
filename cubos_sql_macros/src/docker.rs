@@ -92,42 +92,59 @@ struct ContainerState {
 
 /// Reads all `.sql` files in `path` (sorted by name) and returns the
 /// hex-encoded SHA-256 hash of the concatenated `filename + content` strings.
+///
+/// If the directory does not exist, returns the hash of an empty input
+/// (equivalent to zero migrations).
+#[cfg(test)]
 pub fn hash_migrations_dir(path: &Path) -> Result<String, DockerError> {
-    let mut entries: Vec<_> = fs::read_dir(path)
-        .map_err(|e| {
-            DockerError::Hash(format!(
-                "failed to read migrations directory '{}': {}",
-                path.display(),
-                e
-            ))
-        })?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            let path = entry.path();
-            let name = path.to_string_lossy();
-            name.ends_with(".sql") && !name.ends_with(".down.sql")
-        })
-        .collect();
+    hash_migrations_dirs(&[path])
+}
 
-    entries.sort_by_key(|e| e.file_name());
-
+/// Reads all `.sql` files across multiple directories (each sorted by name)
+/// and returns the hex-encoded SHA-256 hash. Directories are processed in
+/// order, and non-existent directories are skipped.
+pub fn hash_migrations_dirs(paths: &[&Path]) -> Result<String, DockerError> {
     let mut hasher = Sha256::new();
 
-    for entry in entries {
-        let file_path = entry.path();
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
+    for path in paths {
+        if !path.is_dir() {
+            continue;
+        }
 
-        let content = fs::read_to_string(&file_path).map_err(|e| {
-            DockerError::Hash(format!(
-                "failed to read migration file '{}': {}",
-                file_path.display(),
-                e
-            ))
-        })?;
+        let mut entries: Vec<_> = fs::read_dir(path)
+            .map_err(|e| {
+                DockerError::Hash(format!(
+                    "failed to read migrations directory '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let path = entry.path();
+                let name = path.to_string_lossy();
+                name.ends_with(".sql") && !name.ends_with(".down.sql")
+            })
+            .collect();
 
-        hasher.update(name_str.as_bytes());
-        hasher.update(content.as_bytes());
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let file_path = entry.path();
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+
+            let content = fs::read_to_string(&file_path).map_err(|e| {
+                DockerError::Hash(format!(
+                    "failed to read migration file '{}': {}",
+                    file_path.display(),
+                    e
+                ))
+            })?;
+
+            hasher.update(name_str.as_bytes());
+            hasher.update(content.as_bytes());
+        }
     }
 
     let result = hasher.finalize();
@@ -248,7 +265,39 @@ fn wait_for_postgres(container_id: &str) -> Result<(), DockerError> {
 // ─── Migration execution ──────────────────────────────────────────────────────
 
 /// Connects to the running container and runs all `.sql` up-migrations in order.
-pub fn run_migrations(info: &ContainerInfo, migrations_dir: &Path) -> Result<(), DockerError> {
+///
+/// Collects migration files from all provided directories, sorts them globally
+/// by filename, and executes them in order. Non-existent directories are skipped.
+pub fn run_migrations(info: &ContainerInfo, migrations_dirs: &[&Path]) -> Result<(), DockerError> {
+    // Collect all migration file paths from all directories.
+    let mut all_files: Vec<PathBuf> = Vec::new();
+    for dir in migrations_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(dir).map_err(|e| {
+            DockerError::Migration(format!(
+                "failed to read migrations directory '{}': {}",
+                dir.display(),
+                e
+            ))
+        })?;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path.to_string_lossy();
+            if name.ends_with(".sql") && !name.ends_with(".down.sql") {
+                all_files.push(path);
+            }
+        }
+    }
+
+    if all_files.is_empty() {
+        return Ok(());
+    }
+
+    // Sort globally by filename so cross-crate migrations interleave correctly.
+    all_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
     let conn_str = info.connection_string();
 
     // Retry connection a few times — pg_isready can return success slightly
@@ -268,27 +317,8 @@ pub fn run_migrations(info: &ContainerInfo, migrations_dir: &Path) -> Result<(),
         None => postgres::Client::connect(&conn_str, postgres::NoTls)?,
     };
 
-    let mut entries: Vec<_> = fs::read_dir(migrations_dir)
-        .map_err(|e| {
-            DockerError::Migration(format!(
-                "failed to read migrations directory '{}': {}",
-                migrations_dir.display(),
-                e
-            ))
-        })?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            let path = entry.path();
-            let name = path.to_string_lossy();
-            name.ends_with(".sql") && !name.ends_with(".down.sql")
-        })
-        .collect();
-
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let file_path = entry.path();
-        let sql = fs::read_to_string(&file_path).map_err(|e| {
+    for file_path in &all_files {
+        let sql = fs::read_to_string(file_path).map_err(|e| {
             DockerError::Migration(format!(
                 "failed to read migration file '{}': {}",
                 file_path.display(),
@@ -327,7 +357,11 @@ pub fn ensure_container(
     manifest_dir: &Path,
 ) -> Result<(ContainerInfo, String), DockerError> {
     let migrations_dir = config.migrations_dir(manifest_dir);
-    let hash = hash_migrations_dir(&migrations_dir)?;
+    let extra_dirs = config.extra_migrations_dirs(manifest_dir);
+    let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
+    all_dirs.extend(extra_dirs.iter().map(|p| p.as_path()));
+
+    let hash = hash_migrations_dirs(&all_dirs)?;
     let base_dir = cubos_sql_dir(manifest_dir);
 
     let dir = cache_dir(&base_dir, &hash);
@@ -344,7 +378,7 @@ pub fn ensure_container(
     })?;
 
     let sp = state_path(&base_dir, &hash);
-    let result = ensure_container_inner(config, &migrations_dir, &base_dir, &hash, &sp);
+    let result = ensure_container_inner(config, &all_dirs, &base_dir, &hash, &sp);
 
     // Always release lock.
     let _ = lock_file.unlock();
@@ -355,7 +389,7 @@ pub fn ensure_container(
 
 fn ensure_container_inner(
     config: &cubos_sql_core::config::Config,
-    migrations_dir: &Path,
+    migrations_dirs: &[&Path],
     base_dir: &Path,
     hash: &str,
     sp: &Path,
@@ -476,7 +510,7 @@ fn ensure_container_inner(
     };
 
     // Run migrations. On failure: remove container + clean up.
-    if let Err(e) = run_migrations(&info, migrations_dir) {
+    if let Err(e) = run_migrations(&info, migrations_dirs) {
         remove_container(&container_id);
         let _ = fs::remove_file(sp);
         return Err(e);
@@ -514,11 +548,13 @@ mod tests {
             database: cubos_sql_core::config::DatabaseConfig {
                 docker_image: "postgres".to_string(),
                 migrations: migrations_dir.to_path_buf(),
+                extra_migrations: Vec::new(),
             },
             migrations: cubos_sql_core::config::MigrationsConfig::default(),
             domains: std::collections::HashMap::new(),
             enums: std::collections::HashMap::new(),
             types: std::collections::HashMap::new(),
+            use_static_analyzer: true,
         }
     }
 

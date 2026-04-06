@@ -10,15 +10,17 @@
 /// first appearance. The index in the `params` vec (+1) is the positional
 /// placeholder used in the rewritten SQL (i.e., `params[0]` becomes `$1`).
 ///
-/// Nullability annotation: `$foo` is non-nullable (the default), `$foo?` is
-/// nullable (the generated Rust type will be `Option<T>`).
+/// Nullability annotation: `$foo` has no annotation (inferred from schema),
+/// `$foo?` forces nullable, `$foo!` forces non-nullable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
-    /// The parameter name without the `$` prefix and `?` suffix (e.g., `"user_id"`).
+    /// The parameter name without the `$` prefix and `?`/`!` suffix (e.g., `"user_id"`).
     pub name: String,
-    /// Whether this parameter is nullable (`$foo?` syntax).
-    /// When true, the generated Rust type is `Option<T>`.
-    pub nullable: bool,
+    /// Explicit nullability annotation.
+    /// - `None`: no annotation — nullability will be inferred from schema context.
+    /// - `Some(true)`: `$foo?` — force nullable (`Option<T>`).
+    /// - `Some(false)`: `$foo!` — force non-nullable.
+    pub nullable: Option<bool>,
 }
 
 /// A field inside a spread parameter, with optional nullable annotation.

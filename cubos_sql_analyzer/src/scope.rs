@@ -92,10 +92,10 @@ impl Scope {
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
             for source in &self.sources {
-                if source.alias == t {
-                    if let Some(col) = source.columns.iter().find(|c| c.name == column) {
-                        return Ok(col);
-                    }
+                if source.alias == t
+                    && let Some(col) = source.columns.iter().find(|c| c.name == column)
+                {
+                    return Ok(col);
                 }
             }
             return Err(AnalyzeError::UnknownColumn(format!("{t}.{column}")));

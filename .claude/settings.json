@@ -5,26 +5,22 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cargo fmt 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
-            "timeout": 30,
+            "command": "out=$(cargo fmt 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
             "statusMessage": "Running cargo fmt..."
           },
           {
             "type": "command",
-            "command": "cargo check 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
-            "timeout": 120,
+            "command": "out=$(cargo check 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
             "statusMessage": "Running cargo check..."
           },
           {
             "type": "command",
-            "command": "cargo test 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
-            "timeout": 120,
+            "command": "out=$(cargo test 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
             "statusMessage": "Running cargo test..."
           },
           {
             "type": "command",
-            "command": "cargo clippy --fix --allow-dirty --allow-staged -- -D warnings 2>&1; e=$?; [ $e -ne 0 ] && exit 2; exit 0",
-            "timeout": 120,
+            "command": "out=$(cargo clippy -- -D warnings 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
             "statusMessage": "Running cargo clippy..."
           }
         ]

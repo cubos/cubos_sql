@@ -52,10 +52,13 @@ impl MigrationSource {
     /// Scans for `*.sql` files matching the `NNNN_description.sql` naming convention,
     /// pairs them with optional `.down.sql` files, and returns them sorted by version.
     ///
+    /// If the directory does not exist, returns an empty migration source
+    /// (zero migrations).
+    ///
     /// # Errors
     ///
-    /// - [`Error::Migration`](crate::Error::Migration) if the directory does not exist
-    ///   or a file does not match the expected naming format.
+    /// - [`Error::Migration`](crate::Error::Migration) if a file does not match
+    ///   the expected naming format.
     /// - [`Error::Io`](crate::Error::Io) if reading a file fails.
     ///
     /// # Example
@@ -70,10 +73,9 @@ impl MigrationSource {
     /// ```
     pub fn from_dir(path: &Path) -> Result<Self, crate::Error> {
         if !path.is_dir() {
-            return Err(crate::Error::Migration(format!(
-                "migration directory does not exist: {}",
-                path.display()
-            )));
+            return Ok(Self {
+                migrations: Vec::new(),
+            });
         }
 
         let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
@@ -295,11 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_missing_directory() {
-        let result = MigrationSource::from_dir(Path::new("/nonexistent/path/migrations"));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("does not exist"), "unexpected error: {err}");
+    fn missing_directory_returns_empty() {
+        let source = MigrationSource::from_dir(Path::new("/nonexistent/path/migrations")).unwrap();
+        assert!(source.migrations().is_empty());
     }
 
     #[test]

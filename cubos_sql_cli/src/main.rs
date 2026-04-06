@@ -39,11 +39,11 @@ enum Commands {
 #[derive(clap::Subcommand)]
 enum MigrateAction {
     /// Apply all pending migrations
-    Run,
+    Up,
     /// Show migration status
     Status,
     /// Revert a migration (defaults to the last applied)
-    Revert {
+    Down {
         /// Name of migration to revert (defaults to last applied)
         name: Option<String>,
         /// Force revert even without a .down.sql file
@@ -59,6 +59,8 @@ enum MigrateAction {
 
 #[tokio::main]
 async fn main() {
+    let _ = dotenvy::dotenv_override();
+
     let cli = Cli::parse();
 
     if let Err(e) = run(cli).await {
@@ -134,7 +136,7 @@ async fn run_migrate_action(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        MigrateAction::Run => {
+        MigrateAction::Up => {
             let applied = migrate::run(client, source, &config.migrations).await?;
             if applied.is_empty() {
                 println!("No pending migrations");
@@ -163,7 +165,7 @@ async fn run_migrate_action(
                 }
             }
         }
-        MigrateAction::Revert { name, force } => {
+        MigrateAction::Down { name, force } => {
             let revert_name = match name {
                 Some(n) => n,
                 None => {

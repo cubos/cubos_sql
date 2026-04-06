@@ -76,9 +76,9 @@ fn export_search_path(client: &mut postgres::Client) -> Result<Vec<String>, Anal
 // Types
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn export_types(
-    client: &mut postgres::Client,
-) -> Result<(HashMap<u32, TypeEntry>, HashMap<String, u32>), AnalyzeError> {
+type TypeExport = (HashMap<u32, TypeEntry>, HashMap<String, u32>);
+
+fn export_types(client: &mut postgres::Client) -> Result<TypeExport, AnalyzeError> {
     let rows = client.query(
         "SELECT t.oid, t.typname, n.nspname, t.typtype, t.typbasetype, t.typelem, \
                 t.typrelid, t.typlen \
@@ -181,9 +181,9 @@ fn export_types(
 // Tables and views
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn export_tables(
-    client: &mut postgres::Client,
-) -> Result<(HashMap<u32, TableEntry>, HashMap<String, u32>), AnalyzeError> {
+type TableExport = (HashMap<u32, TableEntry>, HashMap<String, u32>);
+
+fn export_tables(client: &mut postgres::Client) -> Result<TableExport, AnalyzeError> {
     let rows = client.query(
         "SELECT c.oid, c.relname, n.nspname, c.relkind \
          FROM pg_catalog.pg_class c \

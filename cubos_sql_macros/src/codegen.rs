@@ -62,8 +62,9 @@ fn qualify_rust_type(rust_type: &str) -> String {
         .replace("serde_json::", "::cubos_sql::__private::serde_json::")
 }
 
-/// If the SQL is a SELECT-like query, wrap it in a subquery with `LIMIT 1`
-/// so that `fetch_one` / `fetch_optional` don't fetch all rows.
+/// If the SQL is a SELECT-like query, wrap it in a subquery with `LIMIT 2`
+/// so that `fetch_one` / `fetch_optional` can detect more-than-one-row without
+/// fetching the entire result set.
 ///
 /// Returns `None` for DML (INSERT/UPDATE/DELETE) where subquery wrapping is
 /// not valid SQL.
@@ -75,7 +76,7 @@ fn wrap_with_limit(sql: &str) -> Option<String> {
         || upper.starts_with("TABLE")
     {
         Some(format!(
-            "SELECT * FROM ({sql}) AS __cubos_sql_limit LIMIT 1"
+            "SELECT * FROM ({sql}) AS __cubos_sql_limit LIMIT 2"
         ))
     } else {
         None
@@ -172,78 +173,154 @@ fn generate_regular(
     let sql_limited = wrap_with_limit(sql_str).unwrap_or_else(|| sql_str.clone());
 
     // ------------------------------------------------------------------
-    // 6. Assemble the full block.
+    // 6. fetch_value() — only when there is exactly one column.
+    // ------------------------------------------------------------------
+    let fetch_value_method = build_fetch_value_method(&query_info.columns)?;
+
+    // ------------------------------------------------------------------
+    // 7. Assemble the full block.
     // ------------------------------------------------------------------
     let ts = quote! {
         {
             // ----- output type -----
             #[derive(Debug, Clone)]
             #[allow(non_camel_case_types)]
-            struct __cubos_sql_output {
+            struct __sql_output {
                 #output_struct
             }
 
             // ----- query builder struct -----
             #[allow(non_camel_case_types)]
-            struct __cubos_sql_query<'__e, __E: cubos_sql::Executor> {
-                __executor: &'__e __E,
+            struct __cubos_sql_query<__E: cubos_sql::Executor> {
+                __executor: __E,
                 #param_field_defs
             }
 
             // ----- method implementations -----
-            impl<'__e, __E: cubos_sql::Executor> __cubos_sql_query<'__e, __E> {
-                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__cubos_sql_output>, cubos_sql::Error> {
+            impl<__E: cubos_sql::Executor> __cubos_sql_query<__E> {
+                /// Execute the query and return all resulting rows.
+                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, cubos_sql::Error> {
                     let __rows = cubos_sql::Executor::query(
-                        self.__executor,
+                        &self.__executor,
                         #sql_str,
                         &[#params_slice],
                     ).await?;
                     __rows.into_iter().map(|__row| {
-                        ::std::result::Result::Ok(__cubos_sql_output {
+                        ::std::result::Result::Ok(__sql_output {
                             #row_mapping
                         })
                     }).collect()
                 }
 
-                async fn fetch_one(self) -> ::std::result::Result<__cubos_sql_output, cubos_sql::Error> {
+                /// Execute the query and return exactly one row.
+                ///
+                /// Returns [`Error::NoRows`] if the query returns no rows, or
+                /// [`Error::TooManyRows`] if it returns more than one.
+                async fn fetch_one(self) -> ::std::result::Result<__sql_output, cubos_sql::Error> {
                     let __rows = cubos_sql::Executor::query(
-                        self.__executor,
+                        &self.__executor,
                         #sql_limited,
                         &[#params_slice],
                     ).await?;
-                    let __row = __rows.into_iter().next()
+                    let mut __iter = __rows.into_iter();
+                    let __row = __iter.next()
                         .ok_or_else(|| cubos_sql::Error::NoRows)?;
-                    ::std::result::Result::Ok(__cubos_sql_output {
+                    if __iter.next().is_some() {
+                        return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                    }
+                    ::std::result::Result::Ok(__sql_output {
                         #row_mapping
                     })
                 }
 
-                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__cubos_sql_output>, cubos_sql::Error> {
+                /// Execute the query and return at most one row.
+                ///
+                /// Returns `Ok(None)` if the query returns no rows, or
+                /// [`Error::TooManyRows`] if it returns more than one.
+                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, cubos_sql::Error> {
                     let __rows = cubos_sql::Executor::query(
-                        self.__executor,
+                        &self.__executor,
                         #sql_limited,
                         &[#params_slice],
                     ).await?;
-                    match __rows.into_iter().next() {
-                        Some(__row) => ::std::result::Result::Ok(Some(__cubos_sql_output {
-                            #row_mapping
-                        })),
+                    let mut __iter = __rows.into_iter();
+                    match __iter.next() {
+                        Some(__row) => {
+                            if __iter.next().is_some() {
+                                return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                            }
+                            ::std::result::Result::Ok(Some(__sql_output {
+                                #row_mapping
+                            }))
+                        },
                         None => ::std::result::Result::Ok(None),
                     }
                 }
 
+                /// Execute the statement and return the number of affected rows.
+                ///
+                /// Intended for `INSERT`, `UPDATE`, and `DELETE` statements.
                 async fn execute(self) -> ::std::result::Result<u64, cubos_sql::Error> {
                     cubos_sql::Executor::execute(
-                        self.__executor,
+                        &self.__executor,
                         #sql_str,
                         &[#params_slice],
                     ).await
+                }
+
+                #fetch_value_method
+
+                /// Execute the query and return all resulting rows mapped to `T`.
+                async fn fetch_all_as<__T: cubos_sql::FromRow>(self) -> ::std::result::Result<::std::vec::Vec<__T>, cubos_sql::Error> {
+                    let __rows = cubos_sql::Executor::query(
+                        &self.__executor,
+                        #sql_str,
+                        &[#params_slice],
+                    ).await?;
+                    __rows.into_iter().map(|__row| {
+                        __T::from_row(&__row)
+                    }).collect()
+                }
+
+                /// Execute the query and return exactly one row mapped to `T`.
+                async fn fetch_one_as<__T: cubos_sql::FromRow>(self) -> ::std::result::Result<__T, cubos_sql::Error> {
+                    let __rows = cubos_sql::Executor::query(
+                        &self.__executor,
+                        #sql_limited,
+                        &[#params_slice],
+                    ).await?;
+                    let mut __iter = __rows.into_iter();
+                    let __row = __iter.next()
+                        .ok_or_else(|| cubos_sql::Error::NoRows)?;
+                    if __iter.next().is_some() {
+                        return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                    }
+                    __T::from_row(&__row)
+                }
+
+                /// Execute the query and return at most one row mapped to `T`.
+                async fn fetch_optional_as<__T: cubos_sql::FromRow>(self) -> ::std::result::Result<::std::option::Option<__T>, cubos_sql::Error> {
+                    let __rows = cubos_sql::Executor::query(
+                        &self.__executor,
+                        #sql_limited,
+                        &[#params_slice],
+                    ).await?;
+                    let mut __iter = __rows.into_iter();
+                    match __iter.next() {
+                        Some(__row) => {
+                            if __iter.next().is_some() {
+                                return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                            }
+                            ::std::result::Result::Ok(Some(__T::from_row(&__row)?))
+                        },
+                        None => ::std::result::Result::Ok(None),
+                    }
                 }
             }
 
             // ----- construct and return the query builder -----
             __cubos_sql_query {
-                __executor: &#executor_expr,
+                __executor: #executor_expr,
                 #param_field_inits
             }
         }
@@ -281,22 +358,32 @@ fn generate_spread(
     let mut regular_param_pushes = TokenStream::new();
     for (idx, param) in lex_output.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
-        let param_info = query_info.params.get(idx);
-        let field_type: syn::Type = if let Some(pi) = param_info {
-            if pi.domain_rust_type.is_some() {
-                parse_str("::cubos_sql::__private::serde_json::Value")?
-            } else {
-                parse_str::<syn::Type>(&qualify_rust_type(&pi.rust_type))?
-            }
-        } else {
+        let pi = query_info.params.get(idx).ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("could not infer type for parameter `${}`", param.name),
+            )
+        })?;
+        let field_type: syn::Type = if pi.domain_rust_type.is_some() {
             parse_str("::cubos_sql::__private::serde_json::Value")?
+        } else {
+            parse_str::<syn::Type>(&qualify_rust_type(&pi.rust_type))?
         };
         let value_expr = resolve_param_value(
             &param.name,
-            param_info.and_then(|p| p.domain_rust_type.as_deref()),
-            param_info.and_then(|p| p.enum_rust_type.as_deref()),
+            pi.domain_rust_type.as_deref(),
+            pi.enum_rust_type.as_deref(),
             assignments,
         )?;
+        // For String fields, wrap with `.into()` so `&str` is accepted.
+        let is_string_field = pi.rust_type == "String"
+            && pi.domain_rust_type.is_none()
+            && pi.enum_rust_type.is_none();
+        let value_expr = if is_string_field {
+            quote! { Into::<String>::into(#value_expr) }
+        } else {
+            value_expr
+        };
         regular_param_fields.extend(quote! { #field_name: #field_type, });
         regular_param_inits.extend(quote! { #field_name: #value_expr, });
         regular_param_pushes.extend(quote! {
@@ -367,14 +454,14 @@ fn generate_spread(
 
         // Param push expressions: iterate spread items and push field values
         let mut item_pushes = TokenStream::new();
-        for ci in 0..col_count {
+        for (ci, field) in fields.iter().enumerate().take(col_count) {
             let param_idx = spread_param_offset + ci;
             let param_info = query_info.params.get(param_idx);
             let is_domain = param_info
                 .map(|pi| pi.domain_rust_type.is_some())
                 .unwrap_or(false);
 
-            let accessor_ident = format_ident!("{}", fields[ci].name);
+            let accessor_ident = format_ident!("{}", field.name);
             let accessor: TokenStream = quote! { __item.#accessor_ident };
 
             if is_domain {
@@ -445,9 +532,8 @@ fn generate_spread(
 
     // ── Capacity estimate ───────────────────────────────────────────────
     let mut capacity_expr = quote! { #num_regular_lit };
-    for si in 0..num_spreads {
+    for (si, fpr) in fields_per_row_lits.iter().enumerate() {
         let field_ident = format_ident!("__spread_{}", si);
-        let fpr = &fields_per_row_lits[si];
         capacity_expr.extend(quote! { + self.#field_ident.len() * #fpr });
     }
 
@@ -465,18 +551,21 @@ fn generate_spread(
             = __params.iter().map(|p| p.as_ref()).collect();
     };
 
+    // ── fetch_value() — only when there is exactly one column ────────
+    let fetch_value_method = build_fetch_value_method(&query_info.columns)?;
+
     // ── Assemble the full block ─────────────────────────────────────────
     let ts = quote! {
         {
             #[derive(Debug, Clone)]
             #[allow(non_camel_case_types)]
-            struct __cubos_sql_output {
+            struct __sql_output {
                 #output_struct
             }
 
             #[allow(non_camel_case_types)]
-            struct __cubos_sql_query<'__e, '__s, __E: cubos_sql::Executor, #(#spread_generic_types,)*> {
-                __executor: &'__e __E,
+            struct __cubos_sql_query<'__s, __E: cubos_sql::Executor, #(#spread_generic_types,)*> {
+                __executor: __E,
                 #spread_struct_fields
                 #regular_param_fields
             }
@@ -485,53 +574,123 @@ fn generate_spread(
                 #sql_builder_body
             }
 
-            impl<'__e, '__s, __E: cubos_sql::Executor, #(#spread_generic_types,)*>
-                __cubos_sql_query<'__e, '__s, __E, #(#spread_generic_types,)*>
+            impl<'__s, __E: cubos_sql::Executor, #(#spread_generic_types,)*>
+                __cubos_sql_query<'__s, __E, #(#spread_generic_types,)*>
             {
-                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__cubos_sql_output>, cubos_sql::Error> {
+                /// Execute the query and return all resulting rows.
+                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, cubos_sql::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Ok(::std::vec::Vec::new());
                     }
-                    let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
+                    let __rows = cubos_sql::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     __rows.into_iter().map(|__row| {
-                        ::std::result::Result::Ok(__cubos_sql_output { #row_mapping })
+                        ::std::result::Result::Ok(__sql_output { #row_mapping })
                     }).collect()
                 }
 
-                async fn fetch_one(self) -> ::std::result::Result<__cubos_sql_output, cubos_sql::Error> {
+                /// Execute the query and return exactly one row.
+                ///
+                /// Returns [`Error::NoRows`] if the query returns no rows, or
+                /// [`Error::TooManyRows`] if it returns more than one.
+                async fn fetch_one(self) -> ::std::result::Result<__sql_output, cubos_sql::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Err(cubos_sql::Error::NoRows);
                     }
-                    let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
-                    let __row = __rows.into_iter().next().ok_or_else(|| cubos_sql::Error::NoRows)?;
-                    ::std::result::Result::Ok(__cubos_sql_output { #row_mapping })
+                    let __rows = cubos_sql::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
+                    let mut __iter = __rows.into_iter();
+                    let __row = __iter.next().ok_or_else(|| cubos_sql::Error::NoRows)?;
+                    if __iter.next().is_some() {
+                        return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                    }
+                    ::std::result::Result::Ok(__sql_output { #row_mapping })
                 }
 
-                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__cubos_sql_output>, cubos_sql::Error> {
+                /// Execute the query and return at most one row.
+                ///
+                /// Returns `Ok(None)` if the query returns no rows, or
+                /// [`Error::TooManyRows`] if it returns more than one.
+                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, cubos_sql::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Ok(::std::option::Option::None);
                     }
-                    let __rows = cubos_sql::Executor::query(self.__executor, &__sql, &__params_ref).await?;
-                    match __rows.into_iter().next() {
-                        Some(__row) => ::std::result::Result::Ok(Some(__cubos_sql_output { #row_mapping })),
+                    let __rows = cubos_sql::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
+                    let mut __iter = __rows.into_iter();
+                    match __iter.next() {
+                        Some(__row) => {
+                            if __iter.next().is_some() {
+                                return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                            }
+                            ::std::result::Result::Ok(Some(__sql_output { #row_mapping }))
+                        },
                         None => ::std::result::Result::Ok(None),
                     }
                 }
 
+                /// Execute the statement and return the number of affected rows.
+                ///
+                /// Intended for `INSERT`, `UPDATE`, and `DELETE` statements.
                 async fn execute(self) -> ::std::result::Result<u64, cubos_sql::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Ok(0);
                     }
-                    cubos_sql::Executor::execute(self.__executor, &__sql, &__params_ref).await
+                    cubos_sql::Executor::execute(&self.__executor, &__sql, &__params_ref).await
+                }
+
+                #fetch_value_method
+
+                /// Execute the query and return all resulting rows mapped to `T`.
+                async fn fetch_all_as<__T: cubos_sql::FromRow>(self) -> ::std::result::Result<::std::vec::Vec<__T>, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Ok(::std::vec::Vec::new());
+                    }
+                    let __rows = cubos_sql::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
+                    __rows.into_iter().map(|__row| {
+                        __T::from_row(&__row)
+                    }).collect()
+                }
+
+                /// Execute the query and return exactly one row mapped to `T`.
+                async fn fetch_one_as<__T: cubos_sql::FromRow>(self) -> ::std::result::Result<__T, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Err(cubos_sql::Error::NoRows);
+                    }
+                    let __rows = cubos_sql::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
+                    let mut __iter = __rows.into_iter();
+                    let __row = __iter.next().ok_or_else(|| cubos_sql::Error::NoRows)?;
+                    if __iter.next().is_some() {
+                        return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                    }
+                    __T::from_row(&__row)
+                }
+
+                /// Execute the query and return at most one row mapped to `T`.
+                async fn fetch_optional_as<__T: cubos_sql::FromRow>(self) -> ::std::result::Result<::std::option::Option<__T>, cubos_sql::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Ok(::std::option::Option::None);
+                    }
+                    let __rows = cubos_sql::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
+                    let mut __iter = __rows.into_iter();
+                    match __iter.next() {
+                        Some(__row) => {
+                            if __iter.next().is_some() {
+                                return ::std::result::Result::Err(cubos_sql::Error::TooManyRows);
+                            }
+                            ::std::result::Result::Ok(Some(__T::from_row(&__row)?))
+                        },
+                        None => ::std::result::Result::Ok(None),
+                    }
                 }
             }
 
             __cubos_sql_query {
-                __executor: &#executor_expr,
+                __executor: #executor_expr,
                 #spread_struct_inits
                 #regular_param_inits
             }
@@ -542,10 +701,76 @@ fn generate_spread(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: fetch_value() method (single-column queries only)
+// ---------------------------------------------------------------------------
+
+/// When the query returns exactly one column, generates `fetch_value()` and
+/// `fetch_value_optional()` methods that return the column's Rust type directly
+/// instead of a struct wrapper.
+///
+/// Returns an empty `TokenStream` when there are zero or more than one column.
+fn build_fetch_value_method(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error> {
+    if columns.len() != 1 {
+        return Ok(TokenStream::new());
+    }
+
+    let col = &columns[0];
+    let return_type = column_rust_type(col)?;
+    let field_name = make_field_ident(&col.name);
+
+    // For fetch_value_optional: when the column is nullable, the field is
+    // already Option<T>, so we return it directly to avoid Option<Option<T>>.
+    let optional_body = if col.nullable {
+        quote! {
+            match self.fetch_optional().await? {
+                Some(__v) => ::std::result::Result::Ok(__v.#field_name),
+                None => ::std::result::Result::Ok(None),
+            }
+        }
+    } else {
+        quote! {
+            match self.fetch_optional().await? {
+                Some(__v) => ::std::result::Result::Ok(Some(__v.#field_name)),
+                None => ::std::result::Result::Ok(None),
+            }
+        }
+    };
+
+    // Return type for fetch_value_optional is always Option<T> — same as the
+    // field type when nullable, or Option-wrapped when not nullable.
+    let optional_return_type = if col.nullable {
+        quote! { #return_type }
+    } else {
+        quote! { ::std::option::Option<#return_type> }
+    };
+
+    Ok(quote! {
+        /// Execute the query and return the single column value from exactly one row.
+        ///
+        /// This method is only available when the query returns a single column.
+        /// Returns [`Error::NoRows`] if the query returns no rows, or
+        /// [`Error::TooManyRows`] if it returns more than one.
+        async fn fetch_value(self) -> ::std::result::Result<#return_type, cubos_sql::Error> {
+            let __v = self.fetch_one().await?;
+            ::std::result::Result::Ok(__v.#field_name)
+        }
+
+        /// Execute the query and return the single column value from at most one row.
+        ///
+        /// This method is only available when the query returns a single column.
+        /// Returns `Ok(None)` if the query returns no rows (or the value is `NULL`
+        /// for nullable columns), or [`Error::TooManyRows`] if it returns more than one.
+        async fn fetch_value_optional(self) -> ::std::result::Result<#optional_return_type, cubos_sql::Error> {
+            #optional_body
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Helper: output struct fields
 // ---------------------------------------------------------------------------
 
-/// Generates the field list for `__cubos_sql_output`.
+/// Generates the field list for `__sql_output`.
 ///
 /// For example:
 /// ```text
@@ -597,17 +822,18 @@ fn build_param_fields(
         let field_name = format_ident!("p{}", idx);
 
         // Resolve the Rust type for this parameter from introspection.
-        let param_info = query_info.params.get(idx);
-        let is_nullable = param_info.map(|pi| pi.nullable).unwrap_or(false);
-        let inner_type_str = if let Some(pi) = param_info {
+        let pi = query_info.params.get(idx).ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("could not infer type for parameter `${}`", param.name),
+            )
+        })?;
+        let is_nullable = pi.nullable;
+        let inner_type_str = if pi.domain_rust_type.is_some() {
             // Domain types are serialized to serde_json::Value before sending.
-            if pi.domain_rust_type.is_some() {
-                "::cubos_sql::__private::serde_json::Value".to_string()
-            } else {
-                qualify_rust_type(&pi.rust_type)
-            }
-        } else {
             "::cubos_sql::__private::serde_json::Value".to_string()
+        } else {
+            qualify_rust_type(&pi.rust_type)
         };
 
         let field_type: syn::Type = if is_nullable {
@@ -619,10 +845,25 @@ fn build_param_fields(
         // Resolve the value expression for this parameter.
         let value_expr: TokenStream = resolve_param_value(
             &param.name,
-            param_info.and_then(|p| p.domain_rust_type.as_deref()),
-            param_info.and_then(|p| p.enum_rust_type.as_deref()),
+            pi.domain_rust_type.as_deref(),
+            pi.enum_rust_type.as_deref(),
             assignments,
         )?;
+
+        // For String fields, wrap the value with `.into()` so that both
+        // `&str` and `String` are accepted transparently.
+        let needs_into = inner_type_str == "String"
+            && pi.domain_rust_type.is_none()
+            && pi.enum_rust_type.is_none();
+        let value_expr = if needs_into {
+            if is_nullable {
+                quote! { (#value_expr).map(Into::<String>::into) }
+            } else {
+                quote! { Into::<String>::into(#value_expr) }
+            }
+        } else {
+            value_expr
+        };
 
         defs.extend(quote! {
             #field_name: #field_type,
@@ -693,7 +934,7 @@ fn build_params_slice(lex_output: &LexOutput) -> TokenStream {
 // Helper: row mapping inside `map(|__row| { ... })`
 // ---------------------------------------------------------------------------
 
-/// Produces the field assignments for `__cubos_sql_output { ... }` from a
+/// Produces the field assignments for `__sql_output { ... }` from a
 /// `tokio_postgres::Row`.
 fn build_row_mapping(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error> {
     let mut mappings = TokenStream::new();
@@ -714,7 +955,7 @@ fn build_row_mapping(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error> 
 // Type helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the Rust type token for a column field in `__cubos_sql_output`.
+/// Returns the Rust type token for a column field in `__sql_output`.
 ///
 /// Domain types override the base type. Nullable columns are wrapped in
 /// `Option<T>`.
@@ -937,10 +1178,7 @@ mod tests {
         let code = ts.to_string();
 
         // Output struct should have the id field from RETURNING.
-        assert!(
-            code.contains("__cubos_sql_output"),
-            "should define output struct"
-        );
+        assert!(code.contains("__sql_output"), "should define output struct");
         assert!(
             code.contains("__row"),
             "should have row mapping for RETURNING columns"
@@ -1031,6 +1269,149 @@ mod tests {
         assert!(
             code.contains("__build_spread_sql"),
             "should have SQL builder"
+        );
+    }
+
+    #[test]
+    fn fetch_value_generated_for_single_column() {
+        let lo = lex("SELECT count(*) FROM users").unwrap();
+        let qi = make_query_info(&[], vec![make_column("count", "i64", false)]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            code.contains("fetch_value"),
+            "single-column query should have fetch_value"
+        );
+        assert!(
+            code.contains("fetch_value_optional"),
+            "single-column query should have fetch_value_optional"
+        );
+    }
+
+    #[test]
+    fn fetch_value_not_generated_for_multiple_columns() {
+        let lo = lex("SELECT id, name FROM users").unwrap();
+        let qi = make_query_info(
+            &[],
+            vec![
+                make_column("id", "i64", false),
+                make_column("name", "String", false),
+            ],
+        );
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            !code.contains("fetch_value"),
+            "multi-column query should NOT have fetch_value"
+        );
+    }
+
+    #[test]
+    fn fetch_value_not_generated_for_zero_columns() {
+        let lo = lex("DELETE FROM users WHERE id = $id").unwrap();
+        let qi = make_query_info(&["i64"], vec![]);
+        let executor = parse_executor_expr();
+        let assignments = vec![ParamAssignment {
+            name: "id".into(),
+            expr: Some(syn::parse_str("1i64").unwrap()),
+        }];
+
+        let ts = generate(&lo, &qi, &executor, &assignments).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            !code.contains("fetch_value"),
+            "zero-column query should NOT have fetch_value"
+        );
+    }
+
+    #[test]
+    fn fetch_value_nullable_column_returns_option() {
+        let lo = lex("SELECT max(age) FROM users").unwrap();
+        let qi = make_query_info(&[], vec![make_column("max", "i32", true)]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            code.contains("fetch_value"),
+            "single nullable column should have fetch_value"
+        );
+        assert!(
+            code.contains("Option"),
+            "nullable column fetch_value should return Option"
+        );
+    }
+
+    #[test]
+    fn fetch_value_on_spread_single_column() {
+        let lo = lex("INSERT INTO users (name) VALUES $..users { name } RETURNING id").unwrap();
+        let qi = make_query_info(&["String"], vec![make_column("id", "i64", false)]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            code.contains("fetch_value"),
+            "spread with single RETURNING column should have fetch_value"
+        );
+    }
+
+    #[test]
+    fn fetch_as_methods_generated_for_regular_query() {
+        let lo = lex("SELECT id, name FROM users").unwrap();
+        let qi = make_query_info(
+            &[],
+            vec![
+                make_column("id", "i64", false),
+                make_column("name", "String", false),
+            ],
+        );
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(code.contains("fetch_all_as"), "should have fetch_all_as");
+        assert!(code.contains("fetch_one_as"), "should have fetch_one_as");
+        assert!(
+            code.contains("fetch_optional_as"),
+            "should have fetch_optional_as"
+        );
+        assert!(
+            code.contains("cubos_sql :: FromRow"),
+            "fetch_as methods should require FromRow bound"
+        );
+    }
+
+    #[test]
+    fn fetch_as_methods_generated_for_spread_query() {
+        let lo = lex("INSERT INTO t (x) VALUES $..data { x } RETURNING id").unwrap();
+        let qi = make_query_info(&["i32"], vec![make_column("id", "i64", false)]);
+        let executor = parse_executor_expr();
+
+        let ts = generate(&lo, &qi, &executor, &[]).unwrap();
+        let code = ts.to_string();
+
+        assert!(
+            code.contains("fetch_all_as"),
+            "spread should have fetch_all_as"
+        );
+        assert!(
+            code.contains("fetch_one_as"),
+            "spread should have fetch_one_as"
+        );
+        assert!(
+            code.contains("fetch_optional_as"),
+            "spread should have fetch_optional_as"
         );
     }
 }

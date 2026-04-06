@@ -29,6 +29,14 @@ pub enum AnalyzeError {
     #[error("cannot resolve operator: {0}")]
     UnresolvedOperator(String),
 
+    /// A type mismatch: an expression's type cannot be coerced to the expected type.
+    #[error("type mismatch: {actual} cannot be coerced to {expected} ({context})")]
+    TypeMismatch {
+        actual: String,
+        expected: String,
+        context: String,
+    },
+
     /// The analyzer encountered an AST node or SQL feature it does not yet support.
     #[error("unsupported SQL feature: {0}")]
     Unsupported(String),

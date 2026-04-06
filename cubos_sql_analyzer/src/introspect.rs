@@ -236,15 +236,15 @@ fn resolve_type_inner(
     match pg_type.kind() {
         Kind::Domain(base_type) => {
             let domain_name = pg_type.name();
-            if base_type.oid() == JSONB_OID {
-                if let Some(rust_path) = domains.get(domain_name) {
-                    return ResolvedType {
-                        effective_oid: JSONB_OID,
-                        rust_type: Some("serde_json::Value".to_owned()),
-                        domain_rust_type: Some(rust_path.clone()),
-                        enum_rust_type: None,
-                    };
-                }
+            if base_type.oid() == JSONB_OID
+                && let Some(rust_path) = domains.get(domain_name)
+            {
+                return ResolvedType {
+                    effective_oid: JSONB_OID,
+                    rust_type: Some("serde_json::Value".to_owned()),
+                    domain_rust_type: Some(rust_path.clone()),
+                    enum_rust_type: None,
+                };
             }
             resolve_type_inner(base_type, domains, enums, custom_types, depth + 1)
         }

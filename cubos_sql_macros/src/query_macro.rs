@@ -25,8 +25,30 @@ struct CachedConnection {
     connection_string: String,
 }
 
+/// Wrapper that leaks its contents on drop instead of running destructors.
+///
+/// During thread-local destruction the drop order of thread-locals is
+/// non-deterministic.  The `postgres::Client` internally holds a Tokio
+/// runtime whose context thread-local may already be gone, causing:
+///
+///   "The Tokio context thread-local variable has been destroyed"
+///
+/// By forgetting the inner value at thread exit we avoid that panic.
+/// Normal replacements (`*slot = None`) still drop the old value properly
+/// because they happen while the Tokio runtime is alive — only the final
+/// thread-local destruction triggers this `Drop`.
+struct ClientSlot(Option<CachedConnection>);
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            std::mem::forget(conn);
+        }
+    }
+}
+
 thread_local! {
-    static CACHED_CLIENT: RefCell<Option<CachedConnection>> = const { RefCell::new(None) };
+    static CACHED_CLIENT: RefCell<ClientSlot> = const { RefCell::new(ClientSlot(None)) };
 }
 
 /// Run a closure with a mutable reference to the cached `postgres::Client`.
@@ -40,8 +62,9 @@ fn with_client<T>(
 ) -> Result<T, syn::Error> {
     CACHED_CLIENT.with(|cell| {
         let mut borrow = cell.borrow_mut();
+        let slot = &mut borrow.0;
 
-        let needs_connect = match borrow.as_mut() {
+        let needs_connect = match slot.as_mut() {
             Some(cached) => {
                 if cached.connection_string != conn_str {
                     true
@@ -60,17 +83,17 @@ fn with_client<T>(
                 )
             })?;
 
-            *borrow = Some(CachedConnection {
+            *slot = Some(CachedConnection {
                 client,
                 connection_string: conn_str.to_string(),
             });
         }
 
-        let cached = borrow.as_mut().unwrap();
+        let cached = slot.as_mut().unwrap();
         let result = f(&mut cached.client);
 
         if result.is_err() {
-            *borrow = None;
+            *slot = None;
         }
 
         result
@@ -97,10 +120,10 @@ fn load_snapshot(snapshot_path: &Path) -> Option<cubos_sql_analyzer::schema::Sch
 
     CACHED_SNAPSHOT.with(|cell| {
         let borrow = cell.borrow();
-        if let Some(cached) = borrow.as_ref() {
-            if cached.path == path_str {
-                return Some(cached.snapshot.clone());
-            }
+        if let Some(cached) = borrow.as_ref()
+            && cached.path == path_str
+        {
+            return Some(cached.snapshot.clone());
         }
         drop(borrow);
 
@@ -134,10 +157,15 @@ fn try_static_analyze_from_snapshot(
         enums: config.enums.clone(),
         types: config.types.clone(),
         param_nullability: {
-            let mut v: Vec<bool> = lex_output.params.iter().map(|p| p.nullable).collect();
+            let mut v: Vec<Option<bool>> = lex_output.params.iter().map(|p| p.nullable).collect();
             for spread in &lex_output.spreads {
                 if let Some(fields) = &spread.fields {
-                    v.extend(fields.iter().map(|f| f.nullable));
+                    // Spread fields only have `?` annotation (no `!`), map to Option.
+                    v.extend(
+                        fields
+                            .iter()
+                            .map(|f| if f.nullable { Some(true) } else { None }),
+                    );
                 }
             }
             v
@@ -294,7 +322,11 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
 
     // 3. Compute migration hash and check cache BEFORE starting any container.
     let migrations_dir = config.migrations_dir(manifest_path);
-    let migration_hash = crate::docker::hash_migrations_dir(&migrations_dir).map_err(|e| {
+    let extra_dirs = config.extra_migrations_dirs(manifest_path);
+    let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
+    all_dirs.extend(extra_dirs.iter().map(|p| p.as_path()));
+
+    let migration_hash = crate::docker::hash_migrations_dirs(&all_dirs).map_err(|e| {
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
@@ -419,17 +451,25 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         }
     };
 
-    // 6. Apply nullable annotations from lexer ($foo?, field?) to ParamInfo.
+    // 6. Merge nullable annotations: explicit `$foo?` forces nullable, `$foo!` forces
+    //    non-nullable, no annotation keeps the introspection/analyzer result.
     let mut query_info = query_info;
     {
-        let mut nullable_flags: Vec<bool> = lex_output.params.iter().map(|p| p.nullable).collect();
+        let mut nullable_flags: Vec<Option<bool>> =
+            lex_output.params.iter().map(|p| p.nullable).collect();
         for spread in &lex_output.spreads {
             if let Some(fields) = &spread.fields {
-                nullable_flags.extend(fields.iter().map(|f| f.nullable));
+                nullable_flags.extend(
+                    fields
+                        .iter()
+                        .map(|f| if f.nullable { Some(true) } else { None }),
+                );
             }
         }
-        for (pi, &nullable) in query_info.params.iter_mut().zip(nullable_flags.iter()) {
-            pi.nullable = nullable;
+        for (pi, &lexer_nullable) in query_info.params.iter_mut().zip(nullable_flags.iter()) {
+            if let Some(explicit) = lexer_nullable {
+                pi.nullable = explicit;
+            }
         }
     }
 

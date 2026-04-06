@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 
-use pg_query::protobuf::{self, node, JoinType, SetOperation};
+use pg_query::protobuf::{self, JoinType, SetOperation, node};
 
 use cubos_sql_core::query_info::{ColumnInfo, ParamInfo, QueryInfo};
 use cubos_sql_core::type_map;
 
 use crate::coerce::oid;
 use crate::error::AnalyzeError;
-use crate::expr;
+use crate::expr::{self, TypeGoal};
 use crate::nullability::{self, NullabilityContext};
 use crate::params::ParamCollector;
 use crate::schema::{SchemaSnapshot, TypeKind};
@@ -20,10 +20,11 @@ pub struct AnalyzerConfig {
     pub domains: HashMap<String, String>,
     pub enums: HashMap<String, String>,
     pub types: HashMap<String, String>,
-    /// Nullable annotations from the lexer: maps 1-based param index → nullable.
-    /// Populated from `$foo?` syntax. Empty if no annotations.
-    #[allow(clippy::type_complexity)]
-    pub param_nullability: Vec<bool>,
+    /// Nullable annotations from the lexer: maps 1-based param index → nullability.
+    /// - `None`: no annotation — nullability inferred from schema context.
+    /// - `Some(true)`: `$foo?` — force nullable.
+    /// - `Some(false)`: `$foo!` — force non-nullable.
+    pub param_nullability: Vec<Option<bool>>,
 }
 
 /// Analyze a SQL query and return typed parameter and column information.
@@ -48,9 +49,11 @@ pub fn analyze(
 
     let mut params = ParamCollector::default();
 
-    // Seed nullable annotations from lexer ($foo? syntax).
+    // Seed explicit nullable annotations from lexer ($foo? / $foo! syntax).
     for (i, &nullable) in config.param_nullability.iter().enumerate() {
-        params.set_nullable((i + 1) as i32, nullable);
+        if let Some(explicit) = nullable {
+            params.set_nullable((i + 1) as i32, explicit);
+        }
     }
 
     let (raw_columns, raw_params) = match stmt {
@@ -62,7 +65,7 @@ pub fn analyze(
             return Err(AnalyzeError::Unsupported(format!(
                 "statement type: {:?}",
                 std::mem::discriminant(stmt)
-            )))
+            )));
         }
     };
 
@@ -88,6 +91,30 @@ pub fn analyze(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Infer an expression type, propagating only `TypeMismatch` errors.
+///
+/// Other errors (e.g. `UnknownColumn` from correlated subqueries referencing
+/// outer scope) are swallowed — they represent pre-existing analyzer
+/// limitations, not user errors.
+fn infer_expr_propagate_mismatch(
+    node: &protobuf::Node,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+    goal: TypeGoal,
+) -> Result<(), AnalyzeError> {
+    match expr::infer_expr(node, scope, null_ctx, snapshot, params, goal) {
+        Ok(_) => Ok(()),
+        Err(e @ AnalyzeError::TypeMismatch { .. }) => Err(e),
+        Err(_) => Ok(()), // Swallow non-type-mismatch errors.
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Raw output types (before Rust type mapping)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -97,6 +124,9 @@ pub(crate) struct RawColumn {
     pub(crate) nullable: bool,
 }
 
+/// Return type for analyze_* functions: columns + optional pre-sorted params.
+type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError>;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // SELECT
 // ──────────────────────────────────────────────────────────────────────────────
@@ -105,7 +135,7 @@ pub(crate) fn analyze_select(
     sel: &protobuf::SelectStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
+) -> AnalyzeResult {
     analyze_select_with_ctes(sel, snapshot, params, &HashMap::new())
 }
 
@@ -114,7 +144,7 @@ fn analyze_select_with_ctes(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
+) -> AnalyzeResult {
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
 
@@ -147,12 +177,32 @@ fn analyze_select_with_ctes(
         params,
     )?;
 
-    // Process WHERE clause (for param inference).
+    // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal.
     if let Some(where_clause) = &sel.where_clause {
-        let _ = expr::infer_expr(where_clause, &scope, &null_ctx, snapshot, params);
+        infer_expr_propagate_mismatch(
+            where_clause,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::BOOL),
+        )?;
     }
 
-    // Resolve target list (SELECT expressions).
+    // Process LIMIT / OFFSET — PG uses coerce_to_specific_type(INT8OID)
+    // with COERCION_ASSIGNMENT.
+    for limit_node in [&sel.limit_count, &sel.limit_offset].into_iter().flatten() {
+        infer_expr_propagate_mismatch(
+            limit_node,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::INT8),
+        )?;
+    }
+
+    // Resolve target list (SELECT expressions) — no type expectation.
     let columns = resolve_target_list(&sel.target_list, &scope, &null_ctx, snapshot, params)?;
 
     Ok((columns, None))
@@ -166,7 +216,7 @@ fn analyze_insert(
     ins: &protobuf::InsertStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
+) -> AnalyzeResult {
     let relation = ins
         .relation
         .as_ref()
@@ -196,44 +246,58 @@ fn analyze_insert(
         })
         .collect();
 
+    // Build a minimal scope for expressions within VALUES (no table in scope
+    // for VALUES, but we need scope for possible subqueries/functions).
+    let scope = Scope::default();
+    let null_ctx = NullabilityContext::default();
+
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
-    if let Some(select_node) = &ins.select_stmt {
-        if let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref() {
-            if !val_sel.values_lists.is_empty() {
-                // VALUES (...) — match params by position.
-                for val_list in &val_sel.values_lists {
-                    if let Some(node::Node::List(list)) = val_list.node.as_ref() {
-                        for (i, val) in list.items.iter().enumerate() {
-                            if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
-                                if let Some(col_name) = col_names.get(i) {
-                                    if let Some(tc) =
-                                        table.columns.iter().find(|c| &c.name == col_name)
-                                    {
-                                        params.record(p.number, tc.type_oid);
-                                    }
-                                }
-                            }
+    if let Some(select_node) = &ins.select_stmt
+        && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
+    {
+        if !val_sel.values_lists.is_empty() {
+            // VALUES (...) — infer each value with the column's type as goal.
+            for val_list in &val_sel.values_lists {
+                if let Some(node::Node::List(list)) = val_list.node.as_ref() {
+                    for (i, val) in list.items.iter().enumerate() {
+                        let goal = col_names
+                            .get(i)
+                            .and_then(|cn| table.columns.iter().find(|c| &c.name == cn))
+                            .map(|tc| TypeGoal::assignment(tc.type_oid))
+                            .unwrap_or(TypeGoal::NONE);
+                        expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
+
+                        // Infer nullable from column definition.
+                        if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                            && let Some(col_name) = col_names.get(i)
+                            && let Some(tc) = table.columns.iter().find(|c| &c.name == col_name)
+                            && !tc.not_null
+                        {
+                            params.infer_nullable(p.number, true);
                         }
                     }
                 }
-            } else {
-                // INSERT ... SELECT — analyze the SELECT for param inference.
-                let _ = analyze_select(val_sel, snapshot, params);
+            }
+        } else {
+            // INSERT ... SELECT — analyze the SELECT for param inference.
+            let _ = analyze_select(val_sel, snapshot, params);
 
-                // Also match SELECT target_list params to INSERT column types by position.
-                for (i, target) in val_sel.target_list.iter().enumerate() {
-                    if let Some(node::Node::ResTarget(rt)) = target.node.as_ref() {
-                        if let Some(val) = &rt.val {
-                            if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
-                                if let Some(col_name) = col_names.get(i) {
-                                    if let Some(tc) =
-                                        table.columns.iter().find(|c| &c.name == col_name)
-                                    {
-                                        params.record(p.number, tc.type_oid);
-                                    }
-                                }
-                            }
-                        }
+            // Back-fill ParamRef targets with column types from INSERT columns.
+            // We only handle direct ParamRef (not complex expressions like p.id)
+            // because the SELECT analysis above already inferred types within
+            // its own scope.
+            for (i, target) in val_sel.target_list.iter().enumerate() {
+                if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+                    && let Some(val) = &rt.val
+                    && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                    && let Some(col_name) = col_names.get(i)
+                    && let Some(tc) = table.columns.iter().find(|c| &c.name == col_name)
+                {
+                    if params.get(p.number) == oid::UNKNOWN {
+                        params.record(p.number, tc.type_oid);
+                    }
+                    if !tc.not_null {
+                        params.infer_nullable(p.number, true);
                     }
                 }
             }
@@ -241,11 +305,17 @@ fn analyze_insert(
     }
 
     // Resolve RETURNING list.
-    let mut scope = Scope::default();
-    let null_ctx = NullabilityContext::default();
-    scope.add_table_columns(&relation.relname, &table.columns);
+    let mut ret_scope = Scope::default();
+    let ret_null_ctx = NullabilityContext::default();
+    ret_scope.add_table_columns(&relation.relname, &table.columns);
 
-    let columns = resolve_target_list(&ins.returning_list, &scope, &null_ctx, snapshot, params)?;
+    let columns = resolve_target_list(
+        &ins.returning_list,
+        &ret_scope,
+        &ret_null_ctx,
+        snapshot,
+        params,
+    )?;
 
     Ok((columns, None))
 }
@@ -254,7 +324,7 @@ fn analyze_update(
     upd: &protobuf::UpdateStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
+) -> AnalyzeResult {
     let relation = upd
         .relation
         .as_ref()
@@ -270,19 +340,6 @@ fn analyze_update(
             &relation.relname,
         )
         .ok_or_else(|| AnalyzeError::UnknownRelation(relation.relname.clone()))?;
-
-    // Infer param types from SET column = $N.
-    for target in &upd.target_list {
-        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref() {
-            if let Some(val) = &rt.val {
-                if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
-                    if let Some(tc) = table.columns.iter().find(|c| c.name == rt.name) {
-                        params.record(p.number, tc.type_oid);
-                    }
-                }
-            }
-        }
-    }
 
     // Build scope with target table + FROM clause tables.
     let mut scope = Scope::default();
@@ -305,8 +362,39 @@ fn analyze_update(
         params,
     )?;
 
+    // Infer param types from SET column = expr — assignment context.
+    for target in &upd.target_list {
+        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            let goal = table
+                .columns
+                .iter()
+                .find(|c| c.name == rt.name)
+                .map(|tc| TypeGoal::assignment(tc.type_oid))
+                .unwrap_or(TypeGoal::NONE);
+            expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
+
+            // Infer nullable from column definition.
+            if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && let Some(tc) = table.columns.iter().find(|c| c.name == rt.name)
+                && !tc.not_null
+            {
+                params.infer_nullable(p.number, true);
+            }
+        }
+    }
+
+    // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &upd.where_clause {
-        let _ = expr::infer_expr(where_clause, &scope, &null_ctx, snapshot, params);
+        infer_expr_propagate_mismatch(
+            where_clause,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::BOOL),
+        )?;
     }
 
     let columns = resolve_target_list(&upd.returning_list, &scope, &null_ctx, snapshot, params)?;
@@ -317,7 +405,7 @@ fn analyze_delete(
     del: &protobuf::DeleteStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
+) -> AnalyzeResult {
     let relation = del
         .relation
         .as_ref()
@@ -338,8 +426,16 @@ fn analyze_delete(
     let null_ctx = NullabilityContext::default();
     scope.add_table_columns(&relation.relname, &table.columns);
 
+    // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {
-        let _ = expr::infer_expr(where_clause, &scope, &null_ctx, snapshot, params);
+        infer_expr_propagate_mismatch(
+            where_clause,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::BOOL),
+        )?;
     }
 
     let columns = resolve_target_list(&del.returning_list, &scope, &null_ctx, snapshot, params)?;
@@ -355,7 +451,7 @@ fn analyze_set_operation(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError> {
+) -> AnalyzeResult {
     let left = sel
         .larg
         .as_ref()
@@ -502,19 +598,19 @@ fn process_from_item(
                 .unwrap_or(&rv.relname);
 
             // Check CTEs first.
-            if rv.schemaname.is_empty() {
-                if let Some(cte_cols) = cte_scopes.get(&rv.relname) {
-                    let cols: Vec<ScopeColumn> = cte_cols
-                        .iter()
-                        .cloned()
-                        .map(|mut c| {
-                            c.table_alias = alias.to_owned();
-                            c
-                        })
-                        .collect();
-                    scope.add_virtual_table(alias, cols);
-                    return Ok(());
-                }
+            if rv.schemaname.is_empty()
+                && let Some(cte_cols) = cte_scopes.get(&rv.relname)
+            {
+                let cols: Vec<ScopeColumn> = cte_cols
+                    .iter()
+                    .cloned()
+                    .map(|mut c| {
+                        c.table_alias = alias.to_owned();
+                        c
+                    })
+                    .collect();
+                scope.add_virtual_table(alias, cols);
+                return Ok(());
             }
 
             let schema = if rv.schemaname.is_empty() {
@@ -542,19 +638,16 @@ fn process_from_item(
 
             match join_type {
                 JoinType::JoinLeft => {
-                    // Right side becomes nullable.
                     let right_aliases =
                         nullability::collect_aliases(&scope.sources[left_end..right_end]);
                     null_ctx.mark_all_nullable(&right_aliases);
                 }
                 JoinType::JoinRight => {
-                    // Left side becomes nullable.
                     let left_aliases =
                         nullability::collect_aliases(&scope.sources[left_start..left_end]);
                     null_ctx.mark_all_nullable(&left_aliases);
                 }
                 JoinType::JoinFull => {
-                    // Both sides become nullable.
                     let all_aliases =
                         nullability::collect_aliases(&scope.sources[left_start..right_end]);
                     null_ctx.mark_all_nullable(&all_aliases);
@@ -569,20 +662,20 @@ fn process_from_item(
                 .map(|a| a.aliasname.as_str())
                 .unwrap_or("_subquery");
 
-            if let Some(subquery) = &sub.subquery {
-                if let Some(node::Node::SelectStmt(sel)) = subquery.node.as_ref() {
-                    let (cols, _) = analyze_select(sel, snapshot, params)?;
-                    let scope_cols: Vec<ScopeColumn> = cols
-                        .into_iter()
-                        .map(|rc| ScopeColumn {
-                            name: rc.name,
-                            type_oid: rc.type_oid,
-                            base_not_null: !rc.nullable,
-                            table_alias: alias.to_owned(),
-                        })
-                        .collect();
-                    scope.add_virtual_table(alias, scope_cols);
-                }
+            if let Some(subquery) = &sub.subquery
+                && let Some(node::Node::SelectStmt(sel)) = subquery.node.as_ref()
+            {
+                let (cols, _) = analyze_select(sel, snapshot, params)?;
+                let scope_cols: Vec<ScopeColumn> = cols
+                    .into_iter()
+                    .map(|rc| ScopeColumn {
+                        name: rc.name,
+                        type_oid: rc.type_oid,
+                        base_not_null: !rc.nullable,
+                        table_alias: alias.to_owned(),
+                    })
+                    .collect();
+                scope.add_virtual_table(alias, scope_cols);
             }
         }
         _ => {
@@ -620,42 +713,42 @@ fn resolve_target_list(
         };
 
         // Check for SELECT * or t.*.
-        if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() {
-            if cr
+        if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref()
+            && cr
                 .fields
                 .iter()
                 .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
-            {
-                // Star expansion.
-                let table_filter = cr.fields.iter().find_map(|f| match f.node.as_ref()? {
-                    node::Node::String(s) => Some(s.sval.as_str()),
-                    _ => None,
+        {
+            // Star expansion.
+            let table_filter = cr.fields.iter().find_map(|f| match f.node.as_ref()? {
+                node::Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            });
+
+            let star_cols: Vec<&ScopeColumn> = if let Some(tbl) = table_filter {
+                scope
+                    .sources
+                    .iter()
+                    .filter(|s| s.alias == tbl)
+                    .flat_map(|s| s.columns.iter())
+                    .collect()
+            } else {
+                scope.all_columns()
+            };
+
+            for col in star_cols {
+                let nullable = null_ctx.is_nullable(&col.table_alias, col.base_not_null);
+                columns.push(RawColumn {
+                    name: col.name.clone(),
+                    type_oid: col.type_oid,
+                    nullable,
                 });
-
-                let star_cols: Vec<&ScopeColumn> = if let Some(tbl) = table_filter {
-                    scope
-                        .sources
-                        .iter()
-                        .filter(|s| s.alias == tbl)
-                        .flat_map(|s| s.columns.iter())
-                        .collect()
-                } else {
-                    scope.all_columns()
-                };
-
-                for col in star_cols {
-                    let nullable = null_ctx.is_nullable(&col.table_alias, col.base_not_null);
-                    columns.push(RawColumn {
-                        name: col.name.clone(),
-                        type_oid: col.type_oid,
-                        nullable,
-                    });
-                }
-                continue;
             }
+            continue;
         }
 
-        let expr_type = expr::infer_expr(val, scope, null_ctx, snapshot, params)?;
+        // No type expectation for SELECT expressions.
+        let expr_type = expr::infer_expr(val, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
 
         // Determine column name: explicit alias, or inferred from expression.
         let name = if !rt.name.is_empty() {

@@ -324,12 +324,15 @@
 
 pub mod error;
 pub mod executor;
+pub mod from_row;
 pub mod migrate;
 mod pool; // Executor impls for pool types (deadpool, bb8)
 
 pub use error::Error;
 pub use executor::Executor;
+pub use from_row::FromRow;
 
+pub use cubos_sql_macros::FromRow;
 /// Re-export the `sql!` macro from `cubos_sql_macros`.
 ///
 /// See the [`macro@sql`] documentation for full syntax, examples, and

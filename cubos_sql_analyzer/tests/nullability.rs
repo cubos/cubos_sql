@@ -1,275 +1,17 @@
-//! Comparative tests: static analyzer vs live introspection.
-//!
-//! Each test runs BOTH analysis paths on the same SQL and compares results.
-//! Where they differ, the static analyzer is MORE precise (documented inline).
+//! Tests for nullability analysis: cases where the static analyzer is more
+//! precise than live introspection, CASE/UNION nullability, complex scenarios,
+//! stress tests, scalar subquery/aggregate nullability, GROUP BY aggregates,
+//! function/operator nullability, and non-strict pg_catalog functions.
 
-use std::collections::HashMap;
-
-use cubos_sql_analyzer::export::export_schema;
-use cubos_sql_analyzer::introspect;
-use cubos_sql_analyzer::resolve::{analyze, AnalyzerConfig};
-use cubos_sql_analyzer::schema::SchemaSnapshot;
-use cubos_sql_core::query_info::{ColumnInfo, QueryInfo};
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Setup
-// ──────────────────────────────────────────────────────────────────────────────
-
-const MIGRATION: &str = "\
-    CREATE TABLE IF NOT EXISTS users (\
-        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-        name TEXT NOT NULL, \
-        email TEXT NOT NULL UNIQUE, \
-        age INT, \
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-    );\
-    CREATE TABLE IF NOT EXISTS posts (\
-        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-        user_id BIGINT NOT NULL REFERENCES users(id), \
-        title TEXT NOT NULL, \
-        body TEXT, \
-        published_at TIMESTAMPTZ\
-    );\
-    CREATE TABLE IF NOT EXISTS comments (\
-        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-        post_id BIGINT NOT NULL REFERENCES posts(id), \
-        author_name TEXT NOT NULL, \
-        content TEXT NOT NULL, \
-        rating INT\
-    );\
-";
-
-fn connect() -> postgres::Client {
-    let search_dirs = [
-        std::env::temp_dir()
-            .join("cubos_sql_introspect_tests")
-            .join(".cubos_sql"),
-        std::env::temp_dir()
-            .join("cubos_sql_analyzer_compare_tests")
-            .join(".cubos_sql"),
-    ];
-    let conn_str = std::env::var("CUBOS_SQL_TEST_CONN").unwrap_or_else(|_| {
-        for base in &search_dirs {
-            if let Ok(entries) = std::fs::read_dir(base) {
-                for entry in entries.flatten() {
-                    let cj = entry.path().join("container.json");
-                    if let Ok(content) = std::fs::read_to_string(&cj) {
-                        if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if info.get("ready").and_then(|v| v.as_bool()) == Some(true) {
-                                let port = info["port"].as_u64().unwrap_or(5432);
-                                return format!(
-                                    "host=127.0.0.1 port={port} user=postgres password=postgres dbname=cubos_sql"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        panic!(
-            "No running cubos_sql test container found. \
-             Run `cargo test -p cubos_sql_macros -- --ignored` first."
-        );
-    });
-
-    let mut client =
-        postgres::Client::connect(&conn_str, postgres::NoTls).expect("Failed to connect");
-    client.batch_execute(MIGRATION).unwrap();
-    client
-}
-
-fn setup() -> (SchemaSnapshot, postgres::Client) {
-    let mut client = connect();
-    let snapshot = export_schema(&mut client).unwrap();
-    (snapshot, client)
-}
-
-fn default_config() -> AnalyzerConfig {
-    AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: Vec::new(),
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Live introspection (reuses cubos_sql_analyzer::introspect)
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn live_introspect(client: &mut postgres::Client, sql: &str) -> QueryInfo {
-    let empty = HashMap::new();
-    introspect::introspect_query(client, sql, &empty, &empty, &empty).unwrap()
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Assertion helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Run the static analyzer on a query (no live comparison).
-fn static_analyze(snapshot: &SchemaSnapshot, sql: &str) -> QueryInfo {
-    analyze(snapshot, sql, &default_config()).unwrap()
-}
-
-fn col<'a>(info: &'a QueryInfo, name: &str) -> &'a ColumnInfo {
-    info.columns
-        .iter()
-        .find(|c| c.name == name)
-        .unwrap_or_else(|| {
-            panic!(
-                "column '{name}' not found in: {:?}",
-                info.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
-            )
-        })
-}
-
-/// Assert two QueryInfos have identical types (ignoring nullability).
-fn assert_same_types(static_info: &QueryInfo, live_info: &QueryInfo, context: &str) {
-    assert_eq!(
-        static_info.columns.len(),
-        live_info.columns.len(),
-        "{context}: column count mismatch"
-    );
-    for (s, l) in static_info.columns.iter().zip(live_info.columns.iter()) {
-        assert_eq!(s.name, l.name, "{context}: column name mismatch");
-        assert_eq!(
-            s.rust_type, l.rust_type,
-            "{context}: type mismatch for column '{}'",
-            s.name
-        );
-    }
-    assert_eq!(
-        static_info.params.len(),
-        live_info.params.len(),
-        "{context}: param count mismatch"
-    );
-    for (i, (s, l)) in static_info
-        .params
-        .iter()
-        .zip(live_info.params.iter())
-        .enumerate()
-    {
-        assert_eq!(
-            s.rust_type, l.rust_type,
-            "{context}: param {i} type mismatch"
-        );
-    }
-}
-
-/// Assert two QueryInfos are completely identical (types + nullability).
-fn assert_identical(static_info: &QueryInfo, live_info: &QueryInfo, context: &str) {
-    assert_same_types(static_info, live_info, context);
-    for (s, l) in static_info.columns.iter().zip(live_info.columns.iter()) {
-        assert_eq!(
-            s.nullable, l.nullable,
-            "{context}: nullability mismatch for column '{}' (static={}, live={})",
-            s.name, s.nullable, l.nullable
-        );
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests: IDENTICAL output (both paths agree)
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[test]
-
-fn identical_simple_select() {
-    let (snapshot, mut client) = setup();
-    let sql = "SELECT id, name, age FROM users";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    assert_identical(&static_info, &live_info, "simple SELECT");
-}
-
-#[test]
-
-fn identical_select_with_params() {
-    let (snapshot, mut client) = setup();
-    let sql = "SELECT id, name FROM users WHERE age > $1 AND name = $2";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    assert_identical(&static_info, &live_info, "SELECT with params");
-}
-
-#[test]
-
-fn identical_inner_join() {
-    let (snapshot, mut client) = setup();
-    let sql = "SELECT u.name, p.title FROM users u INNER JOIN posts p ON p.user_id = u.id";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    // INNER JOIN: both approaches agree on types and nullability.
-    assert_identical(&static_info, &live_info, "INNER JOIN");
-}
-
-#[test]
-
-fn identical_insert_returning() {
-    let (snapshot, mut client) = setup();
-    let sql = "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, age";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    assert_identical(&static_info, &live_info, "INSERT RETURNING");
-}
-
-#[test]
-
-fn identical_update_returning() {
-    let (snapshot, mut client) = setup();
-    let sql = "UPDATE users SET age = $1 WHERE id = $2 RETURNING id, name, age";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    assert_identical(&static_info, &live_info, "UPDATE RETURNING");
-}
-
-#[test]
-
-fn identical_delete_returning() {
-    let (snapshot, mut client) = setup();
-    let sql = "DELETE FROM users WHERE id = $1 RETURNING id, name, age";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    assert_identical(&static_info, &live_info, "DELETE RETURNING");
-}
-
-#[test]
-
-fn identical_nullable_column() {
-    let (snapshot, mut client) = setup();
-    let sql = "SELECT id, age FROM users";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    assert_identical(&static_info, &live_info, "nullable column");
-    assert!(!col(&static_info, "id").nullable);
-    assert!(col(&static_info, "age").nullable);
-}
-
-#[test]
-
-fn identical_where_is_not_null() {
-    let (snapshot, mut client) = setup();
-    let sql = "SELECT id, age FROM users WHERE age IS NOT NULL";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-
-    // Both agree: WHERE doesn't change column nullability.
-    assert_identical(&static_info, &live_info, "WHERE IS NOT NULL");
-    assert!(col(&static_info, "age").nullable);
-}
+mod common;
+use common::*;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests: analyzer is MORE PRECISE (nullability differs)
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_left_join() {
     let (snapshot, mut client) = setup();
@@ -293,6 +35,7 @@ fn more_precise_left_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_right_join() {
     let (snapshot, mut client) = setup();
@@ -313,6 +56,7 @@ fn more_precise_right_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_full_join() {
     let (snapshot, mut client) = setup();
@@ -330,6 +74,7 @@ fn more_precise_full_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_count() {
     let (snapshot, mut client) = setup();
@@ -351,6 +96,7 @@ fn more_precise_count() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_coalesce() {
     let (snapshot, mut client) = setup();
@@ -371,6 +117,7 @@ fn more_precise_coalesce() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_literal() {
     let (snapshot, mut client) = setup();
@@ -391,6 +138,7 @@ fn more_precise_literal() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_case_with_else() {
     let (snapshot, mut client) = setup();
@@ -411,6 +159,7 @@ fn more_precise_case_with_else() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_union_all_not_null() {
     let (snapshot, mut client) = setup();
@@ -431,6 +180,7 @@ fn more_precise_union_all_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn more_precise_cte_dml_left_join() {
     let (snapshot, mut client) = setup();
@@ -461,6 +211,7 @@ fn more_precise_cte_dml_left_join() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn identical_case_without_else() {
     let (snapshot, mut client) = setup();
@@ -481,6 +232,7 @@ fn identical_case_without_else() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn identical_union_nullable_branch() {
     let (snapshot, mut client) = setup();
@@ -499,6 +251,7 @@ fn identical_union_nullable_branch() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_chained_left_joins_cascade_nullability() {
     let (snapshot, mut client) = setup();
@@ -533,6 +286,7 @@ fn complex_chained_left_joins_cascade_nullability() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_three_table_mixed_joins() {
     let (snapshot, mut client) = setup();
@@ -575,6 +329,7 @@ fn complex_three_table_mixed_joins() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_subquery_in_from() {
     let (snapshot, mut client) = setup();
@@ -605,6 +360,7 @@ fn complex_subquery_in_from() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_arithmetic_on_nullable() {
     let (snapshot, mut client) = setup();
@@ -621,6 +377,7 @@ fn complex_arithmetic_on_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_arithmetic_on_not_null() {
     let (snapshot, mut client) = setup();
@@ -643,6 +400,7 @@ fn complex_arithmetic_on_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_coalesce_in_arithmetic() {
     let (snapshot, mut client) = setup();
@@ -664,6 +422,7 @@ fn complex_coalesce_in_arithmetic() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_boolean_with_nullable_input() {
     let (snapshot, mut client) = setup();
@@ -690,6 +449,7 @@ fn complex_boolean_with_nullable_input() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_exists_subquery() {
     let (snapshot, mut client) = setup();
@@ -712,6 +472,7 @@ fn complex_exists_subquery() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_scalar_subquery_always_nullable() {
     let (snapshot, mut client) = setup();
@@ -729,6 +490,7 @@ fn complex_scalar_subquery_always_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_cast_preserves_nullability() {
     let (snapshot, mut client) = setup();
@@ -755,6 +517,7 @@ fn complex_cast_preserves_nullability() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_multiple_params_from_different_contexts() {
     let (snapshot, mut client) = setup();
@@ -772,6 +535,7 @@ fn complex_multiple_params_from_different_contexts() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_mixed_computed_and_direct_cols() {
     let (snapshot, mut client) = setup();
@@ -810,6 +574,7 @@ fn complex_mixed_computed_and_direct_cols() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_cte_chain() {
     let (snapshot, mut client) = setup();
@@ -832,6 +597,7 @@ fn complex_cte_chain() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_union_three_branches() {
     let (snapshot, mut client) = setup();
@@ -851,6 +617,7 @@ fn complex_union_three_branches() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_insert_select_with_join() {
     let (snapshot, mut client) = setup();
@@ -871,6 +638,7 @@ fn complex_insert_select_with_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 
 fn complex_left_join_with_subquery() {
     let (snapshot, mut client) = setup();
@@ -904,6 +672,7 @@ fn complex_left_join_with_subquery() {
 // ── Deeply nested COALESCE / CASE / expressions ────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_nested_coalesce() {
     let (snapshot, _) = setup();
     // COALESCE(COALESCE(nullable, nullable), literal) → NOT NULL
@@ -916,6 +685,7 @@ fn stress_nested_coalesce() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_coalesce_all_nullable() {
     let (snapshot, _) = setup();
     // COALESCE(nullable, nullable) → still nullable (no non-null fallback)
@@ -928,6 +698,7 @@ fn stress_coalesce_all_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_case_with_null_branch() {
     let (snapshot, _) = setup();
     // CASE with one branch returning NULL explicitly
@@ -937,6 +708,7 @@ fn stress_case_with_null_branch() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_case_mixing_nullable_branches() {
     let (snapshot, _) = setup();
     // CASE with one NOT NULL branch and one nullable branch
@@ -953,6 +725,7 @@ fn stress_case_mixing_nullable_branches() {
 // ── Star expansion edge cases ──────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_star_with_left_join() {
     let (snapshot, mut client) = setup();
     // SELECT * from LEFT JOIN — right side columns should be nullable
@@ -974,6 +747,7 @@ fn stress_star_with_left_join() {
 // ── SELECT without FROM ────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_select_without_from() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT 1 as one, 'hello' as greeting, TRUE as flag";
@@ -987,6 +761,7 @@ fn stress_select_without_from() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_select_null_literal() {
     let (snapshot, _) = setup();
     let sql = "SELECT NULL as nothing";
@@ -997,6 +772,7 @@ fn stress_select_null_literal() {
 // ── Multiple same-name columns from different tables ───────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_ambiguous_id_columns() {
     let (snapshot, mut client) = setup();
     // Both tables have 'id' — must use aliases to disambiguate
@@ -1013,6 +789,7 @@ fn stress_ambiguous_id_columns() {
 // ── Nested subqueries ──────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_deeply_nested_subquery() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT * FROM ( \
@@ -1030,6 +807,7 @@ fn stress_deeply_nested_subquery() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_subquery_with_left_join_inside() {
     let (snapshot, mut client) = setup();
     // Subquery does LEFT JOIN, outer SELECT sees nullable cols
@@ -1058,6 +836,7 @@ fn stress_subquery_with_left_join_inside() {
 // ── UNION edge cases ───────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_union_with_null_literal_branch() {
     let (snapshot, _) = setup();
     // One branch is a literal NULL → union should be nullable
@@ -1072,6 +851,7 @@ fn stress_union_with_null_literal_branch() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_union_mixed_types() {
     let (snapshot, mut client) = setup();
     // int + bigint → bigint (coercion)
@@ -1089,6 +869,7 @@ fn stress_union_mixed_types() {
 // ── CTE + UNION combo ──────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_cte_used_in_union() {
     let (snapshot, _) = setup();
     let sql = "WITH active AS (SELECT name FROM users) \
@@ -1103,6 +884,7 @@ fn stress_cte_used_in_union() {
 // ── DML with complex RETURNING ─────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_update_returning_expression() {
     let (snapshot, mut client) = setup();
     let sql = "UPDATE users SET age = $1 WHERE id = $2 \
@@ -1124,6 +906,7 @@ fn stress_update_returning_expression() {
 // ── DELETE with complex WHERE + RETURNING ──────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_delete_returning_all_columns() {
     let (snapshot, mut client) = setup();
     let sql = "DELETE FROM users WHERE id = $1 \
@@ -1142,6 +925,7 @@ fn stress_delete_returning_all_columns() {
 // ── CTE with DML + expressions ─────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_cte_insert_returning_coalesce() {
     let (snapshot, mut client) = setup();
     let sql = "WITH ins AS ( \
@@ -1163,6 +947,7 @@ fn stress_cte_insert_returning_coalesce() {
 // ── Param inference edge cases ─────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_param_from_insert_values() {
     let (snapshot, mut client) = setup();
     let sql = "INSERT INTO posts (user_id, title, body) VALUES ($1, $2, $3) RETURNING id";
@@ -1177,6 +962,7 @@ fn stress_param_from_insert_values() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_param_with_cast() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT id FROM users WHERE id = $1::bigint";
@@ -1190,6 +976,7 @@ fn stress_param_with_cast() {
 // ── Self-join ──────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_self_join() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT a.name as name_a, b.name as name_b \
@@ -1206,6 +993,7 @@ fn stress_self_join() {
 // ── CROSS JOIN ─────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_cross_join() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT u.name, p.title FROM users u CROSS JOIN posts p";
@@ -1221,6 +1009,7 @@ fn stress_cross_join() {
 // ── Implicit CROSS JOIN (comma in FROM) ────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_implicit_cross_join() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT u.name, p.title FROM users u, posts p WHERE p.user_id = u.id";
@@ -1235,6 +1024,7 @@ fn stress_implicit_cross_join() {
 // ── Complex WHERE with AND/OR/NOT ──────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_complex_where_params() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT id FROM users \
@@ -1249,6 +1039,7 @@ fn stress_complex_where_params() {
 // ── RETURNING with star ────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_insert_returning_star() {
     let (snapshot, mut client) = setup();
     let sql = "INSERT INTO posts (user_id, title) VALUES ($1, $2) RETURNING *";
@@ -1266,6 +1057,7 @@ fn stress_insert_returning_star() {
 // ── Aliased subquery with computed columns ─────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_subquery_computed_columns() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT sq.cnt, sq.max_age FROM ( \
@@ -1285,6 +1077,7 @@ fn stress_subquery_computed_columns() {
 // ── LIMIT / OFFSET don't affect types ──────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_limit_offset() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 5";
@@ -1297,6 +1090,7 @@ fn stress_limit_offset() {
 // ── Annotations with complex expressions ───────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_annotation_on_left_join_star() {
     let (snapshot, _) = setup();
     // Force nullable LEFT JOIN column to NOT NULL via annotation
@@ -1312,6 +1106,7 @@ fn stress_annotation_on_left_join_star() {
 // ── DISTINCT ON ────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_distinct_on() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT DISTINCT ON (user_id) user_id, title, body \
@@ -1328,6 +1123,7 @@ fn stress_distinct_on() {
 // ── Mixing aggregates and non-aggregates in subquery ───────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_aggregate_subquery_in_select() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT u.name, \
@@ -1348,6 +1144,7 @@ fn stress_aggregate_subquery_in_select() {
 // ── INSERT with DEFAULT values (no explicit columns) ───────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_insert_minimal() {
     let (snapshot, mut client) = setup();
     let sql = "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id";
@@ -1362,6 +1159,7 @@ fn stress_insert_minimal() {
 // ── Deeply nested CTE with DML and JOINs ──────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_cte_dml_chain() {
     let (snapshot, mut client) = setup();
     let sql = "WITH \
@@ -1388,6 +1186,7 @@ fn stress_cte_dml_chain() {
 // ── SELECT with only aggregates (no GROUP BY) ──────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn stress_aggregates_no_group_by() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT COUNT(*) as cnt, SUM(age) as total_age, MAX(name) as last_name FROM users";
@@ -1410,6 +1209,7 @@ fn stress_aggregates_no_group_by() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_union_in_subquery_in_from() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT sq.val FROM ( \
@@ -1427,6 +1227,7 @@ fn torture_union_in_subquery_in_from() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_left_join_on_union_subquery() {
     let (snapshot, mut client) = setup();
     // LEFT JOIN on a UNION subquery
@@ -1451,6 +1252,7 @@ fn torture_left_join_on_union_subquery() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_cte_with_union_and_left_join() {
     let (snapshot, mut client) = setup();
     let sql = "WITH all_names AS ( \
@@ -1471,6 +1273,7 @@ fn torture_cte_with_union_and_left_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_nested_case_in_coalesce() {
     let (snapshot, _) = setup();
     // COALESCE(CASE without ELSE, literal) → NOT NULL
@@ -1484,6 +1287,7 @@ fn torture_nested_case_in_coalesce() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_triple_left_join() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT u.name, p.title, c.content, c.rating \
@@ -1504,6 +1308,7 @@ fn torture_triple_left_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_full_join_with_coalesce_fix() {
     let (snapshot, _) = setup();
     // FULL JOIN makes both sides nullable, but COALESCE can fix it.
@@ -1517,6 +1322,7 @@ fn torture_full_join_with_coalesce_fix() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_param_in_coalesce() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT COALESCE(age, $1) as val FROM users";
@@ -1529,6 +1335,7 @@ fn torture_param_in_coalesce() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_multiple_ctes_cross_reference() {
     let (snapshot, _) = setup();
     let sql = "WITH \
@@ -1544,6 +1351,7 @@ fn torture_multiple_ctes_cross_reference() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_update_from_join() {
     let (snapshot, mut client) = setup();
     let sql = "UPDATE posts SET body = $1 \
@@ -1560,6 +1368,7 @@ fn torture_update_from_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_select_from_cte_left_join_cte() {
     let (snapshot, _) = setup();
     let sql = "WITH \
@@ -1573,6 +1382,7 @@ fn torture_select_from_cte_left_join_cte() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_count_with_group_by() {
     let (snapshot, mut client) = setup();
     // COUNT in GROUP BY context is still NOT NULL.
@@ -1592,6 +1402,7 @@ fn torture_count_with_group_by() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_expression_in_insert_returning() {
     let (snapshot, mut client) = setup();
     let sql = "INSERT INTO users (name, email, age) VALUES ($1, $2, $3) \
@@ -1612,6 +1423,7 @@ fn torture_expression_in_insert_returning() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn torture_deeply_nested_cte_union_join() {
     let (snapshot, _) = setup();
     // CTE → UNION → subquery → LEFT JOIN
@@ -1633,6 +1445,7 @@ fn torture_deeply_nested_cte_union_join() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_count_star_not_null() {
     let (snapshot, mut client) = setup();
     let sql = "SELECT u.name, \
@@ -1649,6 +1462,7 @@ fn subquery_count_star_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_count_plus_one_not_null() {
     let (snapshot, _) = setup();
     // COUNT(*) + 1 wraps the aggregate in an AExpr — must still detect it.
@@ -1660,6 +1474,7 @@ fn subquery_count_plus_one_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_count_cast_not_null() {
     let (snapshot, _) = setup();
     // COUNT(*)::int wraps aggregate in TypeCast.
@@ -1669,6 +1484,7 @@ fn subquery_count_cast_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_coalesce_sum_not_null() {
     let (snapshot, _) = setup();
     // COALESCE(SUM(rating), 0) — aggregate detected through COALESCE.
@@ -1680,6 +1496,7 @@ fn subquery_coalesce_sum_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_sum_nullable() {
     let (snapshot, _) = setup();
     // SUM without COALESCE: aggregate != COUNT → nullable result.
@@ -1690,6 +1507,7 @@ fn subquery_sum_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_with_group_by_still_nullable() {
     let (snapshot, _) = setup();
     // COUNT(*) with GROUP BY: subquery may return 0 rows → nullable.
@@ -1701,6 +1519,7 @@ fn subquery_with_group_by_still_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_non_aggregate_still_nullable() {
     let (snapshot, _) = setup();
     // Non-aggregate scalar subquery: may return 0 rows → nullable.
@@ -1712,6 +1531,7 @@ fn subquery_non_aggregate_still_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn subquery_case_wrapping_count_not_null() {
     let (snapshot, _) = setup();
     // CASE WHEN ... THEN COUNT(*) ELSE 0 END — aggregate inside CASE with ELSE.
@@ -1725,6 +1545,7 @@ fn subquery_case_wrapping_count_not_null() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_sum_with_group_by_not_null_input() {
     let (snapshot, mut client) = setup();
     // user_id is NOT NULL + GROUP BY → SUM guaranteed non-null.
@@ -1740,6 +1561,7 @@ fn agg_sum_with_group_by_not_null_input() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_sum_with_group_by_nullable_input() {
     let (snapshot, _) = setup();
     // rating is nullable + GROUP BY → SUM still nullable (all rows in group could be NULL).
@@ -1749,6 +1571,7 @@ fn agg_sum_with_group_by_nullable_input() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_min_max_with_group_by_not_null() {
     let (snapshot, _) = setup();
     // title is NOT NULL + GROUP BY → MIN/MAX are NOT NULL.
@@ -1760,6 +1583,7 @@ fn agg_min_max_with_group_by_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_avg_with_group_by_not_null() {
     let (snapshot, _) = setup();
     // id is NOT NULL + GROUP BY → AVG is NOT NULL.
@@ -1769,6 +1593,7 @@ fn agg_avg_with_group_by_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_count_with_group_by() {
     let (snapshot, _) = setup();
     // COUNT is always NOT NULL, with or without GROUP BY.
@@ -1778,6 +1603,7 @@ fn agg_count_with_group_by() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_count_without_group_by() {
     let (snapshot, _) = setup();
     // COUNT without GROUP BY: still NOT NULL (returns 0).
@@ -1787,6 +1613,7 @@ fn agg_count_without_group_by() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_sum_without_group_by_always_nullable() {
     let (snapshot, _) = setup();
     // SUM without GROUP BY: table could be empty → NULL.
@@ -1797,6 +1624,7 @@ fn agg_sum_without_group_by_always_nullable() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_mixed_nullability_with_group_by() {
     let (snapshot, _) = setup();
     // Mix of NOT NULL and nullable aggregates in same GROUP BY query.
@@ -1814,6 +1642,7 @@ fn agg_mixed_nullability_with_group_by() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_with_group_by_and_left_join() {
     let (snapshot, _) = setup();
     // LEFT JOIN + GROUP BY: right-side columns are nullable from JOIN,
@@ -1828,6 +1657,7 @@ fn agg_with_group_by_and_left_join() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn agg_string_agg_with_group_by_not_null() {
     let (snapshot, _) = setup();
     // string_agg(NOT NULL, delimiter) with GROUP BY → NOT NULL.
@@ -1839,44 +1669,11 @@ fn agg_string_agg_with_group_by_not_null() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Tests: UNKNOWN type resolution in function calls
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn unknown_literal_in_function_call() {
-    let (snapshot, mut client) = setup();
-    // ', ' is UNKNOWN type — should resolve string_agg(text, text) unambiguously.
-    let sql = "SELECT post_id, string_agg(author_name, ', ') as authors \
-               FROM comments GROUP BY post_id";
-    let static_info = analyze(&snapshot, sql, &default_config()).unwrap();
-    let live_info = live_introspect(&mut client, sql);
-    assert_same_types(&static_info, &live_info, "string_agg with UNKNOWN literal");
-}
-
-#[test]
-fn unknown_literal_in_replace() {
-    let (snapshot, _) = setup();
-    // replace(text, text, text) — two UNKNOWN literals.
-    let sql = "SELECT replace(name, 'foo', 'bar') as replaced FROM users";
-    let info = static_analyze(&snapshot, sql);
-    assert_eq!(col(&info, "replaced").rust_type, "String");
-    assert!(!col(&info, "replaced").nullable);
-}
-
-#[test]
-fn unknown_literal_in_position() {
-    let (snapshot, _) = setup();
-    // position(text in text) — UNKNOWN in first arg.
-    let sql = "SELECT position('x' in name) as pos FROM users";
-    let info = static_analyze(&snapshot, sql);
-    assert!(!col(&info, "pos").nullable);
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Tests: function/operator nullability (strict, pg_catalog, exceptions)
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn strict_pg_catalog_function_not_null() {
     let (snapshot, _) = setup();
     // length(text) is pg_catalog, strict, not in exceptions → NOT NULL with NOT NULL input.
@@ -1886,6 +1683,7 @@ fn strict_pg_catalog_function_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn strict_pg_catalog_function_nullable_with_nullable_arg() {
     let (snapshot, _) = setup();
     // length(text) is strict: nullable input → nullable output.
@@ -1895,6 +1693,7 @@ fn strict_pg_catalog_function_nullable_with_nullable_arg() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn strict_pg_catalog_upper_not_null() {
     let (snapshot, _) = setup();
     // upper(text) is pg_catalog, strict → NOT NULL with NOT NULL input.
@@ -1904,6 +1703,7 @@ fn strict_pg_catalog_upper_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn operator_plus_not_null() {
     let (snapshot, _) = setup();
     // 1 + 1: both non-null, operator not in exceptions → NOT NULL.
@@ -1913,6 +1713,7 @@ fn operator_plus_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn operator_plus_nullable_arg() {
     let (snapshot, _) = setup();
     // age is nullable → result is nullable.
@@ -1922,6 +1723,7 @@ fn operator_plus_nullable_arg() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn operator_concat_not_null() {
     let (snapshot, _) = setup();
     // || with two NOT NULL → NOT NULL.
@@ -1931,6 +1733,7 @@ fn operator_concat_not_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn operator_concat_nullable_arg() {
     let (snapshot, _) = setup();
     // body is nullable → concat is nullable.
@@ -1944,6 +1747,7 @@ fn operator_concat_nullable_arg() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn nonstrict_concat_never_null() {
     let (snapshot, _) = setup();
     // concat is non-strict but never returns NULL (treats NULLs as '').
@@ -1953,6 +1757,7 @@ fn nonstrict_concat_never_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn nonstrict_concat_ws_never_null() {
     let (snapshot, _) = setup();
     let sql = "SELECT concat_ws(', '::text, name, email) as combined FROM users";
@@ -1961,6 +1766,7 @@ fn nonstrict_concat_ws_never_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn nonstrict_now_never_null() {
     let (snapshot, _) = setup();
     let sql = "SELECT now() as ts";
@@ -1969,105 +1775,10 @@ fn nonstrict_now_never_null() {
 }
 
 #[test]
+#[ignore] // requires PostgreSQL (Docker)
 fn nonstrict_random_never_null() {
     let (snapshot, _) = setup();
     let sql = "SELECT random() as r";
     let info = static_analyze(&snapshot, sql);
     assert!(!col(&info, "r").nullable);
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests: parameter nullability annotations
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn config_with_nullable(nullable: &[bool]) -> AnalyzerConfig {
-    AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: nullable.to_vec(),
-    }
-}
-
-#[test]
-fn param_not_null_by_default() {
-    let (snapshot, _) = setup();
-    // $1 has no nullable annotation → NOT NULL.
-    // COALESCE(nullable_age, not_null_param) → NOT NULL.
-    let sql = "SELECT COALESCE(age, $1) as val FROM users";
-    let info = analyze(&snapshot, sql, &default_config()).unwrap();
-    assert!(!col(&info, "val").nullable);
-}
-
-#[test]
-fn param_nullable_annotation() {
-    let (snapshot, _) = setup();
-    // $1 has nullable annotation → nullable.
-    // COALESCE(nullable_age, nullable_param) → nullable.
-    let sql = "SELECT COALESCE(age, $1) as val FROM users";
-    let config = config_with_nullable(&[true]);
-    let info = analyze(&snapshot, sql, &config).unwrap();
-    assert!(col(&info, "val").nullable);
-}
-
-#[test]
-fn param_nullable_propagates_to_param_info() {
-    let (snapshot, _) = setup();
-    let sql = "SELECT * FROM users WHERE id = $1 AND age = $2";
-    // $1 not nullable, $2 nullable
-    let config = config_with_nullable(&[false, true]);
-    let info = analyze(&snapshot, sql, &config).unwrap();
-    assert!(!info.params[0].nullable);
-    assert!(info.params[1].nullable);
-}
-
-#[test]
-fn param_not_null_in_where_comparison() {
-    let (snapshot, _) = setup();
-    // $1 not null by default → comparison `id = $1` has both sides NOT NULL → NOT NULL.
-    let sql = "SELECT id = $1 as is_match FROM users";
-    let info = analyze(&snapshot, sql, &default_config()).unwrap();
-    assert!(!col(&info, "is_match").nullable);
-}
-
-#[test]
-fn param_nullable_in_where_comparison() {
-    let (snapshot, _) = setup();
-    // $1 nullable → comparison `id = $1?` has one nullable side → nullable.
-    let sql = "SELECT id = $1 as is_match FROM users";
-    let config = config_with_nullable(&[true]);
-    let info = analyze(&snapshot, sql, &config).unwrap();
-    assert!(col(&info, "is_match").nullable);
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests: snapshot serialization roundtrip
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[test]
-
-fn snapshot_roundtrip() {
-    let (snapshot, _client) = setup();
-
-    let json = serde_json::to_string(&snapshot).unwrap();
-    let restored: SchemaSnapshot = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(snapshot.types.len(), restored.types.len());
-    assert_eq!(snapshot.tables.len(), restored.tables.len());
-    assert_eq!(
-        snapshot.functions_by_name.len(),
-        restored.functions_by_name.len()
-    );
-    assert_eq!(
-        snapshot.operators_by_name.len(),
-        restored.operators_by_name.len()
-    );
-    assert_eq!(snapshot.casts.len(), restored.casts.len());
-
-    // Analyze with restored snapshot gives same results.
-    let config = default_config();
-    let sql = "SELECT id, name FROM users";
-    let info1 = analyze(&snapshot, sql, &config).unwrap();
-    let info2 = analyze(&restored, sql, &config).unwrap();
-    assert_identical(&info1, &info2, "snapshot roundtrip");
 }

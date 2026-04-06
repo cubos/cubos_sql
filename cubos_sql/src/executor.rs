@@ -1,5 +1,5 @@
-use tokio_postgres::types::ToSql;
 use tokio_postgres::Row;
+use tokio_postgres::types::ToSql;
 
 /// Abstraction over types that can execute SQL queries against PostgreSQL.
 ///
@@ -14,6 +14,7 @@ use tokio_postgres::Row;
 /// |------|----------|
 /// | `deadpool_postgres::Pool` | Acquires a connection per call, returns it on completion |
 /// | `deadpool_postgres::Object` | Delegates to the inner `tokio_postgres::Client` |
+/// | `deadpool_postgres::Transaction<'_>` | Delegates to the inner `tokio_postgres::Transaction` |
 /// | `tokio_postgres::Client` | Executes directly on the client |
 /// | `tokio_postgres::Transaction<'_>` | Executes within the open transaction |
 ///

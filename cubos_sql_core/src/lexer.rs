@@ -229,9 +229,14 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                             out.push_str(&span);
                             i = after + 1;
                         } else {
-                            // Named param $ident — check for nullable annotation `?`
-                            let nullable = after < len && chars[after] == '?';
-                            let consume_to = if nullable { after + 1 } else { after };
+                            // Named param $ident — check for nullability annotation `?` or `!`
+                            let (nullable, consume_to) = if after < len && chars[after] == '?' {
+                                (Some(true), after + 1)
+                            } else if after < len && chars[after] == '!' {
+                                (Some(false), after + 1)
+                            } else {
+                                (None, after)
+                            };
 
                             // Deduplicate by name
                             let next_idx = if let Some(&idx) = param_indices.get(&ident) {
@@ -274,12 +279,12 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                     out.push(chars[i]);
                     i += 1;
                 }
-                if i >= len {
-                    if let LexState::StringLiteral(_) = state {
-                        return Err(LexError::UnclosedString {
-                            position: start_pos,
-                        });
-                    }
+                if i >= len
+                    && let LexState::StringLiteral(_) = state
+                {
+                    return Err(LexError::UnclosedString {
+                        position: start_pos,
+                    });
                 }
             }
             LexState::DollarQuote(tag, start_pos) => {
@@ -307,13 +312,13 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                 }
                 out.push(chars[i]);
                 i += 1;
-                if i >= len {
-                    if let LexState::DollarQuote(_, _) = state {
-                        return Err(LexError::UnclosedDollarQuote {
-                            tag,
-                            position: start_pos,
-                        });
-                    }
+                if i >= len
+                    && let LexState::DollarQuote(_, _) = state
+                {
+                    return Err(LexError::UnclosedDollarQuote {
+                        tag,
+                        position: start_pos,
+                    });
                 }
             }
             LexState::LineComment => {
@@ -345,12 +350,12 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                     out.push(chars[i]);
                     i += 1;
                 }
-                if i >= len {
-                    if let LexState::BlockComment(_, _) = state {
-                        return Err(LexError::UnclosedBlockComment {
-                            position: start_pos,
-                        });
-                    }
+                if i >= len
+                    && let LexState::BlockComment(_, _) = state
+                {
+                    return Err(LexError::UnclosedBlockComment {
+                        position: start_pos,
+                    });
                 }
             }
             LexState::QuotedIdentifier(start_pos) => {
@@ -370,12 +375,12 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
                     out.push(chars[i]);
                     i += 1;
                 }
-                if i >= len {
-                    if let LexState::QuotedIdentifier(_) = state {
-                        return Err(LexError::UnclosedQuotedIdentifier {
-                            position: start_pos,
-                        });
-                    }
+                if i >= len
+                    && let LexState::QuotedIdentifier(_) = state
+                {
+                    return Err(LexError::UnclosedQuotedIdentifier {
+                        position: start_pos,
+                    });
                 }
             }
         }
@@ -388,13 +393,13 @@ pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
             return Err(LexError::UnclosedDollarQuote {
                 tag: tag.clone(),
                 position: *p,
-            })
+            });
         }
         LexState::BlockComment(_, p) => {
-            return Err(LexError::UnclosedBlockComment { position: *p })
+            return Err(LexError::UnclosedBlockComment { position: *p });
         }
         LexState::QuotedIdentifier(p) => {
-            return Err(LexError::UnclosedQuotedIdentifier { position: *p })
+            return Err(LexError::UnclosedQuotedIdentifier { position: *p });
         }
     }
 
@@ -577,7 +582,16 @@ mod tests {
         assert_eq!(out.sql, "SELECT * FROM t WHERE age = $1");
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "age");
-        assert!(out.params[0].nullable);
+        assert_eq!(out.params[0].nullable, Some(true));
+    }
+
+    #[test]
+    fn force_not_null_param() {
+        let out = lex("SELECT * FROM t WHERE age = $age!").unwrap();
+        assert_eq!(out.sql, "SELECT * FROM t WHERE age = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "age");
+        assert_eq!(out.params[0].nullable, Some(false));
     }
 
     #[test]
@@ -585,7 +599,7 @@ mod tests {
         let out = lex("SELECT * FROM t WHERE id = $id").unwrap();
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "id");
-        assert!(!out.params[0].nullable);
+        assert_eq!(out.params[0].nullable, None);
     }
 
     #[test]
@@ -597,11 +611,24 @@ mod tests {
         );
         assert_eq!(out.params.len(), 3);
         assert_eq!(out.params[0].name, "id");
-        assert!(!out.params[0].nullable);
+        assert_eq!(out.params[0].nullable, None);
         assert_eq!(out.params[1].name, "age");
-        assert!(out.params[1].nullable);
+        assert_eq!(out.params[1].nullable, Some(true));
         assert_eq!(out.params[2].name, "name");
-        assert!(!out.params[2].nullable);
+        assert_eq!(out.params[2].nullable, None);
+    }
+
+    #[test]
+    fn mixed_all_three_annotations() {
+        let out = lex("SELECT * FROM t WHERE a = $a AND b = $b? AND c = $c!").unwrap();
+        assert_eq!(
+            out.sql,
+            "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = $3"
+        );
+        assert_eq!(out.params.len(), 3);
+        assert_eq!(out.params[0].nullable, None); // $a — auto
+        assert_eq!(out.params[1].nullable, Some(true)); // $b? — force nullable
+        assert_eq!(out.params[2].nullable, Some(false)); // $c! — force non-null
     }
 
     #[test]
@@ -610,7 +637,7 @@ mod tests {
         assert_eq!(out.sql, "SELECT * FROM t WHERE a = $1 OR b = $1");
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "x");
-        assert!(out.params[0].nullable);
+        assert_eq!(out.params[0].nullable, Some(true));
     }
 
     #[test]

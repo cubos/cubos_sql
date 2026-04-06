@@ -12,6 +12,7 @@
 //! [package.metadata.cubos_sql.database]
 //! docker_image = "postgres:16"   # Docker image for compile-time PG (default: "postgres")
 //! migrations = "./migrations"    # path to SQL migration files (required)
+//! extra_migrations = ["../other-crate/migrations"]  # extra migrations for compile-time only
 //!
 //! [package.metadata.cubos_sql.migrations]
 //! table = "public._migrations"   # tracking table name (default: "public._migrations")
@@ -33,8 +34,8 @@
 //! `tokio_postgres::types::ToSql + FromSql`. Array versions (`type[]`) are
 //! supported automatically as `Vec<RustType>`.
 //!
-//! Only `[package.metadata.cubos_sql.database].migrations` is required; all
-//! other fields have sensible defaults.
+//! All fields have sensible defaults. The `[package.metadata.cubos_sql]` section
+//! itself is required, but every field within it is optional.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -47,6 +48,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Database-related settings (Docker image, migrations path).
+    #[serde(default)]
     pub database: DatabaseConfig,
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
     #[serde(default)]
@@ -63,6 +65,11 @@ pub struct Config {
     /// Array versions are supported automatically as `Vec<RustType>`.
     #[serde(default)]
     pub types: HashMap<String, String>,
+    /// Whether to use the static SQL analyzer for type/nullability inference.
+    /// When `false`, falls back to introspection via `DESCRIBE`.
+    /// Default: `true`
+    #[serde(default = "Config::default_use_static_analyzer")]
+    pub use_static_analyzer: bool,
 }
 
 /// Database-related configuration.
@@ -76,12 +83,35 @@ pub struct DatabaseConfig {
     #[serde(default = "DatabaseConfig::default_docker_image")]
     pub docker_image: String,
     /// Path to the migrations directory, relative to the project root or absolute.
+    /// Default: `"./migrations"`. If the directory does not exist, it is treated
+    /// as having zero migrations.
+    #[serde(default = "DatabaseConfig::default_migrations")]
     pub migrations: PathBuf,
+    /// Additional migration directories from other crates to include in the
+    /// compile-time PostgreSQL container. These are used only for static analysis
+    /// and type checking — they are NOT executed by the runtime migration runner.
+    /// Paths are relative to the project root or absolute.
+    #[serde(default)]
+    pub extra_migrations: Vec<PathBuf>,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            docker_image: Self::default_docker_image(),
+            migrations: Self::default_migrations(),
+            extra_migrations: Vec::new(),
+        }
+    }
 }
 
 impl DatabaseConfig {
     fn default_docker_image() -> String {
         "postgres".to_string()
+    }
+
+    fn default_migrations() -> PathBuf {
+        PathBuf::from("./migrations")
     }
 }
 
@@ -225,18 +255,21 @@ fn split_qualified_name(name: &str) -> Vec<&str> {
 }
 
 /// Wrapper to extract `[package.metadata.cubos_sql]` from a full Cargo.toml.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct CargoToml {
+    #[serde(default)]
     package: Package,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Package {
+    #[serde(default)]
     metadata: Metadata,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Metadata {
+    #[serde(default)]
     cubos_sql: Config,
 }
 
@@ -253,8 +286,6 @@ pub enum ConfigError {
     },
     #[error("failed to parse Cargo.toml: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("missing [package.metadata.cubos_sql] section in Cargo.toml")]
-    MissingSection,
     #[error("invalid migration table name '{table}': {reason}")]
     InvalidTable { table: String, reason: String },
 }
@@ -263,23 +294,31 @@ impl std::str::FromStr for Config {
     type Err = ConfigError;
 
     fn from_str(content: &str) -> Result<Self, Self::Err> {
-        let cargo: CargoToml = toml::from_str(content).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("missing field")
-                && (msg.contains("metadata") || msg.contains("cubos_sql"))
-            {
-                ConfigError::MissingSection
-            } else {
-                ConfigError::Parse(e)
-            }
-        })?;
+        let cargo: CargoToml = toml::from_str(content)?;
         let config = cargo.package.metadata.cubos_sql;
         config.migrations.validate()?;
         Ok(config)
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            database: DatabaseConfig::default(),
+            migrations: MigrationsConfig::default(),
+            domains: HashMap::new(),
+            enums: HashMap::new(),
+            types: HashMap::new(),
+            use_static_analyzer: true,
+        }
+    }
+}
+
 impl Config {
+    fn default_use_static_analyzer() -> bool {
+        true
+    }
+
     /// Load config from a `Cargo.toml` file.
     pub fn from_cargo_toml(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
@@ -296,6 +335,22 @@ impl Config {
         } else {
             base.join(&self.database.migrations)
         }
+    }
+
+    /// Resolve extra migration paths relative to a base directory.
+    /// These are migration directories from other crates, used only at compile time.
+    pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
+        self.database
+            .extra_migrations
+            .iter()
+            .map(|p| {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    base.join(p)
+                }
+            })
+            .collect()
     }
 }
 
@@ -355,6 +410,22 @@ migrations = "./migrations"
     }
 
     #[test]
+    fn parse_bare_minimum_config() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql]
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.database.docker_image, "postgres");
+        assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
+        assert!(config.domains.is_empty());
+    }
+
+    #[test]
     fn parse_custom_migrations_config() {
         let toml = r#"
 [package]
@@ -378,15 +449,17 @@ use_transaction = false
     }
 
     #[test]
-    fn missing_section_errors() {
+    fn missing_section_uses_defaults() {
         let toml = r#"
 [package]
 name = "my-app"
 version = "0.1.0"
 edition = "2021"
 "#;
-        let result = Config::from_str(toml);
-        assert!(result.is_err());
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.database.docker_image, "postgres");
+        assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
+        assert!(config.use_static_analyzer);
     }
 
     #[test]
