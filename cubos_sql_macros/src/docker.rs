@@ -148,7 +148,10 @@ pub fn hash_migrations_dirs(paths: &[&Path]) -> Result<String, DockerError> {
     }
 
     let result = hasher.finalize();
-    Ok(format!("{:x}", result))
+    Ok(result
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 // ─── Cache directory ─────────────────────────────────────────────────────────

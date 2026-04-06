@@ -158,7 +158,8 @@ async fn run_migrate_action(
                             .applied_at
                             .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                             .unwrap_or_default();
-                        println!("  \u{2713} {:<30} (applied {ts})", s.name);
+                        let drift = if s.drifted { " [MODIFIED]" } else { "" };
+                        println!("  \u{2713} {:<30} (applied {ts}){drift}", s.name);
                     } else {
                         println!("  \u{00b7} {:<30} (pending)", s.name);
                     }

@@ -24,7 +24,11 @@ pub fn query_cache_path(
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
     hasher.update(config_hash.as_bytes());
-    let query_hash = format!("{:x}", hasher.finalize());
+    let query_hash = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
 
     target_dir
         .join(migration_hash)

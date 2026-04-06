@@ -15,7 +15,7 @@
           },
           {
             "type": "command",
-            "command": "out=$(cargo test 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
+            "command": "out=$(RUSTFLAGS=\"-D warnings\" cargo test 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
             "statusMessage": "Running cargo test..."
           },
           {

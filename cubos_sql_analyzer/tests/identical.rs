@@ -831,3 +831,177 @@ fn types_match_cte_union() {
     let l = live_introspect(&mut client, sql);
     assert_same_types(&s, &l, "CTE + UNION");
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Enum types (CREATE TYPE ... AS ENUM)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn identical_enum_column_select() {
+    // Enum columns are typed as String by default (no config mapping).
+    let (snapshot, mut client) = setup();
+    let sql = "SELECT id, name, role FROM users";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_identical(&s, &l, "enum column SELECT");
+    assert_eq!(col(&s, "role").rust_type, "String");
+    assert!(!col(&s, "role").nullable, "role has NOT NULL + DEFAULT");
+}
+
+#[test]
+#[ignore]
+fn identical_enum_in_where() {
+    let (snapshot, mut client) = setup();
+    let sql = "SELECT id, name FROM users WHERE role = $1";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_identical(&s, &l, "enum in WHERE");
+    // $1 should be String (enum typed as String)
+    assert_eq!(s.params[0].rust_type, "String");
+}
+
+#[test]
+#[ignore]
+fn identical_enum_in_insert() {
+    let (snapshot, mut client) = setup();
+    let sql = "INSERT INTO users (name, email, role) VALUES ($1, $2, $3) RETURNING id, role";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_identical(&s, &l, "enum in INSERT");
+    assert_eq!(s.params[2].rust_type, "String", "$3 = role enum → String");
+}
+
+#[test]
+#[ignore]
+fn identical_enum_in_update() {
+    let (snapshot, mut client) = setup();
+    let sql = "UPDATE users SET role = $1 WHERE id = $2 RETURNING role";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_identical(&s, &l, "enum in UPDATE");
+    assert_eq!(s.params[0].rust_type, "String", "$1 = role enum → String");
+}
+
+#[test]
+#[ignore]
+fn identical_enum_with_config_mapping() {
+    // With enum config, enum_rust_type is set but rust_type stays String.
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .enums
+        .insert("user_role".into(), "crate::UserRole".into());
+    let sql = "SELECT id, role FROM users";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert_eq!(col(&info, "role").rust_type, "String");
+    assert_eq!(
+        col(&info, "role").enum_rust_type.as_deref(),
+        Some("crate::UserRole"),
+        "enum_rust_type should be set from config"
+    );
+}
+
+#[test]
+#[ignore]
+fn identical_enum_param_with_config_mapping() {
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .enums
+        .insert("user_role".into(), "crate::UserRole".into());
+    let sql = "INSERT INTO users (name, email, role) VALUES ($1, $2, $3) RETURNING id";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert_eq!(info.params[2].rust_type, "String");
+    assert_eq!(
+        info.params[2].enum_rust_type.as_deref(),
+        Some("crate::UserRole"),
+        "param enum_rust_type should be set from config"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Domain types (CREATE DOMAIN)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn identical_domain_column_without_config() {
+    // Without domain config, a JSONB domain unwraps to its base type.
+    let (snapshot, mut client) = setup();
+    let sql = "SELECT id, preferences FROM users";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_same_types(&s, &l, "domain column without config");
+    // preferences is user_prefs (domain over JSONB) → unwraps to jsonb
+    assert!(
+        col(&s, "preferences").rust_type == "serde_json::Value",
+        "JSONB domain without config → serde_json::Value, got: {}",
+        col(&s, "preferences").rust_type
+    );
+    assert!(col(&s, "preferences").nullable, "preferences is nullable");
+}
+
+#[test]
+#[ignore]
+fn identical_domain_column_with_config() {
+    // With domain config, domain_rust_type is set for deserialization.
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .domains
+        .insert("user_prefs".into(), "crate::UserPrefs".into());
+    let sql = "SELECT id, preferences FROM users";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert_eq!(col(&info, "preferences").rust_type, "serde_json::Value");
+    assert_eq!(
+        col(&info, "preferences").domain_rust_type.as_deref(),
+        Some("crate::UserPrefs"),
+        "domain_rust_type should be set from config"
+    );
+}
+
+#[test]
+#[ignore]
+fn identical_domain_param_insert() {
+    // Inserting into a domain column — param gets domain's base type.
+    let (snapshot, mut client) = setup();
+    let sql = "INSERT INTO users (name, email, preferences) VALUES ($1, $2, $3) RETURNING id";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_same_types(&s, &l, "domain param INSERT");
+    // $3 is user_prefs (JSONB domain) → serde_json::Value
+    assert!(
+        s.params[2].rust_type == "serde_json::Value",
+        "$3 should be serde_json::Value, got: {}",
+        s.params[2].rust_type
+    );
+}
+
+#[test]
+#[ignore]
+fn identical_domain_param_with_config() {
+    let (snapshot, _) = setup();
+    let mut config = default_config();
+    config
+        .domains
+        .insert("user_prefs".into(), "crate::UserPrefs".into());
+    let sql = "INSERT INTO users (name, email, preferences) VALUES ($1, $2, $3) RETURNING id";
+    let info = analyze(&snapshot, sql, &config).unwrap();
+    assert_eq!(info.params[2].rust_type, "serde_json::Value");
+    assert_eq!(
+        info.params[2].domain_rust_type.as_deref(),
+        Some("crate::UserPrefs"),
+        "param domain_rust_type should be set from config"
+    );
+}
+
+#[test]
+#[ignore]
+fn identical_domain_in_where() {
+    let (snapshot, mut client) = setup();
+    let sql = "SELECT id FROM users WHERE preferences IS NOT NULL";
+    let s = analyze(&snapshot, sql, &default_config()).unwrap();
+    let l = live_introspect(&mut client, sql);
+    assert_identical(&s, &l, "domain in WHERE");
+}

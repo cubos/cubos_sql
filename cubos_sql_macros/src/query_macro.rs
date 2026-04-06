@@ -360,7 +360,10 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
             h.update(k.as_bytes());
             h.update(v.as_bytes());
         }
-        format!("{:x}", h.finalize())
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
 
     let cache_path = crate::cache::query_cache_path(

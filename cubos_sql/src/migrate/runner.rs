@@ -3,6 +3,14 @@ use tokio_postgres::Client;
 
 use super::source::MigrationSource;
 
+/// Computes the MD5 hex digest of a migration's SQL content.
+///
+/// Must match PostgreSQL's `md5()` function so we can compare hashes computed
+/// locally with hashes computed on the server via `md5(sql_source)`.
+fn sql_hash(sql: &str) -> String {
+    format!("{:x}", md5::compute(sql.as_bytes()))
+}
+
 /// Status of a single migration, indicating whether it has been applied.
 ///
 /// Returned by [`status`] for each migration found in the [`MigrationSource`].
@@ -30,6 +38,8 @@ pub struct MigrationStatus {
     pub applied: bool,
     /// Timestamp when the migration was applied, or `None` if it is still pending.
     pub applied_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `true` if the migration's SQL source on disk differs from what was originally applied.
+    pub drifted: bool,
 }
 
 /// Applies all pending migrations in order.
@@ -96,11 +106,21 @@ async fn run_inner(
     source: &MigrationSource,
     config: &MigrationsConfig,
 ) -> Result<Vec<String>, crate::Error> {
-    let applied = get_applied_names(client, config).await?;
+    let applied = get_applied(client, config).await?;
     let mut newly_applied = Vec::new();
 
     for migration in source.migrations() {
-        if applied.contains(&migration.name) {
+        if let Some(stored_hash) = applied.get(&migration.name) {
+            // Already applied — check for drift.
+            if let Some(h) = stored_hash {
+                let current = sql_hash(&migration.sql);
+                if *h != current {
+                    eprintln!(
+                        "warning: migration '{}' has been modified since it was applied",
+                        migration.name
+                    );
+                }
+            }
             continue;
         }
 
@@ -117,8 +137,11 @@ async fn run_inner(
             })?;
 
             tx.execute(
-                &format!("INSERT INTO {} (name) VALUES ($1)", config.table),
-                &[&migration.name],
+                &format!(
+                    "INSERT INTO {} (name, sql_source) VALUES ($1, $2)",
+                    config.table
+                ),
+                &[&migration.name, &migration.sql],
             )
             .await?;
 
@@ -133,8 +156,11 @@ async fn run_inner(
 
             client
                 .execute(
-                    &format!("INSERT INTO {} (name) VALUES ($1)", config.table),
-                    &[&migration.name],
+                    &format!(
+                        "INSERT INTO {} (name, sql_source) VALUES ($1, $2)",
+                        config.table
+                    ),
+                    &[&migration.name, &migration.sql],
                 )
                 .await?;
         }
@@ -185,15 +211,17 @@ pub async fn status(
     let rows = client
         .query(
             &format!(
-                "SELECT name, applied_at FROM {} ORDER BY name",
+                "SELECT name, applied_at, md5(sql_source) FROM {} ORDER BY name",
                 config.table
             ),
             &[],
         )
         .await?;
 
-    let mut applied: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
-        std::collections::HashMap::with_capacity(rows.len());
+    let mut applied: std::collections::HashMap<
+        String,
+        (chrono::DateTime<chrono::Utc>, Option<String>),
+    > = std::collections::HashMap::with_capacity(rows.len());
     for row in &rows {
         let name: String = row
             .try_get(0)
@@ -201,7 +229,10 @@ pub async fn status(
         let applied_at: chrono::DateTime<chrono::Utc> = row
             .try_get(1)
             .map_err(|e| crate::Error::Migration(format!("failed to read applied_at: {e}")))?;
-        applied.insert(name, applied_at);
+        let stored_hash: Option<String> = row
+            .try_get(2)
+            .map_err(|e| crate::Error::Migration(format!("failed to read sql_hash: {e}")))?;
+        applied.insert(name, (applied_at, stored_hash));
     }
 
     let statuses = source
@@ -209,10 +240,21 @@ pub async fn status(
         .iter()
         .map(|m| {
             let info = applied.get(&m.name);
+            let drifted = match &info {
+                Some((_, Some(stored))) => *stored != sql_hash(&m.sql),
+                _ => false,
+            };
+            if drifted {
+                eprintln!(
+                    "warning: migration '{}' has been modified since it was applied",
+                    m.name
+                );
+            }
             MigrationStatus {
                 name: m.name.clone(),
                 applied: info.is_some(),
-                applied_at: info.copied(),
+                applied_at: info.map(|(at, _)| *at),
+                drifted,
             }
         })
         .collect();
@@ -290,8 +332,8 @@ async fn revert_inner(
     config: &MigrationsConfig,
 ) -> Result<(), crate::Error> {
     // Check if the migration is actually applied
-    let applied = get_applied_names(client, config).await?;
-    if !applied.contains(name) {
+    let applied = get_applied(client, config).await?;
+    if !applied.contains_key(name) {
         return Err(crate::Error::Migration(format!(
             "migration '{}' is not applied",
             name
@@ -360,8 +402,10 @@ async fn ensure_table(client: &Client, config: &MigrationsConfig) -> Result<(), 
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {} (
             name       TEXT PRIMARY KEY,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );",
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            sql_source TEXT
+        );
+        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS sql_source TEXT;",
         config.table
     );
     client.batch_execute(&sql).await?;
@@ -382,15 +426,24 @@ async fn release_lock(client: &Client, config: &MigrationsConfig) -> Result<(), 
     Ok(())
 }
 
-async fn get_applied_names(
+/// Returns a map of applied migration names to their stored SQL hash (if any).
+async fn get_applied(
     client: &Client,
     config: &MigrationsConfig,
-) -> Result<std::collections::HashSet<String>, crate::Error> {
+) -> Result<std::collections::HashMap<String, Option<String>>, crate::Error> {
     let rows = client
-        .query(&format!("SELECT name FROM {}", config.table), &[])
+        .query(
+            &format!("SELECT name, md5(sql_source) FROM {}", config.table),
+            &[],
+        )
         .await?;
 
-    let names = rows.iter().map(|row| row.get::<_, String>(0)).collect();
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.get(0);
+        let hash: Option<String> = row.get(1);
+        map.insert(name, hash);
+    }
 
-    Ok(names)
+    Ok(map)
 }

@@ -1,5 +1,7 @@
 //! Shared setup, helpers, and assertion utilities for comparative tests.
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
 pub use cubos_sql_analyzer::export::export_schema;
@@ -13,11 +15,15 @@ pub use cubos_sql_core::query_info::{ColumnInfo, QueryInfo};
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub const MIGRATION: &str = "\
+    CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
+    CREATE DOMAIN user_prefs AS JSONB;
     CREATE TABLE IF NOT EXISTS users (\
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
         name TEXT NOT NULL, \
         email TEXT NOT NULL UNIQUE, \
         age INT, \
+        role user_role NOT NULL DEFAULT 'viewer', \
+        preferences user_prefs, \
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
     );\
     CREATE TABLE IF NOT EXISTS posts (\

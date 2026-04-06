@@ -85,6 +85,7 @@ fn assert_type_mismatch(
 
 /// Assert that BOTH our analyzer and PostgreSQL reject the query.
 /// Checks our error message contains `expected_substring`.
+#[allow(dead_code)]
 fn assert_analysis_error(
     snapshot: &SchemaSnapshot,
     client: &mut postgres::Client,
