@@ -341,6 +341,57 @@ pub fn run_migrations(info: &ContainerInfo, migrations_dirs: &[&Path]) -> Result
     Ok(())
 }
 
+// ─── Stale container cleanup ─────────────────────────────────────────────────
+
+/// Scans `.cubos_sql/` for hash directories other than `current_hash` and
+/// stops/removes their containers. Each directory's file lock is acquired
+/// (non-blocking) before cleanup — if another process holds the lock, that
+/// hash is skipped to avoid race conditions.
+fn cleanup_stale_containers(base_dir: &Path, current_hash: &str) {
+    let entries = match fs::read_dir(base_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if dir_name == current_hash {
+            continue;
+        }
+
+        // Try to acquire the lock for this hash dir (non-blocking).
+        let lock_path = path.join("lock");
+        let lock_file = match File::create(&lock_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        if lock_file.try_lock_exclusive().is_err() {
+            // Another process is actively using this hash — skip.
+            continue;
+        }
+
+        // We hold the lock — safe to clean up.
+        let state_file = path.join("container.json");
+        if let Some(state) = read_state(&state_file) {
+            remove_container(&state.container_id);
+        }
+
+        // Remove the entire hash directory.
+        let _ = fs::remove_dir_all(&path);
+        let _ = lock_file.unlock();
+    }
+}
+
 // ─── Container management ─────────────────────────────────────────────────────
 
 /// Ensures a PostgreSQL Docker container is running with the right schema.
@@ -366,6 +417,9 @@ pub fn ensure_container(
 
     let hash = hash_migrations_dirs(&all_dirs)?;
     let base_dir = cubos_sql_dir(manifest_dir);
+
+    // Clean up containers from old migration hashes before proceeding.
+    cleanup_stale_containers(&base_dir, &hash);
 
     let dir = cache_dir(&base_dir, &hash);
     fs::create_dir_all(&dir)?;
@@ -446,6 +500,7 @@ fn ensure_container_inner(
         .args([
             "run",
             "-d",
+            "--rm",
             "--label",
             "cubos_sql=true",
             "--label",
