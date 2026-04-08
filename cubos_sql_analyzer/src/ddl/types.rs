@@ -31,6 +31,13 @@ pub fn create_domain(interp: &mut DdlInterpreter, stmt: &CreateDomainStmt) -> Re
     let oid = interp.alloc_oid();
     let array_oid = interp.alloc_oid();
 
+    // Domains inherit category/preferred from their base type.
+    let (category, is_preferred) = interp
+        .snapshot
+        .types
+        .get(&base_type_oid)
+        .map(|t| (t.category, t.is_preferred))
+        .unwrap_or(('U', false));
     interp.snapshot.types.insert(
         oid,
         TypeEntry {
@@ -38,6 +45,8 @@ pub fn create_domain(interp: &mut DdlInterpreter, stmt: &CreateDomainStmt) -> Re
             name: name.clone(),
             schema: schema.clone(),
             kind: TypeKind::Domain { base_type_oid },
+            category,
+            is_preferred,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -76,6 +85,8 @@ pub fn create_enum(interp: &mut DdlInterpreter, stmt: &CreateEnumStmt) -> Result
             name: name.clone(),
             schema: schema.clone(),
             kind: TypeKind::Enum { labels },
+            category: 'E',
+            is_preferred: false,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -141,6 +152,8 @@ pub fn create_composite(
             name: name.clone(),
             schema: schema.clone(),
             kind: TypeKind::Composite { fields },
+            category: 'C',
+            is_preferred: false,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -184,6 +197,8 @@ pub fn create_range(interp: &mut DdlInterpreter, stmt: &CreateRangeStmt) -> Resu
             name: name.clone(),
             schema: schema.clone(),
             kind: TypeKind::Range { subtype_oid },
+            category: 'R',
+            is_preferred: false,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -268,6 +283,8 @@ pub fn define_type(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(),
             name: name.clone(),
             schema: schema.clone(),
             kind: TypeKind::Base,
+            category: 'U',
+            is_preferred: false,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -327,6 +344,8 @@ fn register_array_type(
             kind: TypeKind::Array {
                 element_type_oid: element_oid,
             },
+            category: 'A',
+            is_preferred: false,
         },
     );
     interp.snapshot.type_by_name.insert(array_key, array_oid);

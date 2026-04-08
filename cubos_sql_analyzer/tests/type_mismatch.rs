@@ -1,5 +1,5 @@
-//! Tests for type mismatch errors: queries that both our static analyzer and
-//! PostgreSQL reject, plus untyped parameter defaults.
+//! Tests for type mismatch errors: queries that our static analyzer rejects,
+//! plus untyped parameter defaults.
 
 mod common;
 use common::*;
@@ -8,31 +8,14 @@ use common::*;
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Try to PREPARE a SQL statement against live PostgreSQL.
-/// Returns `Err(pg_message)` if PG rejects it, `Ok(())` if it succeeds.
-fn pg_prepare(client: &mut postgres::Client, sql: &str) -> Result<(), String> {
-    let _ = client.batch_execute("DEALLOCATE ALL");
-    let prepare = format!("PREPARE __cubos_test AS {sql}");
-    match client.batch_execute(&prepare) {
-        Ok(_) => {
-            let _ = client.batch_execute("DEALLOCATE __cubos_test");
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Assert that BOTH our analyzer and PostgreSQL reject the query with a type
-/// mismatch.  Validates our `TypeMismatch` fields and checks that PG's error
-/// message mentions the same types.
+/// Assert that our analyzer rejects the query with a type mismatch.
+/// Validates our `TypeMismatch` fields.
 fn assert_type_mismatch(
     snapshot: &SchemaSnapshot,
-    client: &mut postgres::Client,
     sql: &str,
     expect_actual: &str,
     expect_expected: &str,
 ) {
-    // ── Our analyzer ──────────────────────────────────────────────────────
     let result = analyze(snapshot, sql, &default_config());
     match &result {
         Err(cubos_sql_analyzer::error::AnalyzeError::TypeMismatch {
@@ -71,28 +54,12 @@ fn assert_type_mismatch(
             );
         }
     }
-
-    // ── PostgreSQL ────────────────────────────────────────────────────────
-    let pg_result = pg_prepare(client, sql);
-    let pg_err = pg_result.expect_err(&format!(
-        "PostgreSQL should also reject: {sql}\n  (our error: {})",
-        result.unwrap_err()
-    ));
-    // PG error should mention the actual type name (in PG's own naming).
-    // We don't assert exact wording — just that PG also errored.
-    assert!(!pg_err.is_empty(), "PG error message is empty for: {sql}");
 }
 
-/// Assert that BOTH our analyzer and PostgreSQL reject the query.
+/// Assert that our analyzer rejects the query.
 /// Checks our error message contains `expected_substring`.
 #[allow(dead_code)]
-fn assert_analysis_error(
-    snapshot: &SchemaSnapshot,
-    client: &mut postgres::Client,
-    sql: &str,
-    expected_substring: &str,
-) {
-    // ── Our analyzer ──────────────────────────────────────────────────────
+fn assert_analysis_error(snapshot: &SchemaSnapshot, sql: &str, expected_substring: &str) {
     let result = analyze(snapshot, sql, &default_config());
     match &result {
         Err(e) => {
@@ -114,72 +81,37 @@ fn assert_analysis_error(
             );
         }
     }
-
-    // ── PostgreSQL ────────────────────────────────────────────────────────
-    let pg_result = pg_prepare(client, sql);
-    let pg_err = pg_result.expect_err(&format!(
-        "PostgreSQL should also reject: {sql}\n  (our error: {})",
-        result.unwrap_err()
-    ));
-    assert!(!pg_err.is_empty(), "PG error message is empty for: {sql}");
 }
 
 // ── WHERE type mismatches ─────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn mismatch_where_integer_not_boolean() {
     // WHERE 42 → int4 is not boolean.
-    // PG: ERROR: argument of WHERE must be type boolean, not type integer
-    let (snapshot, mut client) = setup();
-    assert_type_mismatch(
-        &snapshot,
-        &mut client,
-        "SELECT id FROM users WHERE 42",
-        "int4",
-        "bool",
-    );
+    let snapshot = setup();
+    assert_type_mismatch(&snapshot, "SELECT id FROM users WHERE 42", "int4", "bool");
 }
 
 #[test]
-#[ignore]
 fn mismatch_where_text_not_boolean() {
     // WHERE name → text is not boolean.
-    // PG: ERROR: argument of WHERE must be type boolean, not type text
-    let (snapshot, mut client) = setup();
-    assert_type_mismatch(
-        &snapshot,
-        &mut client,
-        "SELECT id FROM users WHERE name",
-        "text",
-        "bool",
-    );
+    let snapshot = setup();
+    assert_type_mismatch(&snapshot, "SELECT id FROM users WHERE name", "text", "bool");
 }
 
 #[test]
-#[ignore]
 fn mismatch_where_bigint_not_boolean() {
     // WHERE id → int8 is not boolean.
-    // PG: ERROR: argument of WHERE must be type boolean, not type bigint
-    let (snapshot, mut client) = setup();
-    assert_type_mismatch(
-        &snapshot,
-        &mut client,
-        "SELECT name FROM users WHERE id",
-        "int8",
-        "bool",
-    );
+    let snapshot = setup();
+    assert_type_mismatch(&snapshot, "SELECT name FROM users WHERE id", "int8", "bool");
 }
 
 #[test]
-#[ignore]
 fn mismatch_where_timestamptz_not_boolean() {
     // WHERE created_at → timestamptz is not boolean.
-    // PG: ERROR: argument of WHERE must be type boolean, not type timestamp with time zone
-    let (snapshot, mut client) = setup();
+    let snapshot = setup();
     assert_type_mismatch(
         &snapshot,
-        &mut client,
         "SELECT id FROM users WHERE created_at",
         "timestamptz",
         "bool",
@@ -189,44 +121,25 @@ fn mismatch_where_timestamptz_not_boolean() {
 // ── LIMIT/OFFSET type mismatches ──────────────────────────────────────
 
 #[test]
-#[ignore]
 fn mismatch_limit_boolean() {
     // LIMIT true → bool is not int8.
-    // PG: ERROR: argument of LIMIT must be type bigint, not type boolean
-    let (snapshot, mut client) = setup();
-    assert_type_mismatch(
-        &snapshot,
-        &mut client,
-        "SELECT id FROM users LIMIT true",
-        "bool",
-        "int8",
-    );
+    let snapshot = setup();
+    assert_type_mismatch(&snapshot, "SELECT id FROM users LIMIT true", "bool", "int8");
 }
 
 #[test]
-#[ignore]
 fn mismatch_limit_text_column() {
     // LIMIT name → text is not int8.
-    // PG: ERROR: argument of LIMIT must be type bigint, not type text
-    let (snapshot, mut client) = setup();
-    assert_type_mismatch(
-        &snapshot,
-        &mut client,
-        "SELECT id FROM users LIMIT name",
-        "text",
-        "int8",
-    );
+    let snapshot = setup();
+    assert_type_mismatch(&snapshot, "SELECT id FROM users LIMIT name", "text", "int8");
 }
 
 #[test]
-#[ignore]
 fn mismatch_limit_timestamptz_column() {
     // LIMIT created_at → timestamptz is not int8.
-    // PG: ERROR: argument of LIMIT must be type bigint, not type timestamp with time zone
-    let (snapshot, mut client) = setup();
+    let snapshot = setup();
     assert_type_mismatch(
         &snapshot,
-        &mut client,
         "SELECT id FROM users LIMIT created_at",
         "timestamptz",
         "int8",
@@ -234,14 +147,11 @@ fn mismatch_limit_timestamptz_column() {
 }
 
 #[test]
-#[ignore]
 fn mismatch_offset_boolean() {
     // OFFSET false → bool is not int8.
-    // PG: ERROR: argument of OFFSET must be type bigint, not type boolean
-    let (snapshot, mut client) = setup();
+    let snapshot = setup();
     assert_type_mismatch(
         &snapshot,
-        &mut client,
         "SELECT id FROM users OFFSET false",
         "bool",
         "int8",
@@ -251,43 +161,27 @@ fn mismatch_offset_boolean() {
 // ── Untyped params default to text (matching PG) ─────────────────────
 
 #[test]
-#[ignore]
 fn goal_untyped_param_defaults_to_text() {
     // SELECT $1 → no context, defaults to text (PG's preferred type for unknown).
-    let (snapshot, mut client) = setup();
+    let snapshot = setup();
     let info = analyze(&snapshot, "SELECT $1", &default_config()).unwrap();
     assert_eq!(info.params[0].rust_type, "String");
-    let live_info = live_introspect(&mut client, "SELECT $1");
-    assert_eq!(live_info.params[0].rust_type, "String");
 }
 
 #[test]
-#[ignore]
 fn goal_untyped_params_in_comparison_default_to_text() {
     // SELECT $1 > $2 → both unknown, PG infers text for both.
-    let (snapshot, mut client) = setup();
+    let snapshot = setup();
     let info = analyze(&snapshot, "SELECT $1 > $2", &default_config()).unwrap();
     assert_eq!(info.params[0].rust_type, "String");
     assert_eq!(info.params[1].rust_type, "String");
-    let live_info = live_introspect(&mut client, "SELECT $1 > $2");
-    assert_eq!(live_info.params[0].rust_type, "String");
-    assert_eq!(live_info.params[1].rust_type, "String");
 }
 
 #[test]
-#[ignore]
 fn error_insert_wrong_column_name() {
     // INSERT INTO users (nonexistent) VALUES ($1) → column not found.
-    // PG: ERROR: column "nonexistent" of relation "users" does not exist
-    let (snapshot, mut client) = setup();
+    let snapshot = setup();
     let sql = "INSERT INTO users (nonexistent) VALUES ($1)";
-
-    // PG must reject.
-    let pg_err = pg_prepare(&mut client, sql);
-    assert!(
-        pg_err.is_err(),
-        "PG should reject INSERT with nonexistent column"
-    );
 
     // Our analyzer: may produce unknown-typed param or error — either is acceptable.
     // The key is it doesn't silently produce wrong types.

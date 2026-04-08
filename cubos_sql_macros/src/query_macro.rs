@@ -1,8 +1,8 @@
 //! Parsing and orchestration for the `sql!` proc macro.
 //!
-//! Parses the macro input, drives the lexer, Docker container, introspection,
-//! and code generation pipeline.  Results are cached per query+migration hash
-//! inside the `.cubos_sql/` directory.
+//! Parses the macro input, drives the lexer, builds a schema snapshot from
+//! migrations via the DDL interpreter, runs static analysis, and generates
+//! typed Rust code.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -12,93 +12,6 @@ use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitStr, Token};
 
 use crate::codegen::{self, ParamAssignment};
-
-// ---------------------------------------------------------------------------
-// Connection cache (thread-local)
-// ---------------------------------------------------------------------------
-
-/// Cached connection to the compile-time PostgreSQL container.
-/// Reused across `sql!` invocations within the same build process.
-/// Uses `thread_local!` because `postgres::Client` is not `Send`.
-struct CachedConnection {
-    client: postgres::Client,
-    connection_string: String,
-}
-
-/// Wrapper that leaks its contents on drop instead of running destructors.
-///
-/// During thread-local destruction the drop order of thread-locals is
-/// non-deterministic.  The `postgres::Client` internally holds a Tokio
-/// runtime whose context thread-local may already be gone, causing:
-///
-///   "The Tokio context thread-local variable has been destroyed"
-///
-/// By forgetting the inner value at thread exit we avoid that panic.
-/// Normal replacements (`*slot = None`) still drop the old value properly
-/// because they happen while the Tokio runtime is alive — only the final
-/// thread-local destruction triggers this `Drop`.
-struct ClientSlot(Option<CachedConnection>);
-
-impl Drop for ClientSlot {
-    fn drop(&mut self) {
-        if let Some(conn) = self.0.take() {
-            std::mem::forget(conn);
-        }
-    }
-}
-
-thread_local! {
-    static CACHED_CLIENT: RefCell<ClientSlot> = const { RefCell::new(ClientSlot(None)) };
-}
-
-/// Run a closure with a mutable reference to the cached `postgres::Client`.
-///
-/// Connects (or reconnects) if the connection string changed or the connection
-/// is dead, then passes `&mut Client` to `f`. On error from `f`, the cached
-/// connection is dropped so the next call gets a fresh one.
-fn with_client<T>(
-    conn_str: &str,
-    f: impl FnOnce(&mut postgres::Client) -> Result<T, syn::Error>,
-) -> Result<T, syn::Error> {
-    CACHED_CLIENT.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        let slot = &mut borrow.0;
-
-        let needs_connect = match slot.as_mut() {
-            Some(cached) => {
-                if cached.connection_string != conn_str {
-                    true
-                } else {
-                    cached.client.simple_query("").is_err()
-                }
-            }
-            None => true,
-        };
-
-        if needs_connect {
-            let client = postgres::Client::connect(conn_str, postgres::NoTls).map_err(|e| {
-                syn::Error::new(
-                    Span::call_site(),
-                    format!("failed to connect to compile-time PG: {e}"),
-                )
-            })?;
-
-            *slot = Some(CachedConnection {
-                client,
-                connection_string: conn_str.to_string(),
-            });
-        }
-
-        let cached = slot.as_mut().unwrap();
-        let result = f(&mut cached.client);
-
-        if result.is_err() {
-            *slot = None;
-        }
-
-        result
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Static analyzer integration
@@ -116,7 +29,7 @@ thread_local! {
 }
 
 /// Build (or retrieve from cache) a schema snapshot from migrations using the
-/// DDL interpreter. No Docker or disk I/O required.
+/// DDL interpreter.
 fn get_or_build_snapshot(
     migrations_dirs: &[&Path],
     migration_hash: &str,
@@ -186,15 +99,13 @@ fn collect_migration_files(dirs: &[&Path]) -> Result<Vec<(String, String)>, syn:
     Ok(files)
 }
 
-/// Try to analyze the query statically from a snapshot.
-///
-/// Returns `Some(Ok(info))` on success, `None` to signal fallback.
-fn try_static_analyze(
+/// Analyze the query statically against a schema snapshot.
+fn static_analyze(
     snapshot: &cubos_sql_analyzer::schema::SchemaSnapshot,
     sql: &str,
     config: &cubos_sql_core::config::ResolvedConfig<'_>,
     lex_output: &cubos_sql_core::param::LexOutput,
-) -> Option<Result<cubos_sql_core::query_info::QueryInfo, syn::Error>> {
+) -> Result<cubos_sql_core::query_info::QueryInfo, syn::Error> {
     let analyzer_config = cubos_sql_analyzer::resolve::AnalyzerConfig {
         domains: config.domains.clone(),
         enums: config.enums.clone(),
@@ -214,10 +125,8 @@ fn try_static_analyze(
         },
     };
 
-    match cubos_sql_analyzer::resolve::analyze(snapshot, sql, &analyzer_config) {
-        Ok(info) => Some(Ok(info)),
-        Err(e) => Some(Err(syn::Error::new(Span::call_site(), e.to_string()))),
-    }
+    cubos_sql_analyzer::resolve::analyze(snapshot, sql, &analyzer_config)
+        .map_err(|e| syn::Error::new(Span::call_site(), e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -376,13 +285,13 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         )
     })?;
 
-    // 3. Compute migration hash and check cache BEFORE any analysis.
+    // 3. Compute migration hash for snapshot caching.
     let migrations_dir = resolved.migrations_dir(manifest_path);
     let extra_dirs = resolved.extra_migrations_dirs(manifest_path);
     let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
     all_dirs.extend(extra_dirs.iter().map(|p| p.as_path()));
 
-    let migration_hash = crate::docker::hash_migrations_dirs(&all_dirs).map_err(|e| {
+    let migration_hash = crate::migrations_hash::hash_migrations_dirs(&all_dirs).map_err(|e| {
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
@@ -392,150 +301,12 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         build_spread_sample_sql(&lex_output)
     };
 
-    let analysis_mode = resolved.analysis_mode;
-    let is_static_only = matches!(analysis_mode, cubos_sql_core::config::AnalysisMode::Static);
+    // 4. Build schema snapshot and run static analysis.
+    let snapshot = get_or_build_snapshot(&all_dirs, &migration_hash)?;
+    let mut query_info = static_analyze(&snapshot, &introspection_sql, &resolved, &lex_output)?;
 
-    // Disk cache is only useful for Describe/Auto modes where Docker introspection
-    // is expensive. Static mode reproduces results in-memory without Docker, so
-    // writing to `.cubos_sql/` is unnecessary.
-    let cache_path = if !is_static_only {
-        let cubos_dir = crate::docker::cubos_sql_dir(manifest_path);
-
-        // Hash the type-mapping config and analysis mode so cache invalidates on changes.
-        let config_hash = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(match analysis_mode {
-                cubos_sql_core::config::AnalysisMode::Static => b"static" as &[u8],
-                cubos_sql_core::config::AnalysisMode::Describe => b"describe",
-                cubos_sql_core::config::AnalysisMode::Auto => b"auto",
-            });
-            let mut domains: Vec<_> = resolved.domains.iter().collect();
-            domains.sort();
-            for (k, v) in &domains {
-                h.update(k.as_bytes());
-                h.update(v.as_bytes());
-            }
-            let mut enums: Vec<_> = resolved.enums.iter().collect();
-            enums.sort();
-            for (k, v) in &enums {
-                h.update(k.as_bytes());
-                h.update(v.as_bytes());
-            }
-            let mut types: Vec<_> = resolved.types.iter().collect();
-            types.sort();
-            for (k, v) in &types {
-                h.update(k.as_bytes());
-                h.update(v.as_bytes());
-            }
-            h.finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-
-        Some(crate::cache::query_cache_path(
-            &cubos_dir,
-            &migration_hash,
-            &introspection_sql,
-            &config_hash,
-        ))
-    } else {
-        None
-    };
-
-    let query_info = if let Some(cached) = cache_path.as_ref().and_then(|p| crate::cache::get(p)) {
-        cached
-    } else {
-        let use_static = matches!(
-            analysis_mode,
-            cubos_sql_core::config::AnalysisMode::Static
-                | cubos_sql_core::config::AnalysisMode::Auto
-        );
-        let use_describe = matches!(
-            analysis_mode,
-            cubos_sql_core::config::AnalysisMode::Describe
-                | cubos_sql_core::config::AnalysisMode::Auto
-        );
-
-        // 4. Build schema snapshot from seed + migrations (no Docker needed).
-        let static_result: Option<Result<cubos_sql_core::query_info::QueryInfo, syn::Error>> =
-            if use_static {
-                match get_or_build_snapshot(&all_dirs, &migration_hash) {
-                    Ok(snapshot) => {
-                        try_static_analyze(&snapshot, &introspection_sql, &resolved, &lex_output)
-                    }
-                    Err(e) => Some(Err(e)),
-                }
-            } else {
-                None
-            };
-
-        if let Some(Ok(info)) = &static_result {
-            if let Some(ref path) = cache_path {
-                let _ = crate::cache::put(path, info);
-            }
-            info.clone()
-        } else if !use_describe {
-            // Static-only mode: report the real error.
-            return Err(static_result
-                .unwrap_or_else(|| {
-                    Err(syn::Error::new(
-                        Span::call_site(),
-                        "static analysis produced no result",
-                    ))
-                })
-                .unwrap_err());
-        } else {
-            // 5. Fallback: Docker-based introspection.
-            let (container_info, _) =
-                crate::docker::ensure_container(&resolved, manifest_path).map_err(|e| {
-                    let msg = e.to_string();
-                    let hint = if msg.contains("not found") || msg.contains("No such file") {
-                        "\nhint: is Docker installed and in your PATH?"
-                    } else if msg.contains("Cannot connect")
-                        || msg.contains("connection refused")
-                        || msg.contains("Is the docker daemon running")
-                    {
-                        "\nhint: is the Docker daemon running? Try `docker info`."
-                    } else if msg.contains("permission denied") {
-                        "\nhint: does your user have permission to use Docker? Try `sudo usermod -aG docker $USER`."
-                    } else {
-                        ""
-                    };
-                    syn::Error::new(
-                        Span::call_site(),
-                        format!("failed to start compile-time PG container: {e}{hint}"),
-                    )
-                })?;
-
-            let conn_str = container_info.connection_string();
-            let sql_span = input.sql.span();
-
-            let info = with_client(&conn_str, |client| {
-                crate::introspect::introspect_query(
-                    client,
-                    &introspection_sql,
-                    &resolved.domains,
-                    &resolved.enums,
-                    &resolved.types,
-                )
-                .map_err(|e| {
-                    let msg = format_introspect_error(&e, &introspection_sql);
-                    syn::Error::new(sql_span, msg)
-                })
-            })?;
-
-            if let Some(ref path) = cache_path {
-                let _ = crate::cache::put(path, &info);
-            }
-            info
-        }
-    };
-
-    // 6. Merge nullable annotations: explicit `$foo?` forces nullable, `$foo!` forces
-    //    non-nullable, no annotation keeps the introspection/analyzer result.
-    let mut query_info = query_info;
+    // 5. Merge nullable annotations: explicit `$foo?` forces nullable, `$foo!` forces
+    //    non-nullable, no annotation keeps the analyzer result.
     {
         let mut nullable_flags: Vec<Option<bool>> =
             lex_output.params.iter().map(|p| p.nullable).collect();
@@ -555,7 +326,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         }
     }
 
-    // 7. Generate typed Rust code.
+    // 6. Generate typed Rust code.
     codegen::generate(
         &lex_output,
         &query_info,
@@ -568,7 +339,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
 // Spread sample SQL generation
 // ---------------------------------------------------------------------------
 
-/// Build a "sample" SQL for introspection when the query contains spreads.
+/// Build a "sample" SQL for analysis when the query contains spreads.
 ///
 /// Replaces each spread insertion point with a single row of positional
 /// placeholders. Field mapping is mandatory, so fields.len() gives the
@@ -598,63 +369,6 @@ fn build_spread_sample_sql(lex_output: &cubos_sql_core::param::LexOutput) -> Str
 
     result.push_str(&base_sql[last_offset..]);
     result
-}
-
-// ---------------------------------------------------------------------------
-// Error formatting
-// ---------------------------------------------------------------------------
-
-/// Format an introspection error with SQL position info when available.
-fn format_introspect_error(e: &crate::introspect::IntrospectError, sql: &str) -> String {
-    match e {
-        crate::introspect::IntrospectError::Postgres(pg_err) => {
-            if let Some(db_err) = pg_err.as_db_error() {
-                let mut msg = format!("SQL error: {}", db_err.message());
-                if let Some(detail) = db_err.detail() {
-                    msg.push_str(&format!("\n  detail: {detail}"));
-                }
-                if let Some(hint) = db_err.hint() {
-                    msg.push_str(&format!("\n  hint: {hint}"));
-                }
-                if let Some(pos) = db_err.position() {
-                    use postgres::error::ErrorPosition;
-                    if let ErrorPosition::Original(p) = pos {
-                        let adjusted =
-                            (*p as usize).saturating_sub(crate::introspect::PREPARE_PREFIX_LEN);
-                        msg.push_str(&format_sql_position(sql, adjusted));
-                    }
-                }
-                msg
-            } else {
-                format!("query introspection failed: {e}")
-            }
-        }
-        _ => format!("query introspection failed: {e}"),
-    }
-}
-
-/// Format a visual position pointer into a SQL string.
-fn format_sql_position(sql: &str, position: usize) -> String {
-    if position == 0 || position > sql.len() {
-        return format!("\n  at position {position}");
-    }
-    let pos = position - 1; // PG positions are 1-based
-    let mut current_pos = 0;
-    for (line_idx, line) in sql.lines().enumerate() {
-        let line_end = current_pos + line.len();
-        if pos <= line_end {
-            let col = pos - current_pos;
-            return format!(
-                "\n  --> line {}:{}\n  |\n  | {}\n  | {}^",
-                line_idx + 1,
-                col + 1,
-                line,
-                " ".repeat(col),
-            );
-        }
-        current_pos = line_end + 1;
-    }
-    format!("\n  at position {position}")
 }
 
 #[cfg(test)]
@@ -703,12 +417,5 @@ mod tests {
         let sample = build_spread_sample_sql(&lo);
         assert!(sample.contains("VALUES ($1)"));
         assert!(sample.contains("VALUES ($2)"));
-    }
-
-    #[test]
-    fn format_position_basic() {
-        let s = format_sql_position("SELECT bad FROM t", 8);
-        assert!(s.contains("line 1:8"));
-        assert!(s.contains("^"));
     }
 }

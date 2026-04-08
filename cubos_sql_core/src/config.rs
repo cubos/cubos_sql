@@ -10,7 +10,6 @@
 //! edition = "2021"
 //!
 //! [package.metadata.cubos_sql.database]
-//! docker_image = "postgres:16"   # Docker image for compile-time PG (default: "postgres")
 //! migrations = "./migrations"    # path to SQL migration files (required)
 //! extra_migrations = ["../other-crate/migrations"]  # extra migrations for compile-time only
 //!
@@ -18,9 +17,6 @@
 //! table = "public._migrations"   # tracking table name (default: "public._migrations")
 //! lock_id = 713705               # advisory lock ID (default: 713705)
 //! use_transaction = true         # wrap each migration in a transaction (default: true)
-//!
-//! [package.metadata.cubos_sql]
-//! analysis_mode = "auto"             # "static", "describe", or "auto" (default)
 //!
 //! [package.metadata.cubos_sql.domains]
 //! user_preferences = "crate::domains::UserPreferences"
@@ -44,48 +40,13 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Controls how the `sql!` macro analyzes queries at compile time.
-///
-/// - `Static`: use only the static SQL analyzer (no Docker/introspection fallback).
-///   Compile errors if the analyzer cannot resolve the query.
-/// - `Describe`: use only live introspection via `DESCRIBE` (always requires Docker).
-/// - `Auto`: try the static analyzer first, fall back to `DESCRIBE` if it fails.
-///   This is the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AnalysisMode {
-    /// Static analyzer only — no Docker needed once the schema snapshot exists.
-    Static,
-    /// Live introspection only — always requires Docker.
-    Describe,
-    /// Static analyzer first, fall back to live introspection.
-    #[default]
-    Auto,
-}
-
-impl<'de> Deserialize<'de> for AnalysisMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "static" => Ok(AnalysisMode::Static),
-            "describe" => Ok(AnalysisMode::Describe),
-            "auto" => Ok(AnalysisMode::Auto),
-            _ => Err(serde::de::Error::custom(format!(
-                "unknown analysis_mode '{s}': expected \"static\", \"describe\", or \"auto\""
-            ))),
-        }
-    }
-}
-
 /// Top-level configuration for `cubos_sql`, read from `[package.metadata.cubos_sql]` in `Cargo.toml`.
 ///
 /// Load this from a `Cargo.toml` file with [`Config::from_cargo_toml`], or
 /// parse a TOML string directly via [`str::parse`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
-    /// Database-related settings (Docker image, migrations path).
+    /// Database-related settings (migrations path).
     #[serde(default)]
     pub database: DatabaseConfig,
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
@@ -103,11 +64,6 @@ pub struct Config {
     /// Array versions are supported automatically as `Vec<RustType>`.
     #[serde(default)]
     pub types: HashMap<String, String>,
-    /// How the `sql!` macro analyzes queries at compile time.
-    /// `"static"` = static analyzer only, `"describe"` = live introspection only,
-    /// `"auto"` (default) = static first, fallback to describe.
-    #[serde(default)]
-    pub analysis_mode: AnalysisMode,
     /// Named database configurations for multi-database support.
     /// Each key maps to a complete database configuration.
     /// Used with `sql!(db = name, ...)` syntax.
@@ -121,7 +77,7 @@ pub struct Config {
 /// Each entry has its own database settings, migrations, domain/enum/type mappings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseEntry {
-    /// Database-related settings (Docker image, migrations path).
+    /// Database-related settings (migrations path).
     #[serde(default)]
     pub database: DatabaseConfig,
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
@@ -136,29 +92,21 @@ pub struct DatabaseEntry {
     /// Custom type mappings.
     #[serde(default)]
     pub types: HashMap<String, String>,
-    /// How the `sql!` macro analyzes queries at compile time.
-    #[serde(default)]
-    pub analysis_mode: AnalysisMode,
 }
 
 /// Database-related configuration.
 ///
-/// Specifies the Docker image used for the compile-time PostgreSQL container
-/// and the path to the SQL migration files.
+/// Specifies the path to the SQL migration files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
-    /// Docker image to use for the compile-time PostgreSQL container.
-    /// Default: `"postgres"`
-    #[serde(default = "DatabaseConfig::default_docker_image")]
-    pub docker_image: String,
     /// Path to the migrations directory, relative to the project root or absolute.
     /// Default: `"./migrations"`. If the directory does not exist, it is treated
     /// as having zero migrations.
     #[serde(default = "DatabaseConfig::default_migrations")]
     pub migrations: PathBuf,
-    /// Additional migration directories from other crates to include in the
-    /// compile-time PostgreSQL container. These are used only for static analysis
-    /// and type checking — they are NOT executed by the runtime migration runner.
+    /// Additional migration directories from other crates to include at compile
+    /// time. These are used only for static analysis and type checking — they are
+    /// NOT executed by the runtime migration runner.
     /// Paths are relative to the project root or absolute.
     #[serde(default)]
     pub extra_migrations: Vec<PathBuf>,
@@ -167,7 +115,6 @@ pub struct DatabaseConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
-            docker_image: Self::default_docker_image(),
             migrations: Self::default_migrations(),
             extra_migrations: Vec::new(),
         }
@@ -175,10 +122,6 @@ impl Default for DatabaseConfig {
 }
 
 impl DatabaseConfig {
-    fn default_docker_image() -> String {
-        "postgres".to_string()
-    }
-
     fn default_migrations() -> PathBuf {
         PathBuf::from("./migrations")
     }
@@ -372,20 +315,6 @@ impl std::str::FromStr for Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            database: DatabaseConfig::default(),
-            migrations: MigrationsConfig::default(),
-            domains: HashMap::new(),
-            enums: HashMap::new(),
-            types: HashMap::new(),
-            analysis_mode: AnalysisMode::Auto,
-            databases: HashMap::new(),
-        }
-    }
-}
-
 impl Config {
     /// Load config from a `Cargo.toml` file.
     pub fn from_cargo_toml(path: &Path) -> Result<Self, ConfigError> {
@@ -433,7 +362,6 @@ impl Config {
                 domains: qualify_keys(&self.domains),
                 enums: qualify_keys(&self.enums),
                 types: qualify_keys(&self.types),
-                analysis_mode: self.analysis_mode,
             }),
             Some(name) => {
                 let entry = self
@@ -446,7 +374,6 @@ impl Config {
                     domains: qualify_keys(&entry.domains),
                     enums: qualify_keys(&entry.enums),
                     types: qualify_keys(&entry.types),
-                    analysis_mode: entry.analysis_mode,
                 })
             }
         }
@@ -465,7 +392,6 @@ pub struct ResolvedConfig<'a> {
     pub domains: HashMap<String, String>,
     pub enums: HashMap<String, String>,
     pub types: HashMap<String, String>,
-    pub analysis_mode: AnalysisMode,
 }
 
 /// Normalize type-mapping keys to always be schema-qualified.
@@ -521,7 +447,6 @@ edition = "2021"
 
 [package.metadata.cubos_sql]
 [package.metadata.cubos_sql.database]
-docker_image = "postgres:16"
 migrations = "./migrations"
 
 [package.metadata.cubos_sql.domains]
@@ -542,7 +467,6 @@ migrations = "./migrations"
     #[test]
     fn parse_full_config() {
         let config = Config::from_str(VALID_TOML).unwrap();
-        assert_eq!(config.database.docker_image, "postgres:16");
         assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
         assert_eq!(config.domains.len(), 2);
         assert_eq!(
@@ -558,7 +482,6 @@ migrations = "./migrations"
     #[test]
     fn parse_minimal_config() {
         let config = Config::from_str(MINIMAL_TOML).unwrap();
-        assert_eq!(config.database.docker_image, "postgres");
         assert!(config.domains.is_empty());
         assert_eq!(config.migrations.table, "public._migrations");
     }
@@ -574,7 +497,6 @@ edition = "2021"
 [package.metadata.cubos_sql]
 "#;
         let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.database.docker_image, "postgres");
         assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
         assert!(config.domains.is_empty());
     }
@@ -588,7 +510,6 @@ version = "0.1.0"
 edition = "2021"
 
 [package.metadata.cubos_sql.database]
-docker_image = "postgres:16"
 migrations = "./migrations"
 
 [package.metadata.cubos_sql.migrations]
@@ -611,13 +532,12 @@ version = "0.1.0"
 edition = "2021"
 "#;
         let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.database.docker_image, "postgres");
         assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
-        assert_eq!(config.analysis_mode, AnalysisMode::Auto);
     }
 
     #[test]
-    fn parse_analysis_mode_static() {
+    fn legacy_analysis_mode_ignored() {
+        // Old Cargo.toml files with analysis_mode should still parse fine.
         let toml = r#"
 [package]
 name = "my-app"
@@ -627,37 +547,23 @@ edition = "2021"
 [package.metadata.cubos_sql]
 analysis_mode = "static"
 "#;
-        let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.analysis_mode, AnalysisMode::Static);
+        Config::from_str(toml).unwrap();
     }
 
     #[test]
-    fn parse_analysis_mode_describe() {
+    fn legacy_docker_image_ignored() {
+        // Old Cargo.toml files with docker_image should still parse fine.
         let toml = r#"
 [package]
 name = "my-app"
 version = "0.1.0"
 edition = "2021"
 
-[package.metadata.cubos_sql]
-analysis_mode = "describe"
+[package.metadata.cubos_sql.database]
+docker_image = "postgres:16"
+migrations = "./migrations"
 "#;
-        let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.analysis_mode, AnalysisMode::Describe);
-    }
-
-    #[test]
-    fn parse_analysis_mode_invalid() {
-        let toml = r#"
-[package]
-name = "my-app"
-version = "0.1.0"
-edition = "2021"
-
-[package.metadata.cubos_sql]
-analysis_mode = "unknown"
-"#;
-        assert!(Config::from_str(toml).is_err());
+        Config::from_str(toml).unwrap();
     }
 
     #[test]
@@ -676,7 +582,6 @@ version = "0.1.0"
 edition = "2021"
 
 [package.metadata.cubos_sql.database]
-docker_image = "postgres:16"
 migrations = "/opt/migrations"
 "#;
         let config = Config::from_str(toml).unwrap();
@@ -776,7 +681,6 @@ migrations = "./migrations/main"
 [package.metadata.cubos_sql.databases.analytics]
 [package.metadata.cubos_sql.databases.analytics.database]
 migrations = "./migrations/analytics"
-docker_image = "postgres:16"
 
 [package.metadata.cubos_sql.databases.analytics.migrations]
 table = "public._analytics_migrations"
@@ -796,7 +700,6 @@ event_data = "crate::EventData"
             analytics.database.migrations,
             PathBuf::from("./migrations/analytics")
         );
-        assert_eq!(analytics.database.docker_image, "postgres:16");
         assert_eq!(analytics.migrations.table, "public._analytics_migrations");
         assert_eq!(
             analytics.domains.get("event_data").unwrap(),

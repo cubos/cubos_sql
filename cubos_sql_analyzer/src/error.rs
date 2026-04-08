@@ -41,10 +41,6 @@ pub enum AnalyzeError {
     #[error("unsupported SQL feature: {0}")]
     Unsupported(String),
 
-    /// A PostgreSQL error during schema export.
-    #[error("postgres error: {0}")]
-    Postgres(#[from] postgres::Error),
-
     /// JSON serialization/deserialization error.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),

@@ -1,27 +1,25 @@
 //! Proc macro crate for `cubos_sql`.
 //!
 //! This crate provides the [`sql!`] macro, which performs compile-time
-//! verification of SQL queries against a real PostgreSQL schema. Users should
-//! depend on the `cubos_sql` crate (which re-exports this macro) rather than
-//! depending on `cubos_sql_macros` directly.
+//! verification of SQL queries via static analysis. Users should depend on the
+//! `cubos_sql` crate (which re-exports this macro) rather than depending on
+//! `cubos_sql_macros` directly.
 
 extern crate proc_macro;
 
-mod cache;
 mod codegen;
-mod docker;
 mod from_row;
-mod introspect;
+mod migrations_hash;
 mod query_macro;
 
 /// Compile-time verified SQL query with named parameters.
 ///
 /// The `sql!` macro lets you write raw SQL with `$named` parameters and get
-/// full compile-time type checking. At build time it spins up a PostgreSQL
-/// container, runs your migrations, and introspects every query to ensure
-/// column names, parameter types, and result types are all correct. The
-/// generated code is fully typed -- no runtime reflection, no stringly-typed
-/// access.
+/// full compile-time type checking. At build time it reads your migration files,
+/// builds a schema snapshot via the DDL interpreter, and statically analyzes
+/// every query to ensure column names, parameter types, and result types are all
+/// correct. The generated code is fully typed -- no runtime reflection, no
+/// stringly-typed access. No Docker required.
 ///
 /// # Syntax
 ///
@@ -232,19 +230,14 @@ mod query_macro;
 /// following pipeline:
 ///
 /// 1. **Configuration** -- reads `[package.metadata.cubos_sql]` from your
-///    `Cargo.toml` to find migration paths, Docker image, and domain
-///    mappings.
-/// 2. **Docker container** -- hashes your migration files. If the hash
-///    matches a cached container, it is reused. Otherwise, a new PostgreSQL
-///    container is started and migrations are applied.
-/// 3. **Query introspection** -- the SQL is sent to PostgreSQL via `PREPARE`,
-///    and `pg_catalog` is queried to determine parameter types, output column
-///    types, and nullability.
+///    `Cargo.toml` to find migration paths and domain mappings.
+/// 2. **DDL interpretation** -- parses your migration SQL files and builds an
+///    in-memory schema snapshot (types, tables, functions, operators).
+/// 3. **Static analysis** -- the SQL is parsed and analyzed against the
+///    snapshot to determine parameter types, output column types, and
+///    nullability.
 /// 4. **Code generation** -- an anonymous output struct and a typed query
 ///    builder are generated as Rust code.
-/// 5. **Caching** -- introspection results are cached in a `.cubos_sql/`
-///    directory (which should be added to `.gitignore`) to avoid redundant
-///    work on subsequent builds.
 ///
 /// # Compile-time errors
 ///

@@ -1024,7 +1024,7 @@ pub fn create_extension(
             interp.warn(format!(
                 "unknown extension '{name}': types and functions will not be available \
                  for static analysis. Add SQL files to cubos_sql_analyzer/src/extensions/ \
-                 or use analysis_mode = \"auto\" to fall back to Docker."
+                 to enable support."
             ));
             return Ok(());
         }

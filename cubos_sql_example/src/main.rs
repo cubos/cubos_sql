@@ -1,11 +1,9 @@
-//! Example demonstrating cubos_sql with static analysis (no Docker required).
+//! Example demonstrating cubos_sql with static analysis.
 //!
-//! This crate uses `analysis_mode = "static"` in its Cargo.toml, which means
-//! the `sql!` macro analyzes queries at compile time using only the embedded
+//! The `sql!` macro analyzes queries at compile time using the embedded
 //! PostgreSQL seed and the migration files — no Docker daemon needed.
 //!
 //! To build: `cargo build -p cubos_sql_example`
-//! (No Docker required!)
 
 use cubos_sql::sql;
 

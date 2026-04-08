@@ -9,9 +9,5 @@ deadpool-postgres = "0.14"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
-[package.metadata.cubos_sql]
-analysis_mode = "static"
-
 [package.metadata.cubos_sql.database]
-docker_image = "postgres:18"
 migrations = "./migrations"

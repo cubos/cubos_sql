@@ -54,7 +54,7 @@ done
 
 echo "==> Generating seed.json..."
 CONN="host=127.0.0.1 port=${PORT} user=postgres password=postgres dbname=postgres"
-cargo run -p cubos_sql_analyzer --example generate_seed -- "$CONN"
+cargo run -p cubos_sql_seed -- "$CONN"
 
 echo "==> Done! seed.json has been updated."
 echo "    Remember to commit cubos_sql_analyzer/src/seed.json"

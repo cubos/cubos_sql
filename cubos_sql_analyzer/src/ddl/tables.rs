@@ -106,6 +106,8 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
             kind: TypeKind::Composite {
                 fields: composite_fields,
             },
+            category: 'C',
+            is_preferred: false,
         },
     );
     interp
@@ -125,6 +127,8 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
             kind: TypeKind::Array {
                 element_type_oid: composite_oid,
             },
+            category: 'A',
+            is_preferred: false,
         },
     );
     interp.snapshot.type_by_name.insert(array_key, array_oid);

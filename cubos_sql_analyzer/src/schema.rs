@@ -44,6 +44,18 @@ pub struct TypeEntry {
     pub name: String,
     pub schema: String,
     pub kind: TypeKind,
+    /// Type category from `pg_type.typcategory` (e.g. 'S' for string, 'N' for
+    /// numeric).  Used during operator/function resolution when operands are
+    /// `UNKNOWN` — see PostgreSQL §10.2 step 3.e.
+    #[serde(default = "default_category")]
+    pub category: char,
+    /// Whether this type is *preferred* in its category (`pg_type.typispreferred`).
+    #[serde(default)]
+    pub is_preferred: bool,
+}
+
+fn default_category() -> char {
+    'U'
 }
 
 /// The category of a PostgreSQL type.
@@ -199,6 +211,16 @@ impl SchemaSnapshot {
                 .get(&key)
                 .and_then(|oid| self.tables.get(oid));
         }
+        // PG §5.9.5: pg_catalog is implicitly searched before the search_path
+        // unless it is already listed explicitly.
+        if !self.search_path.iter().any(|s| s == "pg_catalog") {
+            let pg_key = format!("pg_catalog.{name}");
+            if let Some(oid) = self.table_by_name.get(&pg_key)
+                && let Some(entry) = self.tables.get(oid)
+            {
+                return Some(entry);
+            }
+        }
         for s in &self.search_path {
             let key = format!("{s}.{name}");
             if let Some(oid) = self.table_by_name.get(&key)
@@ -219,6 +241,16 @@ impl SchemaSnapshot {
                 .get(&key)
                 .and_then(|oid| self.types.get(oid));
         }
+        // PG §5.9.5: pg_catalog is implicitly searched before the search_path
+        // unless it is already listed explicitly.
+        if !self.search_path.iter().any(|s| s == "pg_catalog") {
+            let pg_key = format!("pg_catalog.{name}");
+            if let Some(oid) = self.type_by_name.get(&pg_key)
+                && let Some(entry) = self.types.get(oid)
+            {
+                return Some(entry);
+            }
+        }
         for s in &self.search_path {
             let key = format!("{s}.{name}");
             if let Some(oid) = self.type_by_name.get(&key)
@@ -227,11 +259,7 @@ impl SchemaSnapshot {
                 return Some(entry);
             }
         }
-        // Also check pg_catalog (builtins).
-        let key = format!("pg_catalog.{name}");
-        self.type_by_name
-            .get(&key)
-            .and_then(|oid| self.types.get(oid))
+        None
     }
 
     /// Look up a type by OID.
@@ -278,28 +306,191 @@ impl SchemaSnapshot {
     }
 
     /// Find operators matching name and operand types.
+    ///
+    /// Implements the PostgreSQL §10.2 operator type resolution algorithm:
+    ///   1. Exact match
+    ///   2. Match via implicit casts
+    ///   3. UNKNOWN-aware resolution with preferred-type disambiguation
     pub fn find_operator(
         &self,
         name: &str,
         left_oid: Option<u32>,
         right_oid: u32,
     ) -> Option<&OperatorEntry> {
+        use super::coerce::oid;
+
         let candidates = self.operators_by_name.get(name)?;
-        // Exact match first.
+
+        // PG §10.2 step 3b: unwrap domain types to their base types.
+        let left_oid = left_oid.map(|oid| self.unwrap_domain(oid));
+        let right_oid = self.unwrap_domain(right_oid);
+
+        // Step 1: exact match.
         if let Some(op) = candidates
             .iter()
             .find(|o| o.left_type_oid == left_oid && o.right_type_oid == right_oid)
         {
             return Some(op);
         }
-        // Try with implicit casts on operands.
-        candidates.iter().find(|o| {
+
+        // Step 2: match via implicit casts (non-UNKNOWN operands only).
+        if let Some(op) = candidates.iter().find(|o| {
             let left_ok = match (o.left_type_oid, left_oid) {
                 (Some(expected), Some(actual)) => self.has_implicit_cast(actual, expected),
                 (None, None) => true,
                 _ => false,
             };
             left_ok && self.has_implicit_cast(right_oid, o.right_type_oid)
-        })
+        }) {
+            return Some(op);
+        }
+
+        // Step 3 (PG §10.2 step 3): UNKNOWN-aware resolution.
+        let left_unknown = left_oid == Some(oid::UNKNOWN);
+        let right_unknown = right_oid == oid::UNKNOWN;
+        if !left_unknown && !right_unknown {
+            return None;
+        }
+
+        // 3a. Keep candidates where known sides match (exact or implicit cast)
+        //     and UNKNOWN sides are treated as compatible with anything.
+        let mut remaining: Vec<&OperatorEntry> = candidates
+            .iter()
+            .filter(|o| {
+                let left_ok = match (o.left_type_oid, left_oid) {
+                    (Some(_), Some(actual)) if actual == oid::UNKNOWN => true,
+                    (Some(expected), Some(actual)) => self.has_implicit_cast(actual, expected),
+                    (None, None) => true,
+                    _ => false,
+                };
+                let right_ok = right_unknown || self.has_implicit_cast(right_oid, o.right_type_oid);
+                left_ok && right_ok
+            })
+            .collect();
+
+        if remaining.len() <= 1 {
+            return remaining.into_iter().next();
+        }
+
+        // 3b. If one side is known, keep only candidates that accept exactly
+        //     that type on the known side (narrows from implicit-cast matches).
+        if !left_unknown {
+            let exact: Vec<&OperatorEntry> = remaining
+                .iter()
+                .filter(|o| o.left_type_oid == left_oid)
+                .copied()
+                .collect();
+            if !exact.is_empty() {
+                remaining = exact;
+            }
+        }
+        if !right_unknown {
+            let exact: Vec<&OperatorEntry> = remaining
+                .iter()
+                .filter(|o| o.right_type_oid == right_oid)
+                .copied()
+                .collect();
+            if !exact.is_empty() {
+                remaining = exact;
+            }
+        }
+
+        if remaining.len() <= 1 {
+            return remaining.into_iter().next();
+        }
+
+        // 3c (PG §10.2 step 3e-f). For each UNKNOWN position, check if all
+        //     remaining candidates agree on the type category.  If so, prefer
+        //     the candidate that uses the *preferred* type in that category.
+        //     This mirrors PostgreSQL's "resolve to preferred type" rule.
+        if left_unknown {
+            let preferred = self.prefer_by_category(&remaining, |o| o.left_type_oid);
+            if !preferred.is_empty() {
+                remaining = preferred;
+            }
+        }
+        if remaining.len() > 1 && right_unknown {
+            let preferred = self.prefer_by_category(&remaining, |o| Some(o.right_type_oid));
+            if !preferred.is_empty() {
+                remaining = preferred;
+            }
+        }
+
+        if remaining.len() == 1 {
+            return Some(remaining[0]);
+        }
+
+        // 3d. Final fallback: resolve UNKNOWN positions to `text`, since
+        //     string constants default to text in PostgreSQL.  If exactly one
+        //     candidate matches after this substitution, use it.
+        let text_oid = oid::TEXT;
+        let resolved_left = if left_unknown {
+            Some(text_oid)
+        } else {
+            left_oid
+        };
+        let resolved_right = if right_unknown { text_oid } else { right_oid };
+        let text_matches: Vec<&OperatorEntry> = remaining
+            .iter()
+            .filter(|o| {
+                let left_ok = match (o.left_type_oid, resolved_left) {
+                    (Some(expected), Some(actual)) => {
+                        expected == actual || self.has_implicit_cast(actual, expected)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                let right_ok = o.right_type_oid == resolved_right
+                    || self.has_implicit_cast(resolved_right, o.right_type_oid);
+                left_ok && right_ok
+            })
+            .copied()
+            .collect();
+        if text_matches.len() == 1 {
+            return Some(text_matches[0]);
+        }
+
+        // Truly ambiguous — return None so callers can use fallback logic.
+        None
+    }
+
+    /// Among `candidates`, narrow to those whose type at the position extracted
+    /// by `get_oid` is the *preferred* type in its category — but only when all
+    /// candidates agree on the same category for that position (PG §10.2 step 3f).
+    fn prefer_by_category<'a>(
+        &self,
+        candidates: &[&'a OperatorEntry],
+        get_oid: impl Fn(&OperatorEntry) -> Option<u32>,
+    ) -> Vec<&'a OperatorEntry> {
+        // Collect categories for this position.
+        let cats: Vec<Option<char>> = candidates
+            .iter()
+            .map(|o| {
+                get_oid(o)
+                    .and_then(|id| self.types.get(&id))
+                    .map(|t| t.category)
+            })
+            .collect();
+
+        // All must agree on one category.
+        let first = match cats.first() {
+            Some(Some(c)) => *c,
+            _ => return Vec::new(),
+        };
+        if !cats.iter().all(|c| *c == Some(first)) {
+            return Vec::new();
+        }
+
+        // Keep only candidates using the preferred type in that category.
+        let preferred: Vec<&'a OperatorEntry> = candidates
+            .iter()
+            .filter(|o| {
+                get_oid(o)
+                    .and_then(|id| self.types.get(&id))
+                    .is_some_and(|t| t.is_preferred)
+            })
+            .copied()
+            .collect();
+        preferred
     }
 }
