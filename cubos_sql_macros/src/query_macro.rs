@@ -104,54 +104,97 @@ fn with_client<T>(
 // Static analyzer integration
 // ---------------------------------------------------------------------------
 
-/// Cached schema snapshot (avoids re-reading + deserializing JSON per `sql!` call).
+/// Cached schema snapshot (avoids re-building per `sql!` call).
 struct CachedSnapshot {
     snapshot: cubos_sql_analyzer::schema::SchemaSnapshot,
-    path: String,
+    /// Cache key: migration hash.
+    migration_hash: String,
 }
 
 thread_local! {
     static CACHED_SNAPSHOT: RefCell<Option<CachedSnapshot>> = const { RefCell::new(None) };
 }
 
-/// Load a schema snapshot, using a thread-local cache to avoid repeated IO + deserialization.
-fn load_snapshot(snapshot_path: &Path) -> Option<cubos_sql_analyzer::schema::SchemaSnapshot> {
-    let path_str = snapshot_path.to_string_lossy().to_string();
-
+/// Build (or retrieve from cache) a schema snapshot from migrations using the
+/// DDL interpreter. No Docker or disk I/O required.
+fn get_or_build_snapshot(
+    migrations_dirs: &[&Path],
+    migration_hash: &str,
+) -> Result<cubos_sql_analyzer::schema::SchemaSnapshot, syn::Error> {
     CACHED_SNAPSHOT.with(|cell| {
         let borrow = cell.borrow();
         if let Some(cached) = borrow.as_ref()
-            && cached.path == path_str
+            && cached.migration_hash == migration_hash
         {
-            return Some(cached.snapshot.clone());
+            return Ok(cached.snapshot.clone());
         }
         drop(borrow);
 
-        let content = std::fs::read_to_string(snapshot_path).ok()?;
-        let snapshot: cubos_sql_analyzer::schema::SchemaSnapshot =
-            serde_json::from_str(&content).ok()?;
+        let migrations = collect_migration_files(migrations_dirs)?;
+        let (snapshot, warnings) =
+            cubos_sql_analyzer::seed::build_schema_from_migrations(&migrations).map_err(|e| {
+                syn::Error::new(Span::call_site(), format!("DDL interpretation failed: {e}"))
+            })?;
+
+        // Warnings are non-fatal. Print to stderr so they appear in build output.
+        for w in &warnings {
+            eprintln!("cubos_sql warning: {w}");
+        }
 
         cell.borrow_mut().replace(CachedSnapshot {
             snapshot: snapshot.clone(),
-            path: path_str,
+            migration_hash: migration_hash.to_string(),
         });
 
-        Some(snapshot)
+        Ok(snapshot)
     })
 }
 
-/// Try to analyze the query statically from a cached schema snapshot.
+/// Collect all migration SQL files from the given directories.
+///
+/// Returns `(filename, content)` pairs sorted by filename.
+fn collect_migration_files(dirs: &[&Path]) -> Result<Vec<(String, String)>, syn::Error> {
+    let mut files = Vec::new();
+
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            syn::Error::new(
+                Span::call_site(),
+                format!("failed to read migrations dir '{}': {e}", dir.display()),
+            )
+        })?;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path.to_string_lossy().to_string();
+            if name.ends_with(".sql") && !name.ends_with(".down.sql") {
+                let filename = entry.file_name().to_string_lossy().to_string();
+                let content = std::fs::read_to_string(&path).map_err(|e| {
+                    syn::Error::new(
+                        Span::call_site(),
+                        format!("failed to read migration '{}': {e}", path.display()),
+                    )
+                })?;
+                files.push((filename, content));
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+/// Try to analyze the query statically from a snapshot.
 ///
 /// Returns `Some(Ok(info))` on success, `None` to signal fallback.
-/// Does NOT require a live database connection.
-fn try_static_analyze_from_snapshot(
-    snapshot_path: &Path,
+fn try_static_analyze(
+    snapshot: &cubos_sql_analyzer::schema::SchemaSnapshot,
     sql: &str,
     config: &cubos_sql_core::config::ResolvedConfig<'_>,
     lex_output: &cubos_sql_core::param::LexOutput,
 ) -> Option<Result<cubos_sql_core::query_info::QueryInfo, syn::Error>> {
-    let snapshot = load_snapshot(snapshot_path)?;
-
     let analyzer_config = cubos_sql_analyzer::resolve::AnalyzerConfig {
         domains: config.domains.clone(),
         enums: config.enums.clone(),
@@ -160,7 +203,6 @@ fn try_static_analyze_from_snapshot(
             let mut v: Vec<Option<bool>> = lex_output.params.iter().map(|p| p.nullable).collect();
             for spread in &lex_output.spreads {
                 if let Some(fields) = &spread.fields {
-                    // Spread fields only have `?` annotation (no `!`), map to Option.
                     v.extend(
                         fields
                             .iter()
@@ -172,28 +214,10 @@ fn try_static_analyze_from_snapshot(
         },
     };
 
-    match cubos_sql_analyzer::resolve::analyze(&snapshot, sql, &analyzer_config) {
+    match cubos_sql_analyzer::resolve::analyze(snapshot, sql, &analyzer_config) {
         Ok(info) => Some(Ok(info)),
-        Err(_) => None,
+        Err(e) => Some(Err(syn::Error::new(Span::call_site(), e.to_string()))),
     }
-}
-
-/// Export schema snapshot from a live connection and cache to disk.
-fn export_and_cache_snapshot(
-    client: &mut postgres::Client,
-    snapshot_path: &Path,
-) -> Result<(), syn::Error> {
-    let snapshot = cubos_sql_analyzer::export::export_schema(client)
-        .map_err(|e| syn::Error::new(Span::call_site(), format!("schema export failed: {e}")))?;
-
-    if let Some(parent) = snapshot_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let json = serde_json::to_string(&snapshot)
-        .map_err(|e| syn::Error::new(Span::call_site(), format!("schema serialize: {e}")))?;
-    std::fs::write(snapshot_path, json)
-        .map_err(|e| syn::Error::new(Span::call_site(), format!("schema write: {e}")))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +376,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         )
     })?;
 
-    // 3. Compute migration hash and check cache BEFORE starting any container.
+    // 3. Compute migration hash and check cache BEFORE any analysis.
     let migrations_dir = resolved.migrations_dir(manifest_path);
     let extra_dirs = resolved.extra_migrations_dirs(manifest_path);
     let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
@@ -368,54 +392,61 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         build_spread_sample_sql(&lex_output)
     };
 
-    let cubos_dir = crate::docker::cubos_sql_dir(manifest_path);
+    let analysis_mode = resolved.analysis_mode;
+    let is_static_only = matches!(analysis_mode, cubos_sql_core::config::AnalysisMode::Static);
 
-    // Hash the type-mapping config and analysis mode so cache invalidates on changes.
-    let config_hash = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        // Include analysis_mode so switching modes invalidates cached results.
-        h.update(match resolved.analysis_mode {
-            cubos_sql_core::config::AnalysisMode::Static => b"static" as &[u8],
-            cubos_sql_core::config::AnalysisMode::Describe => b"describe",
-            cubos_sql_core::config::AnalysisMode::Auto => b"auto",
-        });
-        let mut domains: Vec<_> = resolved.domains.iter().collect();
-        domains.sort();
-        for (k, v) in &domains {
-            h.update(k.as_bytes());
-            h.update(v.as_bytes());
-        }
-        let mut enums: Vec<_> = resolved.enums.iter().collect();
-        enums.sort();
-        for (k, v) in &enums {
-            h.update(k.as_bytes());
-            h.update(v.as_bytes());
-        }
-        let mut types: Vec<_> = resolved.types.iter().collect();
-        types.sort();
-        for (k, v) in &types {
-            h.update(k.as_bytes());
-            h.update(v.as_bytes());
-        }
-        h.finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
+    // Disk cache is only useful for Describe/Auto modes where Docker introspection
+    // is expensive. Static mode reproduces results in-memory without Docker, so
+    // writing to `.cubos_sql/` is unnecessary.
+    let cache_path = if !is_static_only {
+        let cubos_dir = crate::docker::cubos_sql_dir(manifest_path);
+
+        // Hash the type-mapping config and analysis mode so cache invalidates on changes.
+        let config_hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(match analysis_mode {
+                cubos_sql_core::config::AnalysisMode::Static => b"static" as &[u8],
+                cubos_sql_core::config::AnalysisMode::Describe => b"describe",
+                cubos_sql_core::config::AnalysisMode::Auto => b"auto",
+            });
+            let mut domains: Vec<_> = resolved.domains.iter().collect();
+            domains.sort();
+            for (k, v) in &domains {
+                h.update(k.as_bytes());
+                h.update(v.as_bytes());
+            }
+            let mut enums: Vec<_> = resolved.enums.iter().collect();
+            enums.sort();
+            for (k, v) in &enums {
+                h.update(k.as_bytes());
+                h.update(v.as_bytes());
+            }
+            let mut types: Vec<_> = resolved.types.iter().collect();
+            types.sort();
+            for (k, v) in &types {
+                h.update(k.as_bytes());
+                h.update(v.as_bytes());
+            }
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+
+        Some(crate::cache::query_cache_path(
+            &cubos_dir,
+            &migration_hash,
+            &introspection_sql,
+            &config_hash,
+        ))
+    } else {
+        None
     };
 
-    let cache_path = crate::cache::query_cache_path(
-        &cubos_dir,
-        &migration_hash,
-        &introspection_sql,
-        &config_hash,
-    );
-
-    let query_info = if let Some(cached) = crate::cache::get(&cache_path) {
+    let query_info = if let Some(cached) = cache_path.as_ref().and_then(|p| crate::cache::get(p)) {
         cached
     } else {
-        let snapshot_path = cubos_dir.join(&migration_hash).join("schema.json");
-        let analysis_mode = resolved.analysis_mode;
         let use_static = matches!(
             analysis_mode,
             cubos_sql_core::config::AnalysisMode::Static
@@ -427,35 +458,36 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
                 | cubos_sql_core::config::AnalysisMode::Auto
         );
 
-        // 4. Try static analyzer WITHOUT Docker (if snapshot exists).
-        let static_result = if use_static && snapshot_path.exists() {
-            try_static_analyze_from_snapshot(
-                &snapshot_path,
-                &introspection_sql,
-                &resolved,
-                &lex_output,
-            )
-        } else {
-            None
-        };
+        // 4. Build schema snapshot from seed + migrations (no Docker needed).
+        let static_result: Option<Result<cubos_sql_core::query_info::QueryInfo, syn::Error>> =
+            if use_static {
+                match get_or_build_snapshot(&all_dirs, &migration_hash) {
+                    Ok(snapshot) => {
+                        try_static_analyze(&snapshot, &introspection_sql, &resolved, &lex_output)
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            } else {
+                None
+            };
 
         if let Some(Ok(info)) = &static_result {
-            let _ = crate::cache::put(&cache_path, info);
+            if let Some(ref path) = cache_path {
+                let _ = crate::cache::put(path, info);
+            }
             info.clone()
         } else if !use_describe {
-            // Static-only mode: report the analyzer error or missing snapshot.
-            match static_result {
-                Some(Err(e)) => return Err(e),
-                _ => {
-                    return Err(syn::Error::new(
+            // Static-only mode: report the real error.
+            return Err(static_result
+                .unwrap_or_else(|| {
+                    Err(syn::Error::new(
                         Span::call_site(),
-                        "analysis_mode = \"static\" but no schema snapshot found. \
-                         Run with analysis_mode = \"auto\" first to generate it.",
-                    ));
-                }
-            }
+                        "static analysis produced no result",
+                    ))
+                })
+                .unwrap_err());
         } else {
-            // 5. Need Docker — ensure container is running.
+            // 5. Fallback: Docker-based introspection.
             let (container_info, _) =
                 crate::docker::ensure_container(&resolved, manifest_path).map_err(|e| {
                     let msg = e.to_string();
@@ -480,42 +512,23 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
             let conn_str = container_info.connection_string();
             let sql_span = input.sql.span();
 
-            // 6. Export schema snapshot if missing (for future Docker-free builds).
-            if !snapshot_path.exists() {
-                let _ = with_client(&conn_str, |client| {
-                    export_and_cache_snapshot(client, &snapshot_path)
-                });
-            }
-
-            // 7. Try static analyzer with (now available) snapshot, unless describe-only.
-            let info = if use_static {
-                try_static_analyze_from_snapshot(
-                    &snapshot_path,
+            let info = with_client(&conn_str, |client| {
+                crate::introspect::introspect_query(
+                    client,
                     &introspection_sql,
-                    &resolved,
-                    &lex_output,
+                    &resolved.domains,
+                    &resolved.enums,
+                    &resolved.types,
                 )
-            } else {
-                None
-            }
-            .unwrap_or_else(|| {
-                // 8. Live introspection (describe).
-                with_client(&conn_str, |client| {
-                    crate::introspect::introspect_query(
-                        client,
-                        &introspection_sql,
-                        &resolved.domains,
-                        &resolved.enums,
-                        &resolved.types,
-                    )
-                    .map_err(|e| {
-                        let msg = format_introspect_error(&e, &introspection_sql);
-                        syn::Error::new(sql_span, msg)
-                    })
+                .map_err(|e| {
+                    let msg = format_introspect_error(&e, &introspection_sql);
+                    syn::Error::new(sql_span, msg)
                 })
             })?;
 
-            let _ = crate::cache::put(&cache_path, &info);
+            if let Some(ref path) = cache_path {
+                let _ = crate::cache::put(path, &info);
+            }
             info
         }
     };

@@ -6,4 +6,5 @@ members = [
     "cubos_sql_macros",
     "cubos_sql_analyzer",
     "cubos_sql_cli",
+    "cubos_sql_example",
 ]

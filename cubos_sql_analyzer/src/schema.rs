@@ -85,6 +85,23 @@ pub struct TableEntry {
     pub schema: String,
     pub kind: RelationKind,
     pub columns: Vec<TableColumn>,
+    /// For views: the definition needed to recreate the view after CASCADE.
+    /// Contains the deparsed SQL query and column dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_def: Option<ViewDef>,
+}
+
+/// View dependency tracking for CASCADE behavior.
+///
+/// Views never get automatically recreated — if a dependent column is altered
+/// or dropped with CASCADE, the view is simply dropped (matching PostgreSQL).
+/// The user must DROP + CREATE VIEW manually in their migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewDef {
+    /// Tables this view depends on (by OID).
+    pub depends_on_tables: Vec<u32>,
+    /// Specific columns this view depends on: `(table_oid, column_name)`.
+    pub depends_on_columns: Vec<(u32, String)>,
 }
 
 /// The kind of relation.

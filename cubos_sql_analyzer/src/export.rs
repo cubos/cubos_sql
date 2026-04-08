@@ -245,6 +245,7 @@ fn export_tables(client: &mut postgres::Client) -> Result<TableExport, AnalyzeEr
                 schema,
                 kind,
                 columns: columns_map.remove(&oid).unwrap_or_default(),
+                view_def: None,
             },
         );
     }

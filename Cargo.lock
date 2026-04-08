@@ -651,6 +651,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubos_sql_example"
+version = "0.1.0"
+dependencies = [
+ "cubos_sql",
+ "deadpool-postgres",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "cubos_sql_macros"
 version = "0.1.0"
 dependencies = [

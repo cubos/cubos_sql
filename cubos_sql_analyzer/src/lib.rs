@@ -16,6 +16,7 @@
 //! correctly tracks LEFT JOIN nullability and expression-level NOT NULL).
 
 pub mod coerce;
+pub mod ddl;
 pub mod error;
 pub mod export;
 pub mod expr;
@@ -26,3 +27,4 @@ pub mod params;
 pub mod resolve;
 pub mod schema;
 pub mod scope;
+pub mod seed;
