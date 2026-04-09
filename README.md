@@ -2,11 +2,11 @@
 
 Compile-time verified PostgreSQL queries for Rust. **PostgreSQL only** -- no abstraction layer, no lowest-common-denominator SQL.
 
-Write plain SQL, get full type safety. The `sql!` macro verifies every query against a real PostgreSQL schema during `cargo build` -- column types, parameter types, nullability, and type coercion errors are all caught before your code ships.
+Write plain SQL, get full type safety. The `sql!` macro statically analyzes every query against your migration files during `cargo build` -- column types, parameter types, nullability, and type coercion errors are all caught before your code ships.
 
 ## Features
 
-- **Compile-time checked** -- every query is validated against your actual schema. Typos in column names, wrong parameter types, invalid SQL, and type mismatches are all compiler errors.
+- **Compile-time checked** -- every query is validated against your actual schema. Typos in column names, wrong parameter types, invalid SQL, and type mismatches are all compiler errors. The analyzer reads your migrations and builds the schema in-memory -- no external process needed.
 - **Real SQL** -- any syntax PostgreSQL accepts, `cubos_sql` accepts. CTEs, window functions, lateral joins, `DISTINCT ON`, `RETURNING`, `FOR UPDATE` -- if Postgres can parse and execute it, the macro will verify it. No restricted SQL subset, no Rust DSL.
 - **Nullability-aware** -- the analyzer tracks nullability through JOINs, COALESCE, CASE, subqueries, and aggregates. `NOT NULL` columns become `T`, nullable columns become `Option<T>`.
 - **Static type analysis** -- parameter types are inferred following PostgreSQL's own type resolution rules (operator/function resolution, implicit/assignment casts, common-type resolution). Type mismatches produce clear errors at compile time.
@@ -55,7 +55,7 @@ for user in &users {
 }
 ```
 
-The macro spins up a disposable Docker Postgres container at compile time, runs your migrations, and type-checks the query. The generated struct has correctly typed fields with proper nullability.
+The macro reads your migration files, builds the schema in memory, and type-checks the query. The generated struct has correctly typed fields with proper nullability.
 
 ## Compile-time error detection
 
@@ -424,7 +424,6 @@ All configuration lives in your `Cargo.toml`:
 ```toml
 [package.metadata.cubos_sql.database]
 migrations = "./migrations"        # required — path to migration files
-docker_image = "postgres"          # optional — Docker image for compile-time PG
 
 [package.metadata.cubos_sql.migrations]
 table = "public._migrations"       # optional — migration tracking table
@@ -444,11 +443,23 @@ Add `.cubos_sql/` to your `.gitignore`:
 .cubos_sql/
 ```
 
+## How it works
+
+The `sql!` macro performs **fully static analysis** at compile time:
+
+1. Reads your migration files from the configured path
+2. Parses the DDL statements using `pg_query` (the same parser PostgreSQL uses internally)
+3. Builds an in-memory schema snapshot by applying each migration's DDL on top of a built-in PostgreSQL 18 catalog seed
+4. Parses your SQL query and resolves column types, parameter types, and nullability against the snapshot
+5. Generates a concrete Rust struct with correctly typed fields
+
+Everything runs in-process during `cargo build`. No external dependencies, fast builds, fully reproducible.
+
+Extensions are supported via built-in SQL definitions that the DDL interpreter processes automatically when it sees `CREATE EXTENSION`.
+
 ## Requirements
 
 - Rust 1.85+
-- Docker (for compile-time query verification)
-- PostgreSQL 12+ (via Docker; no local install needed)
 
 ## License
 
