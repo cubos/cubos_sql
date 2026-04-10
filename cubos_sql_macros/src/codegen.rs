@@ -1076,11 +1076,14 @@ fn build_row_mapping(columns: &[ColumnInfo]) -> Result<TokenStream, syn::Error> 
 /// Domain types override the base type. Nullable columns are wrapped in
 /// `Option<T>`.
 fn column_rust_type(col: &ColumnInfo) -> Result<syn::Type, syn::Error> {
-    // The concrete inner type: domain type takes priority over the base type.
+    // The concrete inner type: domain/enum type takes priority over the base type.
     // Domain/enum types are user-provided paths; base types need qualification.
-    let inner_type_str = match col.domain_rust_type.as_deref() {
-        Some(domain) => domain.to_string(),
-        None => qualify_rust_type(&col.rust_type),
+    let inner_type_str = if let Some(domain) = col.domain_rust_type.as_deref() {
+        domain.to_string()
+    } else if let Some(enum_ty) = col.enum_rust_type.as_deref() {
+        enum_ty.to_string()
+    } else {
+        qualify_rust_type(&col.rust_type)
     };
 
     let inner_type: syn::Type = parse_str(&inner_type_str)?;
