@@ -82,20 +82,35 @@ pub fn create_function(
         is_variadic,
         is_set_returning,
         is_strict,
+        is_procedure: stmt.is_procedure,
         agg_final_type_oid: None,
     };
 
-    // Check for existing function with same signature.
+    // Check for existing entry with same (signature, kind). Functions and
+    // procedures share the `functions_by_name` bucket but PG treats them as
+    // separate object kinds, so a CREATE FUNCTION may coexist with a
+    // CREATE PROCEDURE of the same name and signature.
     if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&name) {
-        let exists = fns
-            .iter()
-            .any(|f| f.arg_types == entry.arg_types && f.schema == entry.schema);
+        let exists = fns.iter().any(|f| {
+            f.arg_types == entry.arg_types
+                && f.schema == entry.schema
+                && f.is_procedure == entry.is_procedure
+        });
         if exists {
             if stmt.replace {
-                fns.retain(|f| f.arg_types != entry.arg_types || f.schema != entry.schema);
+                fns.retain(|f| {
+                    f.arg_types != entry.arg_types
+                        || f.schema != entry.schema
+                        || f.is_procedure != entry.is_procedure
+                });
             } else {
+                let kind = if entry.is_procedure {
+                    "procedure"
+                } else {
+                    "function"
+                };
                 return Err(DdlError::DuplicateObject(format!(
-                    "function \"{name}\" already exists with same argument types"
+                    "{kind} \"{name}\" already exists with same argument types"
                 )));
             }
         }

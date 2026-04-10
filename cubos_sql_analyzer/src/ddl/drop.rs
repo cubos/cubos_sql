@@ -25,7 +25,7 @@ pub fn drop_objects(interp: &mut DdlInterpreter, stmt: &DropStmt) -> Result<(), 
                 drop_type(interp, obj_node, stmt.missing_ok, cascade)?;
             }
             ObjectType::ObjectFunction | ObjectType::ObjectProcedure => {
-                drop_function(interp, obj_node, stmt.missing_ok)?;
+                drop_function(interp, obj_node, stmt.missing_ok, cascade, obj_type)?;
             }
             ObjectType::ObjectExtension => {
                 drop_extension(interp, obj_node, stmt.missing_ok, cascade)?;
@@ -37,10 +37,12 @@ pub fn drop_objects(interp: &mut DdlInterpreter, stmt: &DropStmt) -> Result<(), 
                 drop_operator(interp, obj_node, stmt.missing_ok)?;
             }
             ObjectType::ObjectAggregate => {
-                drop_aggregate(interp, obj_node, stmt.missing_ok)?;
+                drop_aggregate(interp, obj_node, stmt.missing_ok, cascade)?;
             }
-            ObjectType::ObjectSchema
-            | ObjectType::ObjectIndex
+            ObjectType::ObjectSchema => {
+                drop_schema(interp, obj_node, stmt.missing_ok, cascade)?;
+            }
+            ObjectType::ObjectIndex
             | ObjectType::ObjectTrigger
             | ObjectType::ObjectRule
             | ObjectType::ObjectPolicy
@@ -239,10 +241,19 @@ fn drop_extension(
     Ok(())
 }
 
+/// `DROP FUNCTION` / `DROP PROCEDURE`. The `remove_type` of the enclosing
+/// `DropStmt` determines which bucket of overloads to consider, so callers
+/// tell us via `expected_kind`.
+///
+/// `cascade` is accepted (and required syntactically for consistency with
+/// PostgreSQL) but has no effect in the analyzer: functions are not allowed
+/// to participate in query-level dependencies that affect static typing.
 fn drop_function(
     interp: &mut DdlInterpreter,
     obj_node: &pg_query::protobuf::Node,
-    _missing_ok: bool,
+    missing_ok: bool,
+    _cascade: bool,
+    expected_kind: ObjectType,
 ) -> Result<(), DdlError> {
     let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
         return Ok(());
@@ -268,15 +279,45 @@ fn drop_function(
         })
         .collect();
 
-    if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&name) {
-        // Remove only the overload matching the argument types.
-        // If objargs was empty (no signature specified), remove all.
-        if owa.objargs.is_empty() && owa.args_unspecified {
-            fns.clear();
+    // A DROP FUNCTION must match `is_procedure = false`, and DROP PROCEDURE
+    // the opposite — PG enforces the same asymmetry to prevent accidentally
+    // dropping an object of the wrong kind.
+    let want_procedure = expected_kind == ObjectType::ObjectProcedure;
+
+    let existed = interp
+        .snapshot
+        .functions_by_name
+        .get(&name)
+        .is_some_and(|fns| {
+            if owa.objargs.is_empty() && owa.args_unspecified {
+                fns.iter()
+                    .any(|f| !f.is_aggregate && f.is_procedure == want_procedure)
+            } else {
+                fns.iter().any(|f| {
+                    !f.is_aggregate && f.is_procedure == want_procedure && f.arg_types == arg_oids
+                })
+            }
+        });
+
+    if !existed && !missing_ok {
+        let kind = if want_procedure {
+            "procedure"
         } else {
-            fns.retain(|f| f.arg_types != arg_oids);
+            "function"
+        };
+        return Err(DdlError::DependencyError(format!(
+            "{kind} {name} does not exist"
+        )));
+    }
+
+    if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&name) {
+        if owa.objargs.is_empty() && owa.args_unspecified {
+            fns.retain(|f| f.is_aggregate || f.is_procedure != want_procedure);
+        } else {
+            fns.retain(|f| {
+                f.is_aggregate || f.is_procedure != want_procedure || f.arg_types != arg_oids
+            });
         }
-        // Clean up empty entries.
         if fns.is_empty() {
             interp.snapshot.functions_by_name.remove(&name);
         }
@@ -288,10 +329,14 @@ fn drop_function(
 /// DROP AGGREGATE name(argtypes) — shares storage with functions, but we
 /// only remove entries where `is_aggregate = true` so a DROP AGGREGATE cannot
 /// accidentally remove a scalar function with the same signature.
+///
+/// `cascade` is accepted for syntactic parity with PostgreSQL but has no
+/// effect here for the same reason as `drop_function`.
 fn drop_aggregate(
     interp: &mut DdlInterpreter,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
+    _cascade: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
         return Ok(());
@@ -356,7 +401,7 @@ fn drop_operator(
     };
 
     // Operator name is the last element of objname (may be schema-qualified).
-    let op_name = match owa.objname.iter().filter_map(node_string).last() {
+    let op_name = match owa.objname.iter().filter_map(node_string).next_back() {
         Some(n) => n.to_owned(),
         None => return Ok(()),
     };
@@ -446,9 +491,7 @@ fn drop_cast(
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(
-            "cast source or target type".into(),
-        ));
+        return Err(DdlError::TypeNotFound("cast source or target type".into()));
     };
 
     let key = format!("{src}:{tgt}");
@@ -473,4 +516,117 @@ fn format_arg_oids(oids: &[u32], snapshot: &crate::schema::SchemaSnapshot) -> St
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// DROP SCHEMA name [CASCADE | RESTRICT].
+///
+/// Without CASCADE: fail if the schema contains any objects we track.
+/// With CASCADE: remove every table, type, and function living in that
+/// schema (transitively dropping views that depend on them via the normal
+/// `drop_views` machinery).
+fn drop_schema(
+    interp: &mut DdlInterpreter,
+    obj_node: &pg_query::protobuf::Node,
+    missing_ok: bool,
+    cascade: bool,
+) -> Result<(), DdlError> {
+    let name = match obj_node.node.as_ref() {
+        Some(node::Node::String(s)) => s.sval.clone(),
+        _ => return Ok(()),
+    };
+
+    // PG's system schemas are never in our snapshot's search_path writable
+    // surface, but users sometimes DROP SCHEMA IF EXISTS them. Treat absence
+    // as missing.
+    let has_objects = interp
+        .snapshot
+        .table_by_name
+        .keys()
+        .any(|k| k.starts_with(&format!("{name}.")))
+        || interp
+            .snapshot
+            .type_by_name
+            .keys()
+            .any(|k| k.starts_with(&format!("{name}.")))
+        || interp
+            .snapshot
+            .functions_by_name
+            .values()
+            .any(|fns| fns.iter().any(|f| f.schema == name));
+
+    let exists = interp.snapshot.schemas.contains(&name)
+        || interp.snapshot.search_path.contains(&name)
+        || has_objects;
+
+    if !exists {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::DependencyError(format!(
+            "schema \"{name}\" does not exist"
+        )));
+    }
+
+    if has_objects && !cascade {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop schema \"{name}\" because other objects depend on it"
+        )));
+    }
+
+    // CASCADE: gather everything in this schema.
+    let tables_to_drop: Vec<u32> = interp
+        .snapshot
+        .table_by_name
+        .iter()
+        .filter_map(|(k, &oid)| k.starts_with(&format!("{name}.")).then_some(oid))
+        .collect();
+
+    // Drop views/tables. `drop_views` transitively removes dependents; for
+    // plain tables we also need to strip the composite type + array type,
+    // mirroring the `drop_relation` cleanup logic.
+    views::drop_views(&mut interp.snapshot, &tables_to_drop);
+    for oid in &tables_to_drop {
+        if let Some(te) = interp.snapshot.tables.remove(oid) {
+            let key = format!("{}.{}", te.schema, te.name);
+            interp.snapshot.table_by_name.remove(&key);
+            if let Some(&ctype_oid) = interp.snapshot.type_by_name.get(&key) {
+                interp.snapshot.types.remove(&ctype_oid);
+                interp.snapshot.type_by_name.remove(&key);
+                let arr_key = format!("{}._{}", te.schema, te.name);
+                if let Some(arr_oid) = interp.snapshot.type_by_name.remove(&arr_key) {
+                    interp.snapshot.types.remove(&arr_oid);
+                }
+            }
+        }
+    }
+
+    // Remove all remaining types in this schema (enums, domains, ranges,
+    // standalone composites, …).
+    let type_keys: Vec<String> = interp
+        .snapshot
+        .type_by_name
+        .keys()
+        .filter(|k| k.starts_with(&format!("{name}.")))
+        .cloned()
+        .collect();
+    for key in type_keys {
+        if let Some(oid) = interp.snapshot.type_by_name.remove(&key) {
+            interp.snapshot.types.remove(&oid);
+        }
+    }
+
+    // Remove all functions in this schema.
+    for fns in interp.snapshot.functions_by_name.values_mut() {
+        fns.retain(|f| f.schema != name);
+    }
+    interp
+        .snapshot
+        .functions_by_name
+        .retain(|_, fns| !fns.is_empty());
+
+    // Finally, drop the schema itself from the search_path and the known set.
+    interp.snapshot.search_path.retain(|s| s != &name);
+    interp.snapshot.schemas.remove(&name);
+
+    Ok(())
 }

@@ -1058,11 +1058,8 @@ fn drop_aggregate_removes_only_aggregate() {
 
 #[test]
 fn drop_aggregate_missing_errors_without_if_exists() {
-    let err = try_build(&[(
-        "0001.sql",
-        "DROP AGGREGATE nonexistent(int4);",
-    )])
-    .expect_err("dropping a missing aggregate without IF EXISTS must fail");
+    let err = try_build(&[("0001.sql", "DROP AGGREGATE nonexistent(int4);")])
+        .expect_err("dropping a missing aggregate without IF EXISTS must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("aggregate nonexistent"),
@@ -1072,10 +1069,7 @@ fn drop_aggregate_missing_errors_without_if_exists() {
 
 #[test]
 fn drop_aggregate_if_exists_no_error() {
-    let _snap = build(&[(
-        "0001.sql",
-        "DROP AGGREGATE IF EXISTS nonexistent(int4);",
-    )]);
+    let _snap = build(&[("0001.sql", "DROP AGGREGATE IF EXISTS nonexistent(int4);")]);
 }
 
 // ─── DROP OPERATOR ──────────────────────────────────────────────────────────
@@ -1117,19 +1111,13 @@ fn drop_operator_removes_only_matching_signature() {
 
 #[test]
 fn drop_operator_if_exists_no_error() {
-    let _snap = build(&[(
-        "0001.sql",
-        "DROP OPERATOR IF EXISTS <=> (int4, int4);",
-    )]);
+    let _snap = build(&[("0001.sql", "DROP OPERATOR IF EXISTS <=> (int4, int4);")]);
 }
 
 #[test]
 fn drop_operator_missing_errors_without_if_exists() {
-    let err = try_build(&[(
-        "0001.sql",
-        "DROP OPERATOR <=> (int4, int4);",
-    )])
-    .expect_err("dropping a missing operator without IF EXISTS must fail");
+    let err = try_build(&[("0001.sql", "DROP OPERATOR <=> (int4, int4);")])
+        .expect_err("dropping a missing operator without IF EXISTS must fail");
     assert!(err.to_string().contains("operator <=>"));
 }
 
@@ -1178,18 +1166,383 @@ fn drop_cast_removes_cast() {
 #[test]
 fn drop_cast_if_exists_no_error() {
     // There's no user-defined int2 → uuid cast; IF EXISTS must silence it.
-    let _snap = build(&[(
-        "0001.sql",
-        "DROP CAST IF EXISTS (int2 AS uuid);",
-    )]);
+    let _snap = build(&[("0001.sql", "DROP CAST IF EXISTS (int2 AS uuid);")]);
 }
 
 #[test]
 fn drop_cast_missing_errors_without_if_exists() {
+    let err = try_build(&[("0001.sql", "DROP CAST (int2 AS uuid);")])
+        .expect_err("dropping a missing cast without IF EXISTS must fail");
+    assert!(err.to_string().contains("cast from"));
+}
+
+// ─── CREATE PROCEDURE ──────────────────────────────────────────────────────
+
+#[test]
+fn create_procedure_registers_with_is_procedure_flag() {
+    // Procedures land in functions_by_name but must be flagged so the
+    // resolver does not surface them as callable expressions.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE PROCEDURE do_thing(x int) LANGUAGE SQL AS $$ SELECT $1 $$;",
+    )]);
+
+    let fns = snap
+        .functions_by_name
+        .get("do_thing")
+        .expect("do_thing should be registered");
+    assert_eq!(fns.len(), 1);
+    assert!(fns[0].is_procedure);
+    assert!(!fns[0].is_aggregate);
+}
+
+#[test]
+fn procedure_is_not_callable_in_expressions() {
+    // A `CREATE PROCEDURE` must not be considered a valid expression-level
+    // function. Calling it inside a SELECT should fail analysis.
+    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
+    use std::collections::HashMap;
+
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE PROCEDURE do_thing(x int) LANGUAGE SQL AS $$ SELECT $1 $$;",
+    )]);
+
+    let config = AnalyzerConfig {
+        domains: HashMap::new(),
+        enums: HashMap::new(),
+        types: HashMap::new(),
+        param_nullability: Vec::new(),
+    };
+
+    // The analyzer must not find do_thing as a callable function.
+    let result = analyze(&snap, "SELECT do_thing(1)", &config);
+    assert!(
+        result.is_err(),
+        "procedures must not resolve as expression functions"
+    );
+}
+
+// ─── CREATE / DROP MATERIALIZED VIEW ───────────────────────────────────────
+
+#[test]
+fn create_materialized_view_is_registered() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE MATERIALIZED VIEW item_names AS SELECT id, name FROM items;",
+    )]);
+
+    let view = snap
+        .resolve_table(None, "item_names")
+        .expect("materialized view should be registered as a relation");
+    assert_eq!(view.kind, RelationKind::MaterializedView);
+    assert_eq!(view.columns.len(), 2);
+    assert_eq!(view.columns[0].name, "id");
+    assert_eq!(view.columns[1].name, "name");
+}
+
+#[test]
+fn drop_materialized_view_removes_it() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE MATERIALIZED VIEW item_names AS SELECT id, name FROM items;
+         DROP MATERIALIZED VIEW item_names;",
+    )]);
+
+    assert!(snap.resolve_table(None, "item_names").is_none());
+}
+
+// ─── ALTER FUNCTION / AGGREGATE / OPERATOR ─────────────────────────────────
+
+#[test]
+fn alter_function_rename_moves_overload() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION add_one(x int) RETURNS int AS 'SELECT $1 + 1' LANGUAGE SQL;
+         ALTER FUNCTION add_one(int) RENAME TO plus_one;",
+    )]);
+
+    assert!(
+        snap.functions_by_name.get("add_one").is_none(),
+        "old name should be gone"
+    );
+    let fns = snap
+        .functions_by_name
+        .get("plus_one")
+        .expect("renamed function should exist");
+    assert_eq!(fns.len(), 1);
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    assert_eq!(fns[0].arg_types, vec![int4_oid]);
+}
+
+#[test]
+fn alter_function_set_schema_moves_it() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE SCHEMA utils;
+         CREATE FUNCTION add_one(x int) RETURNS int AS 'SELECT $1 + 1' LANGUAGE SQL;
+         ALTER FUNCTION add_one(int) SET SCHEMA utils;",
+    )]);
+
+    let fns = snap.functions_by_name.get("add_one").unwrap();
+    assert_eq!(fns[0].schema, "utils");
+}
+
+#[test]
+fn alter_function_rename_with_overloads_only_moves_matching_signature() {
+    // Two overloads of the same function; the rename must only move the
+    // one whose arg_types match.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION do_it(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
+         CREATE FUNCTION do_it(x text) RETURNS text AS 'SELECT $1' LANGUAGE SQL;
+         ALTER FUNCTION do_it(int) RENAME TO do_it_int;",
+    )]);
+
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let text_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "text")
+        .unwrap()
+        .oid;
+
+    let renamed = snap.functions_by_name.get("do_it_int").unwrap();
+    assert_eq!(renamed.len(), 1);
+    assert_eq!(renamed[0].arg_types, vec![int4_oid]);
+
+    let remaining = snap.functions_by_name.get("do_it").unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "text overload should still be under do_it"
+    );
+    assert_eq!(remaining[0].arg_types, vec![text_oid]);
+}
+
+#[test]
+fn alter_aggregate_rename_only_touches_aggregate() {
+    // A scalar function and an aggregate share the same name. ALTER
+    // AGGREGATE must only rename the aggregate.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION ag(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
+         CREATE FUNCTION ag_sfunc(state int, val int) RETURNS int AS 'SELECT $1 + $2' LANGUAGE SQL;
+         CREATE AGGREGATE ag(int) (SFUNC = ag_sfunc, STYPE = int);
+         ALTER AGGREGATE ag(int) RENAME TO ag_total;",
+    )]);
+
+    // Scalar survives under original name.
+    let scalar = snap.functions_by_name.get("ag").unwrap();
+    assert_eq!(scalar.len(), 1);
+    assert!(!scalar[0].is_aggregate);
+
+    // Aggregate moved.
+    let moved = snap.functions_by_name.get("ag_total").unwrap();
+    assert_eq!(moved.len(), 1);
+    assert!(moved[0].is_aggregate);
+}
+
+#[test]
+fn alter_operator_is_noop_but_does_not_crash() {
+    // ALTER OPERATOR currently only changes attributes (join selectivity,
+    // restriction selectivity). None of those affect type analysis, so this
+    // must be a successful no-op.
+    let _snap = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         ALTER OPERATOR <=> (vector, vector) SET (RESTRICT = scalarlesel);",
+    )]);
+}
+
+// ─── DROP SCHEMA ───────────────────────────────────────────────────────────
+
+#[test]
+fn drop_schema_empty_succeeds() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE SCHEMA temp_stuff;
+         DROP SCHEMA temp_stuff;",
+    )]);
+    assert!(!snap.search_path.contains(&"temp_stuff".to_string()));
+}
+
+#[test]
+fn drop_schema_with_objects_fails_without_cascade() {
     let err = try_build(&[(
         "0001.sql",
-        "DROP CAST (int2 AS uuid);",
+        "CREATE SCHEMA foo;
+         CREATE TABLE foo.bar (id INT PRIMARY KEY);
+         DROP SCHEMA foo;",
     )])
-    .expect_err("dropping a missing cast without IF EXISTS must fail");
-    assert!(err.to_string().contains("cast from"));
+    .expect_err("DROP SCHEMA without CASCADE must fail when schema has objects");
+    assert!(err.to_string().contains("cannot drop schema"));
+}
+
+#[test]
+fn drop_schema_cascade_removes_all_contents() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE SCHEMA foo;
+         CREATE TABLE foo.bar (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TYPE foo.my_enum AS ENUM ('a', 'b');
+         CREATE FUNCTION foo.do_it(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
+         DROP SCHEMA foo CASCADE;",
+    )]);
+
+    assert!(snap.resolve_table(Some("foo"), "bar").is_none());
+    assert!(snap.resolve_type_by_name(Some("foo"), "my_enum").is_none());
+    assert!(snap.find_functions(Some("foo"), "do_it").is_empty());
+}
+
+#[test]
+fn drop_schema_cascade_transitively_drops_views_in_other_schemas() {
+    // A view in `public` depends on a table in `foo`. DROP SCHEMA foo
+    // CASCADE must take the view down too.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE SCHEMA foo;
+         CREATE TABLE foo.items (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE VIEW public.item_names AS SELECT id, name FROM foo.items;
+         DROP SCHEMA foo CASCADE;",
+    )]);
+
+    assert!(snap.resolve_table(Some("public"), "item_names").is_none());
+}
+
+#[test]
+fn drop_schema_if_exists_no_error() {
+    let _snap = build(&[("0001.sql", "DROP SCHEMA IF EXISTS nonexistent;")]);
+}
+
+#[test]
+fn drop_schema_missing_errors_without_if_exists() {
+    let err = try_build(&[("0001.sql", "DROP SCHEMA nonexistent;")])
+        .expect_err("dropping a missing schema without IF EXISTS must fail");
+    assert!(err.to_string().contains("nonexistent"));
+}
+
+// ─── CASCADE for function/aggregate drops ──────────────────────────────────
+
+#[test]
+fn drop_function_cascade_accepted() {
+    // DROP FUNCTION ... CASCADE is a syntactic valid form. It must parse
+    // and execute without erroring.
+    let _snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION add_one(x int) RETURNS int AS 'SELECT $1 + 1' LANGUAGE SQL;
+         DROP FUNCTION add_one(int) CASCADE;",
+    )]);
+}
+
+#[test]
+fn drop_aggregate_cascade_accepted() {
+    let _snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION sum_sfunc(state int, val int) RETURNS int AS 'SELECT $1 + $2' LANGUAGE SQL;
+         CREATE AGGREGATE my_total(int) (SFUNC = sum_sfunc, STYPE = int);
+         DROP AGGREGATE my_total(int) CASCADE;",
+    )]);
+}
+
+#[test]
+fn drop_function_does_not_touch_procedure_of_same_name() {
+    // DROP FUNCTION must not remove a procedure with the same name+sig,
+    // mirroring PostgreSQL's asymmetry between the two object kinds.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
+         CREATE PROCEDURE f(x int) LANGUAGE SQL AS $$ SELECT $1 $$;
+         DROP FUNCTION f(int);",
+    )]);
+
+    let fns = snap.functions_by_name.get("f").unwrap();
+    assert_eq!(fns.len(), 1, "procedure must survive DROP FUNCTION");
+    assert!(fns[0].is_procedure);
+}
+
+#[test]
+fn param_only_in_order_by_is_inferred() {
+    // A parameter that appears exclusively in the ORDER BY clause must
+    // still get its type inferred from the expression context. Regression:
+    // previously ORDER BY was skipped entirely, so `$embedding` below was
+    // reported as UNKNOWN.
+    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
+    use std::collections::HashMap;
+
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         CREATE TABLE items (
+             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+             embedding vector NOT NULL
+         );",
+    )]);
+
+    let config = AnalyzerConfig {
+        domains: HashMap::new(),
+        enums: HashMap::new(),
+        types: HashMap::new(),
+        param_nullability: Vec::new(),
+    };
+
+    let info = analyze(
+        &snap,
+        "SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10",
+        &config,
+    )
+    .expect("ORDER BY param should be resolvable");
+    assert_eq!(info.params.len(), 1);
+    assert_eq!(info.params[0].rust_type, "pgvector::Vector");
+}
+
+#[test]
+fn param_in_group_by_and_having_is_inferred() {
+    // Params in GROUP BY / HAVING clauses must also be walked. This ensures
+    // the analyzer collects and types them.
+    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
+    use std::collections::HashMap;
+
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE orders (id BIGINT, total INT NOT NULL);",
+    )]);
+    let config = AnalyzerConfig {
+        domains: HashMap::new(),
+        enums: HashMap::new(),
+        types: HashMap::new(),
+        param_nullability: Vec::new(),
+    };
+
+    let info = analyze(
+        &snap,
+        "SELECT total, COUNT(*) AS c
+         FROM orders
+         GROUP BY total
+         HAVING COUNT(*) > $1",
+        &config,
+    )
+    .expect("HAVING param should be resolvable");
+    assert_eq!(info.params.len(), 1);
+    assert_eq!(info.params[0].rust_type, "i64");
+}
+
+#[test]
+fn drop_procedure_does_not_touch_function_of_same_name() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
+         CREATE PROCEDURE f(x int) LANGUAGE SQL AS $$ SELECT $1 $$;
+         DROP PROCEDURE f(int);",
+    )]);
+
+    let fns = snap.functions_by_name.get("f").unwrap();
+    assert_eq!(fns.len(), 1);
+    assert!(!fns[0].is_procedure);
 }

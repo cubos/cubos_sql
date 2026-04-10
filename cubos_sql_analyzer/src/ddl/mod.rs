@@ -4,6 +4,7 @@
 //! snapshot as if the DDL had been executed against a real PostgreSQL instance.
 
 pub mod aggregates;
+pub mod alter;
 pub mod drop;
 pub mod extensions;
 pub mod functions;
@@ -187,6 +188,10 @@ impl DdlInterpreter {
             }
             node::Node::CreateCastStmt(s) => types::create_cast(self, s),
 
+            // ── ALTER ... RENAME / SET SCHEMA ───────────────────────────
+            node::Node::RenameStmt(s) => alter::rename(self, s),
+            node::Node::AlterObjectSchemaStmt(s) => alter::set_schema(self, s),
+
             // ── No-ops (irrelevant for type analysis) ───────────────────
             node::Node::IndexStmt(_)
             | node::Node::CreateSeqStmt(_)
@@ -199,7 +204,6 @@ impl DdlInterpreter {
             | node::Node::CreatePolicyStmt(_)
             | node::Node::AlterPolicyStmt(_)
             | node::Node::AlterOwnerStmt(_)
-            | node::Node::AlterObjectSchemaStmt(_)
             | node::Node::AlterDefaultPrivilegesStmt(_)
             | node::Node::CreateRoleStmt(_)
             | node::Node::AlterRoleStmt(_)
@@ -224,7 +228,6 @@ impl DdlInterpreter {
             | node::Node::DiscardStmt(_)
             | node::Node::ExplainStmt(_)
             | node::Node::AlterFunctionStmt(_)
-            | node::Node::RenameStmt(_)
             | node::Node::AlterDomainStmt(_)
             | node::Node::NotifyStmt(_)
             | node::Node::ListenStmt(_)

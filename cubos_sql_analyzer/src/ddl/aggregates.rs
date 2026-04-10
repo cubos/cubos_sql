@@ -99,6 +99,7 @@ pub fn define_aggregate(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Resul
         is_variadic,
         is_set_returning: false,
         is_strict: false,
+        is_procedure: false,
         agg_final_type_oid: final_return,
     };
 

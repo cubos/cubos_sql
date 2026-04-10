@@ -117,6 +117,23 @@ fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgr
         })
         .collect();
 
+    // Derive the known schema set from everything we exported.
+    let mut schemas: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in types.values() {
+        schemas.insert(t.schema.clone());
+    }
+    for t in tables.values() {
+        schemas.insert(t.schema.clone());
+    }
+    for fns in functions_by_name.values() {
+        for f in fns {
+            schemas.insert(f.schema.clone());
+        }
+    }
+    for s in &search_path {
+        schemas.insert(s.clone());
+    }
+
     Ok(SchemaSnapshot {
         types,
         type_by_name,
@@ -126,6 +143,7 @@ fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgr
         operators_by_name,
         casts: casts_map,
         search_path,
+        schemas,
     })
 }
 
@@ -384,6 +402,7 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
             is_variadic,
             is_set_returning,
             is_strict,
+            is_procedure: false,
             agg_final_type_oid,
         });
     }

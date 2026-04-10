@@ -91,7 +91,13 @@ pub fn resolve_function(
         });
     }
 
-    let candidates = snapshot.find_functions(schema, name);
+    // Procedures are only callable via `CALL stmt`, never inside expressions,
+    // so filter them out of the candidate set for expression-level lookups.
+    let candidates: Vec<&FunctionEntry> = snapshot
+        .find_functions(schema, name)
+        .into_iter()
+        .filter(|f| !f.is_procedure)
+        .collect();
     if candidates.is_empty() {
         return Err(AnalyzeError::UnresolvedFunction(format!(
             "function {name} not found"

@@ -31,6 +31,11 @@ pub struct SchemaSnapshot {
     pub casts: HashMap<String, CastContext>,
     /// Current `search_path` schemas, in order.
     pub search_path: Vec<String>,
+    /// Set of all schema names known to the snapshot. Populated by
+    /// `CREATE SCHEMA` and seeded from `search_path`; used by `DROP SCHEMA`
+    /// to detect the "empty but exists" case.
+    #[serde(default)]
+    pub schemas: std::collections::HashSet<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -159,6 +164,11 @@ pub struct FunctionEntry {
     pub is_set_returning: bool,
     /// For strict functions: returns NULL if any input is NULL.
     pub is_strict: bool,
+    /// `true` for `CREATE PROCEDURE`. Procedures share storage with functions
+    /// but cannot appear in query expressions (only `CALL`), so the analyzer
+    /// uses this flag to filter them out of expression-level function lookups.
+    #[serde(default)]
+    pub is_procedure: bool,
     /// For aggregates: the actual return type (may differ from prorettype
     /// when a finalfn transforms the transition state).
     pub agg_final_type_oid: Option<u32>,

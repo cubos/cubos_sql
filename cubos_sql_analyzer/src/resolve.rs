@@ -189,6 +189,43 @@ fn analyze_select_with_ctes(
         )?;
     }
 
+    // Process GROUP BY expressions — no type expectation, but we still need
+    // to walk them so any parameters referenced are collected and typed.
+    for group_node in &sel.group_clause {
+        let _ = expr::infer_expr(
+            group_node,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::NONE,
+        );
+    }
+
+    // Process HAVING clause — same boolean goal as WHERE.
+    if let Some(having) = &sel.having_clause {
+        infer_expr_propagate_mismatch(
+            having,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::BOOL),
+        )?;
+    }
+
+    // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes
+    // — we walk the inner expression so parameters referenced there (e.g.
+    // `ORDER BY embedding <=> $embedding`) get their types inferred from
+    // operator context.
+    for sort_node in &sel.sort_clause {
+        if let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref()
+            && let Some(inner) = sb.node.as_deref()
+        {
+            let _ = expr::infer_expr(inner, &scope, &null_ctx, snapshot, params, TypeGoal::NONE);
+        }
+    }
+
     // Process LIMIT / OFFSET — PG uses coerce_to_specific_type(INT8OID)
     // with COERCION_ASSIGNMENT.
     for limit_node in [&sel.limit_count, &sel.limit_offset].into_iter().flatten() {
