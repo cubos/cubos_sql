@@ -346,9 +346,29 @@ pub use rust_decimal;
 /// Not part of the public API — do not rely on these directly.
 #[doc(hidden)]
 pub mod __private {
-    pub use chrono;
-    pub use rust_decimal;
     pub use serde_json;
     pub use tokio_postgres;
-    pub use uuid;
+
+    use tokio_postgres::types::{FromSql, Kind, Type};
+
+    /// Reads a PostgreSQL enum column as the raw label `String`.
+    ///
+    /// `tokio_postgres` will not decode a PG enum as `String` directly
+    /// because the `FromSql for String` impl only accepts `TEXT`/`VARCHAR`/etc.
+    /// Enum values arrive on the wire as plain UTF-8 bytes, so we provide a
+    /// thin wrapper whose `accepts` matches any `Kind::Enum` type.
+    pub struct EnumString(pub String);
+
+    impl<'a> FromSql<'a> for EnumString {
+        fn from_sql(
+            _ty: &Type,
+            raw: &'a [u8],
+        ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            Ok(EnumString(std::str::from_utf8(raw)?.to_owned()))
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            matches!(ty.kind(), Kind::Enum(_))
+        }
+    }
 }

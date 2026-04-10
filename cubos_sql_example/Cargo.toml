@@ -8,6 +8,7 @@ cubos_sql = { path = "../cubos_sql" }
 deadpool-postgres = "0.14"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+chrono = "0.4"
 
 [package.metadata.cubos_sql.database]
 migrations = "./migrations"

@@ -51,17 +51,6 @@ fn make_field_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
-/// Qualify external crate types so the generated code references them through
-/// `cubos_sql::__private::` instead of requiring the consumer to declare them
-/// as direct dependencies.
-fn qualify_rust_type(rust_type: &str) -> String {
-    rust_type
-        .replace("chrono::", "::cubos_sql::__private::chrono::")
-        .replace("uuid::", "::cubos_sql::__private::uuid::")
-        .replace("rust_decimal::", "::cubos_sql::__private::rust_decimal::")
-        .replace("serde_json::", "::cubos_sql::__private::serde_json::")
-}
-
 /// If the SQL is a SELECT-like query, wrap it in a subquery with `LIMIT 2`
 /// so that `fetch_one` / `fetch_optional` can detect more-than-one-row without
 /// fetching the entire result set.
@@ -377,7 +366,7 @@ fn generate_spread(
         } else if let Some(enum_type) = &pi.enum_rust_type {
             enum_type.clone()
         } else {
-            qualify_rust_type(&pi.rust_type)
+            pi.rust_type.clone()
         };
         let field_type: syn::Type = if is_nullable {
             parse_str(&format!("::std::option::Option<{inner_type_str}>"))?
@@ -890,7 +879,7 @@ fn build_param_fields(
         } else if let Some(enum_type) = &pi.enum_rust_type {
             enum_type.clone()
         } else {
-            qualify_rust_type(&pi.rust_type)
+            pi.rust_type.clone()
         };
 
         let field_type: syn::Type = if is_nullable {
@@ -1083,7 +1072,7 @@ fn column_rust_type(col: &ColumnInfo) -> Result<syn::Type, syn::Error> {
     } else if let Some(enum_ty) = col.enum_rust_type.as_deref() {
         enum_ty.to_string()
     } else {
-        qualify_rust_type(&col.rust_type)
+        col.rust_type.clone()
     };
 
     let inner_type: syn::Type = parse_str(&inner_type_str)?;
@@ -1133,15 +1122,16 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
             })
         }
     } else if let Some(enum_type_str) = &col.enum_rust_type {
-        // Enum column: read as String from PG, parse into the mapped Rust type.
+        // Enum column: read as EnumString (a FromSql wrapper that accepts
+        // Kind::Enum), then parse the label into the mapped Rust type.
         let enum_type: syn::Type = parse_str(enum_type_str)?;
 
         if col.nullable {
             Ok(quote! {
                 {
-                    let __str_val = __row.get::<_, ::std::option::Option<String>>(#idx_lit);
-                    match __str_val {
-                        Some(__v) => Some(__v.parse::<#enum_type>()
+                    let __enum_val = __row.get::<_, ::std::option::Option<::cubos_sql::__private::EnumString>>(#idx_lit);
+                    match __enum_val {
+                        Some(__v) => Some(__v.0.parse::<#enum_type>()
                             .map_err(|e| cubos_sql::Error::Deserialize(
                                 format!("failed to parse enum {}: {e}", stringify!(#enum_type))))?),
                         None => None,
@@ -1151,8 +1141,8 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
         } else {
             Ok(quote! {
                 {
-                    let __str_val = __row.get::<_, String>(#idx_lit);
-                    __str_val.parse::<#enum_type>()
+                    let __enum_val = __row.get::<_, ::cubos_sql::__private::EnumString>(#idx_lit);
+                    __enum_val.0.parse::<#enum_type>()
                         .map_err(|e| cubos_sql::Error::Deserialize(
                             format!("failed to parse enum {}: {e}", stringify!(#enum_type))))?
                 }
@@ -1160,7 +1150,7 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
         }
     } else {
         // Plain column.
-        let base_type: syn::Type = parse_str(&qualify_rust_type(&col.rust_type))?;
+        let base_type: syn::Type = parse_str(&col.rust_type)?;
 
         if col.nullable {
             Ok(quote! {
