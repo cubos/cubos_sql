@@ -108,6 +108,7 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
             },
             category: 'C',
             is_preferred: false,
+            extension: None,
         },
     );
     interp
@@ -129,6 +130,7 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
             },
             category: 'A',
             is_preferred: false,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(array_key, array_oid);

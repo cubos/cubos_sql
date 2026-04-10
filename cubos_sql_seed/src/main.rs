@@ -242,6 +242,7 @@ fn export_types(client: &mut postgres::Client) -> Result<TypeExport, postgres::E
                 kind,
                 category,
                 is_preferred: typispreferred,
+                extension: None,
             },
         );
     }

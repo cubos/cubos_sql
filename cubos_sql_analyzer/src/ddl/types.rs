@@ -47,6 +47,7 @@ pub fn create_domain(interp: &mut DdlInterpreter, stmt: &CreateDomainStmt) -> Re
             kind: TypeKind::Domain { base_type_oid },
             category,
             is_preferred,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -87,6 +88,7 @@ pub fn create_enum(interp: &mut DdlInterpreter, stmt: &CreateEnumStmt) -> Result
             kind: TypeKind::Enum { labels },
             category: 'E',
             is_preferred: false,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -154,6 +156,7 @@ pub fn create_composite(
             kind: TypeKind::Composite { fields },
             category: 'C',
             is_preferred: false,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -199,6 +202,7 @@ pub fn create_range(interp: &mut DdlInterpreter, stmt: &CreateRangeStmt) -> Resu
             kind: TypeKind::Range { subtype_oid },
             category: 'R',
             is_preferred: false,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -285,6 +289,7 @@ pub fn define_type(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(),
             kind: TypeKind::Base,
             category: 'U',
             is_preferred: false,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(key, oid);
@@ -346,6 +351,7 @@ fn register_array_type(
             },
             category: 'A',
             is_preferred: false,
+            extension: None,
         },
     );
     interp.snapshot.type_by_name.insert(array_key, array_oid);

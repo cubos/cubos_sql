@@ -817,8 +817,16 @@ fn build_param_info(
         resolve_rust_type(type_oid, snapshot, config)?;
 
     // Resolve cast_type: unwrap domains to base type, then look up pg_name.
+    // Prefer the static type_map (built-in PG types) but fall back to the
+    // snapshot's type name for extension-defined types like `vector`.
     let base_oid = snapshot.unwrap_domain(type_oid);
-    let cast_type = type_map::from_oid(base_oid).map(|ti| ti.pg_name.to_string());
+    let cast_type = type_map::from_oid(base_oid)
+        .map(|ti| ti.pg_name.to_string())
+        .or_else(|| {
+            snapshot
+                .get_type(base_oid)
+                .and_then(|te| te.extension.is_some().then(|| te.name.clone()))
+        });
 
     Ok(ParamInfo {
         pg_type_oid: type_oid,
@@ -863,10 +871,22 @@ fn resolve_rust_type(
             _ => {}
         }
 
-        // Check custom types config.
+        // Check custom types config (user-provided overrides win over any
+        // built-in extension mapping below).
         let qualified_name = format!("{}.{}", te.schema, te.name);
         if let Some(rt) = config.types.get(&qualified_name) {
             return Ok((rt.clone(), None, None));
+        }
+        if let Some(rt) = config.types.get(&te.name) {
+            return Ok((rt.clone(), None, None));
+        }
+
+        // Built-in mapping for types defined by known extensions
+        // (e.g. pgvector's `vector` → `pgvector::Vector`).
+        if let Some(ext_name) = te.extension.as_deref()
+            && let Some(rt) = crate::ddl::extensions::extension_type_rust_type(ext_name, &te.name)
+        {
+            return Ok((rt.to_owned(), None, None));
         }
     }
 

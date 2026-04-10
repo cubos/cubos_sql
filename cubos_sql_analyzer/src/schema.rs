@@ -52,6 +52,12 @@ pub struct TypeEntry {
     /// Whether this type is *preferred* in its category (`pg_type.typispreferred`).
     #[serde(default)]
     pub is_preferred: bool,
+    /// Name of the extension that created this type, if any. Set during
+    /// `CREATE EXTENSION` so the Rust type mapper can route extension types
+    /// (e.g. pgvector's `vector`) to crate-specific Rust types like
+    /// `pgvector::Vector`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
 }
 
 fn default_category() -> char {

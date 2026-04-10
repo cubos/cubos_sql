@@ -3,9 +3,11 @@
 //! This module parses SQL migration files using `pg_query` and mutates the
 //! snapshot as if the DDL had been executed against a real PostgreSQL instance.
 
+pub mod aggregates;
 pub mod drop;
 pub mod extensions;
 pub mod functions;
+pub mod operators;
 pub mod schema_stmt;
 pub mod tables;
 pub mod types;
@@ -172,7 +174,17 @@ impl DdlInterpreter {
             node::Node::AlterExtensionStmt(s) => extensions::alter_extension(self, s),
 
             // ── Type definitions (CREATE TYPE name (...)) and casts ─────
-            node::Node::DefineStmt(s) => types::define_type(self, s),
+            node::Node::DefineStmt(s) => {
+                use pg_query::protobuf::ObjectType;
+                match ObjectType::try_from(s.kind).unwrap_or(ObjectType::Undefined) {
+                    ObjectType::ObjectType => types::define_type(self, s),
+                    ObjectType::ObjectOperator => operators::define_operator(self, s),
+                    ObjectType::ObjectAggregate => aggregates::define_aggregate(self, s),
+                    // Other DefineStmt kinds (collation, text search, etc.)
+                    // are irrelevant for static type analysis.
+                    _ => Ok(()),
+                }
+            }
             node::Node::CreateCastStmt(s) => types::create_cast(self, s),
 
             // ── No-ops (irrelevant for type analysis) ───────────────────

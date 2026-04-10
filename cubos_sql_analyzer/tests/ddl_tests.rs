@@ -408,6 +408,122 @@ fn create_extension_citext() {
 }
 
 #[test]
+fn create_extension_vector_registers_operators() {
+    // pgvector's CREATE OPERATOR statements (e.g. `<=>`, `<->`) must be
+    // registered in the snapshot so expressions using them type-check.
+    let snap = build(&[("0001.sql", "CREATE EXTENSION vector;")]);
+
+    let vector_oid = snap
+        .resolve_type_by_name(None, "vector")
+        .expect("vector type should be registered")
+        .oid;
+    let float8_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "float8")
+        .unwrap()
+        .oid;
+
+    // Cosine distance `<=>` should resolve with (vector, vector) operands.
+    let op = snap
+        .find_operator("<=>", Some(vector_oid), vector_oid)
+        .expect("'<=>' operator should be registered for (vector, vector)");
+    assert_eq!(op.left_type_oid, Some(vector_oid));
+    assert_eq!(op.right_type_oid, vector_oid);
+    assert_eq!(
+        op.result_type_oid, float8_oid,
+        "cosine_distance returns float8"
+    );
+
+    // L2 distance `<->` too.
+    assert!(
+        snap.find_operator("<->", Some(vector_oid), vector_oid)
+            .is_some()
+    );
+}
+
+#[test]
+fn analyze_vector_query_maps_to_pgvector_rust_type() {
+    // End-to-end: a SELECT on a vector column and a `<=>` expression should
+    // produce Rust types routed to the `pgvector` crate. `cubos_sql` itself
+    // does not depend on pgvector — the type path is emitted as a string.
+    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
+    use std::collections::HashMap;
+
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         CREATE TABLE items (
+             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+             embedding vector NOT NULL
+         );",
+    )]);
+
+    let config = AnalyzerConfig {
+        domains: HashMap::new(),
+        enums: HashMap::new(),
+        types: HashMap::new(),
+        param_nullability: Vec::new(),
+    };
+
+    // Column of type `vector` is mapped to `pgvector::Vector`.
+    let info = analyze(&snap, "SELECT id, embedding FROM items", &config).unwrap();
+    let embedding = info.columns.iter().find(|c| c.name == "embedding").unwrap();
+    assert_eq!(embedding.rust_type, "pgvector::Vector");
+    assert!(!embedding.nullable);
+
+    // A query using the `<=>` operator infers the parameter's type as vector
+    // (via the operator's left operand), and the parameter's Rust type is
+    // mapped to `pgvector::Vector`.
+    let info = analyze(
+        &snap,
+        "SELECT id, (embedding <=> $1) AS dist FROM items ORDER BY embedding <=> $1",
+        &config,
+    )
+    .unwrap();
+    let dist = info.columns.iter().find(|c| c.name == "dist").unwrap();
+    assert_eq!(dist.rust_type, "f64", "cosine_distance returns float8");
+    assert_eq!(info.params.len(), 1);
+    assert_eq!(info.params[0].rust_type, "pgvector::Vector");
+    assert_eq!(
+        info.params[0].cast_type.as_deref(),
+        Some("vector"),
+        "cast_type should fall through to the snapshot type name for extension types"
+    );
+}
+
+#[test]
+fn create_extension_tags_types_with_extension_name() {
+    // Types created by `CREATE EXTENSION` must carry the extension name so
+    // the Rust type mapper can route them to crate-specific Rust types.
+    let snap = build(&[("0001.sql", "CREATE EXTENSION vector;")]);
+
+    let vector = snap
+        .resolve_type_by_name(None, "vector")
+        .expect("vector type should be registered");
+    assert_eq!(vector.extension.as_deref(), Some("vector"));
+
+    let halfvec = snap
+        .resolve_type_by_name(None, "halfvec")
+        .expect("halfvec type should be registered");
+    assert_eq!(halfvec.extension.as_deref(), Some("vector"));
+
+    let sparsevec = snap
+        .resolve_type_by_name(None, "sparsevec")
+        .expect("sparsevec type should be registered");
+    assert_eq!(sparsevec.extension.as_deref(), Some("vector"));
+
+    // User-defined types (from the same migration) must NOT be tagged.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         CREATE TYPE my_thing AS ENUM ('a', 'b');",
+    )]);
+    let my_thing = snap
+        .resolve_type_by_name(None, "my_thing")
+        .expect("my_thing should exist");
+    assert_eq!(my_thing.extension, None);
+}
+
+#[test]
 fn create_extension_with_schema() {
     let snap = build(&[(
         "0001.sql",
@@ -850,4 +966,230 @@ fn extension_unknown_warns_no_error() {
         "0001.sql",
         "CREATE EXTENSION IF NOT EXISTS some_unknown_ext;",
     )]);
+}
+
+// ─── CREATE / DROP AGGREGATE ────────────────────────────────────────────────
+
+#[test]
+fn create_aggregate_registers_function() {
+    // CREATE AGGREGATE should register the aggregate in functions_by_name
+    // with is_aggregate = true and the STYPE as the return type when no
+    // FINALFUNC is declared.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION my_sum_sfunc(int8, int4) RETURNS int8
+             AS 'SELECT $1 + $2::int8' LANGUAGE SQL;
+         CREATE AGGREGATE my_sum(int4) (
+             SFUNC = my_sum_sfunc,
+             STYPE = int8,
+             INITCOND = '0'
+         );",
+    )]);
+
+    let fns = snap.find_functions(None, "my_sum");
+    let agg = fns
+        .iter()
+        .find(|f| f.is_aggregate)
+        .expect("my_sum should be registered as an aggregate");
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let int8_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int8")
+        .unwrap()
+        .oid;
+    assert_eq!(agg.arg_types, vec![int4_oid]);
+    assert_eq!(
+        agg.return_type_oid, int8_oid,
+        "no FINALFUNC ⇒ return type equals STYPE"
+    );
+}
+
+#[test]
+fn create_aggregate_with_finalfunc_uses_final_return_type() {
+    // When FINALFUNC is declared, the aggregate's effective return type is
+    // the final function's return type, not the STYPE.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION my_avg_sfunc(int8, int4) RETURNS int8
+             AS 'SELECT $1' LANGUAGE SQL;
+         CREATE FUNCTION my_avg_finalfunc(int8) RETURNS float8
+             AS 'SELECT $1::float8' LANGUAGE SQL;
+         CREATE AGGREGATE my_avg(int4) (
+             SFUNC = my_avg_sfunc,
+             STYPE = int8,
+             FINALFUNC = my_avg_finalfunc
+         );",
+    )]);
+
+    let float8_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "float8")
+        .unwrap()
+        .oid;
+    let agg = snap
+        .find_functions(None, "my_avg")
+        .into_iter()
+        .find(|f| f.is_aggregate)
+        .expect("my_avg aggregate should exist");
+    assert_eq!(agg.return_type_oid, float8_oid);
+    assert_eq!(agg.agg_final_type_oid, Some(float8_oid));
+}
+
+#[test]
+fn drop_aggregate_removes_only_aggregate() {
+    // DROP AGGREGATE must match on (name, arg_types, is_aggregate) — a
+    // scalar function with the same name/signature must survive.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION dup(int4) RETURNS int4 AS 'SELECT $1' LANGUAGE SQL;
+         CREATE FUNCTION dup_sfunc(int4, int4) RETURNS int4 AS 'SELECT $1 + $2' LANGUAGE SQL;
+         CREATE AGGREGATE dup(int4) (
+             SFUNC = dup_sfunc,
+             STYPE = int4
+         );
+         DROP AGGREGATE dup(int4);",
+    )]);
+
+    let fns = snap.find_functions(None, "dup");
+    assert_eq!(fns.len(), 1, "scalar dup(int4) should remain");
+    assert!(!fns[0].is_aggregate);
+}
+
+#[test]
+fn drop_aggregate_missing_errors_without_if_exists() {
+    let err = try_build(&[(
+        "0001.sql",
+        "DROP AGGREGATE nonexistent(int4);",
+    )])
+    .expect_err("dropping a missing aggregate without IF EXISTS must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("aggregate nonexistent"),
+        "error should mention the aggregate name, got: {msg}"
+    );
+}
+
+#[test]
+fn drop_aggregate_if_exists_no_error() {
+    let _snap = build(&[(
+        "0001.sql",
+        "DROP AGGREGATE IF EXISTS nonexistent(int4);",
+    )]);
+}
+
+// ─── DROP OPERATOR ──────────────────────────────────────────────────────────
+
+#[test]
+fn drop_operator_removes_only_matching_signature() {
+    // pgvector registers multiple `<=>` overloads (vector/halfvec/sparsevec).
+    // Dropping the (vector, vector) overload must leave the others alone.
+    //
+    // We inspect the raw registry directly because pgvector also defines
+    // implicit casts between vector, halfvec and sparsevec — so
+    // `find_operator` would still succeed via cast-based resolution after
+    // the exact (vector, vector) entry is removed.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         DROP OPERATOR <=> (vector, vector);",
+    )]);
+
+    let vector_oid = snap.resolve_type_by_name(None, "vector").unwrap().oid;
+    let halfvec_oid = snap.resolve_type_by_name(None, "halfvec").unwrap().oid;
+
+    let ops = snap
+        .operators_by_name
+        .get("<=>")
+        .expect("other overloads should still be registered");
+
+    assert!(
+        !ops.iter()
+            .any(|o| o.left_type_oid == Some(vector_oid) && o.right_type_oid == vector_oid),
+        "(vector, vector) overload should have been dropped"
+    );
+    assert!(
+        ops.iter()
+            .any(|o| o.left_type_oid == Some(halfvec_oid) && o.right_type_oid == halfvec_oid),
+        "(halfvec, halfvec) overload should still be registered"
+    );
+}
+
+#[test]
+fn drop_operator_if_exists_no_error() {
+    let _snap = build(&[(
+        "0001.sql",
+        "DROP OPERATOR IF EXISTS <=> (int4, int4);",
+    )]);
+}
+
+#[test]
+fn drop_operator_missing_errors_without_if_exists() {
+    let err = try_build(&[(
+        "0001.sql",
+        "DROP OPERATOR <=> (int4, int4);",
+    )])
+    .expect_err("dropping a missing operator without IF EXISTS must fail");
+    assert!(err.to_string().contains("operator <=>"));
+}
+
+// ─── CREATE / DROP CAST ─────────────────────────────────────────────────────
+
+#[test]
+fn create_cast_registers_implicit_cast() {
+    // A basic CREATE CAST between two built-in types with WITH INOUT.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE CAST (int4 AS text) WITH INOUT AS IMPLICIT;",
+    )]);
+
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let text_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "text")
+        .unwrap()
+        .oid;
+    assert!(snap.has_implicit_cast(int4_oid, text_oid));
+}
+
+#[test]
+fn drop_cast_removes_cast() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE CAST (int4 AS text) WITH INOUT AS IMPLICIT;
+         DROP CAST (int4 AS text);",
+    )]);
+
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let text_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "text")
+        .unwrap()
+        .oid;
+    // The user-defined cast is gone. (Built-in int4→text cast is explicit,
+    // not implicit, so this check still holds.)
+    assert!(!snap.has_implicit_cast(int4_oid, text_oid));
+}
+
+#[test]
+fn drop_cast_if_exists_no_error() {
+    // There's no user-defined int2 → uuid cast; IF EXISTS must silence it.
+    let _snap = build(&[(
+        "0001.sql",
+        "DROP CAST IF EXISTS (int2 AS uuid);",
+    )]);
+}
+
+#[test]
+fn drop_cast_missing_errors_without_if_exists() {
+    let err = try_build(&[(
+        "0001.sql",
+        "DROP CAST (int2 AS uuid);",
+    )])
+    .expect_err("dropping a missing cast without IF EXISTS must fail");
+    assert!(err.to_string().contains("cast from"));
 }

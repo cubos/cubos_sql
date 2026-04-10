@@ -2,7 +2,7 @@
 
 use pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 
-use super::util::{extract_names, node_string};
+use super::util::{extract_names, node_string, resolve_type_name};
 use super::views;
 use super::{DdlError, DdlInterpreter};
 
@@ -29,6 +29,15 @@ pub fn drop_objects(interp: &mut DdlInterpreter, stmt: &DropStmt) -> Result<(), 
             }
             ObjectType::ObjectExtension => {
                 drop_extension(interp, obj_node, stmt.missing_ok, cascade)?;
+            }
+            ObjectType::ObjectCast => {
+                drop_cast(interp, obj_node, stmt.missing_ok)?;
+            }
+            ObjectType::ObjectOperator => {
+                drop_operator(interp, obj_node, stmt.missing_ok)?;
+            }
+            ObjectType::ObjectAggregate => {
+                drop_aggregate(interp, obj_node, stmt.missing_ok)?;
             }
             ObjectType::ObjectSchema
             | ObjectType::ObjectIndex
@@ -274,4 +283,194 @@ fn drop_function(
     }
 
     Ok(())
+}
+
+/// DROP AGGREGATE name(argtypes) — shares storage with functions, but we
+/// only remove entries where `is_aggregate = true` so a DROP AGGREGATE cannot
+/// accidentally remove a scalar function with the same signature.
+fn drop_aggregate(
+    interp: &mut DdlInterpreter,
+    obj_node: &pg_query::protobuf::Node,
+    missing_ok: bool,
+) -> Result<(), DdlError> {
+    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+        return Ok(());
+    };
+
+    let parts: Vec<&str> = owa.objname.iter().filter_map(node_string).collect();
+    let name = match parts.last() {
+        Some(n) => (*n).to_owned(),
+        None => return Ok(()),
+    };
+
+    // Resolve argument types. A zero-arg aggregate (`DROP AGGREGATE name(*)`)
+    // has an empty objargs list.
+    let arg_oids: Vec<u32> = owa
+        .objargs
+        .iter()
+        .filter_map(|n| {
+            if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
+                resolve_type_name(tn, &interp.snapshot)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let existed = interp
+        .snapshot
+        .functions_by_name
+        .get(&name)
+        .is_some_and(|fns| {
+            fns.iter()
+                .any(|f| f.is_aggregate && f.arg_types == arg_oids)
+        });
+
+    if !existed && !missing_ok {
+        return Err(DdlError::DependencyError(format!(
+            "aggregate {name}({}) does not exist",
+            format_arg_oids(&arg_oids, &interp.snapshot),
+        )));
+    }
+
+    if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&name) {
+        fns.retain(|f| !(f.is_aggregate && f.arg_types == arg_oids));
+        if fns.is_empty() {
+            interp.snapshot.functions_by_name.remove(&name);
+        }
+    }
+
+    Ok(())
+}
+
+/// DROP OPERATOR name(lefttype, righttype) — the pg_query AST always emits
+/// two objargs, with a `TypeName` whose names list is empty for NONE (prefix
+/// operators). We detect that by inspecting `names.is_empty()`.
+fn drop_operator(
+    interp: &mut DdlInterpreter,
+    obj_node: &pg_query::protobuf::Node,
+    missing_ok: bool,
+) -> Result<(), DdlError> {
+    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+        return Ok(());
+    };
+
+    // Operator name is the last element of objname (may be schema-qualified).
+    let op_name = match owa.objname.iter().filter_map(node_string).last() {
+        Some(n) => n.to_owned(),
+        None => return Ok(()),
+    };
+
+    let (left_oid, right_oid) = parse_operator_arg_types(&owa.objargs, &interp.snapshot);
+    let Some(right_oid) = right_oid else {
+        // Right operand is required for both binary and prefix operators.
+        return Ok(());
+    };
+
+    let existed = interp
+        .snapshot
+        .operators_by_name
+        .get(&op_name)
+        .is_some_and(|ops| {
+            ops.iter()
+                .any(|o| o.left_type_oid == left_oid && o.right_type_oid == right_oid)
+        });
+
+    if !existed && !missing_ok {
+        return Err(DdlError::DependencyError(format!(
+            "operator {op_name} does not exist for the requested operand types"
+        )));
+    }
+
+    if let Some(ops) = interp.snapshot.operators_by_name.get_mut(&op_name) {
+        ops.retain(|o| !(o.left_type_oid == left_oid && o.right_type_oid == right_oid));
+        if ops.is_empty() {
+            interp.snapshot.operators_by_name.remove(&op_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse `(left, right)` type OIDs from the two-element `objargs` of a
+/// `DROP OPERATOR`. A `TypeName` with an empty `names` list stands for
+/// `NONE`, indicating a prefix operator (no left operand).
+fn parse_operator_arg_types(
+    objargs: &[pg_query::protobuf::Node],
+    snapshot: &crate::schema::SchemaSnapshot,
+) -> (Option<u32>, Option<u32>) {
+    let resolve = |n: &pg_query::protobuf::Node| -> Option<u32> {
+        if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
+            if tn.names.is_empty() {
+                return None; // NONE — prefix operator
+            }
+            return resolve_type_name(tn, snapshot);
+        }
+        None
+    };
+
+    match objargs {
+        [l, r] => (resolve(l), resolve(r)),
+        [r] => (None, resolve(r)),
+        _ => (None, None),
+    }
+}
+
+/// DROP CAST (source AS target) — objects list contains a single `List`
+/// with two `TypeName` elements.
+fn drop_cast(
+    interp: &mut DdlInterpreter,
+    obj_node: &pg_query::protobuf::Node,
+    missing_ok: bool,
+) -> Result<(), DdlError> {
+    let items = match obj_node.node.as_ref() {
+        Some(node::Node::List(list)) => &list.items,
+        _ => return Ok(()),
+    };
+
+    let (src_node, tgt_node) = match items.as_slice() {
+        [s, t] => (s, t),
+        _ => return Ok(()),
+    };
+
+    let src_oid = match src_node.node.as_ref() {
+        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, &interp.snapshot),
+        _ => None,
+    };
+    let tgt_oid = match tgt_node.node.as_ref() {
+        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, &interp.snapshot),
+        _ => None,
+    };
+
+    let (Some(src), Some(tgt)) = (src_oid, tgt_oid) else {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TypeNotFound(
+            "cast source or target type".into(),
+        ));
+    };
+
+    let key = format!("{src}:{tgt}");
+    if interp.snapshot.casts.remove(&key).is_none() && !missing_ok {
+        return Err(DdlError::DependencyError(format!(
+            "cast from OID {src} to OID {tgt} does not exist"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Format a list of argument OIDs as PG type names for error messages.
+/// Falls back to `"oid:N"` when a type isn't in the snapshot.
+fn format_arg_oids(oids: &[u32], snapshot: &crate::schema::SchemaSnapshot) -> String {
+    oids.iter()
+        .map(|oid| {
+            snapshot
+                .get_type(*oid)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("oid:{oid}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
