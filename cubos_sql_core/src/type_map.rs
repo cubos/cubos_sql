@@ -98,7 +98,7 @@ static PG_TYPES: &[PgTypeInfo] = &[
     PgTypeInfo {
         oid: 114,
         pg_name: "json",
-        rust_type: "serde_json::Value",
+        rust_type: "::serde_json::Value",
     },
     PgTypeInfo {
         oid: 700,
@@ -123,37 +123,37 @@ static PG_TYPES: &[PgTypeInfo] = &[
     PgTypeInfo {
         oid: 1082,
         pg_name: "date",
-        rust_type: "chrono::NaiveDate",
+        rust_type: "::chrono::NaiveDate",
     },
     PgTypeInfo {
         oid: 1083,
         pg_name: "time",
-        rust_type: "chrono::NaiveTime",
+        rust_type: "::chrono::NaiveTime",
     },
     PgTypeInfo {
         oid: 1114,
         pg_name: "timestamp",
-        rust_type: "chrono::NaiveDateTime",
+        rust_type: "::chrono::NaiveDateTime",
     },
     PgTypeInfo {
         oid: 1184,
         pg_name: "timestamptz",
-        rust_type: "chrono::DateTime<chrono::Utc>",
+        rust_type: "::chrono::DateTime<::chrono::Utc>",
     },
     PgTypeInfo {
         oid: 1700,
         pg_name: "numeric",
-        rust_type: "rust_decimal::Decimal",
+        rust_type: "::rust_decimal::Decimal",
     },
     PgTypeInfo {
         oid: 2950,
         pg_name: "uuid",
-        rust_type: "uuid::Uuid",
+        rust_type: "::uuid::Uuid",
     },
     PgTypeInfo {
         oid: 3802,
         pg_name: "jsonb",
-        rust_type: "serde_json::Value",
+        rust_type: "::serde_json::Value",
     },
     // Array types are resolved generically by the proc macro via Kind::Array.
 ];

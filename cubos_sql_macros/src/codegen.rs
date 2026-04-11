@@ -401,7 +401,7 @@ fn generate_spread(
             if is_nullable {
                 regular_param_pushes.extend(quote! {
                     __params.push(Box::new(match &self.#field_name {
-                        Some(__v) => Some(::cubos_sql::serde_json::to_value(__v)
+                        Some(__v) => Some(::serde_json::to_value(__v)
                             .map_err(|e| cubos_sql::Error::Serialize(
                                 format!("failed to serialize domain type to JSON: {e}")))?),
                         None => None,
@@ -409,7 +409,7 @@ fn generate_spread(
                 });
             } else {
                 regular_param_pushes.extend(quote! {
-                    __params.push(Box::new(::cubos_sql::serde_json::to_value(&self.#field_name)
+                    __params.push(Box::new(::serde_json::to_value(&self.#field_name)
                         .map_err(|e| cubos_sql::Error::Serialize(
                             format!("failed to serialize domain type to JSON: {e}")))?)
                         as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
@@ -510,7 +510,7 @@ fn generate_spread(
             if is_domain {
                 item_pushes.extend(quote! {
                     __params.push(
-                        Box::new(::cubos_sql::serde_json::to_value(&#accessor)
+                        Box::new(::serde_json::to_value(&#accessor)
                             .map_err(|e| cubos_sql::Error::Serialize(
                                 format!("failed to serialize domain type to JSON: {e}")))?)
                             as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>
@@ -999,7 +999,7 @@ fn build_params_slice(
                 // Option<DomainType> → Option<serde_json::Value> → &dyn ToSql
                 elems.extend(quote! {
                     &match &self.#field_name {
-                        Some(__v) => Some(::cubos_sql::serde_json::to_value(__v)
+                        Some(__v) => Some(::serde_json::to_value(__v)
                             .map_err(|e| cubos_sql::Error::Serialize(
                                 format!("failed to serialize domain type to JSON: {e}")))?),
                         None => None,
@@ -1007,7 +1007,7 @@ fn build_params_slice(
                 });
             } else {
                 elems.extend(quote! {
-                    &::cubos_sql::serde_json::to_value(&self.#field_name)
+                    &::serde_json::to_value(&self.#field_name)
                         .map_err(|e| cubos_sql::Error::Serialize(
                             format!("failed to serialize domain type to JSON: {e}")))?
                         as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
@@ -1104,9 +1104,9 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
         if col.nullable {
             Ok(quote! {
                 {
-                    let __json_val = __row.get::<_, ::std::option::Option<::cubos_sql::serde_json::Value>>(#idx_lit);
+                    let __json_val = __row.get::<_, ::std::option::Option<::serde_json::Value>>(#idx_lit);
                     match __json_val {
-                        Some(__v) => Some(::cubos_sql::serde_json::from_value::<#domain_type>(__v)
+                        Some(__v) => Some(::serde_json::from_value::<#domain_type>(__v)
                             .map_err(|e| cubos_sql::Error::Deserialize(
                                 format!("failed to deserialize {}: {e}", stringify!(#domain_type))))?),
                         None => None,
@@ -1115,8 +1115,8 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
             })
         } else {
             Ok(quote! {
-                ::cubos_sql::serde_json::from_value::<#domain_type>(
-                    __row.get::<_, ::cubos_sql::serde_json::Value>(#idx_lit)
+                ::serde_json::from_value::<#domain_type>(
+                    __row.get::<_, ::serde_json::Value>(#idx_lit)
                 ).map_err(|e| cubos_sql::Error::Deserialize(
                     format!("failed to deserialize {}: {e}", stringify!(#domain_type))))?
             })
