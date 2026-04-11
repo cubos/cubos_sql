@@ -264,37 +264,37 @@ mod tests {
     #[test]
     fn from_oid_timestamptz() {
         let info = from_oid(1184).expect("timestamptz OID 1184 must be present");
-        assert_eq!(info.rust_type, "chrono::DateTime<chrono::Utc>");
+        assert_eq!(info.rust_type, "::chrono::DateTime<::chrono::Utc>");
     }
 
     #[test]
     fn from_oid_timestamp() {
         let info = from_oid(1114).expect("timestamp OID 1114 must be present");
-        assert_eq!(info.rust_type, "chrono::NaiveDateTime");
+        assert_eq!(info.rust_type, "::chrono::NaiveDateTime");
     }
 
     #[test]
     fn from_oid_date() {
         let info = from_oid(1082).expect("date OID 1082 must be present");
-        assert_eq!(info.rust_type, "chrono::NaiveDate");
+        assert_eq!(info.rust_type, "::chrono::NaiveDate");
     }
 
     #[test]
     fn from_oid_uuid() {
         let info = from_oid(2950).expect("uuid OID 2950 must be present");
-        assert_eq!(info.rust_type, "uuid::Uuid");
+        assert_eq!(info.rust_type, "::uuid::Uuid");
     }
 
     #[test]
     fn from_oid_jsonb() {
         let info = from_oid(3802).expect("jsonb OID 3802 must be present");
-        assert_eq!(info.rust_type, "serde_json::Value");
+        assert_eq!(info.rust_type, "::serde_json::Value");
     }
 
     #[test]
     fn from_oid_json() {
         let info = from_oid(114).expect("json OID 114 must be present");
-        assert_eq!(info.rust_type, "serde_json::Value");
+        assert_eq!(info.rust_type, "::serde_json::Value");
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn from_oid_time() {
         let info = from_oid(1083).expect("time OID 1083 must be present");
-        assert_eq!(info.rust_type, "chrono::NaiveTime");
+        assert_eq!(info.rust_type, "::chrono::NaiveTime");
     }
 
     #[test]

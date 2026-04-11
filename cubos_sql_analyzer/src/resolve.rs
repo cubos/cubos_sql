@@ -888,7 +888,7 @@ fn resolve_rust_type(
                 if let Some(rust_path) = config.domains.get(&qualified_name) {
                     // JSONB domain.
                     return Ok((
-                        "serde_json::Value".to_owned(),
+                        "::serde_json::Value".to_owned(),
                         Some(rust_path.clone()),
                         None,
                     ));

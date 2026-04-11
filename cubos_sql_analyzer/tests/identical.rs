@@ -700,8 +700,8 @@ fn identical_domain_column_without_config() {
     let s = analyze(&snapshot, sql, &default_config()).unwrap();
     // preferences is user_prefs (domain over JSONB) → unwraps to jsonb
     assert!(
-        col(&s, "preferences").rust_type == "serde_json::Value",
-        "JSONB domain without config → serde_json::Value, got: {}",
+        col(&s, "preferences").rust_type == "::serde_json::Value",
+        "JSONB domain without config → ::serde_json::Value, got: {}",
         col(&s, "preferences").rust_type
     );
     assert!(col(&s, "preferences").nullable, "preferences is nullable");
@@ -717,7 +717,7 @@ fn identical_domain_column_with_config() {
         .insert("public.user_prefs".into(), "crate::UserPrefs".into());
     let sql = "SELECT id, preferences FROM users";
     let info = analyze(&snapshot, sql, &config).unwrap();
-    assert_eq!(col(&info, "preferences").rust_type, "serde_json::Value");
+    assert_eq!(col(&info, "preferences").rust_type, "::serde_json::Value");
     assert_eq!(
         col(&info, "preferences").domain_rust_type.as_deref(),
         Some("crate::UserPrefs"),
@@ -731,10 +731,10 @@ fn identical_domain_param_insert() {
     let snapshot = setup();
     let sql = "INSERT INTO users (name, email, preferences) VALUES ($1, $2, $3) RETURNING id";
     let s = analyze(&snapshot, sql, &default_config()).unwrap();
-    // $3 is user_prefs (JSONB domain) → serde_json::Value
+    // $3 is user_prefs (JSONB domain) → ::serde_json::Value
     assert!(
-        s.params[2].rust_type == "serde_json::Value",
-        "$3 should be serde_json::Value, got: {}",
+        s.params[2].rust_type == "::serde_json::Value",
+        "$3 should be ::serde_json::Value, got: {}",
         s.params[2].rust_type
     );
 }
@@ -748,7 +748,7 @@ fn identical_domain_param_with_config() {
         .insert("public.user_prefs".into(), "crate::UserPrefs".into());
     let sql = "INSERT INTO users (name, email, preferences) VALUES ($1, $2, $3) RETURNING id";
     let info = analyze(&snapshot, sql, &config).unwrap();
-    assert_eq!(info.params[2].rust_type, "serde_json::Value");
+    assert_eq!(info.params[2].rust_type, "::serde_json::Value");
     assert_eq!(
         info.params[2].domain_rust_type.as_deref(),
         Some("crate::UserPrefs"),
@@ -771,8 +771,8 @@ fn identical_schema_qualified_domain_column_without_config() {
     let s = analyze(&snapshot, sql, &default_config()).unwrap();
     assert_eq!(
         col(&s, "health").rust_type,
-        "serde_json::Value",
-        "JSONB domain without config → serde_json::Value"
+        "::serde_json::Value",
+        "JSONB domain without config → ::serde_json::Value"
     );
     assert!(col(&s, "health").nullable, "health is nullable");
 }
@@ -787,7 +787,7 @@ fn identical_schema_qualified_domain_column_with_config() {
         .insert("whatsapp.health_data".into(), "crate::HealthData".into());
     let sql = "SELECT channel_id, health FROM whatsapp.channels";
     let info = analyze(&snapshot, sql, &config).unwrap();
-    assert_eq!(col(&info, "health").rust_type, "serde_json::Value");
+    assert_eq!(col(&info, "health").rust_type, "::serde_json::Value");
     assert_eq!(
         col(&info, "health").domain_rust_type.as_deref(),
         Some("crate::HealthData"),
@@ -806,7 +806,7 @@ fn identical_schema_qualified_domain_param_with_config() {
     let sql = "INSERT INTO whatsapp.channels (channel_id, health, updated_at) \
                VALUES ($1, $2, now())";
     let info = analyze(&snapshot, sql, &config).unwrap();
-    assert_eq!(info.params[1].rust_type, "serde_json::Value");
+    assert_eq!(info.params[1].rust_type, "::serde_json::Value");
     assert_eq!(
         info.params[1].domain_rust_type.as_deref(),
         Some("crate::HealthData"),

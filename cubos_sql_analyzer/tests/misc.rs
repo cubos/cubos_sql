@@ -72,7 +72,7 @@ fn unknown_param_jsonb_exists_then_arrow() {
                WHERE channel_id = $2 AND id = $3";
     let info = analyze(&snapshot, sql, &default_config()).unwrap();
     // $1 should be inferred as jsonb via the `?` operator
-    assert_eq!(info.params[0].rust_type, "serde_json::Value");
+    assert_eq!(info.params[0].rust_type, "::serde_json::Value");
     assert_eq!(info.params[1].rust_type, "i64");
     assert_eq!(info.params[2].rust_type, "String");
 }
@@ -87,7 +87,7 @@ fn unknown_param_jsonb_multiple_case_branches() {
                is_business = CASE WHEN $1 ? 'is_business' THEN ($1->>'is_business')::boolean ELSE is_business END \
                WHERE channel_id = $2 AND id = $3";
     let info = analyze(&snapshot, sql, &default_config()).unwrap();
-    assert_eq!(info.params[0].rust_type, "serde_json::Value");
+    assert_eq!(info.params[0].rust_type, "::serde_json::Value");
     assert_eq!(info.params[1].rust_type, "i64");
     assert_eq!(info.params[2].rust_type, "String");
 }
@@ -99,7 +99,7 @@ fn unknown_operator_jsonb_arrow() {
     let sql = "SELECT preferences->'theme' as theme FROM users";
     let info = static_analyze(&snapshot, sql);
     // -> returns jsonb (when left is jsonb)
-    assert_eq!(col(&info, "theme").rust_type, "serde_json::Value");
+    assert_eq!(col(&info, "theme").rust_type, "::serde_json::Value");
 }
 
 /// Query against pg_catalog table with obj_description function.
