@@ -11,6 +11,36 @@ fn sql_hash(sql: &str) -> String {
     format!("{:x}", md5::compute(sql.as_bytes()))
 }
 
+/// Formats a `tokio_postgres::Error` including the underlying Postgres
+/// `DbError` details (severity, message, detail, hint, position), which are
+/// otherwise hidden behind the generic `"db error"` Display impl.
+fn format_pg_error(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut out = format!("{}: {}", db.severity(), db.message());
+        if let Some(detail) = db.detail() {
+            out.push_str("\nDETAIL: ");
+            out.push_str(detail);
+        }
+        if let Some(hint) = db.hint() {
+            out.push_str("\nHINT: ");
+            out.push_str(hint);
+        }
+        if let Some(pos) = db.position() {
+            use tokio_postgres::error::ErrorPosition;
+            match pos {
+                ErrorPosition::Original(p) => out.push_str(&format!("\nPOSITION: {}", p)),
+                ErrorPosition::Internal { position, query } => out.push_str(&format!(
+                    "\nINTERNAL POSITION: {}\nQUERY: {}",
+                    position, query
+                )),
+            }
+        }
+        out
+    } else {
+        e.to_string()
+    }
+}
+
 /// Status of a single migration, indicating whether it has been applied.
 ///
 /// Returned by [`status`] for each migration found in the [`MigrationSource`].
@@ -132,7 +162,8 @@ async fn run_inner(
             tx.batch_execute(&migration.sql).await.map_err(|e| {
                 crate::Error::Migration(format!(
                     "failed to apply migration {}: {}",
-                    migration.name, e
+                    migration.name,
+                    format_pg_error(&e)
                 ))
             })?;
 
@@ -150,7 +181,8 @@ async fn run_inner(
             client.batch_execute(&migration.sql).await.map_err(|e| {
                 crate::Error::Migration(format!(
                     "failed to apply migration {}: {}",
-                    migration.name, e
+                    migration.name,
+                    format_pg_error(&e)
                 ))
             })?;
 
