@@ -346,17 +346,18 @@ pub use rust_decimal;
 /// Not part of the public API — do not rely on these directly.
 #[doc(hidden)]
 pub mod __private {
-    pub use serde_json;
     pub use tokio_postgres;
 
-    use tokio_postgres::types::{FromSql, Kind, Type};
+    use bytes::BytesMut;
+    use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
-    /// Reads a PostgreSQL enum column as the raw label `String`.
+    /// Bridge type for PostgreSQL enums.
     ///
-    /// `tokio_postgres` will not decode a PG enum as `String` directly
-    /// because the `FromSql for String` impl only accepts `TEXT`/`VARCHAR`/etc.
-    /// Enum values arrive on the wire as plain UTF-8 bytes, so we provide a
+    /// `tokio_postgres` will not decode/encode a PG enum as `String` directly:
+    /// `FromSql`/`ToSql` for `String` only accept `TEXT`/`VARCHAR`/etc. Enum
+    /// values travel on the wire as plain UTF-8 label bytes, so we expose a
     /// thin wrapper whose `accepts` matches any `Kind::Enum` type.
+    #[derive(Debug)]
     pub struct EnumString(pub String);
 
     impl<'a> FromSql<'a> for EnumString {
@@ -370,5 +371,22 @@ pub mod __private {
         fn accepts(ty: &Type) -> bool {
             matches!(ty.kind(), Kind::Enum(_))
         }
+    }
+
+    impl ToSql for EnumString {
+        fn to_sql(
+            &self,
+            _ty: &Type,
+            out: &mut BytesMut,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            out.extend_from_slice(self.0.as_bytes());
+            Ok(IsNull::No)
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            matches!(ty.kind(), Kind::Enum(_))
+        }
+
+        to_sql_checked!();
     }
 }

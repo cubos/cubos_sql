@@ -594,6 +594,7 @@ version = "0.1.0"
 dependencies = [
  "bb8",
  "bb8-postgres",
+ "bytes",
  "chrono",
  "cubos_sql_core",
  "cubos_sql_macros",
