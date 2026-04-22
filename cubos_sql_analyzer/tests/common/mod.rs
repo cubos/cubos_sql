@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
+pub use cubos_sql_analyzer::query_info::{ColumnInfo, QueryInfo};
 pub use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
 pub use cubos_sql_analyzer::schema::SchemaSnapshot;
-pub use cubos_sql_core::query_info::{ColumnInfo, QueryInfo};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Setup

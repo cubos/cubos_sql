@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use pg_query::protobuf::{self, JoinType, SetOperation, node};
 
-use cubos_sql_core::query_info::{ColumnInfo, ParamInfo, QueryInfo};
-use cubos_sql_core::type_map;
+use crate::query_info::{ColumnInfo, ParamInfo, QueryInfo};
+use crate::type_map;
 
 use crate::coerce::oid;
 use crate::error::AnalyzeError;

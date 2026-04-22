@@ -104,8 +104,8 @@ fn static_analyze(
     snapshot: &cubos_sql_analyzer::schema::SchemaSnapshot,
     sql: &str,
     config: &cubos_sql_core::config::ResolvedConfig<'_>,
-    lex_output: &cubos_sql_core::param::LexOutput,
-) -> Result<cubos_sql_core::query_info::QueryInfo, syn::Error> {
+    lex_output: &cubos_sql_analyzer::param::LexOutput,
+) -> Result<cubos_sql_analyzer::query_info::QueryInfo, syn::Error> {
     let analyzer_config = cubos_sql_analyzer::resolve::AnalyzerConfig {
         domains: config.domains.clone(),
         enums: config.enums.clone(),
@@ -205,7 +205,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     let sql_str = input.sql.value();
 
     // 1. Lex the SQL template.
-    let lex_output = cubos_sql_core::lexer::lex(&sql_str)
+    let lex_output = cubos_sql_analyzer::lexer::lex(&sql_str)
         .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
 
     // Validate that all assignments match SQL params.
@@ -344,7 +344,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
 /// Replaces each spread insertion point with a single row of positional
 /// placeholders. Field mapping is mandatory, so fields.len() gives the
 /// column count.
-fn build_spread_sample_sql(lex_output: &cubos_sql_core::param::LexOutput) -> String {
+fn build_spread_sample_sql(lex_output: &cubos_sql_analyzer::param::LexOutput) -> String {
     let base_sql = &lex_output.sql;
     let num_regular_params = lex_output.params.len();
     let mut result = String::with_capacity(base_sql.len() + 64);
@@ -374,7 +374,7 @@ fn build_spread_sample_sql(lex_output: &cubos_sql_core::param::LexOutput) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubos_sql_core::lexer::lex;
+    use cubos_sql_analyzer::lexer::lex;
 
     #[test]
     fn sample_sql_simple_spread() {

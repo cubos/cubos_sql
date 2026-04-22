@@ -25,16 +25,16 @@ Workspace with crates:
 ```
 cubos_sql_cli (binary, stub)
     └── cubos_sql (runtime: Pool, Executor, migrate)
-            ├── cubos_sql_core (shared: config, lexer, param types, type_map)
+            ├── cubos_sql_core (shared config only — kept small so runtime does not pull pg_query)
             └── cubos_sql_macros (proc macro: sql!)
                     ├── cubos_sql_core
-                    └── cubos_sql_analyzer (static SQL type/nullability analyzer)
+                    └── cubos_sql_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
 ```
 
 ### Compile-time pipeline (`sql!` macro)
 
 1. Parse macro input: `sql!(executor, "SQL with $params", name = value)`
-2. Lex SQL via `cubos_sql_core::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
+2. Lex SQL via `cubos_sql_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
 3. Load config from `[package.metadata.cubos_sql]` in consumer's `Cargo.toml`
 4. Build schema snapshot from seed + migrations via DDL interpreter (in-memory, no Docker)
 5. Static analysis: parse SQL with `pg_query`, resolve types and nullability against snapshot

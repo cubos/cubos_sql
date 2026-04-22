@@ -95,7 +95,7 @@ fn read_ident(chars: &[char], start: usize) -> &[char] {
 /// # Examples
 ///
 /// ```
-/// use cubos_sql_core::lexer::lex;
+/// use cubos_sql_analyzer::lexer::lex;
 ///
 /// let output = lex("SELECT * FROM users WHERE id = $id AND name = $name").unwrap();
 /// assert_eq!(output.sql, "SELECT * FROM users WHERE id = $1 AND name = $2");

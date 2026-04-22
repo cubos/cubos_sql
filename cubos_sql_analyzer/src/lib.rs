@@ -13,18 +13,22 @@
 //! 2. **Static analysis**: [`resolve::analyze`] parses a query using `pg_query`
 //!    and walks the AST, resolving types and nullability against the snapshot.
 //!
-//! The analyzer produces a [`cubos_sql_core::query_info::QueryInfo`] with
-//! precise nullability tracking (e.g., LEFT JOIN nullability, expression-level
-//! NOT NULL via COALESCE/COUNT/CASE).
+//! The analyzer produces a [`query_info::QueryInfo`] with precise nullability
+//! tracking (e.g., LEFT JOIN nullability, expression-level NOT NULL via
+//! COALESCE/COUNT/CASE).
 
 pub mod coerce;
 pub mod ddl;
 pub mod error;
 pub mod expr;
 pub mod functions;
+pub mod lexer;
 pub mod nullability;
+pub mod param;
 pub mod params;
+pub mod query_info;
 pub mod resolve;
 pub mod schema;
 pub mod scope;
 pub mod seed;
+pub mod type_map;

@@ -1,15 +1,15 @@
 //! Code generation for the `query!` macro.
 //!
-//! Receives the lexer output ([`cubos_sql_core::param::LexOutput`]) and the
-//! introspection result ([`cubos_sql_core::query_info::QueryInfo`]) and produces a
+//! Receives the lexer output ([`cubos_sql_analyzer::param::LexOutput`]) and the
+//! introspection result ([`cubos_sql_analyzer::query_info::QueryInfo`]) and produces a
 //! [`proc_macro2::TokenStream`] that implements the typed query builder.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse_str;
 
-use cubos_sql_core::param::LexOutput;
-use cubos_sql_core::query_info::{ColumnInfo, QueryInfo};
+use cubos_sql_analyzer::param::LexOutput;
+use cubos_sql_analyzer::query_info::{ColumnInfo, QueryInfo};
 
 /// Rust keywords that cannot be used as identifiers without the `r#` prefix.
 const RUST_KEYWORDS: &[&str] = &[
@@ -1167,8 +1167,8 @@ fn column_get_expr(col: &ColumnInfo, idx: usize) -> Result<TokenStream, syn::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubos_sql_core::lexer::lex;
-    use cubos_sql_core::query_info::{ColumnInfo, ParamInfo, QueryInfo};
+    use cubos_sql_analyzer::lexer::lex;
+    use cubos_sql_analyzer::query_info::{ColumnInfo, ParamInfo, QueryInfo};
 
     fn make_query_info(param_types: &[&str], columns: Vec<ColumnInfo>) -> QueryInfo {
         QueryInfo {

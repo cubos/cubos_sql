@@ -81,7 +81,7 @@ Notas:
 
 ## Componentes-Chave
 
-### 1. Lexer SQL (`cubos_sql_core::lexer`)
+### 1. Lexer SQL (`cubos_sql_analyzer::lexer`)
 
 Maquina de estados que rastreia contexto (string, comentario, etc.) e extrai:
 - `$param` -> `Param { name, position }`
