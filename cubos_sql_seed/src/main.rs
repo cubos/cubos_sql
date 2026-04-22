@@ -1,10 +1,12 @@
 //! Generates `seed.json` for the static analyzer from a live PostgreSQL instance.
 //!
 //! Usage:
-//!   cargo run -p cubos_sql_seed -- [connection_string]
+//!   cargo run -p cubos_sql_seed
 //!
-//! If no connection string is provided, connects to a local PostgreSQL with
-//! default credentials. The output is written to `cubos_sql_analyzer/src/seed.json`.
+//! Spins up a disposable `postgres:latest` container via the Docker daemon
+//! (using `testcontainers`), waits for it to accept connections, exports the
+//! schema, and then stops + removes the container (via `Drop`). The output is
+//! written to `cubos_sql_analyzer/src/seed.json`.
 //!
 //! Run this when updating to a new PostgreSQL version (e.g. PG 19) to refresh
 //! the baseline type catalog used by the DDL interpreter.
@@ -12,11 +14,32 @@
 use std::collections::{BTreeMap, HashMap};
 
 use cubos_sql_analyzer::schema::*;
+use testcontainers::ImageExt;
+use testcontainers::runners::SyncRunner;
+use testcontainers_modules::postgres::Postgres;
 
 fn main() {
-    let conn_str = std::env::args().nth(1).unwrap_or_else(|| {
-        "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres".to_string()
-    });
+    eprintln!("Pulling postgres:latest from registry...");
+    // `pull_image()` forces a fresh pull on every run — otherwise
+    // `start()` only pulls on 404, which would pin us to whatever
+    // `postgres:latest` was when the image was first cached locally.
+    let request = Postgres::default()
+        .with_tag("latest")
+        .pull_image()
+        .expect("failed to pull postgres:latest");
+
+    eprintln!("Starting postgres:latest container...");
+    // `testcontainers_modules::postgres::Postgres` waits for the "database
+    // system is ready to accept connections" log line before `start()`
+    // returns, so no manual readiness polling is required.
+    let container = request.start().expect("failed to start postgres container");
+
+    let host = container.get_host().expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .expect("failed to get container port");
+    let conn_str =
+        format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
 
     eprintln!("Connecting to: {conn_str}");
     let mut client = postgres::Client::connect(&conn_str, postgres::NoTls)
