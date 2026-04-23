@@ -1,9 +1,66 @@
 use cubos_sql::migrate::MigrationSource;
 use cubos_sql_core::config::MigrationsConfig;
 use std::fs;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
+
+/// Container IDs that an `atexit` hook must force-remove before the test
+/// process exits. testcontainers-rs relies on `Drop` to remove containers,
+/// but `Drop` is never invoked for values held in `static` slots (used by
+/// the e2e harness) and can be skipped on abnormal exit paths. Shelling out
+/// to `docker rm -f` from `libc::atexit` is a last-resort reaper that works
+/// even when Ryuk isn't around.
+static TRACKED_CONTAINERS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+extern "C" fn reap_containers() {
+    let Some(ids) = TRACKED_CONTAINERS.get() else {
+        return;
+    };
+    let ids = match ids.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => return,
+    };
+    for id in ids {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn track_container(id: String) {
+    let slot = TRACKED_CONTAINERS.get_or_init(|| {
+        // SAFETY: `reap_containers` has the required C ABI and only touches
+        // the static `Mutex`; registering it once is safe on every POSIX
+        // target we support.
+        unsafe {
+            libc::atexit(reap_containers);
+        }
+        Mutex::new(Vec::new())
+    });
+    if let Ok(mut ids) = slot.lock() {
+        ids.push(id);
+    }
+}
+
+/// Start a throwaway Postgres container on the latest tag with Docker's
+/// `--rm` flag set, so the container is deleted as soon as it exits — even
+/// when the Ryuk reaper is unavailable or a test panics before Drop runs.
+async fn start_postgres() -> ContainerAsync<Postgres> {
+    let container = Postgres::default()
+        .with_tag("latest")
+        .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
+        .start()
+        .await
+        .unwrap();
+    track_container(container.id().to_string());
+    container
+}
 
 async fn connect_to_container(
     container: &testcontainers::ContainerAsync<Postgres>,
@@ -59,7 +116,7 @@ fn create_test_migrations_with_down(dir: &std::path::Path) {
 
 #[tokio::test]
 async fn run_applies_all_pending_migrations() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -88,7 +145,7 @@ async fn run_applies_all_pending_migrations() {
 
 #[tokio::test]
 async fn run_is_idempotent() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -110,7 +167,7 @@ async fn run_is_idempotent() {
 
 #[tokio::test]
 async fn status_shows_applied_and_pending() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -147,7 +204,7 @@ async fn status_shows_applied_and_pending() {
 
 #[tokio::test]
 async fn revert_with_down_sql() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -201,7 +258,7 @@ async fn revert_with_down_sql() {
 
 #[tokio::test]
 async fn revert_without_down_sql_errors() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -230,7 +287,7 @@ async fn revert_without_down_sql_errors() {
 
 #[tokio::test]
 async fn revert_force_without_down_sql() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -273,7 +330,7 @@ async fn revert_force_without_down_sql() {
 
 #[tokio::test]
 async fn revert_not_applied_errors() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -299,7 +356,7 @@ async fn revert_not_applied_errors() {
 
 #[tokio::test]
 async fn failed_migration_rolls_back() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -329,7 +386,7 @@ async fn failed_migration_rolls_back() {
 
 #[tokio::test]
 async fn no_transaction_migration() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -364,7 +421,7 @@ async fn no_transaction_migration() {
 
 #[tokio::test]
 async fn custom_table_name() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = start_postgres().await;
     let mut client = connect_to_container(&container).await;
 
     let dir = tempfile::tempdir().unwrap();

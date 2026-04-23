@@ -757,6 +757,44 @@ fn infer_a_expr(
         "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~~" | "~~*" | "!~~" | "!~~*"
     );
 
+    // col IN ($1, $2, ...) / col NOT IN (...): rexpr is a Node::List whose
+    // items need to be inferred with the left side's type as the goal so any
+    // untyped params inside the list get their OID resolved. The generic
+    // Pass 1 below calls `infer_expr` on the List node itself, which hits the
+    // `_` fallback and silently errors (swallowed by the WHERE-clause helper).
+    if matches!(
+        protobuf::AExprKind::try_from(expr.kind),
+        Ok(protobuf::AExprKind::AexprIn)
+    ) {
+        let left = expr
+            .lexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
+            .transpose()?;
+        let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
+
+        let mut any_right_nullable = false;
+        if let Some(rexpr) = &expr.rexpr
+            && let Some(node::Node::List(list)) = rexpr.node.as_ref()
+        {
+            let goal = if left_oid != oid::UNKNOWN {
+                TypeGoal::implicit(left_oid)
+            } else {
+                TypeGoal::NONE
+            };
+            for item in &list.items {
+                let t = infer_expr(item, scope, null_ctx, snapshot, params, goal)?;
+                any_right_nullable = any_right_nullable || t.nullable;
+            }
+        }
+
+        let any_nullable = left.as_ref().is_some_and(|l| l.nullable) || any_right_nullable;
+        return Ok(ExprType {
+            type_oid: oid::BOOL,
+            nullable: any_nullable,
+        });
+    }
+
     // col = ANY($arr) / col = ALL($arr): lexpr is scalar, rexpr is array.
     // The generic back-fill below would assign the wrong type (element ↔ array
     // confusion), so we handle it first and return early.
@@ -971,11 +1009,10 @@ fn infer_a_expr(
         });
     }
 
-    // IN, LIKE, BETWEEN, etc. → bool.
+    // LIKE, BETWEEN, etc. → bool. (IN is handled earlier, before Pass 1.)
     if matches!(
         protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprIn)
-            | Ok(protobuf::AExprKind::AexprLike)
+        Ok(protobuf::AExprKind::AexprLike)
             | Ok(protobuf::AExprKind::AexprIlike)
             | Ok(protobuf::AExprKind::AexprBetween)
             | Ok(protobuf::AExprKind::AexprNotBetween)
@@ -1172,10 +1209,20 @@ fn infer_sublink(
         .unwrap_or(protobuf::SubLinkType::ExprSublink);
 
     match sub_type {
-        protobuf::SubLinkType::ExistsSublink => Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: false,
-        }),
+        protobuf::SubLinkType::ExistsSublink => {
+            // Walk the subselect to collect any params referenced inside —
+            // without this, `EXISTS(SELECT 1 FROM t WHERE x = $p1)` would
+            // drop `$p1` from the param list entirely.
+            if let Some(subselect) = &sub.subselect
+                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
+            {
+                let _ = crate::resolve::analyze_select(sel, snapshot, params)?;
+            }
+            Ok(ExprType {
+                type_oid: oid::BOOL,
+                nullable: false,
+            })
+        }
         protobuf::SubLinkType::ExprSublink => {
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
@@ -1200,10 +1247,19 @@ fn infer_sublink(
                 nullable: true,
             })
         }
-        protobuf::SubLinkType::AnySublink | protobuf::SubLinkType::AllSublink => Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: true,
-        }),
+        protobuf::SubLinkType::AnySublink | protobuf::SubLinkType::AllSublink => {
+            // Walk the subselect so params inside `col = ANY(SELECT …)` /
+            // `col = ALL(SELECT …)` are collected with the right types.
+            if let Some(subselect) = &sub.subselect
+                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
+            {
+                let _ = crate::resolve::analyze_select(sel, snapshot, params)?;
+            }
+            Ok(ExprType {
+                type_oid: oid::BOOL,
+                nullable: true,
+            })
+        }
         protobuf::SubLinkType::ArraySublink => {
             // `ARRAY(SELECT expr FROM …)` — returns an array of the subquery's
             // first output column. The array itself is always NOT NULL (an

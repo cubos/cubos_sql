@@ -160,7 +160,11 @@ fn indirection_field_nullability_honors_field_not_null() {
 fn indirection_field_unknown_errors() {
     let db = setup();
     let sql = "SELECT (u).nao_existe FROM users u";
-    assert!(db.analyze(sql).is_err());
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UnknownColumn(_),
+        "nao_existe"
+    );
 }
 
 // ── ARRAY(SELECT …) sublink ──────────────────────────────────────────────────
@@ -238,7 +242,11 @@ fn indirection_on_srf_with_out_args_resolves_named_field() {
 fn indirection_on_srf_unknown_field_errors() {
     let db = setup();
     let sql = "SELECT (pg_options_to_table(ARRAY['a=b']::text[])).nao_existe";
-    assert!(db.analyze(sql).is_err());
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UnknownColumn(_),
+        "nao_existe"
+    );
 }
 
 // ── Record field via subquery column (record_fields propagation) ─────────────

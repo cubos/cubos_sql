@@ -106,7 +106,7 @@ fn union_nullable_branch() {
     // Nullable because body is nullable.
     let sql = "SELECT name as val FROM users UNION ALL SELECT body as val FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "val").nullable);
+    assert_cols(&info, vec![cn("val", text())]);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn union_all_not_null() {
     let db = setup();
     let sql = "SELECT name as val FROM users UNION ALL SELECT title as val FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "val").nullable);
+    assert_cols(&info, vec![c("val", text())]);
 }
 
 // ── Stress / complex ─────────────────────────────────────────────────────────
@@ -139,7 +139,7 @@ fn stress_union_mixed_types() {
                SELECT id as num FROM users";
     let info = db.analyze(sql).unwrap();
     // age is nullable → union is nullable (even though id is NOT NULL).
-    assert!(col(&info, "num").nullable);
+    assert_cols(&info, vec![cn("num", int8())]);
 }
 
 #[test]

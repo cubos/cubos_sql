@@ -259,12 +259,17 @@ fn stress_star_with_left_join() {
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "name").nullable);
-    // title is NOT NULL in table but LEFT JOIN makes it nullable.
-    assert!(col(&info, "title").nullable);
-    // body is nullable in table AND LEFT JOIN.
-    assert!(col(&info, "body").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            c("name", text()),
+            // title is NOT NULL in table but LEFT JOIN makes it nullable.
+            cn("title", text()),
+            // body is nullable in table AND LEFT JOIN.
+            cn("body", text()),
+        ],
+    );
 }
 
 #[test]
@@ -297,23 +302,16 @@ fn stress_ambiguous_id_columns() {
 }
 
 #[test]
-fn stress_limit_offset() {
-    let db = setup();
-    let sql = "SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 5";
-    let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "name").nullable);
-}
-
-#[test]
 fn stress_distinct_on() {
     let db = setup();
+    // Differs from `distinct_on` by adding the nullable `body` column.
     let sql = "SELECT DISTINCT ON (user_id) user_id, title, body \
                FROM posts ORDER BY user_id, published_at DESC NULLS LAST";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "user_id").nullable);
-    assert!(!col(&info, "title").nullable);
-    assert!(col(&info, "body").nullable);
+    assert_cols(
+        &info,
+        vec![c("user_id", int8()), c("title", text()), cn("body", text())],
+    );
 }
 
 // ── Mixed computed and direct columns ────────────────────────────────────────
@@ -332,14 +330,18 @@ fn complex_mixed_computed_and_direct_cols() {
                INNER JOIN posts p ON p.user_id = u.id \
                GROUP BY u.id, u.name, u.age, u.email";
     let info = db.analyze(sql).unwrap();
-    // Direct columns.
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "name").nullable);
-    assert!(col(&info, "age").nullable);
-    // COUNT(*): NOT NULL.
-    assert!(!col(&info, "post_count").nullable);
-    // COALESCE(age, 0): NOT NULL.
-    assert!(!col(&info, "safe_age").nullable);
-    // String concat with NOT NULL cols: NOT NULL.
-    assert!(!col(&info, "display").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            c("name", text()),
+            cn("age", int4()),
+            // COUNT(*): NOT NULL int8.
+            c("post_count", int8()),
+            // COALESCE(age, 0): NOT NULL int4.
+            c("safe_age", int4()),
+            // String concat with NOT NULL cols: NOT NULL text.
+            c("display", text()),
+        ],
+    );
 }

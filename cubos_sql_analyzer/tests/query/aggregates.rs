@@ -83,56 +83,68 @@ fn count_not_null() {
 fn agg_sum_with_group_by_not_null_input() {
     let db = setup();
     // user_id is NOT NULL + GROUP BY → SUM guaranteed non-null.
+    // SUM(int8) → numeric.
     let sql = "SELECT user_id, SUM(user_id) as total FROM posts GROUP BY user_id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "total").nullable);
+    assert_cols(&info, vec![c("user_id", int8()), c("total", numeric())]);
 }
 
 #[test]
 fn agg_sum_with_group_by_nullable_input() {
     let db = setup();
     // rating is nullable + GROUP BY → SUM still nullable (all rows in group could be NULL).
+    // SUM(int4) → int8.
     let sql = "SELECT post_id, SUM(rating) as total FROM comments GROUP BY post_id";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "total").nullable);
+    assert_cols(&info, vec![c("post_id", int8()), cn("total", int8())]);
 }
 
 #[test]
 fn agg_min_max_with_group_by_not_null() {
     let db = setup();
     // title is NOT NULL + GROUP BY → MIN/MAX are NOT NULL.
+    // MIN/MAX(text) → text.
     let sql = "SELECT user_id, MIN(title) as first_title, MAX(title) as last_title \
                FROM posts GROUP BY user_id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "first_title").nullable);
-    assert!(!col(&info, "last_title").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("user_id", int8()),
+            c("first_title", text()),
+            c("last_title", text()),
+        ],
+    );
 }
 
 #[test]
 fn agg_avg_with_group_by_not_null() {
     let db = setup();
     // id is NOT NULL + GROUP BY → AVG is NOT NULL.
+    // AVG(int8) → numeric.
     let sql = "SELECT user_id, AVG(id) as avg_id FROM posts GROUP BY user_id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "avg_id").nullable);
+    assert_cols(&info, vec![c("user_id", int8()), c("avg_id", numeric())]);
 }
 
 #[test]
 fn agg_count_with_group_by() {
     let db = setup();
     // COUNT is always NOT NULL, with or without GROUP BY.
+    // COUNT(*) → int8.
     let sql = "SELECT user_id, COUNT(*) as cnt FROM posts GROUP BY user_id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "cnt").nullable);
+    assert_cols(&info, vec![c("user_id", int8()), c("cnt", int8())]);
 }
 
 #[test]
 fn agg_count_without_group_by() {
     let db = setup();
     // COUNT without GROUP BY: still NOT NULL (returns 0).
+    // COUNT(*) → int8.
     let sql = "SELECT COUNT(*) as cnt FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "cnt").nullable);
+    assert_cols(&info, vec![c("cnt", int8())]);
 }
 
 #[test]
@@ -140,15 +152,17 @@ fn agg_sum_without_group_by_always_nullable() {
     let db = setup();
     // SUM without GROUP BY: table could be empty → NULL.
     // Even with NOT NULL input.
+    // SUM(int8) → numeric.
     let sql = "SELECT SUM(id) as total FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "total").nullable);
+    assert_cols(&info, vec![cn("total", numeric())]);
 }
 
 #[test]
 fn agg_mixed_nullability_with_group_by() {
     let db = setup();
     // Mix of NOT NULL and nullable aggregates in same GROUP BY query.
+    // COUNT(*) → int8, SUM(int4) → int8, MIN(text) → text, MAX(int4) → int4.
     let sql = "SELECT post_id, \
                       COUNT(*) as cnt, \
                       SUM(rating) as sum_rating, \
@@ -156,10 +170,16 @@ fn agg_mixed_nullability_with_group_by() {
                       MAX(rating) as max_rating \
                FROM comments GROUP BY post_id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "cnt").nullable);
-    assert!(col(&info, "sum_rating").nullable);
-    assert!(!col(&info, "first_author").nullable);
-    assert!(col(&info, "max_rating").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("post_id", int8()),
+            c("cnt", int8()),
+            cn("sum_rating", int8()),
+            c("first_author", text()),
+            cn("max_rating", int4()),
+        ],
+    );
 }
 
 #[test]
@@ -167,13 +187,20 @@ fn agg_with_group_by_and_left_join() {
     let db = setup();
     // LEFT JOIN + GROUP BY: right-side columns are nullable from JOIN,
     // so aggregate on them is nullable even with GROUP BY.
+    // COUNT(x) → int8, MAX(text) → text.
     let sql = "SELECT u.id, COUNT(p.id) as post_count, MAX(p.title) as last_title \
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id \
                GROUP BY u.id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "post_count").nullable);
-    assert!(col(&info, "last_title").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            c("post_count", int8()),
+            cn("last_title", text()),
+        ],
+    );
 }
 
 #[test]
@@ -181,10 +208,11 @@ fn agg_string_agg_with_group_by_not_null() {
     let db = setup();
     // string_agg(NOT NULL, delimiter) with GROUP BY → NOT NULL.
     // The literal ', ' has type UNKNOWN — resolved via UNKNOWN-compatible matching.
+    // string_agg(text, text) → text.
     let sql = "SELECT post_id, string_agg(author_name, ', ') as authors \
                FROM comments GROUP BY post_id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "authors").nullable);
+    assert_cols(&info, vec![c("post_id", int8()), c("authors", text())]);
 }
 
 // ── Stress / torture ─────────────────────────────────────────────────────────
@@ -192,22 +220,29 @@ fn agg_string_agg_with_group_by_not_null() {
 #[test]
 fn stress_aggregates_no_group_by() {
     let db = setup();
+    // COUNT(*) → int8, SUM(int4) → int8, MAX(text) → text.
+    // SUM and MAX are nullable (empty table → NULL).
     let sql = "SELECT COUNT(*) as cnt, SUM(age) as total_age, MAX(name) as last_name FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "cnt").nullable);
-    // SUM and MAX are nullable (empty table → NULL).
-    assert!(col(&info, "total_age").nullable);
-    assert!(col(&info, "last_name").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("cnt", int8()),
+            cn("total_age", int8()),
+            cn("last_name", text()),
+        ],
+    );
 }
 
 #[test]
 fn torture_count_with_group_by() {
     let db = setup();
     // COUNT in GROUP BY context is still NOT NULL.
+    // COUNT(x) → int8.
     let sql = "SELECT u.name, COUNT(p.id) as post_count \
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id \
                GROUP BY u.name";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "post_count").nullable);
+    assert_cols(&info, vec![c("name", text()), c("post_count", int8())]);
 }

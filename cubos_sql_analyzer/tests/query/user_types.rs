@@ -71,11 +71,10 @@ fn star_expr_on_cte_is_unsupported() {
     // CTE rows don't have a registered composite type — analyzer errors.
     let sql = "WITH u AS (SELECT id, name FROM users) \
                SELECT row_to_json(u.*) FROM u";
-    let err = db.analyze(sql).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("CTE") || msg.contains("subquery") || msg.contains("real relation"),
-        "expected CTE/subquery error, got: {msg}",
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::Unsupported(_),
+        "CTE or subquery, not a real relation",
     );
 }
 
@@ -83,7 +82,11 @@ fn star_expr_on_cte_is_unsupported() {
 fn star_expr_on_unknown_alias_fails() {
     let db = setup();
     let sql = "SELECT row_to_json(nope.*) FROM users u";
-    assert!(db.analyze(sql).is_err());
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UnknownRelation(_),
+        "no table named nope",
+    );
 }
 
 // ── Enum types (CREATE TYPE ... AS ENUM) ─────────────────────────────────────

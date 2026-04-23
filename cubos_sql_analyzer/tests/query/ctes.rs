@@ -113,7 +113,7 @@ fn stress_cte_used_in_union() {
                UNION ALL \
                SELECT title as name FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "name").nullable);
+    assert_cols(&info, vec![c("name", text())]);
 }
 
 #[test]
@@ -125,8 +125,7 @@ fn stress_cte_insert_returning_coalesce() {
                ) \
                SELECT id, COALESCE(age, 0) as safe_age FROM ins";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "safe_age").nullable);
+    assert_cols(&info, vec![c("id", int8()), c("safe_age", int4())]);
 }
 
 #[test]
@@ -145,9 +144,10 @@ fn stress_cte_dml_chain() {
                FROM new_user nu \
                INNER JOIN new_post np ON np.user_id = nu.id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "name").nullable);
-    assert!(!col(&info, "title").nullable);
-    assert!(!col(&info, "post_id").nullable);
+    assert_cols(
+        &info,
+        vec![c("name", text()), c("title", text()), c("post_id", int8())],
+    );
 }
 
 // ── Torture ──────────────────────────────────────────────────────────────────
@@ -164,9 +164,8 @@ fn torture_cte_with_union_and_left_join() {
                FROM users u \
                LEFT JOIN all_names an ON true";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    // LEFT JOIN on CTE → nullable.
-    assert!(col(&info, "other_name").nullable);
+    // LEFT JOIN on CTE → other_name nullable.
+    assert_cols(&info, vec![c("id", int8()), cn("other_name", text())]);
 }
 
 #[test]
@@ -179,9 +178,10 @@ fn torture_multiple_ctes_cross_reference() {
                          FROM b LEFT JOIN comments cm ON true) \
                SELECT name, title, content FROM c";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "name").nullable);
-    assert!(!col(&info, "title").nullable);
-    assert!(col(&info, "content").nullable, "LEFT JOIN in CTE c");
+    assert_cols(
+        &info,
+        vec![c("name", text()), c("title", text()), cn("content", text())],
+    );
 }
 
 #[test]
@@ -193,8 +193,7 @@ fn torture_select_from_cte_left_join_cte() {
                SELECT u.name, p.title \
                FROM u LEFT JOIN p ON p.user_id = u.id";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "name").nullable);
-    assert!(col(&info, "title").nullable);
+    assert_cols(&info, vec![c("name", text()), cn("title", text())]);
 }
 
 #[test]
@@ -210,6 +209,5 @@ fn torture_deeply_nested_cte_union_join() {
                FROM names n \
                LEFT JOIN users u ON u.name = n.val";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "val").nullable);
-    assert!(col(&info, "age").nullable);
+    assert_cols(&info, vec![c("val", text()), cn("age", int4())]);
 }

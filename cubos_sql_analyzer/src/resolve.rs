@@ -196,7 +196,17 @@ pub(crate) fn analyze_static(
 
     let columns = raw_columns
         .into_iter()
-        .map(|rc| build_column(rc, snapshot))
+        .map(|mut rc| {
+            // PG resolves any `unknown`-typed top-level output column (bare
+            // string literal, NULL, untyped param that stayed unresolved) to
+            // `text` before sending it to the client. `analyze_raw` is also
+            // used for view-column analysis, which needs the raw OID, so apply
+            // the coercion only here at the statement boundary.
+            if rc.type_oid == oid::UNKNOWN {
+                rc.type_oid = oid::TEXT;
+            }
+            build_column(rc, snapshot)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let params_info = raw_params

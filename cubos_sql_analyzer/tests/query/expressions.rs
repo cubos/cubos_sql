@@ -45,7 +45,9 @@ fn literal_not_null() {
     let db = setup();
     let sql = "SELECT id, 'constant' as label FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "label").nullable);
+    // PG coerces any `unknown`-typed output column to `text` before sending
+    // it to the client, so the bare string literal surfaces as `text`.
+    assert_cols(&info, vec![c("id", int8()), c("label", text())]);
 }
 
 // ── Arithmetic / operators ───────────────────────────────────────────────────
@@ -74,7 +76,7 @@ fn complex_arithmetic_on_nullable() {
     // age is nullable → age + 1 nullable.
     let sql = "SELECT id, age + 1 as age_plus_one FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "age_plus_one").nullable);
+    assert_cols(&info, vec![c("id", int8()), cn("age_plus_one", int4())]);
 }
 
 #[test]
@@ -83,7 +85,7 @@ fn complex_arithmetic_on_not_null() {
     // id is NOT NULL → id + 1 also NOT NULL.
     let sql = "SELECT id + 1 as next_id FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "next_id").nullable);
+    assert_cols(&info, vec![c("next_id", int8())]);
 }
 
 #[test]
@@ -92,7 +94,7 @@ fn complex_coalesce_in_arithmetic() {
     // COALESCE(age, 0) is NOT NULL → adding 10 stays NOT NULL.
     let sql = "SELECT COALESCE(age, 0) + 10 as safe_age_plus FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "safe_age_plus").nullable);
+    assert_cols(&info, vec![c("safe_age_plus", int4())]);
 }
 
 // ── Built-in strict / non-strict functions ───────────────────────────────────
@@ -134,7 +136,7 @@ fn coalesce_not_null() {
     let db = setup();
     let sql = "SELECT COALESCE(age, 0) as safe_age FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "safe_age").nullable);
+    assert_cols(&info, vec![c("safe_age", int4())]);
 }
 
 // ── CASE ─────────────────────────────────────────────────────────────────────
@@ -154,7 +156,10 @@ fn types_match_case_expression() {
     let s = db
         .analyze("SELECT CASE WHEN age IS NULL THEN 0 ELSE age END AS safe_age FROM users")
         .unwrap();
-    assert_eq!(col(&s, "safe_age").pg_type, int4());
+    // PG control-flow narrowing would make this NOT NULL (ELSE branch only
+    // reached when age IS NOT NULL), but the analyzer does not currently
+    // infer that — it takes the least-common nullability across branches.
+    assert_cols(&s, vec![cn("safe_age", int4())]);
 }
 
 #[test]
@@ -162,7 +167,7 @@ fn case_with_else_not_null() {
     let db = setup();
     let sql = "SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END as category FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "category").nullable);
+    assert_cols(&info, vec![c("category", text())]);
 }
 
 #[test]
@@ -171,7 +176,7 @@ fn case_without_else_is_nullable() {
     let sql = "SELECT CASE WHEN age > 18 THEN 'adult' END as category FROM users";
     let info = db.analyze(sql).unwrap();
     // CASE without ELSE is nullable because there's no ELSE branch.
-    assert!(col(&info, "category").nullable);
+    assert_cols(&info, vec![cn("category", text())]);
 }
 
 // ── Boolean / NULL tests ─────────────────────────────────────────────────────
@@ -209,10 +214,10 @@ fn complex_boolean_with_nullable_input() {
     // age IS NOT NULL → bool, NOT NULL. age > 18 → bool, nullable (age can be NULL).
     let sql = "SELECT age IS NOT NULL as has_age, age > 18 as is_adult FROM users";
     let info = db.analyze(sql).unwrap();
-    // IS NOT NULL is always NOT NULL.
-    assert!(!col(&info, "has_age").nullable);
-    // age > 18: age is nullable → comparison is nullable.
-    assert!(col(&info, "is_adult").nullable);
+    assert_cols(
+        &info,
+        vec![c("has_age", bool_ty()), cn("is_adult", bool_ty())],
+    );
 }
 
 // ── Stress: nested COALESCE / CASE / expressions ─────────────────────────────
@@ -223,7 +228,7 @@ fn stress_nested_coalesce() {
     // COALESCE(COALESCE(nullable, nullable), literal) → NOT NULL.
     let sql = "SELECT COALESCE(COALESCE(age, age), 0) as val FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "val").nullable);
+    assert_cols(&info, vec![c("val", int4())]);
 }
 
 #[test]
@@ -232,7 +237,7 @@ fn stress_coalesce_all_nullable() {
     // COALESCE(nullable, nullable) → still nullable (no non-null fallback).
     let sql = "SELECT COALESCE(age, age) as val FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "val").nullable);
+    assert_cols(&info, vec![cn("val", int4())]);
 }
 
 #[test]
@@ -241,7 +246,7 @@ fn stress_case_with_null_branch() {
     // CASE with one branch returning NULL explicitly.
     let sql = "SELECT CASE WHEN age > 18 THEN name ELSE NULL END as val FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "val").nullable);
+    assert_cols(&info, vec![cn("val", text())]);
 }
 
 #[test]
@@ -252,7 +257,7 @@ fn stress_case_mixing_nullable_branches() {
                FROM users u INNER JOIN posts p ON p.user_id = u.id";
     let info = db.analyze(sql).unwrap();
     // name is NOT NULL but body is nullable → result is nullable.
-    assert!(col(&info, "val").nullable);
+    assert_cols(&info, vec![cn("val", text())]);
 }
 
 // ── Torture ──────────────────────────────────────────────────────────────────
@@ -267,7 +272,7 @@ fn torture_nested_case_in_coalesce() {
                ) as val FROM users";
     let info = db.analyze(sql).unwrap();
     // CASE without ELSE is nullable, but COALESCE with 0 fallback makes it NOT NULL.
-    assert!(!col(&info, "val").nullable);
+    assert_cols(&info, vec![c("val", int4())]);
 }
 
 // ── Strict pg_catalog functions ──────────────────────────────────────────────
@@ -278,7 +283,7 @@ fn strict_pg_catalog_function_not_null() {
     // length(text) is pg_catalog, strict, not in exceptions → NOT NULL with NOT NULL input.
     let sql = "SELECT length(name) as len FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "len").nullable);
+    assert_cols(&info, vec![c("len", int4())]);
 }
 
 #[test]
@@ -287,7 +292,7 @@ fn strict_pg_catalog_function_nullable_with_nullable_arg() {
     // length(text) is strict: nullable input → nullable output.
     let sql = "SELECT length(body) as len FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "len").nullable);
+    assert_cols(&info, vec![cn("len", int4())]);
 }
 
 #[test]
@@ -296,7 +301,7 @@ fn strict_pg_catalog_upper_not_null() {
     // upper(text) is pg_catalog, strict → NOT NULL with NOT NULL input.
     let sql = "SELECT upper(name) as uname FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "uname").nullable);
+    assert_cols(&info, vec![c("uname", text())]);
 }
 
 // ── Operators: + / ‖ strictness ──────────────────────────────────────────────
@@ -307,7 +312,7 @@ fn operator_plus_not_null() {
     // 1 + 1: both non-null, operator not in exceptions → NOT NULL.
     let sql = "SELECT 1 + 1 as result";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "result").nullable);
+    assert_cols(&info, vec![c("result", int4())]);
 }
 
 #[test]
@@ -316,7 +321,7 @@ fn operator_plus_nullable_arg() {
     // age is nullable → result is nullable.
     let sql = "SELECT age + 1 as next_age FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "next_age").nullable);
+    assert_cols(&info, vec![cn("next_age", int4())]);
 }
 
 #[test]
@@ -325,7 +330,7 @@ fn operator_concat_not_null() {
     // || with two NOT NULL → NOT NULL.
     let sql = "SELECT name || ' <' || email || '>' as display FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "display").nullable);
+    assert_cols(&info, vec![c("display", text())]);
 }
 
 #[test]
@@ -334,7 +339,7 @@ fn operator_concat_nullable_arg() {
     // body is nullable → concat is nullable.
     let sql = "SELECT title || body as combined FROM posts";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "combined").nullable);
+    assert_cols(&info, vec![cn("combined", text())]);
 }
 
 // ── Non-strict pg_catalog functions that never return NULL ───────────────────
@@ -345,7 +350,7 @@ fn nonstrict_concat_never_null() {
     // concat is non-strict but never returns NULL (treats NULLs as '').
     let sql = "SELECT concat(p.title, ' ', p.body) as full_text FROM posts p";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "full_text").nullable);
+    assert_cols(&info, vec![c("full_text", text())]);
 }
 
 #[test]
@@ -353,7 +358,7 @@ fn nonstrict_concat_ws_never_null() {
     let db = setup();
     let sql = "SELECT concat_ws(', '::text, name, email) as combined FROM users";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "combined").nullable);
+    assert_cols(&info, vec![c("combined", text())]);
 }
 
 #[test]
@@ -361,7 +366,7 @@ fn nonstrict_now_never_null() {
     let db = setup();
     let sql = "SELECT now() as ts";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "ts").nullable);
+    assert_cols(&info, vec![c("ts", timestamptz())]);
 }
 
 #[test]
@@ -369,5 +374,5 @@ fn nonstrict_random_never_null() {
     let db = setup();
     let sql = "SELECT random() as r";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "r").nullable);
+    assert_cols(&info, vec![c("r", float8())]);
 }

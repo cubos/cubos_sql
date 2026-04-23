@@ -106,10 +106,25 @@ fn where_not() {
 #[test]
 fn where_in_list() {
     let db = setup();
+    // Literal form: PG promotes list elements to the column's type (int4), but
+    // since they are constants nothing surfaces in the param list.
     let s = db
         .analyze("SELECT id FROM users WHERE age IN (1, 2, 3)")
         .unwrap();
     assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![]);
+}
+
+#[test]
+fn where_in_list_with_params() {
+    let db = setup();
+    // Param form: each `$pN` inside the IN list must be inferred with the
+    // left-hand column's type as the goal, so all three params surface as int4.
+    let s = db
+        .analyze("SELECT id FROM users WHERE age IN ($p1, $p2, $p3)")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int4()), p(int4()), p(int4())]);
 }
 
 #[test]
@@ -140,5 +155,6 @@ fn stress_complex_where_params() {
     let sql = "SELECT id FROM users \
                WHERE (name = $p1 OR email = $p2) AND age > $p3";
     let info = db.analyze(sql).unwrap();
-    assert_eq!(info.params.len(), 3);
+    assert_cols(&info, vec![c("id", int8())]);
+    assert_params(&info, vec![p(text()), p(text()), p(int4())]);
 }

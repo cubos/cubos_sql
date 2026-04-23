@@ -82,6 +82,27 @@ impl PgCatalog {
         let (columns, mut info_params) =
             analyze_static(&self.snapshot, &analysis_sql, &param_nullability)?;
 
+        // Invariant: the analyzer must produce exactly one param entry per
+        // positional placeholder the lexer extracted (regular params +
+        // materialized spread fields). A mismatch means the analyzer missed
+        // a placeholder during walk — e.g. hit an unsupported node and
+        // swallowed the error — which would silently drop params from
+        // generated types.
+        let expected_param_count = lex_output.params.len()
+            + lex_output
+                .spreads
+                .iter()
+                .map(|s| s.fields.as_ref().map(|f| f.len()).unwrap_or(0))
+                .sum::<usize>();
+        assert_eq!(
+            info_params.len(),
+            expected_param_count,
+            "analyzer param count ({}) does not match lexer placeholder count ({}) \
+             for SQL: {analysis_sql}",
+            info_params.len(),
+            expected_param_count,
+        );
+
         // Merge explicit $foo? / $foo! annotations from the lexer on top of
         // the analyzer's inferred nullability (explicit always wins).
         for (pi, &lexer_nullable) in info_params.iter_mut().zip(param_nullability.iter()) {

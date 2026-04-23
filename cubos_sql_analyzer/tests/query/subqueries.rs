@@ -96,7 +96,7 @@ fn complex_exists_subquery() {
                FROM users u";
     let info = db.analyze(sql).unwrap();
     // EXISTS always returns bool, never NULL.
-    assert!(!col(&info, "has_posts").nullable);
+    assert_cols(&info, vec![c("name", text()), c("has_posts", bool_ty())]);
 }
 
 // ── Scalar subqueries (always nullable unless aggregate without GROUP BY) ────
@@ -206,9 +206,10 @@ fn stress_deeply_nested_subquery() {
                    ) inner_sq \
                ) outer_sq";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "name").nullable);
-    assert!(col(&info, "age").nullable);
+    assert_cols(
+        &info,
+        vec![c("id", int8()), c("name", text()), cn("age", int4())],
+    );
 }
 
 #[test]
@@ -221,8 +222,8 @@ fn stress_subquery_with_left_join_inside() {
                    LEFT JOIN posts p ON p.user_id = u.id \
                ) sq";
     let info = db.analyze(sql).unwrap();
-    // title is nullable because of LEFT JOIN inside subquery.
-    assert!(col(&info, "title").nullable);
+    // title is nullable because of LEFT JOIN inside subquery; name stays NOT NULL.
+    assert_cols(&info, vec![c("name", text()), cn("title", text())]);
 }
 
 #[test]
@@ -233,8 +234,7 @@ fn stress_subquery_computed_columns() {
                ) sq";
     let info = db.analyze(sql).unwrap();
     // COUNT is NOT NULL, MAX is nullable.
-    assert!(!col(&info, "cnt").nullable);
-    assert!(col(&info, "max_age").nullable);
+    assert_cols(&info, vec![c("cnt", int8()), cn("max_age", int4())]);
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn stress_aggregate_subquery_in_select() {
     let info = db.analyze(sql).unwrap();
     // Aggregate without GROUP BY → exactly 1 row, and COUNT is NOT NULL →
     // scalar subquery result is NOT NULL.
-    assert!(!col(&info, "post_count").nullable);
+    assert_cols(&info, vec![c("name", text()), c("post_count", int8())]);
 }
 
 // ── Torture ──────────────────────────────────────────────────────────────────
@@ -261,5 +261,5 @@ fn torture_union_in_subquery_in_from() {
                ) sq";
     let info = db.analyze(sql).unwrap();
     // Both NOT NULL → union NOT NULL → subquery NOT NULL.
-    assert!(!col(&info, "val").nullable);
+    assert_cols(&info, vec![c("val", text())]);
 }

@@ -11,15 +11,56 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use cubos_sql::migrate::MigrationSource;
 use cubos_sql_core::config::MigrationsConfig;
 use deadpool_postgres::{Config, Pool, Runtime};
-use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
+
+/// Container IDs that an `atexit` hook force-removes before the test process
+/// exits. The `ContainerAsync` below lives inside a `static OnceCell` and
+/// `Drop` is never invoked for `static`s, so without this fallback the
+/// testcontainers-rs remove-on-drop path never runs and containers leak on
+/// any environment without Ryuk.
+static TRACKED_CONTAINERS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+extern "C" fn reap_containers() {
+    let Some(ids) = TRACKED_CONTAINERS.get() else {
+        return;
+    };
+    let ids = match ids.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => return,
+    };
+    for id in ids {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn track_container(id: String) {
+    let slot = TRACKED_CONTAINERS.get_or_init(|| {
+        // SAFETY: `reap_containers` has the required C ABI and only touches
+        // the static `Mutex`; registering it once is safe on every POSIX
+        // target we support.
+        unsafe {
+            libc::atexit(reap_containers);
+        }
+        Mutex::new(Vec::new())
+    });
+    if let Ok(mut ids) = slot.lock() {
+        ids.push(id);
+    }
+}
 
 pub struct TestEnv {
     host: String,
@@ -34,7 +75,17 @@ static ENV: OnceCell<TestEnv> = OnceCell::const_new();
 pub async fn setup() -> Pool {
     let env = ENV
         .get_or_init(|| async {
-            let container = Postgres::default().start().await.expect("start postgres");
+            // Run on the latest Postgres image with Docker's `--rm` flag, so
+            // the container is deleted as soon as it exits. This is the
+            // fallback for environments where the Ryuk reaper isn't running
+            // and would otherwise leak containers on panic or abort.
+            let container = Postgres::default()
+                .with_tag("latest")
+                .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
+                .start()
+                .await
+                .expect("start postgres");
+            track_container(container.id().to_string());
             let host = container
                 .get_host()
                 .await

@@ -167,7 +167,21 @@ fn update_multiple_columns() {
     let s = db
         .analyze("UPDATE users SET name = $p1, email = $p2, age = $p3 WHERE id = $p4 RETURNING *")
         .unwrap();
-    assert_eq!(s.columns.len(), 7);
+    assert_cols(
+        &s,
+        vec![
+            c("id", int8()),
+            c("name", text()),
+            c("email", text()),
+            cn("age", int4()),
+            c(
+                "role",
+                enum_ty("public", "user_role", &["admin", "editor", "viewer"]),
+            ),
+            cn("preferences", domain("public", "user_prefs", jsonb())),
+            c("created_at", timestamptz()),
+        ],
+    );
     assert_params(&s, vec![p(text()), p(text()), pn(int4()), p(int8())]);
 }
 
@@ -255,9 +269,14 @@ fn complex_insert_select_with_join() {
                WHERE p.user_id = $p3 \
                RETURNING id, post_id, author_name";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "post_id").nullable);
-    assert!(!col(&info, "author_name").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            c("post_id", int8()),
+            c("author_name", text()),
+        ],
+    );
 }
 
 // ── Stress ───────────────────────────────────────────────────────────────────
@@ -268,11 +287,16 @@ fn stress_update_returning_expression() {
     let sql = "UPDATE users SET age = $p1 WHERE id = $p2 \
                RETURNING id, COALESCE(age, 0) as safe_age, name || '!' as excited";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    // COALESCE in RETURNING.
-    assert!(!col(&info, "safe_age").nullable);
-    // String concat in RETURNING.
-    assert!(!col(&info, "excited").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            // COALESCE in RETURNING.
+            c("safe_age", int4()),
+            // String concat in RETURNING.
+            c("excited", text()),
+        ],
+    );
 }
 
 #[test]
@@ -281,11 +305,16 @@ fn stress_delete_returning_all_columns() {
     let sql = "DELETE FROM users WHERE id = $p1 \
                RETURNING id, name, email, age, created_at";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "name").nullable);
-    assert!(!col(&info, "email").nullable);
-    assert!(col(&info, "age").nullable);
-    assert!(!col(&info, "created_at").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            c("name", text()),
+            c("email", text()),
+            cn("age", int4()),
+            c("created_at", timestamptz()),
+        ],
+    );
 }
 
 #[test]
@@ -293,11 +322,16 @@ fn stress_insert_returning_star() {
     let db = setup();
     let sql = "INSERT INTO posts (user_id, title) VALUES ($p1, $p2) RETURNING *";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "user_id").nullable);
-    assert!(!col(&info, "title").nullable);
-    assert!(col(&info, "body").nullable);
-    assert!(col(&info, "published_at").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            c("user_id", int8()),
+            c("title", text()),
+            cn("body", text()),
+            cn("published_at", timestamptz()),
+        ],
+    );
 }
 
 #[test]
@@ -305,7 +339,7 @@ fn stress_insert_minimal() {
     let db = setup();
     let sql = "INSERT INTO users (name, email) VALUES ($p1, $p2) RETURNING id";
     let info = db.analyze(sql).unwrap();
-    assert_eq!(info.params.len(), 2);
+    assert_params(&info, vec![p(text()), p(text())]);
     assert!(!col(&info, "id").nullable);
 }
 
@@ -319,9 +353,10 @@ fn torture_update_from_join() {
                WHERE posts.user_id = u.id AND u.name = $p2 \
                RETURNING posts.id, posts.title, posts.body";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    assert!(!col(&info, "title").nullable);
-    assert!(col(&info, "body").nullable);
+    assert_cols(
+        &info,
+        vec![c("id", int8()), c("title", text()), cn("body", text())],
+    );
 }
 
 #[test]
@@ -332,9 +367,14 @@ fn torture_expression_in_insert_returning() {
                          name || ' (' || email || ')' as display, \
                          CASE WHEN age >= 18 THEN true ELSE false END as is_adult";
     let info = db.analyze(sql).unwrap();
-    assert!(!col(&info, "id").nullable);
-    // Concat of NOT NULL → NOT NULL.
-    assert!(!col(&info, "display").nullable);
-    // CASE with ELSE, all literal booleans → NOT NULL.
-    assert!(!col(&info, "is_adult").nullable);
+    assert_cols(
+        &info,
+        vec![
+            c("id", int8()),
+            // Concat of NOT NULL → NOT NULL.
+            c("display", text()),
+            // CASE with ELSE, all literal booleans → NOT NULL.
+            c("is_adult", bool_ty()),
+        ],
+    );
 }
