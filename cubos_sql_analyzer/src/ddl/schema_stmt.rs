@@ -2,9 +2,10 @@
 
 use pg_query::protobuf::CreateSchemaStmt;
 
-use super::{DdlError, DdlInterpreter};
+use super::DdlError;
+use crate::database::Database;
 
-pub fn create_schema(interp: &mut DdlInterpreter, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
+pub fn create_schema(interp: &mut Database, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
     // Register the schema name so `DROP SCHEMA` can distinguish between
     // "schema is empty" and "schema doesn't exist".
     if !stmt.schemaname.is_empty() {
@@ -13,7 +14,7 @@ pub fn create_schema(interp: &mut DdlInterpreter, stmt: &CreateSchemaStmt) -> Re
     // Process any inline schema elements (CREATE SCHEMA ... CREATE TABLE ...).
     for elt in &stmt.schema_elts {
         if let Some(node) = elt.node.as_ref() {
-            interp.apply_statement(node)?;
+            super::apply_statement(interp, node)?;
         }
     }
     Ok(())

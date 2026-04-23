@@ -12,7 +12,8 @@
 
 use pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt};
 
-use super::{DdlError, DdlInterpreter, InstalledExtension};
+use super::{DdlError, InstalledExtension};
+use crate::database::Database;
 
 // ─── Extension version graph ────────────────────────────────────────────────
 
@@ -1025,10 +1026,7 @@ pub fn extension_type_rust_type(extension: &str, type_name: &str) -> Option<&'st
 
 // ─── CREATE EXTENSION ───────────────────────────────────────────────────────
 
-pub fn create_extension(
-    interp: &mut DdlInterpreter,
-    stmt: &CreateExtensionStmt,
-) -> Result<(), DdlError> {
+pub fn create_extension(interp: &mut Database, stmt: &CreateExtensionStmt) -> Result<(), DdlError> {
     let name = &stmt.extname;
 
     // Check if already installed.
@@ -1041,17 +1039,15 @@ pub fn create_extension(
         )));
     }
 
-    let ext = match REGISTRY.iter().find(|e| e.name == name.as_str()) {
-        Some(e) => e,
-        None => {
-            interp.warn(format!(
-                "unknown extension '{name}': types and functions will not be available \
-                 for static analysis. Add SQL files to cubos_sql_analyzer/src/extensions/ \
-                 to enable support."
-            ));
-            return Ok(());
-        }
-    };
+    let ext = REGISTRY
+        .iter()
+        .find(|e| e.name == name.as_str())
+        .ok_or_else(|| {
+            DdlError::ExtensionError(format!(
+                "unknown extension '{name}': add a SQL file to cubos_sql_analyzer/src/extensions/ \
+                 to register it for static analysis"
+            ))
+        })?;
 
     let target_version = extract_option(&stmt.options, "new_version")
         .unwrap_or_else(|| ext.default_version.to_owned());
@@ -1064,7 +1060,7 @@ pub fn create_extension(
     // Snapshot state before install to track what the extension creates.
     let types_before: std::collections::HashSet<u32> =
         interp.snapshot.types.keys().copied().collect();
-    let funcs_before: std::collections::HashSet<String> =
+    let funcs_before: std::collections::HashSet<crate::qualified_name::QualifiedName> =
         interp.snapshot.functions_by_name.keys().cloned().collect();
     let casts_before: std::collections::HashSet<String> =
         interp.snapshot.casts.keys().cloned().collect();
@@ -1089,11 +1085,11 @@ pub fn create_extension(
             te.extension = Some(name.clone());
         }
     }
-    let function_names: Vec<String> = interp
+    let function_names: Vec<crate::qualified_name::QualifiedName> = interp
         .snapshot
         .functions_by_name
         .keys()
-        .filter(|k| !funcs_before.contains(k.as_str()))
+        .filter(|k| !funcs_before.contains(*k))
         .cloned()
         .collect();
     let cast_keys: Vec<String> = interp
@@ -1121,10 +1117,7 @@ pub fn create_extension(
 
 // ─── ALTER EXTENSION UPDATE ─────────────────────────────────────────────────
 
-pub fn alter_extension(
-    interp: &mut DdlInterpreter,
-    stmt: &AlterExtensionStmt,
-) -> Result<(), DdlError> {
+pub fn alter_extension(interp: &mut Database, stmt: &AlterExtensionStmt) -> Result<(), DdlError> {
     let name = &stmt.extname;
 
     let installed = interp
@@ -1149,16 +1142,16 @@ pub fn alter_extension(
     let path = find_upgrade_path(ext, &installed.version, &target_version)?;
 
     // Track new objects created by upgrade scripts.
-    let funcs_before: std::collections::HashSet<String> =
+    let funcs_before: std::collections::HashSet<crate::qualified_name::QualifiedName> =
         interp.snapshot.functions_by_name.keys().cloned().collect();
 
     apply_with_schema(interp, &installed.schema, &path)?;
 
-    let new_funcs: Vec<String> = interp
+    let new_funcs: Vec<crate::qualified_name::QualifiedName> = interp
         .snapshot
         .functions_by_name
         .keys()
-        .filter(|k| !funcs_before.contains(k.as_str()))
+        .filter(|k| !funcs_before.contains(*k))
         .cloned()
         .collect();
 
@@ -1244,7 +1237,7 @@ fn find_upgrade_path<'a>(
 
 /// Apply a list of SQL scripts with a temporary search_path override.
 fn apply_with_schema(
-    interp: &mut DdlInterpreter,
+    interp: &mut Database,
     schema: &str,
     scripts: &[&str],
 ) -> Result<(), DdlError> {

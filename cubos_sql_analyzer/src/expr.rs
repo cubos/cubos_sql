@@ -13,13 +13,14 @@
 
 use pg_query::protobuf::{self, a_const, node};
 
-use crate::coerce::{self, CoercionContext, can_coerce, oid};
+use crate::coerce::{self, CoercionContext, can_coerce};
 use crate::error::AnalyzeError;
 use crate::functions;
 use crate::nullability::NullabilityContext;
-use crate::params::ParamCollector;
+use crate::param_collector::ParamCollector;
 use crate::schema::SchemaSnapshot;
 use crate::scope::Scope;
+use crate::type_map::oid;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // TypeGoal
@@ -31,7 +32,7 @@ use crate::scope::Scope;
 /// VALUES`, …) tells the parser "I expect this expression to produce type X
 /// with coercion level Y".
 #[derive(Debug, Clone, Copy)]
-pub struct TypeGoal {
+pub(crate) struct TypeGoal {
     pub type_oid: u32,
     pub coercion: CoercionContext,
 }
@@ -72,7 +73,7 @@ impl TypeGoal {
 
 /// Result of inferring an expression's type.
 #[derive(Debug, Clone)]
-pub struct ExprType {
+pub(crate) struct ExprType {
     pub type_oid: u32,
     pub nullable: bool,
 }
@@ -87,7 +88,7 @@ pub struct ExprType {
 /// expression is a `ParamRef` whose type is still unknown, the goal type is
 /// recorded as a constraint.  After inference, the result is checked for
 /// compatibility with the goal (raising `TypeMismatch` on failure).
-pub fn infer_expr(
+pub(crate) fn infer_expr(
     node: &protobuf::Node,
     scope: &Scope,
     null_ctx: &NullabilityContext,
@@ -871,7 +872,7 @@ fn node_contains_aggregate(node: &protobuf::Node) -> bool {
 }
 
 /// Extract string values from a list of nodes.
-pub fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
+pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
     nodes
         .iter()
         .filter_map(|n| match n.node.as_ref()? {
@@ -882,7 +883,7 @@ pub fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
 }
 
 /// Resolve a TypeName to a type OID.
-pub fn resolve_type_name(
+fn resolve_type_name(
     type_name: Option<&protobuf::TypeName>,
     snapshot: &SchemaSnapshot,
 ) -> Result<u32, AnalyzeError> {

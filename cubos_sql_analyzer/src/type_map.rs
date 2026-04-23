@@ -41,6 +41,23 @@
 //! Custom types can be mapped via `[package.metadata.cubos_sql.types]` in
 //! `Cargo.toml` — see the [configuration docs](crate::config).
 
+/// Well-known OIDs for builtin PostgreSQL types, keyed by pg_catalog name.
+pub(crate) mod oid {
+    pub const BOOL: u32 = 16;
+    pub const BYTEA: u32 = 17;
+    pub const NAME: u32 = 19;
+    pub const INT8: u32 = 20;
+    pub const INT2: u32 = 21;
+    pub const INT4: u32 = 23;
+    pub const TEXT: u32 = 25;
+    pub const FLOAT4: u32 = 700;
+    pub const FLOAT8: u32 = 701;
+    pub const UNKNOWN: u32 = 705;
+    pub const BPCHAR: u32 = 1042;
+    pub const VARCHAR: u32 = 1043;
+    pub const NUMERIC: u32 = 1700;
+}
+
 /// Static type information for a single PostgreSQL type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PgTypeInfo {
@@ -165,26 +182,6 @@ static PG_TYPES: &[PgTypeInfo] = &[
 /// OIDs.
 pub fn from_oid(oid: u32) -> Option<&'static PgTypeInfo> {
     PG_TYPES.iter().find(|t| t.oid == oid)
-}
-
-/// Returns type information for the given PostgreSQL type name (case-insensitive).
-///
-/// Returns `None` if the name does not match any supported type.
-pub fn from_name(name: &str) -> Option<&'static PgTypeInfo> {
-    PG_TYPES
-        .iter()
-        .find(|t| t.pg_name.eq_ignore_ascii_case(name))
-}
-
-/// Returns a comma-separated list of all supported PostgreSQL type names.
-///
-/// Useful for error messages that need to list what types are available.
-pub fn supported_type_names() -> String {
-    PG_TYPES
-        .iter()
-        .map(|t| t.pg_name)
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]
@@ -339,33 +336,5 @@ mod tests {
     fn from_oid_unknown_returns_none() {
         assert!(from_oid(99999).is_none());
         assert!(from_oid(0).is_none());
-    }
-
-    #[test]
-    fn from_name_case_insensitive() {
-        let lower = from_name("bool").expect("'bool' must be found");
-        let upper = from_name("BOOL").expect("'BOOL' must be found");
-        let mixed = from_name("Bool").expect("'Bool' must be found");
-        assert_eq!(lower.oid, upper.oid);
-        assert_eq!(lower.oid, mixed.oid);
-        assert_eq!(lower.oid, 16);
-    }
-
-    #[test]
-    fn from_name_text() {
-        let info = from_name("text").expect("'text' must be found");
-        assert_eq!(info.oid, 25);
-    }
-
-    #[test]
-    fn from_name_timestamptz() {
-        let info = from_name("timestamptz").expect("'timestamptz' must be found");
-        assert_eq!(info.oid, 1184);
-    }
-
-    #[test]
-    fn from_name_unknown_returns_none() {
-        assert!(from_name("notareal_type").is_none());
-        assert!(from_name("").is_none());
     }
 }

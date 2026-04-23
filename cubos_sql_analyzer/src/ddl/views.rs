@@ -11,17 +11,19 @@ use pg_query::protobuf::{CreateTableAsStmt, ObjectType, ViewStmt, node};
 
 use crate::schema::{RelationKind, TableColumn, TableEntry, ViewDef};
 
+use super::DdlError;
 use super::util::range_var_names;
-use super::{DdlError, DdlInterpreter};
+use crate::database::Database;
+use crate::qualified_name::QualifiedName;
 
-pub fn create_view(interp: &mut DdlInterpreter, stmt: &ViewStmt) -> Result<(), DdlError> {
+pub fn create_view(interp: &mut Database, stmt: &ViewStmt) -> Result<(), DdlError> {
     let rv = stmt
         .view
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW without name".into()))?;
 
     let (schema, name) = range_var_names(rv, &interp.snapshot);
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     let query_sql = stmt.query.as_deref().and_then(deparse_query);
 
@@ -43,18 +45,13 @@ pub fn create_view(interp: &mut DdlInterpreter, stmt: &ViewStmt) -> Result<(), D
         (Vec::new(), None)
     };
 
-    let oid = interp.alloc_oid();
-
-    if stmt.replace
-        && let Some(old_oid) = interp.snapshot.table_by_name.remove(&key)
-    {
-        interp.snapshot.tables.remove(&old_oid);
+    if stmt.replace {
+        interp.snapshot.tables.remove(&key);
     }
 
     interp.snapshot.tables.insert(
-        oid,
+        key,
         TableEntry {
-            oid,
             name,
             schema,
             kind: RelationKind::View,
@@ -62,15 +59,11 @@ pub fn create_view(interp: &mut DdlInterpreter, stmt: &ViewStmt) -> Result<(), D
             view_def,
         },
     );
-    interp.snapshot.table_by_name.insert(key, oid);
 
     Ok(())
 }
 
-pub fn create_table_as(
-    interp: &mut DdlInterpreter,
-    stmt: &CreateTableAsStmt,
-) -> Result<(), DdlError> {
+pub fn create_table_as(interp: &mut Database, stmt: &CreateTableAsStmt) -> Result<(), DdlError> {
     let rv = stmt
         .into
         .as_ref()
@@ -83,7 +76,7 @@ pub fn create_table_as(
     };
 
     let (schema, name) = range_var_names(rv, &interp.snapshot);
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     let query_sql = stmt.query.as_deref().and_then(deparse_query);
 
@@ -93,12 +86,9 @@ pub fn create_table_as(
         (Vec::new(), None)
     };
 
-    let oid = interp.alloc_oid();
-
     interp.snapshot.tables.insert(
-        oid,
+        key,
         TableEntry {
-            oid,
             name,
             schema,
             kind,
@@ -106,7 +96,6 @@ pub fn create_table_as(
             view_def,
         },
     );
-    interp.snapshot.table_by_name.insert(key, oid);
 
     Ok(())
 }
@@ -139,20 +128,14 @@ fn resolve_view_now(
     sql: &str,
     aliases: &[String],
 ) -> (Vec<TableColumn>, Option<ViewDef>) {
-    let config = crate::resolve::AnalyzerConfig {
-        domains: std::collections::HashMap::new(),
-        enums: std::collections::HashMap::new(),
-        types: std::collections::HashMap::new(),
-        param_nullability: Vec::new(),
-    };
+    let config = crate::resolve::AnalyzerConfig::default();
 
-    let info = match crate::resolve::analyze(snapshot, sql, &config) {
-        Ok(info) => info,
+    let analyzed_columns = match crate::resolve::analyze_static(snapshot, sql, &config, &[]) {
+        Ok((cols, _)) => cols,
         Err(_) => return (Vec::new(), None),
     };
 
-    let columns: Vec<TableColumn> = info
-        .columns
+    let columns: Vec<TableColumn> = analyzed_columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -199,19 +182,20 @@ fn resolve_view_now(
     (columns, Some(view_def))
 }
 
-/// Collect table OIDs from RangeVar references in serialized JSON.
+/// Collect table references (as qualified names) from RangeVar mentions in
+/// the serialized JSON AST.
 fn collect_table_refs_from_json(
     json: &str,
     snapshot: &crate::schema::SchemaSnapshot,
-    out: &mut Vec<u32>,
+    out: &mut Vec<QualifiedName>,
 ) {
     // Match "relname":"<exact_name>" with proper quoting.
-    for table in snapshot.tables.values() {
-        let pattern = format!("\"relname\":\"{}\"", table.name);
+    for key in snapshot.tables.keys() {
+        let pattern = format!("\"relname\":\"{}\"", key.name);
         if json.contains(&pattern) {
             // Verify schema if present: check for "schemaname":"<schema>" nearby.
             // For unqualified refs, accept if table is in search_path.
-            out.push(table.oid);
+            out.push(key.clone());
         }
     }
 }
@@ -223,8 +207,8 @@ fn collect_table_refs_from_json(
 fn collect_column_deps_from_json(
     json: &str,
     snapshot: &crate::schema::SchemaSnapshot,
-    table_oids: &[u32],
-    out: &mut Vec<(u32, String)>,
+    table_keys: &[QualifiedName],
+    out: &mut Vec<(QualifiedName, String)>,
 ) {
     // Strategy: find all "ColumnRef" patterns and extract the field names.
     // A ColumnRef in the JSON looks like:
@@ -236,11 +220,11 @@ fn collect_column_deps_from_json(
     let column_refs = extract_column_ref_names(json);
 
     for col_name in &column_refs {
-        for &table_oid in table_oids {
-            if let Some(table) = snapshot.tables.get(&table_oid)
+        for table_key in table_keys {
+            if let Some(table) = snapshot.tables.get(table_key)
                 && table.columns.iter().any(|tc| tc.name == *col_name)
             {
-                out.push((table_oid, col_name.clone()));
+                out.push((table_key.clone(), col_name.clone()));
             }
         }
     }
@@ -284,8 +268,11 @@ fn extract_column_ref_names(json: &str) -> Vec<String> {
 
 // ─── Dependency checking ────────────────────────────────────────────────────
 
-/// Find all views that depend on a given table/view OID.
-pub fn find_dependent_views(snapshot: &crate::schema::SchemaSnapshot, table_oid: u32) -> Vec<u32> {
+/// Find all views that depend on the given table or view.
+pub fn find_dependent_views(
+    snapshot: &crate::schema::SchemaSnapshot,
+    table_key: &QualifiedName,
+) -> Vec<QualifiedName> {
     snapshot
         .tables
         .iter()
@@ -293,18 +280,18 @@ pub fn find_dependent_views(snapshot: &crate::schema::SchemaSnapshot, table_oid:
             matches!(t.kind, RelationKind::View | RelationKind::MaterializedView)
                 && t.view_def
                     .as_ref()
-                    .is_some_and(|vd| vd.depends_on_tables.contains(&table_oid))
+                    .is_some_and(|vd| vd.depends_on_tables.iter().any(|k| k == table_key))
         })
-        .map(|(&oid, _)| oid)
+        .map(|(k, _)| k.clone())
         .collect()
 }
 
 /// Find all views that depend on a specific column of a table.
 pub fn find_views_depending_on_column(
     snapshot: &crate::schema::SchemaSnapshot,
-    table_oid: u32,
+    table_key: &QualifiedName,
     column_name: &str,
-) -> Vec<u32> {
+) -> Vec<QualifiedName> {
     snapshot
         .tables
         .iter()
@@ -313,35 +300,103 @@ pub fn find_views_depending_on_column(
                 && t.view_def.as_ref().is_some_and(|vd| {
                     vd.depends_on_columns
                         .iter()
-                        .any(|(tid, cname)| *tid == table_oid && cname == column_name)
+                        .any(|(tk, cname)| tk == table_key && cname == column_name)
                 })
         })
-        .map(|(&oid, _)| oid)
+        .map(|(k, _)| k.clone())
         .collect()
 }
 
-/// Drop views by OID, transitively dropping any views that depend on them.
-pub fn drop_views(snapshot: &mut crate::schema::SchemaSnapshot, view_oids: &[u32]) {
-    let mut to_drop: Vec<u32> = view_oids.to_vec();
-    let mut dropped = Vec::new();
+/// Drop views by qualified name, transitively dropping any views that depend
+/// on them.
+pub fn drop_views(snapshot: &mut crate::schema::SchemaSnapshot, view_keys: &[QualifiedName]) {
+    let mut to_drop: Vec<QualifiedName> = view_keys.to_vec();
+    let mut dropped: Vec<QualifiedName> = Vec::new();
 
     // Transitively find all dependents.
-    while let Some(oid) = to_drop.pop() {
-        if dropped.contains(&oid) {
+    while let Some(key) = to_drop.pop() {
+        if dropped.contains(&key) {
             continue;
         }
         // Find views that depend on this one.
-        let dependents = find_dependent_views(snapshot, oid);
+        let dependents = find_dependent_views(snapshot, &key);
         for dep in dependents {
             if !dropped.contains(&dep) {
                 to_drop.push(dep);
             }
         }
         // Drop this view.
-        if let Some(table) = snapshot.tables.remove(&oid) {
-            let key = format!("{}.{}", table.schema, table.name);
-            snapshot.table_by_name.remove(&key);
+        snapshot.tables.remove(&key);
+        dropped.push(key);
+    }
+}
+
+// ─── Dependency rewriting (RENAME / SET SCHEMA propagation) ─────────────────
+
+/// Rewrite every view's dependencies so references to `old` now point at `new`.
+/// Call this after renaming a table/view or moving it to a new schema.
+pub fn rewrite_deps_on_table_rename(
+    snapshot: &mut crate::schema::SchemaSnapshot,
+    old: &QualifiedName,
+    new: &QualifiedName,
+) {
+    for table in snapshot.tables.values_mut() {
+        let Some(vd) = table.view_def.as_mut() else {
+            continue;
+        };
+        for k in vd.depends_on_tables.iter_mut() {
+            if k == old {
+                *k = new.clone();
+            }
         }
-        dropped.push(oid);
+        for (k, _) in vd.depends_on_columns.iter_mut() {
+            if k == old {
+                *k = new.clone();
+            }
+        }
+    }
+}
+
+/// Rewrite every view's column-level dependencies after a column rename.
+pub fn rewrite_deps_on_column_rename(
+    snapshot: &mut crate::schema::SchemaSnapshot,
+    table_key: &QualifiedName,
+    old_col: &str,
+    new_col: &str,
+) {
+    for table in snapshot.tables.values_mut() {
+        let Some(vd) = table.view_def.as_mut() else {
+            continue;
+        };
+        for (k, c) in vd.depends_on_columns.iter_mut() {
+            if k == table_key && c == old_col {
+                *c = new_col.to_owned();
+            }
+        }
+    }
+}
+
+/// Rewrite every view's dependencies after renaming a whole schema — any
+/// dependency whose schema matches `old_schema` has its schema field
+/// replaced with `new_schema`.
+pub fn rewrite_deps_on_schema_rename(
+    snapshot: &mut crate::schema::SchemaSnapshot,
+    old_schema: &str,
+    new_schema: &str,
+) {
+    for table in snapshot.tables.values_mut() {
+        let Some(vd) = table.view_def.as_mut() else {
+            continue;
+        };
+        for k in vd.depends_on_tables.iter_mut() {
+            if k.schema == old_schema {
+                k.schema = new_schema.to_owned();
+            }
+        }
+        for (k, _) in vd.depends_on_columns.iter_mut() {
+            if k.schema == old_schema {
+                k.schema = new_schema.to_owned();
+            }
+        }
     }
 }

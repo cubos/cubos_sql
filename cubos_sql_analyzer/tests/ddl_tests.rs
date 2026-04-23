@@ -1,29 +1,26 @@
 //! Unit tests for the DDL interpreter.
 
-use cubos_sql_analyzer::schema::{RelationKind, TypeKind};
-use cubos_sql_analyzer::seed::build_schema_from_migrations;
+use cubos_sql_analyzer::schema::{RelationKind, SchemaSnapshot, TypeKind};
+use cubos_sql_analyzer::{AnalyzerConfig, Database, DdlError, QualifiedName};
 
-fn build(migrations: &[(&str, &str)]) -> cubos_sql_analyzer::schema::SchemaSnapshot {
-    let m: Vec<(String, String)> = migrations
-        .iter()
-        .map(|(f, s)| (f.to_string(), s.to_string()))
-        .collect();
-    let (snapshot, warnings) = build_schema_from_migrations(&m).unwrap();
-    for w in &warnings {
-        eprintln!("warning: {w}");
+fn build_db(migrations: &[(&str, &str)]) -> Database {
+    let mut db = Database::new();
+    for (_, sql) in migrations {
+        db.apply_sql(sql).unwrap();
     }
-    snapshot
+    db
 }
 
-fn try_build(
-    migrations: &[(&str, &str)],
-) -> Result<cubos_sql_analyzer::schema::SchemaSnapshot, cubos_sql_analyzer::ddl::DdlError> {
-    let m: Vec<(String, String)> = migrations
-        .iter()
-        .map(|(f, s)| (f.to_string(), s.to_string()))
-        .collect();
-    let (snapshot, _) = build_schema_from_migrations(&m)?;
-    Ok(snapshot)
+fn build(migrations: &[(&str, &str)]) -> SchemaSnapshot {
+    build_db(migrations).into_snapshot()
+}
+
+fn try_apply(migrations: &[(&str, &str)]) -> Result<(), DdlError> {
+    let mut db = Database::new();
+    for (_, sql) in migrations {
+        db.apply_sql(sql)?;
+    }
+    Ok(())
 }
 
 // ─── CREATE TABLE ───────────────────────────────────────────────────────────
@@ -445,10 +442,7 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
     // End-to-end: a SELECT on a vector column and a `<=>` expression should
     // produce Rust types routed to the `pgvector` crate. `cubos_sql` itself
     // does not depend on pgvector — the type path is emitted as a string.
-    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
-    use std::collections::HashMap;
-
-    let snap = build(&[(
+    let db = build_db(&[(
         "0001.sql",
         "CREATE EXTENSION vector;
          CREATE TABLE items (
@@ -456,16 +450,12 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
              embedding vector NOT NULL
          );",
     )]);
-
-    let config = AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: Vec::new(),
-    };
+    let config = AnalyzerConfig::default();
 
     // Column of type `vector` is mapped to `pgvector::Vector`.
-    let info = analyze(&snap, "SELECT id, embedding FROM items", &config).unwrap();
+    let info = db
+        .analyze("SELECT id, embedding FROM items", &config)
+        .unwrap();
     let embedding = info.columns.iter().find(|c| c.name == "embedding").unwrap();
     assert_eq!(embedding.rust_type, "pgvector::Vector");
     assert!(!embedding.nullable);
@@ -473,12 +463,12 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
     // A query using the `<=>` operator infers the parameter's type as vector
     // (via the operator's left operand), and the parameter's Rust type is
     // mapped to `pgvector::Vector`.
-    let info = analyze(
-        &snap,
-        "SELECT id, (embedding <=> $1) AS dist FROM items ORDER BY embedding <=> $1",
-        &config,
-    )
-    .unwrap();
+    let info = db
+        .analyze(
+            "SELECT id, (embedding <=> $q) AS dist FROM items ORDER BY embedding <=> $q",
+            &config,
+        )
+        .unwrap();
     let dist = info.columns.iter().find(|c| c.name == "dist").unwrap();
     assert_eq!(dist.rust_type, "f64", "cosine_distance returns float8");
     assert_eq!(info.params.len(), 1);
@@ -718,7 +708,7 @@ fn view_with_aliases() {
 
 #[test]
 fn view_drop_referenced_column_fails_without_cascade() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
@@ -777,7 +767,7 @@ fn view_drop_unrelated_column_succeeds() {
 
 #[test]
 fn view_alter_type_fails_without_cascade() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, amount INT);
@@ -839,7 +829,7 @@ fn view_alter_unrelated_column_succeeds() {
 
 #[test]
 fn view_drop_table_fails_without_cascade() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL);
@@ -960,12 +950,19 @@ fn extension_if_not_exists() {
 }
 
 #[test]
-fn extension_unknown_warns_no_error() {
-    // Unknown extension should produce a warning, not an error.
-    let _snap = build(&[(
+fn extension_unknown_is_error() {
+    // Unknown extensions are rejected: the analyzer has no way to know what
+    // types or functions they register, so silently accepting them would
+    // hide type errors downstream.
+    let err = try_apply(&[(
         "0001.sql",
         "CREATE EXTENSION IF NOT EXISTS some_unknown_ext;",
-    )]);
+    )])
+    .unwrap_err();
+    assert!(
+        matches!(err, DdlError::ExtensionError(_)),
+        "expected ExtensionError, got: {err:?}"
+    );
 }
 
 // ─── CREATE / DROP AGGREGATE ────────────────────────────────────────────────
@@ -1058,7 +1055,7 @@ fn drop_aggregate_removes_only_aggregate() {
 
 #[test]
 fn drop_aggregate_missing_errors_without_if_exists() {
-    let err = try_build(&[("0001.sql", "DROP AGGREGATE nonexistent(int4);")])
+    let err = try_apply(&[("0001.sql", "DROP AGGREGATE nonexistent(int4);")])
         .expect_err("dropping a missing aggregate without IF EXISTS must fail");
     let msg = err.to_string();
     assert!(
@@ -1094,7 +1091,7 @@ fn drop_operator_removes_only_matching_signature() {
 
     let ops = snap
         .operators_by_name
-        .get("<=>")
+        .get(&QualifiedName::new("public", "<=>"))
         .expect("other overloads should still be registered");
 
     assert!(
@@ -1116,7 +1113,7 @@ fn drop_operator_if_exists_no_error() {
 
 #[test]
 fn drop_operator_missing_errors_without_if_exists() {
-    let err = try_build(&[("0001.sql", "DROP OPERATOR <=> (int4, int4);")])
+    let err = try_apply(&[("0001.sql", "DROP OPERATOR <=> (int4, int4);")])
         .expect_err("dropping a missing operator without IF EXISTS must fail");
     assert!(err.to_string().contains("operator <=>"));
 }
@@ -1171,7 +1168,7 @@ fn drop_cast_if_exists_no_error() {
 
 #[test]
 fn drop_cast_missing_errors_without_if_exists() {
-    let err = try_build(&[("0001.sql", "DROP CAST (int2 AS uuid);")])
+    let err = try_apply(&[("0001.sql", "DROP CAST (int2 AS uuid);")])
         .expect_err("dropping a missing cast without IF EXISTS must fail");
     assert!(err.to_string().contains("cast from"));
 }
@@ -1189,7 +1186,7 @@ fn create_procedure_registers_with_is_procedure_flag() {
 
     let fns = snap
         .functions_by_name
-        .get("do_thing")
+        .get(&QualifiedName::new("public", "do_thing"))
         .expect("do_thing should be registered");
     assert_eq!(fns.len(), 1);
     assert!(fns[0].is_procedure);
@@ -1200,23 +1197,12 @@ fn create_procedure_registers_with_is_procedure_flag() {
 fn procedure_is_not_callable_in_expressions() {
     // A `CREATE PROCEDURE` must not be considered a valid expression-level
     // function. Calling it inside a SELECT should fail analysis.
-    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
-    use std::collections::HashMap;
-
-    let snap = build(&[(
+    let db = build_db(&[(
         "0001.sql",
         "CREATE PROCEDURE do_thing(x int) LANGUAGE SQL AS $$ SELECT $1 $$;",
     )]);
 
-    let config = AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: Vec::new(),
-    };
-
-    // The analyzer must not find do_thing as a callable function.
-    let result = analyze(&snap, "SELECT do_thing(1)", &config);
+    let result = db.analyze("SELECT do_thing(1)", &AnalyzerConfig::default());
     assert!(
         result.is_err(),
         "procedures must not resolve as expression functions"
@@ -1265,12 +1251,14 @@ fn alter_function_rename_moves_overload() {
     )]);
 
     assert!(
-        snap.functions_by_name.get("add_one").is_none(),
+        !snap
+            .functions_by_name
+            .contains_key(&QualifiedName::new("public", "add_one")),
         "old name should be gone"
     );
     let fns = snap
         .functions_by_name
-        .get("plus_one")
+        .get(&QualifiedName::new("public", "plus_one"))
         .expect("renamed function should exist");
     assert_eq!(fns.len(), 1);
     let int4_oid = snap
@@ -1289,7 +1277,10 @@ fn alter_function_set_schema_moves_it() {
          ALTER FUNCTION add_one(int) SET SCHEMA utils;",
     )]);
 
-    let fns = snap.functions_by_name.get("add_one").unwrap();
+    let fns = snap
+        .functions_by_name
+        .get(&QualifiedName::new("utils", "add_one"))
+        .unwrap();
     assert_eq!(fns[0].schema, "utils");
 }
 
@@ -1313,11 +1304,17 @@ fn alter_function_rename_with_overloads_only_moves_matching_signature() {
         .unwrap()
         .oid;
 
-    let renamed = snap.functions_by_name.get("do_it_int").unwrap();
+    let renamed = snap
+        .functions_by_name
+        .get(&QualifiedName::new("public", "do_it_int"))
+        .unwrap();
     assert_eq!(renamed.len(), 1);
     assert_eq!(renamed[0].arg_types, vec![int4_oid]);
 
-    let remaining = snap.functions_by_name.get("do_it").unwrap();
+    let remaining = snap
+        .functions_by_name
+        .get(&QualifiedName::new("public", "do_it"))
+        .unwrap();
     assert_eq!(
         remaining.len(),
         1,
@@ -1339,12 +1336,18 @@ fn alter_aggregate_rename_only_touches_aggregate() {
     )]);
 
     // Scalar survives under original name.
-    let scalar = snap.functions_by_name.get("ag").unwrap();
+    let scalar = snap
+        .functions_by_name
+        .get(&QualifiedName::new("public", "ag"))
+        .unwrap();
     assert_eq!(scalar.len(), 1);
     assert!(!scalar[0].is_aggregate);
 
     // Aggregate moved.
-    let moved = snap.functions_by_name.get("ag_total").unwrap();
+    let moved = snap
+        .functions_by_name
+        .get(&QualifiedName::new("public", "ag_total"))
+        .unwrap();
     assert_eq!(moved.len(), 1);
     assert!(moved[0].is_aggregate);
 }
@@ -1375,7 +1378,7 @@ fn drop_schema_empty_succeeds() {
 
 #[test]
 fn drop_schema_with_objects_fails_without_cascade() {
-    let err = try_build(&[(
+    let err = try_apply(&[(
         "0001.sql",
         "CREATE SCHEMA foo;
          CREATE TABLE foo.bar (id INT PRIMARY KEY);
@@ -1423,7 +1426,7 @@ fn drop_schema_if_exists_no_error() {
 
 #[test]
 fn drop_schema_missing_errors_without_if_exists() {
-    let err = try_build(&[("0001.sql", "DROP SCHEMA nonexistent;")])
+    let err = try_apply(&[("0001.sql", "DROP SCHEMA nonexistent;")])
         .expect_err("dropping a missing schema without IF EXISTS must fail");
     assert!(err.to_string().contains("nonexistent"));
 }
@@ -1462,7 +1465,10 @@ fn drop_function_does_not_touch_procedure_of_same_name() {
          DROP FUNCTION f(int);",
     )]);
 
-    let fns = snap.functions_by_name.get("f").unwrap();
+    let fns = snap
+        .functions_by_name
+        .get(&QualifiedName::new("public", "f"))
+        .unwrap();
     assert_eq!(fns.len(), 1, "procedure must survive DROP FUNCTION");
     assert!(fns[0].is_procedure);
 }
@@ -1473,10 +1479,7 @@ fn param_only_in_order_by_is_inferred() {
     // still get its type inferred from the expression context. Regression:
     // previously ORDER BY was skipped entirely, so `$embedding` below was
     // reported as UNKNOWN.
-    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
-    use std::collections::HashMap;
-
-    let snap = build(&[(
+    let db = build_db(&[(
         "0001.sql",
         "CREATE EXTENSION vector;
          CREATE TABLE items (
@@ -1485,19 +1488,12 @@ fn param_only_in_order_by_is_inferred() {
          );",
     )]);
 
-    let config = AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: Vec::new(),
-    };
-
-    let info = analyze(
-        &snap,
-        "SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10",
-        &config,
-    )
-    .expect("ORDER BY param should be resolvable");
+    let info = db
+        .analyze(
+            "SELECT id FROM items ORDER BY embedding <=> $q LIMIT 10",
+            &AnalyzerConfig::default(),
+        )
+        .expect("ORDER BY param should be resolvable");
     assert_eq!(info.params.len(), 1);
     assert_eq!(info.params[0].rust_type, "pgvector::Vector");
 }
@@ -1506,29 +1502,20 @@ fn param_only_in_order_by_is_inferred() {
 fn param_in_group_by_and_having_is_inferred() {
     // Params in GROUP BY / HAVING clauses must also be walked. This ensures
     // the analyzer collects and types them.
-    use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
-    use std::collections::HashMap;
-
-    let snap = build(&[(
+    let db = build_db(&[(
         "0001.sql",
         "CREATE TABLE orders (id BIGINT, total INT NOT NULL);",
     )]);
-    let config = AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: Vec::new(),
-    };
 
-    let info = analyze(
-        &snap,
-        "SELECT total, COUNT(*) AS c
-         FROM orders
-         GROUP BY total
-         HAVING COUNT(*) > $1",
-        &config,
-    )
-    .expect("HAVING param should be resolvable");
+    let info = db
+        .analyze(
+            "SELECT total, COUNT(*) AS c
+             FROM orders
+             GROUP BY total
+             HAVING COUNT(*) > $min",
+            &AnalyzerConfig::default(),
+        )
+        .expect("HAVING param should be resolvable");
     assert_eq!(info.params.len(), 1);
     assert_eq!(info.params[0].rust_type, "i64");
 }
@@ -1542,7 +1529,10 @@ fn drop_procedure_does_not_touch_function_of_same_name() {
          DROP PROCEDURE f(int);",
     )]);
 
-    let fns = snap.functions_by_name.get("f").unwrap();
+    let fns = snap
+        .functions_by_name
+        .get(&QualifiedName::new("public", "f"))
+        .unwrap();
     assert_eq!(fns.len(), 1);
     assert!(!fns[0].is_procedure);
 }

@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use cubos_sql_analyzer::QualifiedName;
 use cubos_sql_analyzer::schema::*;
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
@@ -48,10 +49,11 @@ fn main() {
     eprintln!("Exporting schema...");
     let mut snapshot = export_schema(&mut client).expect("failed to export schema");
 
-    // Sort all Vec values for deterministic output.
-    for fns in snapshot.functions_by_name.values_mut() {
-        fns.sort_by_key(|f| f.oid);
-    }
+    // Vec values are kept in the natural pg_proc order (the export query is
+    // ordered by oid). That ordering determines overload resolution
+    // tie-breaking, and pg_proc oids correlate with preferred overloads in
+    // the way the analyzer expects (e.g. `length(text)` before
+    // `length(bytea)`), so do not re-sort here.
     for ops in snapshot.operators_by_name.values_mut() {
         ops.sort_by_key(|o| (o.left_type_oid.unwrap_or(0), o.right_type_oid));
     }
@@ -89,8 +91,7 @@ fn main() {
 struct OrderedSnapshot {
     types: BTreeMap<u32, TypeEntry>,
     type_by_name: BTreeMap<String, u32>,
-    tables: BTreeMap<u32, TableEntry>,
-    table_by_name: BTreeMap<String, u32>,
+    tables: BTreeMap<String, TableEntry>,
     functions_by_name: BTreeMap<String, Vec<FunctionEntry>>,
     operators_by_name: BTreeMap<String, Vec<OperatorEntry>>,
     casts: BTreeMap<String, CastContext>,
@@ -101,11 +102,26 @@ impl From<SchemaSnapshot> for OrderedSnapshot {
     fn from(s: SchemaSnapshot) -> Self {
         Self {
             types: s.types.into_iter().collect(),
-            type_by_name: s.type_by_name.into_iter().collect(),
-            tables: s.tables.into_iter().collect(),
-            table_by_name: s.table_by_name.into_iter().collect(),
-            functions_by_name: s.functions_by_name.into_iter().collect(),
-            operators_by_name: s.operators_by_name.into_iter().collect(),
+            type_by_name: s
+                .type_by_name
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            tables: s
+                .tables
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            functions_by_name: s
+                .functions_by_name
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            operators_by_name: s
+                .operators_by_name
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
             casts: s.casts.into_iter().collect(),
             search_path: s.search_path,
         }
@@ -117,19 +133,21 @@ impl From<SchemaSnapshot> for OrderedSnapshot {
 fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgres::Error> {
     let search_path = export_search_path(client)?;
     let (types, type_by_name) = export_types(client)?;
-    let (tables, table_by_name) = export_tables(client)?;
+    let tables = export_tables(client)?;
     let functions = export_functions(client)?;
     let operators = export_operators(client)?;
     let casts = export_casts(client)?;
 
-    let mut functions_by_name: HashMap<String, Vec<FunctionEntry>> = HashMap::new();
+    let mut functions_by_name: HashMap<QualifiedName, Vec<FunctionEntry>> = HashMap::new();
     for f in functions {
-        functions_by_name.entry(f.name.clone()).or_default().push(f);
+        let key = QualifiedName::new(&f.schema, &f.name);
+        functions_by_name.entry(key).or_default().push(f);
     }
 
-    let mut operators_by_name: HashMap<String, Vec<OperatorEntry>> = HashMap::new();
+    let mut operators_by_name: HashMap<QualifiedName, Vec<OperatorEntry>> = HashMap::new();
     for o in operators {
-        operators_by_name.entry(o.name.clone()).or_default().push(o);
+        let key = QualifiedName::new("pg_catalog", &o.name);
+        operators_by_name.entry(key).or_default().push(o);
     }
 
     let casts_map: HashMap<String, CastContext> = casts
@@ -161,7 +179,6 @@ fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgr
         types,
         type_by_name,
         tables,
-        table_by_name,
         functions_by_name,
         operators_by_name,
         casts: casts_map,
@@ -173,21 +190,25 @@ fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgr
 fn export_search_path(client: &mut postgres::Client) -> Result<Vec<String>, postgres::Error> {
     let row = client.query_one("SHOW search_path", &[])?;
     let raw: String = row.get(0);
-    let schemas: Vec<String> = raw
-        .split(',')
-        .map(|s| {
-            let s = s.trim().trim_matches('"');
-            if s == "$user" || s == "\"$user\"" {
-                "public".to_owned()
-            } else {
-                s.to_owned()
-            }
-        })
-        .collect();
+    // Both `$user` (session role) and `"$user"` get normalized to "public"
+    // since we don't have a real user context at analysis time. Dedupe after
+    // normalization so the same schema doesn't appear twice.
+    let mut schemas: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim().trim_matches('"');
+        let name = if part == "$user" || part == "\"$user\"" {
+            "public".to_owned()
+        } else {
+            part.to_owned()
+        };
+        if !schemas.contains(&name) {
+            schemas.push(name);
+        }
+    }
     Ok(schemas)
 }
 
-type TypeExport = (HashMap<u32, TypeEntry>, HashMap<String, u32>);
+type TypeExport = (HashMap<u32, TypeEntry>, HashMap<QualifiedName, u32>);
 
 fn export_types(client: &mut postgres::Client) -> Result<TypeExport, postgres::Error> {
     let rows = client.query(
@@ -233,7 +254,7 @@ fn export_types(client: &mut postgres::Client) -> Result<TypeExport, postgres::E
     }
 
     let mut types = HashMap::new();
-    let mut type_by_name = HashMap::new();
+    let mut type_by_name: HashMap<QualifiedName, u32> = HashMap::new();
 
     for row in &rows {
         let oid: u32 = row.get(0);
@@ -273,7 +294,7 @@ fn export_types(client: &mut postgres::Client) -> Result<TypeExport, postgres::E
             }
         };
 
-        type_by_name.insert(format!("{schema}.{name}"), oid);
+        type_by_name.insert(QualifiedName::new(&schema, &name), oid);
         types.insert(
             oid,
             TypeEntry {
@@ -291,9 +312,9 @@ fn export_types(client: &mut postgres::Client) -> Result<TypeExport, postgres::E
     Ok((types, type_by_name))
 }
 
-type TableExport = (HashMap<u32, TableEntry>, HashMap<String, u32>);
-
-fn export_tables(client: &mut postgres::Client) -> Result<TableExport, postgres::Error> {
+fn export_tables(
+    client: &mut postgres::Client,
+) -> Result<HashMap<QualifiedName, TableEntry>, postgres::Error> {
     let rows = client.query(
         "SELECT c.oid, c.relname, n.nspname, c.relkind \
          FROM pg_catalog.pg_class c \
@@ -329,8 +350,7 @@ fn export_tables(client: &mut postgres::Client) -> Result<TableExport, postgres:
         });
     }
 
-    let mut tables = HashMap::new();
-    let mut table_by_name = HashMap::new();
+    let mut tables: HashMap<QualifiedName, TableEntry> = HashMap::new();
 
     for row in &rows {
         let oid: u32 = row.get(0);
@@ -346,11 +366,10 @@ fn export_tables(client: &mut postgres::Client) -> Result<TableExport, postgres:
             _ => continue,
         };
 
-        table_by_name.insert(format!("{schema}.{name}"), oid);
+        let key = QualifiedName::new(&schema, &name);
         tables.insert(
-            oid,
+            key,
             TableEntry {
-                oid,
                 name,
                 schema,
                 kind,
@@ -360,7 +379,7 @@ fn export_tables(client: &mut postgres::Client) -> Result<TableExport, postgres:
         );
     }
 
-    Ok((tables, table_by_name))
+    Ok(tables)
 }
 
 fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>, postgres::Error> {
@@ -414,8 +433,8 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
             None
         };
 
+        let _ = oid; // Only used for the agg_final lookup above.
         functions.push(FunctionEntry {
-            oid,
             name,
             schema,
             arg_types,

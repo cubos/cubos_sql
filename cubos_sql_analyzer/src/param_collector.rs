@@ -2,12 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::coerce::oid;
 use crate::error::AnalyzeError;
+use crate::type_map::oid;
 
 /// Collects type constraints for positional parameters ($1, $2, ...).
 #[derive(Debug, Default)]
-pub struct ParamCollector {
+pub(crate) struct ParamCollector {
     /// Maps param number (1-based) → inferred type OID.
     constraints: HashMap<i32, u32>,
     /// All param numbers seen in the query (even if type not yet inferred).
@@ -72,11 +72,7 @@ impl ParamCollector {
             .seen
             .iter()
             .map(|&num| {
-                let oid = self
-                    .constraints
-                    .get(&num)
-                    .copied()
-                    .unwrap_or(crate::coerce::oid::TEXT);
+                let oid = self.constraints.get(&num).copied().unwrap_or(oid::TEXT);
                 let nullable = self.nullable.get(&num).copied().unwrap_or(false);
                 (num, oid, nullable)
             })

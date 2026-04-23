@@ -1,12 +1,12 @@
 //! Parsing and orchestration for the `sql!` proc macro.
 //!
-//! Parses the macro input, drives the lexer, builds a schema snapshot from
-//! migrations via the DDL interpreter, runs static analysis, and generates
-//! typed Rust code.
+//! Parses the macro input, builds a cached [`Database`] from migrations,
+//! runs static analysis, and generates typed Rust code.
 
 use std::cell::RefCell;
 use std::path::Path;
 
+use cubos_sql_analyzer::{AnalyzerConfig, Database, QualifiedName};
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitStr, Token};
@@ -14,52 +14,72 @@ use syn::{Expr, Ident, LitStr, Token};
 use crate::codegen::{self, ParamAssignment};
 
 // ---------------------------------------------------------------------------
-// Static analyzer integration
+// Database caching
 // ---------------------------------------------------------------------------
 
-/// Cached schema snapshot (avoids re-building per `sql!` call).
-struct CachedSnapshot {
-    snapshot: cubos_sql_analyzer::schema::SchemaSnapshot,
+struct CachedDatabase {
+    db: Database,
     /// Cache key: migration hash.
     migration_hash: String,
 }
 
 thread_local! {
-    static CACHED_SNAPSHOT: RefCell<Option<CachedSnapshot>> = const { RefCell::new(None) };
+    static CACHED_DATABASE: RefCell<Option<CachedDatabase>> = const { RefCell::new(None) };
 }
 
-/// Build (or retrieve from cache) a schema snapshot from migrations using the
-/// DDL interpreter.
-fn get_or_build_snapshot(
+/// Parse each key of a TOML-sourced type-mapping map into a
+/// [`QualifiedName`]. The `field` argument names the section (e.g. `"types"`)
+/// for nicer error messages.
+fn parse_qualified_map(
+    map: &std::collections::HashMap<String, String>,
+    field: &str,
+) -> Result<std::collections::HashMap<QualifiedName, String>, syn::Error> {
+    map.iter()
+        .map(|(k, v)| {
+            let q: QualifiedName = k.parse().map_err(|e| {
+                syn::Error::new(
+                    Span::call_site(),
+                    format!(
+                        "invalid qualified name in [package.metadata.cubos_sql.{field}] key {k:?}: {e}"
+                    ),
+                )
+            })?;
+            Ok((q, v.clone()))
+        })
+        .collect()
+}
+
+/// Build (or retrieve from cache) a [`Database`] from migration files.
+fn get_or_build_database(
     migrations_dirs: &[&Path],
     migration_hash: &str,
-) -> Result<cubos_sql_analyzer::schema::SchemaSnapshot, syn::Error> {
-    CACHED_SNAPSHOT.with(|cell| {
+) -> Result<Database, syn::Error> {
+    CACHED_DATABASE.with(|cell| {
         let borrow = cell.borrow();
         if let Some(cached) = borrow.as_ref()
             && cached.migration_hash == migration_hash
         {
-            return Ok(cached.snapshot.clone());
+            return Ok(cached.db.clone());
         }
         drop(borrow);
 
         let migrations = collect_migration_files(migrations_dirs)?;
-        let (snapshot, warnings) =
-            cubos_sql_analyzer::seed::build_schema_from_migrations(&migrations).map_err(|e| {
-                syn::Error::new(Span::call_site(), format!("DDL interpretation failed: {e}"))
+        let mut db = Database::new();
+        for (filename, sql) in &migrations {
+            db.apply_sql(sql).map_err(|e| {
+                syn::Error::new(
+                    Span::call_site(),
+                    format!("DDL interpretation failed in '{filename}': {e}"),
+                )
             })?;
-
-        // Warnings are non-fatal. Print to stderr so they appear in build output.
-        for w in &warnings {
-            eprintln!("cubos_sql warning: {w}");
         }
 
-        cell.borrow_mut().replace(CachedSnapshot {
-            snapshot: snapshot.clone(),
+        cell.borrow_mut().replace(CachedDatabase {
+            db: db.clone(),
             migration_hash: migration_hash.to_string(),
         });
 
-        Ok(snapshot)
+        Ok(db)
     })
 }
 
@@ -97,36 +117,6 @@ fn collect_migration_files(dirs: &[&Path]) -> Result<Vec<(String, String)>, syn:
 
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
-}
-
-/// Analyze the query statically against a schema snapshot.
-fn static_analyze(
-    snapshot: &cubos_sql_analyzer::schema::SchemaSnapshot,
-    sql: &str,
-    config: &cubos_sql_core::config::ResolvedConfig<'_>,
-    lex_output: &cubos_sql_analyzer::param::LexOutput,
-) -> Result<cubos_sql_analyzer::query_info::QueryInfo, syn::Error> {
-    let analyzer_config = cubos_sql_analyzer::resolve::AnalyzerConfig {
-        domains: config.domains.clone(),
-        enums: config.enums.clone(),
-        types: config.types.clone(),
-        param_nullability: {
-            let mut v: Vec<Option<bool>> = lex_output.params.iter().map(|p| p.nullable).collect();
-            for spread in &lex_output.spreads {
-                if let Some(fields) = &spread.fields {
-                    v.extend(
-                        fields
-                            .iter()
-                            .map(|f| if f.nullable { Some(true) } else { None }),
-                    );
-                }
-            }
-            v
-        },
-    };
-
-    cubos_sql_analyzer::resolve::analyze(snapshot, sql, &analyzer_config)
-        .map_err(|e| syn::Error::new(Span::call_site(), e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,64 +194,7 @@ impl Parse for QueryInput {
 pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
     let sql_str = input.sql.value();
 
-    // 1. Lex the SQL template.
-    let lex_output = cubos_sql_analyzer::lexer::lex(&sql_str)
-        .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
-
-    // Validate that all assignments match SQL params.
-    for assignment in &input.assignments {
-        if !lex_output.params.iter().any(|p| p.name == assignment.name)
-            && !lex_output.spreads.iter().any(|s| s.name == assignment.name)
-        {
-            let available: Vec<String> = lex_output
-                .params
-                .iter()
-                .map(|p| format!("${}", p.name))
-                .chain(lex_output.spreads.iter().map(|s| format!("$..{}", s.name)))
-                .collect();
-            let available_str = if available.is_empty() {
-                "none".to_string()
-            } else {
-                available.join(", ")
-            };
-            return Err(syn::Error::new(
-                input.sql.span(),
-                format!(
-                    "unknown parameter `{}` — not found in SQL. Available parameters: {}",
-                    assignment.name, available_str,
-                ),
-            ));
-        }
-    }
-
-    // Validate spread constraints: field mapping is mandatory, fields must be unique.
-    for spread in &lex_output.spreads {
-        if spread.fields.is_none() {
-            return Err(syn::Error::new(
-                input.sql.span(),
-                format!(
-                    "$..{} requires explicit field mapping: $..{} {{ field1, field2 }}",
-                    spread.name, spread.name,
-                ),
-            ));
-        }
-        if let Some(fields) = &spread.fields {
-            let mut seen = std::collections::HashSet::new();
-            for field in fields {
-                if !seen.insert(field.name.as_str()) {
-                    return Err(syn::Error::new(
-                        input.sql.span(),
-                        format!(
-                            "duplicate field '{}' in $..{} spread",
-                            field.name, spread.name,
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    // 2. Load project config from Cargo.toml.
+    // 1. Load project config from Cargo.toml.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
         syn::Error::new(
             Span::call_site(),
@@ -285,7 +218,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         )
     })?;
 
-    // 3. Compute migration hash for snapshot caching.
+    // 2. Build (or reuse cached) Database from migrations.
     let migrations_dir = resolved.migrations_dir(manifest_path);
     let extra_dirs = resolved.extra_migrations_dirs(manifest_path);
     let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
@@ -295,127 +228,65 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
-    let introspection_sql = if lex_output.spreads.is_empty() {
-        lex_output.sql.clone()
-    } else {
-        build_spread_sample_sql(&lex_output)
+    let database = get_or_build_database(&all_dirs, &migration_hash)?;
+
+    // 3. Analyze the SQL (lex + type inference in one pass).
+    //
+    // Convert the string-keyed maps from Cargo.toml into the analyzer's
+    // QualifiedName keys. Bare names have already been prefixed with
+    // `public.` by `Config::resolve`, so here we just parse each key.
+    let analyzer_config = AnalyzerConfig {
+        domains: parse_qualified_map(&resolved.domains, "domains")?,
+        enums: parse_qualified_map(&resolved.enums, "enums")?,
+        types: parse_qualified_map(&resolved.types, "types")?,
     };
 
-    // 4. Build schema snapshot and run static analysis.
-    let snapshot = get_or_build_snapshot(&all_dirs, &migration_hash)?;
-    let mut query_info = static_analyze(&snapshot, &introspection_sql, &resolved, &lex_output)?;
+    let analyzed = database
+        .analyze(&sql_str, &analyzer_config)
+        .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
 
-    // 5. Merge nullable annotations: explicit `$foo?` forces nullable, `$foo!` forces
-    //    non-nullable, no annotation keeps the analyzer result.
-    {
-        let mut nullable_flags: Vec<Option<bool>> =
-            lex_output.params.iter().map(|p| p.nullable).collect();
-        for spread in &lex_output.spreads {
-            if let Some(fields) = &spread.fields {
-                nullable_flags.extend(
-                    fields
-                        .iter()
-                        .map(|f| if f.nullable { Some(true) } else { None }),
-                );
-            }
+    // 4. Validate that all assignments match SQL params/spreads.
+    for assignment in &input.assignments {
+        if !analyzed.params.iter().any(|p| p.name == assignment.name)
+            && !analyzed.spreads.iter().any(|s| s.name == assignment.name)
+        {
+            let available: Vec<String> = analyzed
+                .params
+                .iter()
+                .map(|p| format!("${}", p.name))
+                .chain(analyzed.spreads.iter().map(|s| format!("$..{}", s.name)))
+                .collect();
+            let available_str = if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            };
+            return Err(syn::Error::new(
+                input.sql.span(),
+                format!(
+                    "unknown parameter `{}` — not found in SQL. Available parameters: {}",
+                    assignment.name, available_str,
+                ),
+            ));
         }
-        for (pi, &lexer_nullable) in query_info.params.iter_mut().zip(nullable_flags.iter()) {
-            if let Some(explicit) = lexer_nullable {
-                pi.nullable = explicit;
+    }
+
+    // 5. Validate spread constraints: field names must be unique within each spread.
+    for spread in &analyzed.spreads {
+        let mut seen = std::collections::HashSet::new();
+        for field in &spread.fields {
+            if !seen.insert(field.name.as_str()) {
+                return Err(syn::Error::new(
+                    input.sql.span(),
+                    format!(
+                        "duplicate field '{}' in $..{} spread",
+                        field.name, spread.name,
+                    ),
+                ));
             }
         }
     }
 
     // 6. Generate typed Rust code.
-    codegen::generate(
-        &lex_output,
-        &query_info,
-        &input.executor,
-        &input.assignments,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Spread sample SQL generation
-// ---------------------------------------------------------------------------
-
-/// Build a "sample" SQL for analysis when the query contains spreads.
-///
-/// Replaces each spread insertion point with a single row of positional
-/// placeholders. Field mapping is mandatory, so fields.len() gives the
-/// column count.
-fn build_spread_sample_sql(lex_output: &cubos_sql_analyzer::param::LexOutput) -> String {
-    let base_sql = &lex_output.sql;
-    let num_regular_params = lex_output.params.len();
-    let mut result = String::with_capacity(base_sql.len() + 64);
-    let mut last_offset = 0;
-    let mut param_counter = num_regular_params;
-
-    for spread in &lex_output.spreads {
-        result.push_str(&base_sql[last_offset..spread.offset]);
-        let fields = spread.fields.as_ref().expect("spread must have fields");
-        result.push('(');
-        for (i, _) in fields.iter().enumerate() {
-            if i > 0 {
-                result.push_str(", ");
-            }
-            param_counter += 1;
-            result.push('$');
-            result.push_str(&param_counter.to_string());
-        }
-        result.push(')');
-        last_offset = spread.offset;
-    }
-
-    result.push_str(&base_sql[last_offset..]);
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cubos_sql_analyzer::lexer::lex;
-
-    #[test]
-    fn sample_sql_simple_spread() {
-        let lo = lex("INSERT INTO users (name, email) VALUES $..users { name, email }").unwrap();
-        let sample = build_spread_sample_sql(&lo);
-        assert_eq!(sample, "INSERT INTO users (name, email) VALUES ($1, $2)");
-    }
-
-    #[test]
-    fn sample_sql_spread_with_regular_params() {
-        let lo = lex("INSERT INTO t (org, name) VALUES ($org), $..items { name }").unwrap();
-        let sample = build_spread_sample_sql(&lo);
-        assert_eq!(sample, "INSERT INTO t (org, name) VALUES ($1), ($2)");
-    }
-
-    #[test]
-    fn sample_sql_spread_with_suffix() {
-        let lo =
-            lex("INSERT INTO users (name, email) VALUES $..users { name, email } RETURNING id")
-                .unwrap();
-        let sample = build_spread_sample_sql(&lo);
-        assert_eq!(
-            sample,
-            "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id"
-        );
-    }
-
-    #[test]
-    fn sample_sql_three_fields() {
-        let lo = lex("INSERT INTO t (a, b, c) VALUES $..items { a, b, c }").unwrap();
-        let sample = build_spread_sample_sql(&lo);
-        assert_eq!(sample, "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)");
-    }
-
-    #[test]
-    fn sample_sql_multiple_spreads() {
-        let lo = lex("WITH a AS (INSERT INTO t1 (x) VALUES $..s1 { x }) \
-             INSERT INTO t2 (y) VALUES $..s2 { y }")
-        .unwrap();
-        let sample = build_spread_sample_sql(&lo);
-        assert!(sample.contains("VALUES ($1)"));
-        assert!(sample.contains("VALUES ($2)"));
-    }
+    codegen::generate(&analyzed, &input.executor, &input.assignments)
 }

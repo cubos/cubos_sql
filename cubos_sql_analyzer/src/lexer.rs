@@ -16,9 +16,10 @@ use crate::param::{LexOutput, Param, SpreadField, SpreadParam};
 /// An error produced when the lexer encounters invalid SQL syntax.
 ///
 /// All variants include the byte `position` where the problem was detected.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LexError {
+pub(crate) enum LexError {
     /// A single-quoted string literal was opened but never closed.
     UnclosedString { position: usize },
     /// A `/* ... */` block comment was opened but never closed.
@@ -94,16 +95,14 @@ fn read_ident(chars: &[char], start: usize) -> &[char] {
 ///
 /// # Examples
 ///
-/// ```
-/// use cubos_sql_analyzer::lexer::lex;
-///
+/// ```ignore
 /// let output = lex("SELECT * FROM users WHERE id = $id AND name = $name").unwrap();
 /// assert_eq!(output.sql, "SELECT * FROM users WHERE id = $1 AND name = $2");
 /// assert_eq!(output.params.len(), 2);
 /// assert_eq!(output.params[0].name, "id");
 /// assert_eq!(output.params[1].name, "name");
 /// ```
-pub fn lex(sql: &str) -> Result<LexOutput, LexError> {
+pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
     let mut state = LexState::Normal;

@@ -2,6 +2,7 @@
 
 use pg_query::protobuf::{Node, RangeVar, TypeName, node};
 
+use crate::qualified_name::QualifiedName;
 use crate::schema::SchemaSnapshot;
 
 /// Extract the (schema, name) pair from a `RangeVar`.
@@ -19,10 +20,10 @@ pub fn range_var_names(rv: &RangeVar, snapshot: &SchemaSnapshot) -> (String, Str
     (schema, rv.relname.clone())
 }
 
-/// Extract schema-qualified key `"schema.name"` from a `RangeVar`.
-pub fn range_var_key(rv: &RangeVar, snapshot: &SchemaSnapshot) -> String {
+/// Extract schema-qualified key from a `RangeVar`.
+pub fn range_var_key(rv: &RangeVar, snapshot: &SchemaSnapshot) -> QualifiedName {
     let (schema, name) = range_var_names(rv, snapshot);
-    format!("{schema}.{name}")
+    QualifiedName::new(schema, name)
 }
 
 /// Extract (schema, name) from a list of name nodes (e.g., `domainname`, `type_name` in DDL).
@@ -51,9 +52,9 @@ pub fn extract_names(names: &[Node], snapshot: &SchemaSnapshot) -> (String, Stri
 }
 
 /// Extract a schema-qualified key from name nodes.
-pub fn names_key(names: &[Node], snapshot: &SchemaSnapshot) -> String {
+pub fn names_key(names: &[Node], snapshot: &SchemaSnapshot) -> QualifiedName {
     let (schema, name) = extract_names(names, snapshot);
-    format!("{schema}.{name}")
+    QualifiedName::new(schema, name)
 }
 
 /// Resolve a `TypeName` AST node to a type OID in the snapshot.
@@ -84,20 +85,20 @@ pub fn resolve_type_name(tn: &TypeName, snapshot: &SchemaSnapshot) -> Option<u32
 
     // Try to find the type by name.
     let oid = if let Some(schema) = schema {
-        let key = format!("{schema}.{name}");
+        let key = QualifiedName::new(schema, name);
         snapshot.type_by_name.get(&key).copied()
     } else {
         // Search path then pg_catalog.
         let mut found = None;
         for s in &snapshot.search_path {
-            let key = format!("{s}.{name}");
+            let key = QualifiedName::new(s.clone(), name);
             if let Some(oid) = snapshot.type_by_name.get(&key) {
                 found = Some(*oid);
                 break;
             }
         }
         if found.is_none() {
-            let key = format!("pg_catalog.{name}");
+            let key = QualifiedName::new("pg_catalog", name);
             found = snapshot.type_by_name.get(&key).copied();
         }
         found
@@ -147,16 +148,4 @@ pub fn node_string(n: &Node) -> Option<&str> {
         node::Node::String(s) => Some(s.sval.as_str()),
         _ => None,
     }
-}
-
-/// Extract a DefElem name/value from options list.
-pub fn find_def_elem<'a>(options: &'a [Node], name: &str) -> Option<&'a Node> {
-    for n in options {
-        if let Some(node::Node::DefElem(de)) = n.node.as_ref()
-            && de.defname == name
-        {
-            return de.arg.as_deref();
-        }
-    }
-    None
 }

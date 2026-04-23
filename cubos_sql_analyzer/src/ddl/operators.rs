@@ -6,18 +6,35 @@
 
 use pg_query::protobuf::{DefineStmt, node};
 
+use crate::qualified_name::QualifiedName;
 use crate::schema::OperatorEntry;
 
+use super::DdlError;
 use super::util::resolve_type_name;
-use super::{DdlError, DdlInterpreter};
+use crate::database::Database;
 
-pub fn define_operator(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(), DdlError> {
-    // Operator name — last string in defnames (may be schema-qualified).
-    let Some(op_name) = stmt.defnames.last().and_then(|n| match n.node.as_ref()? {
-        node::Node::String(s) => Some(s.sval.clone()),
-        _ => None,
-    }) else {
-        return Ok(());
+pub fn define_operator(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlError> {
+    // Operator name: `defnames` holds either `[name]` or `[schema, name]`.
+    let parts: Vec<String> = stmt
+        .defnames
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let (schema, op_name) = match parts.as_slice() {
+        [name] => (
+            interp
+                .snapshot
+                .search_path
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "public".to_owned()),
+            name.clone(),
+        ),
+        [schema, name] => (schema.clone(), name.clone()),
+        _ => return Ok(()),
     };
 
     let mut left_type: Option<u32> = None;
@@ -64,7 +81,7 @@ pub fn define_operator(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result
     interp
         .snapshot
         .operators_by_name
-        .entry(op_name.clone())
+        .entry(QualifiedName::new(schema, &op_name))
         .or_default()
         .push(OperatorEntry {
             name: op_name,
@@ -112,7 +129,7 @@ fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, St
 /// Look up a procedure in the snapshot and return its result type, matching
 /// on the operator's operand types.
 fn resolve_procedure_return(
-    interp: &DdlInterpreter,
+    interp: &Database,
     schema: Option<&str>,
     name: &str,
     left: Option<u32>,

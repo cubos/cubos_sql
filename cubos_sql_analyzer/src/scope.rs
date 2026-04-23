@@ -5,7 +5,7 @@ use crate::schema::{SchemaSnapshot, TableColumn};
 
 /// A resolved column with its type and base nullability (from table definition).
 #[derive(Debug, Clone)]
-pub struct ScopeColumn {
+pub(crate) struct ScopeColumn {
     pub name: String,
     pub type_oid: u32,
     /// NOT NULL from the table definition (before JOIN effects).
@@ -16,14 +16,14 @@ pub struct ScopeColumn {
 
 /// A table-like source in the FROM clause.
 #[derive(Debug, Clone)]
-pub struct TableSource {
+pub(crate) struct TableSource {
     pub alias: String,
     pub columns: Vec<ScopeColumn>,
 }
 
 /// Tracks all table sources visible in the current query scope.
 #[derive(Debug, Clone, Default)]
-pub struct Scope {
+pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
 }
 

@@ -13,7 +13,7 @@
 /// Nullability annotation: `$foo` has no annotation (inferred from schema),
 /// `$foo?` forces nullable, `$foo!` forces non-nullable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Param {
+pub(crate) struct Param {
     /// The parameter name without the `$` prefix and `?`/`!` suffix (e.g., `"user_id"`).
     pub name: String,
     /// Explicit nullability annotation.
@@ -32,7 +32,7 @@ pub struct Param {
 /// `email?` in `$..items { name, email?, age }` produces
 /// `SpreadField { name: "email", nullable: true }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpreadField {
+pub(crate) struct SpreadField {
     /// Field name without the `?` suffix.
     pub name: String,
     /// Whether this field is nullable (`field?` syntax).
@@ -59,7 +59,7 @@ impl From<&str> for SpreadField {
 /// Positional indices for spread placeholders start after the last named
 /// parameter index (`params.len() + 1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpreadParam {
+pub(crate) struct SpreadParam {
     /// The spread name without the `$..` prefix (e.g., `"items"`).
     pub name: String,
     /// Explicit fields when provided inline (e.g., `{ name, email?, age }`),
@@ -75,7 +75,7 @@ pub struct SpreadParam {
 /// Contains the rewritten SQL (with positional placeholders), the list of
 /// deduplicated named parameters, and any spread parameters found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexOutput {
+pub(crate) struct LexOutput {
     /// SQL with named params rewritten to positional placeholders (`$1`, `$2`, ...).
     ///
     /// Spread tokens are removed from this string. The caller must insert

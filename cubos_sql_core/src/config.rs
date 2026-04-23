@@ -756,7 +756,7 @@ migrations = "./migrations/analytics"
             "crate::domains::OrderMetadata"
         );
         // Original unqualified key should not exist
-        assert!(resolved.domains.get("user_preferences").is_none());
+        assert!(!resolved.domains.contains_key("user_preferences"));
     }
 
     #[test]

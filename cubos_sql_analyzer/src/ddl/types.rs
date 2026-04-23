@@ -5,16 +5,18 @@ use pg_query::protobuf::{
     CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, node,
 };
 
+use crate::qualified_name::QualifiedName;
 use crate::schema::{CompositeField, TypeEntry, TypeKind};
 
+use super::DdlError;
 use super::util::{extract_names, names_key, node_string, resolve_type_name};
-use super::{DdlError, DdlInterpreter};
+use crate::database::Database;
 
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
 
-pub fn create_domain(interp: &mut DdlInterpreter, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
+pub fn create_domain(interp: &mut Database, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.domainname, &interp.snapshot);
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     if interp.snapshot.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
@@ -60,9 +62,9 @@ pub fn create_domain(interp: &mut DdlInterpreter, stmt: &CreateDomainStmt) -> Re
 
 // ─── CREATE TYPE AS ENUM ────────────────────────────────────────────────────
 
-pub fn create_enum(interp: &mut DdlInterpreter, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
+pub fn create_enum(interp: &mut Database, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.type_name, &interp.snapshot);
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     if interp.snapshot.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
@@ -100,10 +102,7 @@ pub fn create_enum(interp: &mut DdlInterpreter, stmt: &CreateEnumStmt) -> Result
 
 // ─── CREATE TYPE AS (composite) ─────────────────────────────────────────────
 
-pub fn create_composite(
-    interp: &mut DdlInterpreter,
-    stmt: &CompositeTypeStmt,
-) -> Result<(), DdlError> {
+pub fn create_composite(interp: &mut Database, stmt: &CompositeTypeStmt) -> Result<(), DdlError> {
     let rv = stmt
         .typevar
         .as_ref()
@@ -120,7 +119,7 @@ pub fn create_composite(
         rv.schemaname.clone()
     };
     let name = rv.relname.clone();
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     if interp.snapshot.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
@@ -168,9 +167,9 @@ pub fn create_composite(
 
 // ─── CREATE TYPE AS RANGE ───────────────────────────────────────────────────
 
-pub fn create_range(interp: &mut DdlInterpreter, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
+pub fn create_range(interp: &mut Database, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.type_name, &interp.snapshot);
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     if interp.snapshot.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
@@ -214,17 +213,17 @@ pub fn create_range(interp: &mut DdlInterpreter, stmt: &CreateRangeStmt) -> Resu
 
 // ─── ALTER TYPE ... ADD VALUE (enum) ────────────────────────────────────────
 
-pub fn alter_enum(interp: &mut DdlInterpreter, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
+pub fn alter_enum(interp: &mut Database, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
     let key = names_key(&stmt.type_name, &interp.snapshot);
 
     let Some(&oid) = interp.snapshot.type_by_name.get(&key) else {
         // IF NOT EXISTS applies to the VALUE, not the TYPE.
         // Type must always exist.
-        return Err(DdlError::TypeNotFound(key));
+        return Err(DdlError::TypeNotFound(key.to_string()));
     };
 
     let Some(te) = interp.snapshot.types.get_mut(&oid) else {
-        return Err(DdlError::TypeNotFound(key));
+        return Err(DdlError::TypeNotFound(key.to_string()));
     };
 
     if let TypeKind::Enum { labels } = &mut te.kind {
@@ -259,7 +258,7 @@ pub fn alter_enum(interp: &mut DdlInterpreter, stmt: &AlterEnumStmt) -> Result<(
 
 /// Handle `DefineStmt` which covers shell types (`CREATE TYPE citext;`) and
 /// full type definitions (`CREATE TYPE citext (INPUT = ..., OUTPUT = ...)`).
-pub fn define_type(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(), DdlError> {
+pub fn define_type(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlError> {
     let obj_type = ObjectType::try_from(stmt.kind).unwrap_or(ObjectType::Undefined);
     if obj_type != ObjectType::ObjectType {
         // Not a type definition (could be an operator, aggregate, etc. via DefineStmt).
@@ -267,7 +266,7 @@ pub fn define_type(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(),
     }
 
     let (schema, name) = extract_names(&stmt.defnames, &interp.snapshot);
-    let key = format!("{schema}.{name}");
+    let key = QualifiedName::new(&schema, &name);
 
     // If the type already exists (e.g., shell type followed by full definition), reuse OID.
     if interp.snapshot.type_by_name.contains_key(&key) {
@@ -301,7 +300,7 @@ pub fn define_type(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(),
 
 // ─── CREATE CAST ────────────────────────────────────────────────────────────
 
-pub fn create_cast(interp: &mut DdlInterpreter, stmt: &CreateCastStmt) -> Result<(), DdlError> {
+pub fn create_cast(interp: &mut Database, stmt: &CreateCastStmt) -> Result<(), DdlError> {
     let source_oid = stmt
         .sourcetype
         .as_ref()
@@ -332,14 +331,14 @@ pub fn create_cast(interp: &mut DdlInterpreter, stmt: &CreateCastStmt) -> Result
 
 /// Register an array type (`_name`) for a base type.
 fn register_array_type(
-    interp: &mut DdlInterpreter,
+    interp: &mut Database,
     array_oid: u32,
     schema: &str,
     base_name: &str,
     element_oid: u32,
 ) {
     let array_name = format!("_{base_name}");
-    let array_key = format!("{schema}.{array_name}");
+    let array_key = QualifiedName::new(schema, &array_name);
     interp.snapshot.types.insert(
         array_oid,
         TypeEntry {

@@ -1,42 +1,240 @@
-//! Top-level query analysis: parse SQL, walk AST, produce QueryInfo.
+//! Top-level query analysis: lex the SQL template, parse it, walk the AST,
+//! and produce an [`AnalyzedQuery`] combining lexer positions with inferred
+//! types.
 
 use std::collections::HashMap;
 
 use pg_query::protobuf::{self, JoinType, SetOperation, node};
 
-use crate::query_info::{ColumnInfo, ParamInfo, QueryInfo};
-use crate::type_map;
-
-use crate::coerce::oid;
 use crate::error::AnalyzeError;
 use crate::expr::{self, TypeGoal};
 use crate::nullability::{self, NullabilityContext};
-use crate::params::ParamCollector;
+use crate::param::LexOutput;
+use crate::param_collector::ParamCollector;
+use crate::qualified_name::QualifiedName;
 use crate::schema::{SchemaSnapshot, TypeKind};
 use crate::scope::{Scope, ScopeColumn};
+use crate::type_map::{self, oid};
 
-/// Configuration for the analyzer (mirrors the relevant parts of Config).
-pub struct AnalyzerConfig {
-    pub domains: HashMap<String, String>,
-    pub enums: HashMap<String, String>,
-    pub types: HashMap<String, String>,
-    /// Nullable annotations from the lexer: maps 1-based param index → nullability.
-    /// - `None`: no annotation — nullability inferred from schema context.
-    /// - `Some(true)`: `$foo?` — force nullable.
-    /// - `Some(false)`: `$foo!` — force non-nullable.
-    pub param_nullability: Vec<Option<bool>>,
+/// Internal parameter representation produced by [`analyze_static`] before
+/// being fused with lexer-side info (name, sql offsets) into [`AnalyzedParam`].
+pub(crate) struct ParamInfo {
+    pub pg_type_oid: u32,
+    pub rust_type: String,
+    pub nullable: bool,
+    pub domain_rust_type: Option<String>,
+    pub enum_rust_type: Option<String>,
+    pub cast_type: Option<String>,
 }
 
-/// Analyze a SQL query and return typed parameter and column information.
+// ──────────────────────────────────────────────────────────────────────────────
+// Public API
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Rust-type mappings for user-defined PostgreSQL types.
 ///
-/// This is the main entry point for static analysis. It parses the SQL using
-/// `pg_query`, walks the AST to resolve types and nullability, and produces
-/// the same `QueryInfo` structure as live introspection.
-pub fn analyze(
+/// Values are fully-qualified Rust type paths
+/// (e.g. `"crate::domains::UserPreferences"`) that will be emitted verbatim
+/// into generated code.
+///
+/// Keys are [`QualifiedName`]s — always schema-qualified. When deserializing
+/// from TOML/JSON, keys go through PostgreSQL's identifier-lexer rules: use
+/// `public.vector` for pgvector's `vector` type, or
+/// `"My Schema"."My Table"` to escape identifiers containing special
+/// characters. See [`QualifiedName`] for the full quoting grammar.
+///
+/// Unqualified names like `"vector"` are rejected: always qualify with the
+/// schema that owns the type (usually `public` for extensions).
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzerConfig {
+    /// Mappings for JSONB-backed domain types. The value is the Rust struct
+    /// that `serde_json` will (de)serialize the JSONB payload to.
+    pub domains: HashMap<QualifiedName, String>,
+    /// Mappings for enum types. The value is the Rust enum that implements
+    /// `ToString` / `FromStr` for the SQL labels.
+    pub enums: HashMap<QualifiedName, String>,
+    /// Mappings for other custom types (e.g. pgvector's `vector`).
+    pub types: HashMap<QualifiedName, String>,
+}
+
+/// A single output column of an analyzed query.
+#[derive(Debug, Clone)]
+pub struct AnalyzedColumn {
+    pub name: String,
+    pub pg_type_oid: u32,
+    pub rust_type: String,
+    pub nullable: bool,
+    pub domain_rust_type: Option<String>,
+    pub enum_rust_type: Option<String>,
+}
+
+/// A named query parameter (`$name`) with lexer position plus inferred type.
+#[derive(Debug, Clone)]
+pub struct AnalyzedParam {
+    /// Parameter name without the `$` prefix and `?`/`!` suffix.
+    pub name: String,
+    /// Byte offsets in [`AnalyzedQuery::sql`] immediately after each `$N`
+    /// placeholder for this parameter. Used by code generators to insert
+    /// type casts (e.g. `::jsonb`). A param referenced multiple times has
+    /// multiple offsets.
+    pub sql_offsets: Vec<usize>,
+    pub pg_type_oid: u32,
+    pub rust_type: String,
+    pub nullable: bool,
+    pub domain_rust_type: Option<String>,
+    pub enum_rust_type: Option<String>,
+    /// PostgreSQL type name for explicit cast (`::jsonb`, `::int8`, …).
+    pub cast_type: Option<String>,
+}
+
+/// A field inside a spread parameter (`$..name { field1, field2 }`), with
+/// inferred type.
+#[derive(Debug, Clone)]
+pub struct AnalyzedSpreadField {
+    pub name: String,
+    pub pg_type_oid: u32,
+    pub rust_type: String,
+    pub nullable: bool,
+    pub domain_rust_type: Option<String>,
+    pub enum_rust_type: Option<String>,
+    pub cast_type: Option<String>,
+}
+
+/// A spread parameter (`$..name { ... }`) with its offset in the rewritten SQL
+/// and the typed field list.
+#[derive(Debug, Clone)]
+pub struct AnalyzedSpread {
+    pub name: String,
+    /// Byte offset in [`AnalyzedQuery::sql`] where the expanded
+    /// `($N, $M, ...), ...` placeholders should be inserted.
+    pub offset: usize,
+    pub fields: Vec<AnalyzedSpreadField>,
+}
+
+/// The full result of analyzing a SQL query template.
+#[derive(Debug, Clone)]
+pub struct AnalyzedQuery {
+    /// SQL rewritten with positional placeholders (`$1`, `$2`, …). Spread
+    /// tokens are removed; the caller must expand them at each spread's
+    /// [`AnalyzedSpread::offset`].
+    pub sql: String,
+    pub params: Vec<AnalyzedParam>,
+    pub spreads: Vec<AnalyzedSpread>,
+    pub columns: Vec<AnalyzedColumn>,
+}
+
+/// Build a "sample" SQL for analysis when the query contains spreads.
+///
+/// Replaces each spread insertion point with a single row of positional
+/// placeholders numbered after the last regular parameter. Field mapping is
+/// mandatory for spreads, so `fields.len()` gives the column count.
+pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> String {
+    let base_sql = &lex_output.sql;
+    let num_regular_params = lex_output.params.len();
+    let mut result = String::with_capacity(base_sql.len() + 64);
+    let mut last_offset = 0;
+    let mut param_counter = num_regular_params;
+
+    for spread in &lex_output.spreads {
+        result.push_str(&base_sql[last_offset..spread.offset]);
+        let fields = spread.fields.as_ref().expect("spread must have fields");
+        result.push('(');
+        for (i, _) in fields.iter().enumerate() {
+            if i > 0 {
+                result.push_str(", ");
+            }
+            param_counter += 1;
+            result.push('$');
+            result.push_str(&param_counter.to_string());
+        }
+        result.push(')');
+        last_offset = spread.offset;
+    }
+
+    result.push_str(&base_sql[last_offset..]);
+    result
+}
+
+pub(crate) fn fuse(
+    lex_output: LexOutput,
+    columns: Vec<AnalyzedColumn>,
+    info_params: Vec<ParamInfo>,
+) -> AnalyzedQuery {
+    let LexOutput {
+        sql,
+        params: lex_params,
+        spreads: lex_spreads,
+    } = lex_output;
+
+    let num_regular = lex_params.len();
+
+    // Regular params: zip lex params with the first N inferred params.
+    let mut params = Vec::with_capacity(num_regular);
+    for (p, pi) in lex_params
+        .into_iter()
+        .zip(info_params.iter().take(num_regular))
+    {
+        params.push(AnalyzedParam {
+            name: p.name,
+            sql_offsets: p.sql_offsets,
+            pg_type_oid: pi.pg_type_oid,
+            rust_type: pi.rust_type.clone(),
+            nullable: pi.nullable,
+            domain_rust_type: pi.domain_rust_type.clone(),
+            enum_rust_type: pi.enum_rust_type.clone(),
+            cast_type: pi.cast_type.clone(),
+        });
+    }
+
+    // Spread fields: consume the remaining inferred params in order.
+    let mut spread_param_cursor = num_regular;
+    let mut spreads = Vec::with_capacity(lex_spreads.len());
+    for spread in lex_spreads {
+        let lex_fields = spread.fields.expect("spread must have fields");
+        let mut fields = Vec::with_capacity(lex_fields.len());
+        for lf in lex_fields {
+            let pi = &info_params[spread_param_cursor];
+            fields.push(AnalyzedSpreadField {
+                name: lf.name,
+                pg_type_oid: pi.pg_type_oid,
+                rust_type: pi.rust_type.clone(),
+                nullable: pi.nullable,
+                domain_rust_type: pi.domain_rust_type.clone(),
+                enum_rust_type: pi.enum_rust_type.clone(),
+                cast_type: pi.cast_type.clone(),
+            });
+            spread_param_cursor += 1;
+        }
+        spreads.push(AnalyzedSpread {
+            name: spread.name,
+            offset: spread.offset,
+            fields,
+        });
+    }
+
+    AnalyzedQuery {
+        sql,
+        params,
+        spreads,
+        columns,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Internal static analyzer
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Parse `sql` with `pg_query`, walk the AST, and produce the resolved output
+/// columns and parameter type information.
+///
+/// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
+/// 1-based positional parameter index minus one.
+pub(crate) fn analyze_static(
     snapshot: &SchemaSnapshot,
     sql: &str,
     config: &AnalyzerConfig,
-) -> Result<QueryInfo, AnalyzeError> {
+    param_nullability: &[Option<bool>],
+) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>), AnalyzeError> {
     let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(e.to_string()))?;
 
     let stmt = parsed
@@ -50,7 +248,7 @@ pub fn analyze(
     let mut params = ParamCollector::default();
 
     // Seed explicit nullable annotations from lexer ($foo? / $foo! syntax).
-    for (i, &nullable) in config.param_nullability.iter().enumerate() {
+    for (i, &nullable) in param_nullability.iter().enumerate() {
         if let Some(explicit) = nullable {
             params.set_nullable((i + 1) as i32, explicit);
         }
@@ -69,10 +267,9 @@ pub fn analyze(
         }
     };
 
-    // Build final QueryInfo with Rust types.
     let columns = raw_columns
         .into_iter()
-        .map(|rc| build_column_info(rc, snapshot, config))
+        .map(|rc| build_column(rc, snapshot, config))
         .collect::<Result<Vec<_>, _>>()?;
 
     let param_list = match raw_params {
@@ -84,10 +281,7 @@ pub fn analyze(
         .map(|(_, type_oid, nullable)| build_param_info(type_oid, nullable, snapshot, config))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(QueryInfo {
-        params: params_info,
-        columns,
-    })
+    Ok((columns, params_info))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -119,9 +313,9 @@ fn infer_expr_propagate_mismatch(
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub(crate) struct RawColumn {
-    pub(crate) name: String,
-    pub(crate) type_oid: u32,
-    pub(crate) nullable: bool,
+    pub name: String,
+    pub type_oid: u32,
+    pub nullable: bool,
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.
@@ -670,8 +864,11 @@ fn process_from_item(
             }
             let right_end = scope.sources.len();
 
-            // Apply JOIN nullability.
-            let join_type = JoinType::try_from(join.jointype).unwrap_or(JoinType::JoinInner);
+            // Apply JOIN nullability. Fail loudly on unknown join kinds rather
+            // than defaulting to INNER, which would silently produce wrong
+            // nullability for outer joins the parser couldn't classify.
+            let join_type = JoinType::try_from(join.jointype)
+                .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
 
             match join_type {
                 JoinType::JoinLeft => {
@@ -689,7 +886,8 @@ fn process_from_item(
                         nullability::collect_aliases(&scope.sources[left_start..right_end]);
                     null_ctx.mark_all_nullable(&all_aliases);
                 }
-                _ => {} // INNER, CROSS: no nullability change
+                JoinType::JoinInner => {} // No nullability change.
+                other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
             }
         }
         node::Node::RangeSubselect(sub) => {
@@ -823,18 +1021,18 @@ fn infer_column_name(node: &protobuf::Node) -> Option<String> {
 // Rust type mapping
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn build_column_info(
+fn build_column(
     rc: RawColumn,
     snapshot: &SchemaSnapshot,
     config: &AnalyzerConfig,
-) -> Result<ColumnInfo, AnalyzeError> {
+) -> Result<AnalyzedColumn, AnalyzeError> {
     let (rust_type, domain_rust_type, enum_rust_type) =
         resolve_rust_type(rc.type_oid, snapshot, config)?;
 
     // Handle nullability annotations (! and ?).
     let (name, nullable) = parse_nullability_annotation(&rc.name, rc.nullable);
 
-    Ok(ColumnInfo {
+    Ok(AnalyzedColumn {
         name,
         pg_type_oid: rc.type_oid,
         rust_type,
@@ -882,9 +1080,9 @@ fn resolve_rust_type(
 ) -> Result<(String, Option<String>, Option<String>), AnalyzeError> {
     // Check type kind in snapshot.
     if let Some(te) = snapshot.get_type(type_oid) {
+        let qualified_name = QualifiedName::new(&te.schema, &te.name);
         match &te.kind {
             TypeKind::Domain { base_type_oid } => {
-                let qualified_name = format!("{}.{}", te.schema, te.name);
                 if let Some(rust_path) = config.domains.get(&qualified_name) {
                     // JSONB domain.
                     return Ok((
@@ -897,7 +1095,6 @@ fn resolve_rust_type(
                 return resolve_rust_type(*base_type_oid, snapshot, config);
             }
             TypeKind::Enum { .. } => {
-                let qualified_name = format!("{}.{}", te.schema, te.name);
                 let enum_rt = config.enums.get(&qualified_name).cloned();
                 return Ok(("String".to_owned(), None, enum_rt));
             }
@@ -908,13 +1105,8 @@ fn resolve_rust_type(
             _ => {}
         }
 
-        // Check custom types config (user-provided overrides win over any
-        // built-in extension mapping below).
-        let qualified_name = format!("{}.{}", te.schema, te.name);
+        // Check custom types config. Keys must be schema-qualified.
         if let Some(rt) = config.types.get(&qualified_name) {
-            return Ok((rt.clone(), None, None));
-        }
-        if let Some(rt) = config.types.get(&te.name) {
             return Ok((rt.clone(), None, None));
         }
 

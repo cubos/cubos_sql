@@ -9,10 +9,11 @@ use pg_query::protobuf::{DefineStmt, FunctionParameterMode, node};
 
 use crate::schema::FunctionEntry;
 
+use super::DdlError;
 use super::util::{extract_names, resolve_type_name};
-use super::{DdlError, DdlInterpreter};
+use crate::database::Database;
 
-pub fn define_aggregate(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Result<(), DdlError> {
+pub fn define_aggregate(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.defnames, &interp.snapshot);
 
     // Argument types come from `args`. The shape varies between
@@ -87,9 +88,7 @@ pub fn define_aggregate(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Resul
 
     let return_type_oid = final_return.or(state_type).unwrap_or(0);
 
-    let oid = interp.alloc_oid();
     let entry = FunctionEntry {
-        oid,
         name: name.clone(),
         schema,
         arg_types,
@@ -103,10 +102,11 @@ pub fn define_aggregate(interp: &mut DdlInterpreter, stmt: &DefineStmt) -> Resul
         agg_final_type_oid: final_return,
     };
 
+    let key = crate::qualified_name::QualifiedName::new(&entry.schema, &entry.name);
     interp
         .snapshot
         .functions_by_name
-        .entry(name)
+        .entry(key)
         .or_default()
         .push(entry);
 

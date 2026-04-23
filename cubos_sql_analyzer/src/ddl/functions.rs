@@ -2,15 +2,14 @@
 
 use pg_query::protobuf::{CreateFunctionStmt, FunctionParameterMode, node};
 
+use crate::qualified_name::QualifiedName;
 use crate::schema::FunctionEntry;
 
+use super::DdlError;
 use super::util::{extract_names, resolve_type_name};
-use super::{DdlError, DdlInterpreter};
+use crate::database::Database;
 
-pub fn create_function(
-    interp: &mut DdlInterpreter,
-    stmt: &CreateFunctionStmt,
-) -> Result<(), DdlError> {
+pub fn create_function(interp: &mut Database, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.funcname, &interp.snapshot);
 
     // Resolve parameter types (IN params only for the signature).
@@ -69,10 +68,7 @@ pub fn create_function(
         false
     });
 
-    let oid = interp.alloc_oid();
-
     let entry = FunctionEntry {
-        oid,
         name: name.clone(),
         schema,
         arg_types,
@@ -90,18 +86,15 @@ pub fn create_function(
     // procedures share the `functions_by_name` bucket but PG treats them as
     // separate object kinds, so a CREATE FUNCTION may coexist with a
     // CREATE PROCEDURE of the same name and signature.
-    if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&name) {
-        let exists = fns.iter().any(|f| {
-            f.arg_types == entry.arg_types
-                && f.schema == entry.schema
-                && f.is_procedure == entry.is_procedure
-        });
+    let key = QualifiedName::new(&entry.schema, &entry.name);
+    if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&key) {
+        let exists = fns
+            .iter()
+            .any(|f| f.arg_types == entry.arg_types && f.is_procedure == entry.is_procedure);
         if exists {
             if stmt.replace {
                 fns.retain(|f| {
-                    f.arg_types != entry.arg_types
-                        || f.schema != entry.schema
-                        || f.is_procedure != entry.is_procedure
+                    f.arg_types != entry.arg_types || f.is_procedure != entry.is_procedure
                 });
             } else {
                 let kind = if entry.is_procedure {
@@ -119,7 +112,7 @@ pub fn create_function(
     interp
         .snapshot
         .functions_by_name
-        .entry(name)
+        .entry(key)
         .or_default()
         .push(entry);
 

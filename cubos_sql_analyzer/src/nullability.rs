@@ -5,7 +5,7 @@ use std::collections::HashSet;
 /// Tracks which table aliases are on the nullable side of an outer JOIN,
 /// and whether the current SELECT has a GROUP BY clause.
 #[derive(Debug, Clone, Default)]
-pub struct NullabilityContext {
+pub(crate) struct NullabilityContext {
     /// Aliases that are on the nullable side of some JOIN.
     nullable_aliases: HashSet<String>,
     /// Whether the current SELECT has a GROUP BY clause.
@@ -15,11 +15,6 @@ pub struct NullabilityContext {
 }
 
 impl NullabilityContext {
-    /// Mark an alias as being on the nullable side of a JOIN.
-    pub fn mark_nullable(&mut self, alias: &str) {
-        self.nullable_aliases.insert(alias.to_owned());
-    }
-
     /// Mark all aliases from a list as nullable (used for FULL JOIN).
     pub fn mark_all_nullable(&mut self, aliases: &[String]) {
         for a in aliases {
@@ -41,6 +36,6 @@ impl NullabilityContext {
 }
 
 /// Collect all table aliases from a scope source list.
-pub fn collect_aliases(sources: &[crate::scope::TableSource]) -> Vec<String> {
+pub(crate) fn collect_aliases(sources: &[crate::scope::TableSource]) -> Vec<String> {
     sources.iter().map(|s| s.alias.clone()).collect()
 }

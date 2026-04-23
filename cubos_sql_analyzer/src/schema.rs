@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::qualified_name::QualifiedName;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Top-level snapshot
 // ──────────────────────────────────────────────────────────────────────────────
@@ -17,16 +19,16 @@ use serde::{Deserialize, Serialize};
 pub struct SchemaSnapshot {
     /// All types indexed by OID.
     pub types: HashMap<u32, TypeEntry>,
-    /// Type name lookup: `"schema.name" → OID`.
-    pub type_by_name: HashMap<String, u32>,
-    /// All tables and views indexed by OID.
-    pub tables: HashMap<u32, TableEntry>,
-    /// Table/view name lookup: `"schema.name" → OID`.
-    pub table_by_name: HashMap<String, u32>,
-    /// Functions indexed by name for fast lookup.
-    pub functions_by_name: HashMap<String, Vec<FunctionEntry>>,
-    /// Operators indexed by name for fast lookup.
-    pub operators_by_name: HashMap<String, Vec<OperatorEntry>>,
+    /// Type name lookup keyed by the schema-qualified type name.
+    pub type_by_name: HashMap<QualifiedName, u32>,
+    /// All tables and views, keyed by their schema-qualified name.
+    pub tables: HashMap<QualifiedName, TableEntry>,
+    /// Functions indexed by their schema-qualified name. Each key maps to
+    /// the list of overloads (by argument types) defined under that name.
+    pub functions_by_name: HashMap<QualifiedName, Vec<FunctionEntry>>,
+    /// Operators indexed by their schema-qualified name. Each key maps to
+    /// the list of overloads (by operand types) defined under that name.
+    pub operators_by_name: HashMap<QualifiedName, Vec<OperatorEntry>>,
     /// Cast rules: `"source_oid:target_oid"` → context for O(1) lookup.
     pub casts: HashMap<String, CastContext>,
     /// Current `search_path` schemas, in order.
@@ -103,7 +105,6 @@ pub struct CompositeField {
 /// A table or view from `pg_class`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableEntry {
-    pub oid: u32,
     pub name: String,
     pub schema: String,
     pub kind: RelationKind,
@@ -119,12 +120,17 @@ pub struct TableEntry {
 /// Views never get automatically recreated — if a dependent column is altered
 /// or dropped with CASCADE, the view is simply dropped (matching PostgreSQL).
 /// The user must DROP + CREATE VIEW manually in their migration.
+///
+/// References are stored by [`QualifiedName`], so any `ALTER TABLE ... RENAME`,
+/// `ALTER TABLE ... SET SCHEMA`, or `ALTER SCHEMA ... RENAME` must update
+/// these fields to keep dependencies pointing at the right target (see
+/// `crate::ddl::views::rewrite_deps_*` helpers).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewDef {
-    /// Tables this view depends on (by OID).
-    pub depends_on_tables: Vec<u32>,
-    /// Specific columns this view depends on: `(table_oid, column_name)`.
-    pub depends_on_columns: Vec<(u32, String)>,
+    /// Tables/views this view reads from.
+    pub depends_on_tables: Vec<QualifiedName>,
+    /// Specific columns this view depends on: `(table, column_name)`.
+    pub depends_on_columns: Vec<(QualifiedName, String)>,
 }
 
 /// The kind of relation.
@@ -153,7 +159,6 @@ pub struct TableColumn {
 /// A function or aggregate from `pg_proc`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionEntry {
-    pub oid: u32,
     pub name: String,
     pub schema: String,
     pub arg_types: Vec<u32>,
@@ -194,14 +199,6 @@ pub struct OperatorEntry {
 // Casts
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// A type cast rule from `pg_cast`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CastEntry {
-    pub source_type_oid: u32,
-    pub target_type_oid: u32,
-    pub context: CastContext,
-}
-
 /// When a cast is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CastContext {
@@ -221,27 +218,17 @@ impl SchemaSnapshot {
     /// Look up a table or view by name, searching the `search_path`.
     pub fn resolve_table(&self, schema: Option<&str>, name: &str) -> Option<&TableEntry> {
         if let Some(s) = schema {
-            let key = format!("{s}.{name}");
-            return self
-                .table_by_name
-                .get(&key)
-                .and_then(|oid| self.tables.get(oid));
+            return self.tables.get(&QualifiedName::new(s, name));
         }
         // PG §5.9.5: pg_catalog is implicitly searched before the search_path
         // unless it is already listed explicitly.
-        if !self.search_path.iter().any(|s| s == "pg_catalog") {
-            let pg_key = format!("pg_catalog.{name}");
-            if let Some(oid) = self.table_by_name.get(&pg_key)
-                && let Some(entry) = self.tables.get(oid)
-            {
-                return Some(entry);
-            }
+        if !self.search_path.iter().any(|s| s == "pg_catalog")
+            && let Some(entry) = self.tables.get(&QualifiedName::new("pg_catalog", name))
+        {
+            return Some(entry);
         }
         for s in &self.search_path {
-            let key = format!("{s}.{name}");
-            if let Some(oid) = self.table_by_name.get(&key)
-                && let Some(entry) = self.tables.get(oid)
-            {
+            if let Some(entry) = self.tables.get(&QualifiedName::new(s, name)) {
                 return Some(entry);
             }
         }
@@ -251,7 +238,7 @@ impl SchemaSnapshot {
     /// Look up a type by name, searching the `search_path`.
     pub fn resolve_type_by_name(&self, schema: Option<&str>, name: &str) -> Option<&TypeEntry> {
         if let Some(s) = schema {
-            let key = format!("{s}.{name}");
+            let key = QualifiedName::new(s, name);
             return self
                 .type_by_name
                 .get(&key)
@@ -260,7 +247,7 @@ impl SchemaSnapshot {
         // PG §5.9.5: pg_catalog is implicitly searched before the search_path
         // unless it is already listed explicitly.
         if !self.search_path.iter().any(|s| s == "pg_catalog") {
-            let pg_key = format!("pg_catalog.{name}");
+            let pg_key = QualifiedName::new("pg_catalog", name);
             if let Some(oid) = self.type_by_name.get(&pg_key)
                 && let Some(entry) = self.types.get(oid)
             {
@@ -268,7 +255,7 @@ impl SchemaSnapshot {
             }
         }
         for s in &self.search_path {
-            let key = format!("{s}.{name}");
+            let key = QualifiedName::new(s, name);
             if let Some(oid) = self.type_by_name.get(&key)
                 && let Some(entry) = self.types.get(oid)
             {
@@ -308,17 +295,33 @@ impl SchemaSnapshot {
     }
 
     /// Find all functions matching a name, searching the `search_path`.
+    ///
+    /// When `schema` is `Some`, only overloads in that schema are returned.
+    /// When `schema` is `None`, overloads from every schema on the
+    /// `search_path` (plus `pg_catalog` if not explicitly listed) are
+    /// concatenated; downstream type resolution picks the best match.
     pub fn find_functions(&self, schema: Option<&str>, name: &str) -> Vec<&FunctionEntry> {
-        let Some(candidates) = self.functions_by_name.get(name) else {
-            return Vec::new();
-        };
-        candidates
-            .iter()
-            .filter(|f| match schema {
-                Some(s) => f.schema == s,
-                None => self.search_path.contains(&f.schema) || f.schema == "pg_catalog",
-            })
-            .collect()
+        if let Some(s) = schema {
+            return self
+                .functions_by_name
+                .get(&QualifiedName::new(s, name))
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+        }
+        let mut out = Vec::new();
+        if !self.search_path.iter().any(|s| s == "pg_catalog")
+            && let Some(entries) = self
+                .functions_by_name
+                .get(&QualifiedName::new("pg_catalog", name))
+        {
+            out.extend(entries.iter());
+        }
+        for s in &self.search_path {
+            if let Some(entries) = self.functions_by_name.get(&QualifiedName::new(s, name)) {
+                out.extend(entries.iter());
+            }
+        }
+        out
     }
 
     /// Find operators matching name and operand types.
@@ -327,15 +330,34 @@ impl SchemaSnapshot {
     ///   1. Exact match
     ///   2. Match via implicit casts
     ///   3. UNKNOWN-aware resolution with preferred-type disambiguation
+    ///
+    /// Candidates are gathered from every schema on the `search_path` (plus
+    /// `pg_catalog` if not listed explicitly).
     pub fn find_operator(
         &self,
         name: &str,
         left_oid: Option<u32>,
         right_oid: u32,
     ) -> Option<&OperatorEntry> {
-        use super::coerce::oid;
+        use super::type_map::oid;
 
-        let candidates = self.operators_by_name.get(name)?;
+        let mut candidate_buf: Vec<&OperatorEntry> = Vec::new();
+        if !self.search_path.iter().any(|s| s == "pg_catalog")
+            && let Some(entries) = self
+                .operators_by_name
+                .get(&QualifiedName::new("pg_catalog", name))
+        {
+            candidate_buf.extend(entries.iter());
+        }
+        for s in &self.search_path {
+            if let Some(entries) = self.operators_by_name.get(&QualifiedName::new(s, name)) {
+                candidate_buf.extend(entries.iter());
+            }
+        }
+        if candidate_buf.is_empty() {
+            return None;
+        }
+        let candidates = &candidate_buf;
 
         // PG §10.2 step 3b: unwrap domain types to their base types.
         let left_oid = left_oid.map(|oid| self.unwrap_domain(oid));
@@ -382,6 +404,7 @@ impl SchemaSnapshot {
                 let right_ok = right_unknown || self.has_implicit_cast(right_oid, o.right_type_oid);
                 left_ok && right_ok
             })
+            .copied()
             .collect();
 
         if remaining.len() <= 1 {

@@ -4,27 +4,23 @@
 //! DDL interpreter. Tests are marked `#[should_panic]` where the bug is
 //! confirmed — flip to normal `#[test]` after fixing.
 
-use cubos_sql_analyzer::schema::TypeKind;
-use cubos_sql_analyzer::seed::build_schema_from_migrations;
+use cubos_sql_analyzer::schema::{SchemaSnapshot, TypeKind};
+use cubos_sql_analyzer::{Database, DdlError};
 
-fn build(migrations: &[(&str, &str)]) -> cubos_sql_analyzer::schema::SchemaSnapshot {
-    let m: Vec<(String, String)> = migrations
-        .iter()
-        .map(|(f, s)| (f.to_string(), s.to_string()))
-        .collect();
-    let (snapshot, _) = build_schema_from_migrations(&m).unwrap();
-    snapshot
+fn build(migrations: &[(&str, &str)]) -> SchemaSnapshot {
+    let mut db = Database::new();
+    for (_, sql) in migrations {
+        db.apply_sql(sql).unwrap();
+    }
+    db.into_snapshot()
 }
 
-fn try_build(
-    migrations: &[(&str, &str)],
-) -> Result<cubos_sql_analyzer::schema::SchemaSnapshot, cubos_sql_analyzer::ddl::DdlError> {
-    let m: Vec<(String, String)> = migrations
-        .iter()
-        .map(|(f, s)| (f.to_string(), s.to_string()))
-        .collect();
-    let (snapshot, _) = build_schema_from_migrations(&m)?;
-    Ok(snapshot)
+fn try_apply(migrations: &[(&str, &str)]) -> Result<(), DdlError> {
+    let mut db = Database::new();
+    for (_, sql) in migrations {
+        db.apply_sql(sql)?;
+    }
+    Ok(())
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -43,7 +39,7 @@ fn try_build(
 
 #[test]
 fn bug_alias_hides_column_dependency() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
@@ -74,7 +70,7 @@ fn bug_alias_hides_column_dependency() {
 
 #[test]
 fn bug_computed_column_false_dependency() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, age INT);
@@ -334,7 +330,7 @@ fn smallserial_resolves_to_int2() {
 
 #[test]
 fn view_on_view_drop_fails_without_cascade() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL);
@@ -655,7 +651,7 @@ fn bug_drop_function_keeps_other_overloads() {
 
 #[test]
 fn bug_alter_enum_duplicate_value_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TYPE mood AS ENUM ('happy', 'sad');"),
         ("0002.sql", "ALTER TYPE mood ADD VALUE 'happy';"),
     ]);
@@ -678,7 +674,7 @@ fn bug_alter_enum_duplicate_value_errors() {
 
 #[test]
 fn view_depends_on_column_in_expression() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
@@ -702,7 +698,7 @@ fn view_depends_on_column_in_expression() {
 
 #[test]
 fn view_depends_on_column_in_where() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
@@ -726,7 +722,7 @@ fn view_depends_on_column_in_where() {
 
 #[test]
 fn view_depends_on_column_in_join_on() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t1 (id INT NOT NULL, name TEXT NOT NULL);
@@ -748,7 +744,7 @@ fn view_depends_on_column_in_join_on() {
 
 #[test]
 fn view_depends_on_column_in_order_by() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, score INT);
@@ -1033,7 +1029,7 @@ fn user_enum_array_column() {
 
 #[test]
 fn drop_type_fails_with_dependent_column() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TYPE status AS ENUM ('a', 'b');
@@ -1234,7 +1230,7 @@ fn complex_real_world_migration() {
 
 #[test]
 fn bug_alter_enum_if_not_exists_on_missing_type() {
-    let result = try_build(&[(
+    let result = try_apply(&[(
         "0001.sql",
         "ALTER TYPE nonexistent ADD VALUE IF NOT EXISTS 'x';",
     )]);
@@ -1258,7 +1254,7 @@ fn bug_alter_enum_if_not_exists_on_missing_type() {
 
 #[test]
 fn bug_create_extension_duplicate_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE EXTENSION \"uuid-ossp\";"),
         ("0002.sql", "CREATE EXTENSION \"uuid-ossp\";"),
     ]);
@@ -1280,7 +1276,7 @@ fn bug_create_extension_duplicate_errors() {
 
 #[test]
 fn bug_create_table_duplicate_columns() {
-    let result = try_build(&[(
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE TABLE t (id INT NOT NULL, name TEXT, id TEXT);",
     )]);
@@ -1326,7 +1322,7 @@ fn bug_drop_extension_removes_objects() {
 
 #[test]
 fn bug_create_table_duplicate_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
         ("0002.sql", "CREATE TABLE t (name TEXT NOT NULL);"),
     ]);
@@ -1347,7 +1343,7 @@ fn bug_create_table_duplicate_errors() {
 
 #[test]
 fn bug_create_type_duplicate_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TYPE mood AS ENUM ('happy', 'sad');"),
         ("0002.sql", "CREATE TYPE mood AS ENUM ('angry');"),
     ]);
@@ -1368,7 +1364,7 @@ fn bug_create_type_duplicate_errors() {
 
 #[test]
 fn bug_add_column_duplicate_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);",
@@ -1391,7 +1387,7 @@ fn bug_add_column_duplicate_errors() {
 
 #[test]
 fn bug_alter_nonexistent_column_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
         (
             "0002.sql",
@@ -1415,7 +1411,7 @@ fn bug_alter_nonexistent_column_errors() {
 
 #[test]
 fn bug_create_function_duplicate_errors() {
-    let result = try_build(&[(
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x $$ LANGUAGE sql;
          CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x + 1 $$ LANGUAGE sql;",
@@ -1436,7 +1432,7 @@ fn bug_create_function_duplicate_errors() {
 
 #[test]
 fn bug_set_default_nonexistent_column() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
         (
             "0002.sql",
@@ -1459,7 +1455,7 @@ fn bug_set_default_nonexistent_column() {
 
 #[test]
 fn bug_alter_type_nonexistent_column() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
         ("0002.sql", "ALTER TABLE t ALTER COLUMN ghost TYPE BIGINT;"),
     ]);
@@ -1480,7 +1476,7 @@ fn bug_alter_type_nonexistent_column() {
 
 #[test]
 fn bug_drop_nonexistent_column_errors() {
-    let result = try_build(&[
+    let result = try_apply(&[
         ("0001.sql", "CREATE TABLE t (id INT NOT NULL, name TEXT);"),
         ("0002.sql", "ALTER TABLE t DROP COLUMN ghost;"),
     ]);
@@ -1501,7 +1497,7 @@ fn bug_drop_nonexistent_column_errors() {
 
 #[test]
 fn bug_create_composite_duplicate_errors() {
-    let result = try_build(&[(
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE TYPE point2d AS (x float8, y float8);
          CREATE TYPE point2d AS (a int, b int);",
@@ -1523,7 +1519,7 @@ fn bug_create_composite_duplicate_errors() {
 
 #[test]
 fn bug_create_range_duplicate_errors() {
-    let result = try_build(&[(
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE TYPE floatrange AS RANGE (subtype = float8);
          CREATE TYPE floatrange AS RANGE (subtype = float8);",

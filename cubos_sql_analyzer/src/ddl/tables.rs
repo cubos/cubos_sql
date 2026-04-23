@@ -6,13 +6,15 @@ use pg_query::protobuf::{
 
 use crate::schema::{CompositeField, RelationKind, TableColumn, TableEntry, TypeEntry, TypeKind};
 
+use super::DdlError;
 use super::util::{range_var_key, range_var_names, resolve_type_name};
 use super::views;
-use super::{DdlError, DdlInterpreter};
+use crate::database::Database;
+use crate::qualified_name::QualifiedName;
 
 // ─── CREATE TABLE ───────────────────────────────────────────────────────────
 
-pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<(), DdlError> {
+pub fn create_table(interp: &mut Database, stmt: &CreateStmt) -> Result<(), DdlError> {
     let rv = stmt
         .relation
         .as_ref()
@@ -22,7 +24,7 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
     let (schema, name) = range_var_names(rv, &interp.snapshot);
 
     // Check for existing table.
-    if interp.snapshot.table_by_name.contains_key(&key) {
+    if interp.snapshot.tables.contains_key(&key) {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -81,8 +83,8 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
         columns.push(col);
     }
 
-    // Allocate OIDs: table, composite type, array type.
-    let table_oid = interp.alloc_oid();
+    // Allocate OIDs for the composite and array types (tables don't need
+    // their own OID — the map key is the qualified name).
     let composite_oid = interp.alloc_oid();
     let array_oid = interp.alloc_oid();
 
@@ -96,7 +98,7 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
         })
         .collect();
 
-    let composite_key = format!("{schema}.{name}");
+    let composite_key = QualifiedName::new(&schema, &name);
     interp.snapshot.types.insert(
         composite_oid,
         TypeEntry {
@@ -118,7 +120,7 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
 
     // Register array type for the composite.
     let array_name = format!("_{name}");
-    let array_key = format!("{schema}.{array_name}");
+    let array_key = QualifiedName::new(&schema, &array_name);
     interp.snapshot.types.insert(
         array_oid,
         TypeEntry {
@@ -137,9 +139,8 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
 
     // Register the table.
     interp.snapshot.tables.insert(
-        table_oid,
+        key,
         TableEntry {
-            oid: table_oid,
             name: name.clone(),
             schema: schema.clone(),
             kind: RelationKind::Table,
@@ -147,14 +148,13 @@ pub fn create_table(interp: &mut DdlInterpreter, stmt: &CreateStmt) -> Result<()
             view_def: None,
         },
     );
-    interp.snapshot.table_by_name.insert(key, table_oid);
 
     Ok(())
 }
 
 /// Parse a `ColumnDef` AST node into a `TableColumn`.
 fn parse_column_def(
-    interp: &DdlInterpreter,
+    interp: &Database,
     cd: &pg_query::protobuf::ColumnDef,
     attnum: i16,
     pk_columns: &[String],
@@ -232,7 +232,7 @@ fn parse_column_def(
 
 // ─── ALTER TABLE ────────────────────────────────────────────────────────────
 
-pub fn alter_table(interp: &mut DdlInterpreter, stmt: &AlterTableStmt) -> Result<(), DdlError> {
+pub fn alter_table(interp: &mut Database, stmt: &AlterTableStmt) -> Result<(), DdlError> {
     let rv = stmt
         .relation
         .as_ref()
@@ -240,52 +240,49 @@ pub fn alter_table(interp: &mut DdlInterpreter, stmt: &AlterTableStmt) -> Result
 
     let key = range_var_key(rv, &interp.snapshot);
 
-    // Find the table OID. Handle missing_ok (IF EXISTS).
-    let table_oid = match interp.snapshot.table_by_name.get(&key).copied() {
-        Some(oid) => oid,
-        None => {
-            if stmt.missing_ok {
-                return Ok(());
-            }
-            return Err(DdlError::TableNotFound(key));
+    // Verify the table exists. Handle missing_ok (IF EXISTS).
+    if !interp.snapshot.tables.contains_key(&key) {
+        if stmt.missing_ok {
+            return Ok(());
         }
-    };
+        return Err(DdlError::TableNotFound(key.to_string()));
+    }
 
     for cmd_node in &stmt.cmds {
         let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
             continue;
         };
-        apply_alter_cmd(interp, table_oid, cmd)?;
+        apply_alter_cmd(interp, &key, cmd)?;
     }
 
     Ok(())
 }
 
 fn apply_alter_cmd(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let subtype = AlterTableType::try_from(cmd.subtype).unwrap_or(AlterTableType::Undefined);
 
     match subtype {
         AlterTableType::AtAddColumn | AlterTableType::AtAddColumnToView => {
-            add_column(interp, table_oid, cmd)
+            add_column(interp, table_key, cmd)
         }
-        AlterTableType::AtDropColumn => drop_column(interp, table_oid, cmd),
-        AlterTableType::AtSetNotNull => set_not_null(interp, table_oid, &cmd.name, true),
-        AlterTableType::AtDropNotNull => set_not_null(interp, table_oid, &cmd.name, false),
-        AlterTableType::AtColumnDefault => set_default(interp, table_oid, cmd),
-        AlterTableType::AtAlterColumnType => alter_column_type(interp, table_oid, cmd),
-        AlterTableType::AtAddConstraint => add_constraint(interp, table_oid, cmd),
+        AlterTableType::AtDropColumn => drop_column(interp, table_key, cmd),
+        AlterTableType::AtSetNotNull => set_not_null(interp, table_key, &cmd.name, true),
+        AlterTableType::AtDropNotNull => set_not_null(interp, table_key, &cmd.name, false),
+        AlterTableType::AtColumnDefault => set_default(interp, table_key, cmd),
+        AlterTableType::AtAlterColumnType => alter_column_type(interp, table_key, cmd),
+        AlterTableType::AtAddConstraint => add_constraint(interp, table_key, cmd),
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
 }
 
 fn add_column(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
@@ -298,8 +295,8 @@ fn add_column(
     let table = interp
         .snapshot
         .tables
-        .get(&table_oid)
-        .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
+        .get(table_key)
+        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
     let next_attnum = table.columns.iter().map(|c| c.attnum).max().unwrap_or(0) + 1;
 
     // Check for duplicate column.
@@ -316,25 +313,25 @@ fn add_column(
     let col = parse_column_def(interp, cd, next_attnum, &[])?;
 
     // Mutate table and composite type.
-    let table = interp.snapshot.tables.get_mut(&table_oid).unwrap();
+    let table = interp.snapshot.tables.get_mut(table_key).unwrap();
     table.columns.push(col.clone());
 
     // Update composite type.
-    update_composite_for_table(interp, table_oid);
+    update_composite_for_table(interp, table_key);
 
     Ok(())
 }
 
 fn drop_column(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let table = interp
         .snapshot
         .tables
-        .get(&table_oid)
-        .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
+        .get(table_key)
+        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
 
     // Check column exists.
     if !table.columns.iter().any(|c| c.name == cmd.name) {
@@ -347,7 +344,6 @@ fn drop_column(
         )));
     }
 
-    let table_name = format!("{}.{}", table.schema, table.name);
     let cascade = matches!(
         DropBehavior::try_from(cmd.behavior),
         Ok(DropBehavior::DropCascade)
@@ -355,16 +351,12 @@ fn drop_column(
 
     // Check for dependent views.
     let dependent_views =
-        views::find_views_depending_on_column(&interp.snapshot, table_oid, &cmd.name);
+        views::find_views_depending_on_column(&interp.snapshot, table_key, &cmd.name);
     if !dependent_views.is_empty() && !cascade {
-        let view_names: Vec<String> = dependent_views
-            .iter()
-            .filter_map(|oid| interp.snapshot.tables.get(oid))
-            .map(|t| format!("{}.{}", t.schema, t.name))
-            .collect();
+        let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
         return Err(DdlError::DependencyError(format!(
             "cannot drop column {}.{} because view(s) {} depend on it",
-            table_name,
+            table_key,
             cmd.name,
             view_names.join(", "),
         )));
@@ -375,23 +367,23 @@ fn drop_column(
         views::drop_views(&mut interp.snapshot, &dependent_views);
     }
 
-    let table = interp.snapshot.tables.get_mut(&table_oid).unwrap();
+    let table = interp.snapshot.tables.get_mut(table_key).unwrap();
     table.columns.retain(|c| c.name != cmd.name);
-    update_composite_for_table(interp, table_oid);
+    update_composite_for_table(interp, table_key);
     Ok(())
 }
 
 fn set_not_null(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     col_name: &str,
     not_null: bool,
 ) -> Result<(), DdlError> {
     let table = interp
         .snapshot
         .tables
-        .get_mut(&table_oid)
-        .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
+        .get_mut(table_key)
+        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
 
     let col = table
         .columns
@@ -401,20 +393,20 @@ fn set_not_null(
             DdlError::Parse(format!("column \"{col_name}\" of relation does not exist"))
         })?;
     col.not_null = not_null;
-    update_composite_for_table(interp, table_oid);
+    update_composite_for_table(interp, table_key);
     Ok(())
 }
 
 fn set_default(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let table = interp
         .snapshot
         .tables
-        .get_mut(&table_oid)
-        .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
+        .get_mut(table_key)
+        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
 
     let col = table
         .columns
@@ -431,8 +423,8 @@ fn set_default(
 }
 
 fn alter_column_type(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
@@ -448,33 +440,26 @@ fn alter_column_type(
         .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
         .unwrap_or(0);
 
-    let table = interp
-        .snapshot
-        .tables
-        .get(&table_oid)
-        .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
-    let table_name = format!("{}.{}", table.schema, table.name);
+    if !interp.snapshot.tables.contains_key(table_key) {
+        return Err(DdlError::TableNotFound(table_key.to_string()));
+    }
 
     // In PostgreSQL, ALTER COLUMN TYPE always fails if views depend on the column.
     // The user must DROP VIEW first, ALTER TYPE, then recreate the view.
     let dependent_views =
-        views::find_views_depending_on_column(&interp.snapshot, table_oid, &cmd.name);
+        views::find_views_depending_on_column(&interp.snapshot, table_key, &cmd.name);
     if !dependent_views.is_empty() {
-        let view_names: Vec<String> = dependent_views
-            .iter()
-            .filter_map(|oid| interp.snapshot.tables.get(oid))
-            .map(|t| format!("{}.{}", t.schema, t.name))
-            .collect();
+        let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
         return Err(DdlError::DependencyError(format!(
             "cannot alter type of column {}.{} because view(s) {} depend on it \
              (hint: drop the view(s) first, alter the column, then recreate)",
-            table_name,
+            table_key,
             cmd.name,
             view_names.join(", "),
         )));
     }
 
-    let table = interp.snapshot.tables.get_mut(&table_oid).unwrap();
+    let table = interp.snapshot.tables.get_mut(table_key).unwrap();
     let col = table
         .columns
         .iter_mut()
@@ -486,13 +471,13 @@ fn alter_column_type(
             ))
         })?;
     col.type_oid = new_type_oid;
-    update_composite_for_table(interp, table_oid);
+    update_composite_for_table(interp, table_key);
     Ok(())
 }
 
 fn add_constraint(
-    interp: &mut DdlInterpreter,
-    table_oid: u32,
+    interp: &mut Database,
+    table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
@@ -519,15 +504,15 @@ fn add_constraint(
         let table = interp
             .snapshot
             .tables
-            .get_mut(&table_oid)
-            .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
+            .get_mut(table_key)
+            .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
 
         for col in &mut table.columns {
             if pk_cols.contains(&col.name) {
                 col.not_null = true;
             }
         }
-        update_composite_for_table(interp, table_oid);
+        update_composite_for_table(interp, table_key);
     }
 
     // NOT NULL constraint.
@@ -535,8 +520,8 @@ fn add_constraint(
         let table = interp
             .snapshot
             .tables
-            .get_mut(&table_oid)
-            .ok_or_else(|| DdlError::TableNotFound(table_oid.to_string()))?;
+            .get_mut(table_key)
+            .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
 
         // The column name may be in keys[0] or cmd.name.
         let col_name = c
@@ -554,19 +539,18 @@ fn add_constraint(
         if let Some(col) = table.columns.iter_mut().find(|col| col.name == col_name) {
             col.not_null = true;
         }
-        update_composite_for_table(interp, table_oid);
+        update_composite_for_table(interp, table_key);
     }
 
     Ok(())
 }
 
 /// Sync the composite type fields with the table's columns.
-fn update_composite_for_table(interp: &mut DdlInterpreter, table_oid: u32) {
-    let Some(table) = interp.snapshot.tables.get(&table_oid) else {
+fn update_composite_for_table(interp: &mut Database, table_key: &QualifiedName) {
+    let Some(table) = interp.snapshot.tables.get(table_key) else {
         return;
     };
-    let key = format!("{}.{}", table.schema, table.name);
-    let Some(&composite_oid) = interp.snapshot.type_by_name.get(&key) else {
+    let Some(&composite_oid) = interp.snapshot.type_by_name.get(table_key) else {
         return;
     };
     let fields: Vec<CompositeField> = table

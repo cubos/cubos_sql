@@ -1,6 +1,7 @@
 //! Type coercion and common-type resolution.
 
 use crate::schema::{CastContext, SchemaSnapshot};
+use crate::type_map::oid;
 
 /// Describes the level of implicit coercion allowed in a given context.
 ///
@@ -11,14 +12,14 @@ use crate::schema::{CastContext, SchemaSnapshot};
 ///   (used for INSERT/UPDATE target columns, WHERE, LIMIT, OFFSET —
 ///   matches PG's `COERCION_ASSIGNMENT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoercionContext {
+pub(crate) enum CoercionContext {
     Implicit,
     Assignment,
 }
 
 /// Check whether a cast from `source` to `target` is permitted under
 /// the given coercion context, consulting the snapshot's cast catalog.
-pub fn can_coerce(
+pub(crate) fn can_coerce(
     source: u32,
     target: u32,
     context: CoercionContext,
@@ -41,31 +42,6 @@ pub fn can_coerce(
     )
 }
 
-/// Well-known OIDs for builtin types.
-pub mod oid {
-    pub const BOOL: u32 = 16;
-    pub const INT2: u32 = 21;
-    pub const INT4: u32 = 23;
-    pub const INT8: u32 = 20;
-    pub const FLOAT4: u32 = 700;
-    pub const FLOAT8: u32 = 701;
-    pub const NUMERIC: u32 = 1700;
-    pub const TEXT: u32 = 25;
-    pub const VARCHAR: u32 = 1043;
-    pub const BPCHAR: u32 = 1042;
-    pub const NAME: u32 = 19;
-    pub const BYTEA: u32 = 17;
-    pub const OID_TYPE: u32 = 26;
-    pub const DATE: u32 = 1082;
-    pub const TIME: u32 = 1083;
-    pub const TIMESTAMP: u32 = 1114;
-    pub const TIMESTAMPTZ: u32 = 1184;
-    pub const UUID: u32 = 2950;
-    pub const JSON: u32 = 114;
-    pub const JSONB: u32 = 3802;
-    pub const UNKNOWN: u32 = 705;
-}
-
 /// Numeric type promotion order (lower index = less preferred).
 const NUMERIC_PROMOTION: &[(u32, u8)] = &[
     (oid::INT2, 0),
@@ -84,14 +60,14 @@ fn numeric_rank(type_oid: u32) -> Option<u8> {
 }
 
 /// Check if a type is a string-like type.
-pub fn is_string_type(type_oid: u32) -> bool {
+fn is_string_type(type_oid: u32) -> bool {
     matches!(type_oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME)
 }
 
 /// Find the common supertype for a list of types.
 ///
 /// Used for CASE, COALESCE, UNION column reconciliation.
-pub fn find_common_type(types: &[u32], snapshot: &SchemaSnapshot) -> Option<u32> {
+pub(crate) fn find_common_type(types: &[u32], snapshot: &SchemaSnapshot) -> Option<u32> {
     if types.is_empty() {
         return None;
     }

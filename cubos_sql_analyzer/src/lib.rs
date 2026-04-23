@@ -1,34 +1,66 @@
 //! Static SQL type and nullability analyzer for `cubos_sql`.
 //!
-//! This crate determines query parameter types, output column types, and
-//! nullability by statically analyzing SQL against an in-memory schema
-//! snapshot built from migration files via the DDL interpreter.
+//! This crate does at compile time what a live PostgreSQL connection would do
+//! at runtime: it understands a SQL template's parameter types, its output
+//! columns, and the nullability of both — without requiring Docker or a
+//! running database.
 //!
-//! # How it works
+//! # Public surface
 //!
-//! 1. **Schema construction**: [`seed::build_schema_from_migrations`] parses
-//!    migration SQL files using `pg_query` and applies DDL statements to build
-//!    a [`schema::SchemaSnapshot`] in memory — no running PostgreSQL needed.
+//! The entry point is [`Database`]. Everything else is either returned by
+//! [`Database::analyze`] or used to configure it:
 //!
-//! 2. **Static analysis**: [`resolve::analyze`] parses a query using `pg_query`
-//!    and walks the AST, resolving types and nullability against the snapshot.
+//! | Item | Role |
+//! |------|------|
+//! | [`Database`] | Mutable schema: seed the PG18 catalog, then apply DDL and analyze queries against it. |
+//! | [`AnalyzerConfig`] | Rust-type overrides for user-defined SQL types (domains, enums, custom types). |
+//! | [`AnalyzedQuery`] | Result of analysis: rewritten SQL + typed parameters, spreads, and output columns. |
+//! | [`AnalyzedParam`] | A named parameter with its inferred Rust type and the byte offsets where it appears. |
+//! | [`AnalyzedSpread`] | A `$..name { ... }` spread with its insertion offset and typed fields. |
+//! | [`AnalyzedSpreadField`] | A single field inside a spread. |
+//! | [`AnalyzedColumn`] | A single output column: name, Rust type, nullability. |
+//! | [`AnalyzeError`] | Errors returned by [`Database::analyze`]. |
+//! | [`DdlError`] | Errors returned by [`Database::apply_sql`]. |
 //!
-//! The analyzer produces a [`query_info::QueryInfo`] with precise nullability
-//! tracking (e.g., LEFT JOIN nullability, expression-level NOT NULL via
-//! COALESCE/COUNT/CASE).
+//! # Typical flow
+//!
+//! ```ignore
+//! let mut db = Database::new();
+//! db.apply_sql("CREATE TABLE users (id bigint primary key, name text not null);")?;
+//! let result = db.analyze(
+//!     "SELECT id, name FROM users WHERE id = $id",
+//!     &AnalyzerConfig::default(),
+//! )?;
+//! // result.columns[0].rust_type == "i64"
+//! // result.params[0].rust_type  == "i64"
+//! ```
 
-pub mod coerce;
-pub mod ddl;
-pub mod error;
-pub mod expr;
-pub mod functions;
-pub mod lexer;
-pub mod nullability;
-pub mod param;
-pub mod params;
-pub mod query_info;
-pub mod resolve;
+mod coerce;
+mod database;
+mod ddl;
+mod error;
+mod expr;
+mod functions;
+mod lexer;
+mod nullability;
+mod param;
+mod param_collector;
+mod qualified_name;
+mod resolve;
+mod scope;
+mod seed;
+mod type_map;
+
+#[cfg(any(test, feature = "internal"))]
 pub mod schema;
-pub mod scope;
-pub mod seed;
-pub mod type_map;
+#[cfg(not(any(test, feature = "internal")))]
+mod schema;
+
+pub use database::Database;
+pub use ddl::DdlError;
+pub use error::AnalyzeError;
+pub use qualified_name::{ParseQualifiedNameError, QualifiedName};
+pub use resolve::{
+    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread, AnalyzedSpreadField,
+    AnalyzerConfig,
+};

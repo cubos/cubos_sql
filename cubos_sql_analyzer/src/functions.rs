@@ -1,17 +1,16 @@
 //! Function and aggregate resolution.
 
-use crate::coerce::oid;
 use crate::error::AnalyzeError;
 use crate::schema::{FunctionEntry, SchemaSnapshot};
+use crate::type_map::oid;
 
 /// Resolved function call result.
-pub struct ResolvedFunction {
+pub(crate) struct ResolvedFunction {
     pub return_type_oid: u32,
     /// The resolved argument types from the matched function signature.
     pub arg_types: Vec<u32>,
     pub schema: String,
     pub is_aggregate: bool,
-    pub is_set_returning: bool,
     pub is_strict: bool,
 }
 
@@ -72,7 +71,7 @@ const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &[
 ];
 
 /// Resolve a function call by name and argument types.
-pub fn resolve_function(
+pub(crate) fn resolve_function(
     snapshot: &SchemaSnapshot,
     schema: Option<&str>,
     name: &str,
@@ -86,7 +85,6 @@ pub fn resolve_function(
             arg_types: vec![],
             schema: "pg_catalog".into(),
             is_aggregate: true,
-            is_set_returning: false,
             is_strict: true,
         });
     }
@@ -185,10 +183,10 @@ fn find_cast_match<'a>(
     arg_types: &[u32],
     snapshot: &SchemaSnapshot,
 ) -> Option<&'a FunctionEntry> {
-    candidates
+    let matching: Vec<&FunctionEntry> = candidates
         .iter()
         .filter(|f| f.arg_types.len() == arg_types.len())
-        .find(|f| {
+        .filter(|f| {
             f.arg_types
                 .iter()
                 .zip(arg_types.iter())
@@ -199,6 +197,71 @@ fn find_cast_match<'a>(
                 })
         })
         .copied()
+        .collect();
+
+    if matching.len() <= 1 {
+        return matching.into_iter().next();
+    }
+
+    // Tie-break for UNKNOWN arguments (PG §10.3 step 4e).
+    //
+    // Untyped literals (`'foo'`, `$1` without context) arrive as UNKNOWN. For
+    // each UNKNOWN-arg position, PG assumes the string category, then:
+    //   1. Keep candidates whose param at that position is in category 'S'.
+    //   2. Among those, prefer candidates whose param is `typispreferred`
+    //      (e.g. `text` over `varchar`/`bpchar`, `text` over `bytea`).
+    //
+    // Without this, relying on the natural pg_proc order would be fragile —
+    // extensions installed later could reorder overloads and flip results.
+    if !arg_types.contains(&oid::UNKNOWN) {
+        return matching.into_iter().next();
+    }
+
+    let string_compatible: Vec<&FunctionEntry> = matching
+        .iter()
+        .filter(|f| {
+            f.arg_types
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(&param_oid, &actual)| {
+                    if actual != oid::UNKNOWN {
+                        return true;
+                    }
+                    snapshot
+                        .get_type(param_oid)
+                        .is_some_and(|t| t.category == 'S')
+                })
+        })
+        .copied()
+        .collect();
+
+    if string_compatible.is_empty() {
+        return matching.into_iter().next();
+    }
+    if string_compatible.len() == 1 {
+        return Some(string_compatible[0]);
+    }
+
+    let preferred: Vec<&FunctionEntry> = string_compatible
+        .iter()
+        .filter(|f| {
+            f.arg_types
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(&param_oid, &actual)| {
+                    if actual != oid::UNKNOWN {
+                        return true;
+                    }
+                    snapshot.get_type(param_oid).is_some_and(|t| t.is_preferred)
+                })
+        })
+        .copied()
+        .collect();
+
+    if !preferred.is_empty() {
+        return preferred.into_iter().next();
+    }
+    string_compatible.into_iter().next()
 }
 
 fn make_resolved(f: &FunctionEntry) -> ResolvedFunction {
@@ -207,19 +270,18 @@ fn make_resolved(f: &FunctionEntry) -> ResolvedFunction {
         arg_types: f.arg_types.clone(),
         schema: f.schema.clone(),
         is_aggregate: f.is_aggregate,
-        is_set_returning: f.is_set_returning,
         is_strict: f.is_strict,
     }
 }
 
 /// Returns true if a pg_catalog strict function is known to possibly return NULL
 /// even with non-null inputs.
-pub fn is_nullable_strict_exception(name: &str) -> bool {
+pub(crate) fn is_nullable_strict_exception(name: &str) -> bool {
     NULLABLE_STRICT_PG_CATALOG_FUNCTIONS.contains(&name)
 }
 
 /// Returns true if an operator can return NULL with non-null inputs.
-pub fn is_nullable_operator(name: &str) -> bool {
+pub(crate) fn is_nullable_operator(name: &str) -> bool {
     NULLABLE_PG_CATALOG_OPERATORS.contains(&name)
 }
 
@@ -277,6 +339,6 @@ const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
 
 /// Returns true if a pg_catalog non-strict function is guaranteed to never
 /// return NULL.
-pub fn is_not_null_nonstrict(name: &str) -> bool {
+pub(crate) fn is_not_null_nonstrict(name: &str) -> bool {
     NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS.contains(&name)
 }

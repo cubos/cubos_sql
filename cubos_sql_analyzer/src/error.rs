@@ -2,9 +2,15 @@
 
 use thiserror::Error;
 
+use crate::lexer::LexError;
+
 /// Errors that can occur during static SQL analysis.
 #[derive(Debug, Error)]
 pub enum AnalyzeError {
+    /// The SQL could not be lexed (unclosed string, comment, etc.).
+    #[error("SQL lex error: {0}")]
+    Lex(String),
+
     /// The SQL could not be parsed.
     #[error("SQL parse error: {0}")]
     Parse(String),
@@ -41,6 +47,12 @@ pub enum AnalyzeError {
     #[error("unsupported SQL feature: {0}")]
     Unsupported(String),
 
+    /// The parser reported a JOIN kind the analyzer does not recognize.
+    /// Returned instead of silently falling back to INNER JOIN semantics,
+    /// which would produce incorrect nullability.
+    #[error("unsupported join type: {0}")]
+    UnsupportedJoinType(i32),
+
     /// JSON serialization/deserialization error.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
@@ -48,4 +60,10 @@ pub enum AnalyzeError {
     /// IO error (reading/writing snapshot files).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<LexError> for AnalyzeError {
+    fn from(err: LexError) -> Self {
+        AnalyzeError::Lex(err.to_string())
+    }
 }

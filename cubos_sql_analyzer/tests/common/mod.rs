@@ -2,11 +2,14 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+pub use cubos_sql_analyzer::{
+    AnalyzedColumn, AnalyzedQuery, AnalyzerConfig, Database, QualifiedName,
+};
 
-pub use cubos_sql_analyzer::query_info::{ColumnInfo, QueryInfo};
-pub use cubos_sql_analyzer::resolve::{AnalyzerConfig, analyze};
-pub use cubos_sql_analyzer::schema::SchemaSnapshot;
+/// Terse helper for building a [`QualifiedName`] in tests.
+pub fn qn(schema: &str, name: &str) -> QualifiedName {
+    QualifiedName::new(schema, name)
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Setup
@@ -59,42 +62,27 @@ pub const MIGRATION: &str = "\
     );\
 ";
 
-/// Build a schema snapshot from the test migration using the DDL interpreter.
-pub fn setup() -> SchemaSnapshot {
-    let migrations = vec![("0001.sql".to_string(), MIGRATION.to_string())];
-    let (snapshot, _warnings) =
-        cubos_sql_analyzer::seed::build_schema_from_migrations(&migrations).unwrap();
-    snapshot
+/// Build a [`Database`] from the shared test migration.
+pub fn setup() -> Database {
+    let mut db = Database::new();
+    db.apply_sql(MIGRATION).unwrap();
+    db
 }
 
 pub fn default_config() -> AnalyzerConfig {
-    AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: Vec::new(),
-    }
-}
-
-pub fn config_with_nullable(nullable: &[Option<bool>]) -> AnalyzerConfig {
-    AnalyzerConfig {
-        domains: HashMap::new(),
-        enums: HashMap::new(),
-        types: HashMap::new(),
-        param_nullability: nullable.to_vec(),
-    }
+    AnalyzerConfig::default()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Assertion helpers
+// Analyze helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Run the static analyzer on a query.
-pub fn static_analyze(snapshot: &SchemaSnapshot, sql: &str) -> QueryInfo {
-    analyze(snapshot, sql, &default_config()).unwrap()
+/// Run `Database::analyze` on a query with the default config and unwrap.
+pub fn static_analyze(db: &Database, sql: &str) -> AnalyzedQuery {
+    db.analyze(sql, &default_config()).unwrap()
 }
 
-pub fn col<'a>(info: &'a QueryInfo, name: &str) -> &'a ColumnInfo {
+pub fn col<'a>(info: &'a AnalyzedQuery, name: &str) -> &'a AnalyzedColumn {
     info.columns
         .iter()
         .find(|c| c.name == name)
@@ -106,8 +94,8 @@ pub fn col<'a>(info: &'a QueryInfo, name: &str) -> &'a ColumnInfo {
         })
 }
 
-/// Assert two QueryInfos have identical types (ignoring nullability).
-pub fn assert_same_types(a: &QueryInfo, b: &QueryInfo, context: &str) {
+/// Assert two [`AnalyzedQuery`]s have identical types (ignoring nullability).
+pub fn assert_same_types(a: &AnalyzedQuery, b: &AnalyzedQuery, context: &str) {
     assert_eq!(
         a.columns.len(),
         b.columns.len(),
@@ -134,8 +122,8 @@ pub fn assert_same_types(a: &QueryInfo, b: &QueryInfo, context: &str) {
     }
 }
 
-/// Assert two QueryInfos are completely identical (types + nullability).
-pub fn assert_identical(a: &QueryInfo, b: &QueryInfo, context: &str) {
+/// Assert two [`AnalyzedQuery`]s are completely identical (types + nullability).
+pub fn assert_identical(a: &AnalyzedQuery, b: &AnalyzedQuery, context: &str) {
     assert_same_types(a, b, context);
     for (ca, cb) in a.columns.iter().zip(b.columns.iter()) {
         assert_eq!(

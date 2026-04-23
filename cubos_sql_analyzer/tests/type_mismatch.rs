@@ -10,15 +10,10 @@ use common::*;
 
 /// Assert that our analyzer rejects the query with a type mismatch.
 /// Validates our `TypeMismatch` fields.
-fn assert_type_mismatch(
-    snapshot: &SchemaSnapshot,
-    sql: &str,
-    expect_actual: &str,
-    expect_expected: &str,
-) {
-    let result = analyze(snapshot, sql, &default_config());
+fn assert_type_mismatch(db: &Database, sql: &str, expect_actual: &str, expect_expected: &str) {
+    let result = db.analyze(sql, &default_config());
     match &result {
-        Err(cubos_sql_analyzer::error::AnalyzeError::TypeMismatch {
+        Err(cubos_sql_analyzer::AnalyzeError::TypeMismatch {
             actual,
             expected,
             context,
@@ -59,8 +54,8 @@ fn assert_type_mismatch(
 /// Assert that our analyzer rejects the query.
 /// Checks our error message contains `expected_substring`.
 #[allow(dead_code)]
-fn assert_analysis_error(snapshot: &SchemaSnapshot, sql: &str, expected_substring: &str) {
-    let result = analyze(snapshot, sql, &default_config());
+fn assert_analysis_error(db: &Database, sql: &str, expected_substring: &str) {
+    let result = db.analyze(sql, &default_config());
     match &result {
         Err(e) => {
             let msg = e.to_string();
@@ -88,30 +83,30 @@ fn assert_analysis_error(snapshot: &SchemaSnapshot, sql: &str, expected_substrin
 #[test]
 fn mismatch_where_integer_not_boolean() {
     // WHERE 42 → int4 is not boolean.
-    let snapshot = setup();
-    assert_type_mismatch(&snapshot, "SELECT id FROM users WHERE 42", "int4", "bool");
+    let db = setup();
+    assert_type_mismatch(&db, "SELECT id FROM users WHERE 42", "int4", "bool");
 }
 
 #[test]
 fn mismatch_where_text_not_boolean() {
     // WHERE name → text is not boolean.
-    let snapshot = setup();
-    assert_type_mismatch(&snapshot, "SELECT id FROM users WHERE name", "text", "bool");
+    let db = setup();
+    assert_type_mismatch(&db, "SELECT id FROM users WHERE name", "text", "bool");
 }
 
 #[test]
 fn mismatch_where_bigint_not_boolean() {
     // WHERE id → int8 is not boolean.
-    let snapshot = setup();
-    assert_type_mismatch(&snapshot, "SELECT name FROM users WHERE id", "int8", "bool");
+    let db = setup();
+    assert_type_mismatch(&db, "SELECT name FROM users WHERE id", "int8", "bool");
 }
 
 #[test]
 fn mismatch_where_timestamptz_not_boolean() {
     // WHERE created_at → timestamptz is not boolean.
-    let snapshot = setup();
+    let db = setup();
     assert_type_mismatch(
-        &snapshot,
+        &db,
         "SELECT id FROM users WHERE created_at",
         "timestamptz",
         "bool",
@@ -123,23 +118,23 @@ fn mismatch_where_timestamptz_not_boolean() {
 #[test]
 fn mismatch_limit_boolean() {
     // LIMIT true → bool is not int8.
-    let snapshot = setup();
-    assert_type_mismatch(&snapshot, "SELECT id FROM users LIMIT true", "bool", "int8");
+    let db = setup();
+    assert_type_mismatch(&db, "SELECT id FROM users LIMIT true", "bool", "int8");
 }
 
 #[test]
 fn mismatch_limit_text_column() {
     // LIMIT name → text is not int8.
-    let snapshot = setup();
-    assert_type_mismatch(&snapshot, "SELECT id FROM users LIMIT name", "text", "int8");
+    let db = setup();
+    assert_type_mismatch(&db, "SELECT id FROM users LIMIT name", "text", "int8");
 }
 
 #[test]
 fn mismatch_limit_timestamptz_column() {
     // LIMIT created_at → timestamptz is not int8.
-    let snapshot = setup();
+    let db = setup();
     assert_type_mismatch(
-        &snapshot,
+        &db,
         "SELECT id FROM users LIMIT created_at",
         "timestamptz",
         "int8",
@@ -149,43 +144,38 @@ fn mismatch_limit_timestamptz_column() {
 #[test]
 fn mismatch_offset_boolean() {
     // OFFSET false → bool is not int8.
-    let snapshot = setup();
-    assert_type_mismatch(
-        &snapshot,
-        "SELECT id FROM users OFFSET false",
-        "bool",
-        "int8",
-    );
+    let db = setup();
+    assert_type_mismatch(&db, "SELECT id FROM users OFFSET false", "bool", "int8");
 }
 
 // ── Untyped params default to text (matching PG) ─────────────────────
 
 #[test]
 fn goal_untyped_param_defaults_to_text() {
-    // SELECT $1 → no context, defaults to text (PG's preferred type for unknown).
-    let snapshot = setup();
-    let info = analyze(&snapshot, "SELECT $1", &default_config()).unwrap();
+    // SELECT $p1 → no context, defaults to text (PG's preferred type for unknown).
+    let db = setup();
+    let info = db.analyze("SELECT $p1", &default_config()).unwrap();
     assert_eq!(info.params[0].rust_type, "String");
 }
 
 #[test]
 fn goal_untyped_params_in_comparison_default_to_text() {
-    // SELECT $1 > $2 → both unknown, PG infers text for both.
-    let snapshot = setup();
-    let info = analyze(&snapshot, "SELECT $1 > $2", &default_config()).unwrap();
+    // SELECT $p1 > $p2 → both unknown, PG infers text for both.
+    let db = setup();
+    let info = db.analyze("SELECT $p1 > $p2", &default_config()).unwrap();
     assert_eq!(info.params[0].rust_type, "String");
     assert_eq!(info.params[1].rust_type, "String");
 }
 
 #[test]
 fn error_insert_wrong_column_name() {
-    // INSERT INTO users (nonexistent) VALUES ($1) → column not found.
-    let snapshot = setup();
-    let sql = "INSERT INTO users (nonexistent) VALUES ($1)";
+    // INSERT INTO users (nonexistent) VALUES ($p1) → column not found.
+    let db = setup();
+    let sql = "INSERT INTO users (nonexistent) VALUES ($p1)";
 
     // Our analyzer: may produce unknown-typed param or error — either is acceptable.
     // The key is it doesn't silently produce wrong types.
-    let result = analyze(&snapshot, sql, &default_config());
+    let result = db.analyze(sql, &default_config());
     if let Ok(info) = result {
         assert_eq!(info.params.len(), 1);
     }
