@@ -123,6 +123,10 @@ impl TypedParam for AnalyzedSpreadField {
 struct RustMapping {
     rust_type: syn::Type,
     strategy: DeserStrategy,
+    /// True when `rust_type` is a `Vec<T>` with a plain element type. In
+    /// that case, param bindings can use `into_flex_vec` to accept any
+    /// `IntoIterator<Item: Into<T>>` (e.g. `[&str; N]` for `Vec<String>`).
+    accepts_iter: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +161,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 return Ok(RustMapping {
                     rust_type: target.clone(),
                     strategy: DeserStrategy::JsonbDomain { target },
+                    accepts_iter: false,
                 });
             }
             // Transparent domain: recurse into base.
@@ -169,6 +174,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 return Ok(RustMapping {
                     rust_type: target.clone(),
                     strategy: DeserStrategy::EnumAsString { target },
+                    accepts_iter: false,
                 });
             }
             // No mapping: surface as String.
@@ -177,6 +183,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 strategy: DeserStrategy::Plain {
                     accepts_into_string: true,
                 },
+                accepts_iter: false,
             })
         }
         Type::Array { element } => {
@@ -189,6 +196,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                         strategy: DeserStrategy::Plain {
                             accepts_into_string: false,
                         },
+                        accepts_iter: true,
                     })
                 }
                 DeserStrategy::JsonbDomain { target } => {
@@ -196,6 +204,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                     Ok(RustMapping {
                         rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
                         strategy: DeserStrategy::VecOfJsonbDomain { inner: target },
+                        accepts_iter: false,
                     })
                 }
                 DeserStrategy::EnumAsString { target } => {
@@ -203,6 +212,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                     Ok(RustMapping {
                         rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
                         strategy: DeserStrategy::VecOfEnumAsString { inner: target },
+                        accepts_iter: false,
                     })
                 }
                 DeserStrategy::VecOfJsonbDomain { .. }
@@ -226,6 +236,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                     strategy: DeserStrategy::Plain {
                         accepts_into_string: false,
                     },
+                    accepts_iter: false,
                 });
             }
             // No override: map to postgres_range::Range<T>.
@@ -239,6 +250,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 strategy: DeserStrategy::Plain {
                     accepts_into_string: false,
                 },
+                accepts_iter: false,
             })
         }
         Type::Basic {
@@ -254,6 +266,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                     strategy: DeserStrategy::Plain {
                         accepts_into_string: false,
                     },
+                    accepts_iter: false,
                 });
             }
             // 2. Known extension type.
@@ -265,6 +278,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                     strategy: DeserStrategy::Plain {
                         accepts_into_string: false,
                     },
+                    accepts_iter: false,
                 });
             }
             // 3. Built-in PG catalog type.
@@ -274,6 +288,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                     strategy: DeserStrategy::Plain {
                         accepts_into_string: pg_type_map::is_string_like(schema, name),
                     },
+                    accepts_iter: false,
                 });
             }
             Err(syn::Error::new(
@@ -293,6 +308,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 strategy: DeserStrategy::Plain {
                     accepts_into_string: false,
                 },
+                accepts_iter: false,
             })
         }
     }
@@ -888,14 +904,21 @@ fn build_field_type_and_value<P: TypedParam>(
             accepts_into_string: true
         }
     );
-    let value_expr = if accepts_into_string {
-        if is_nullable {
-            quote! { (#value_expr).map(Into::<String>::into) }
-        } else {
-            quote! { Into::<String>::into(#value_expr) }
+    let value_expr = match (accepts_into_string, mapping.accepts_iter, is_nullable) {
+        (true, _, true) => {
+            quote! {
+                ::cubos_sql::__private::IntoOptionString::into_option_string(#value_expr)
+            }
         }
-    } else {
-        value_expr.clone()
+        (true, _, false) => quote! { Into::<String>::into(#value_expr) },
+        (_, true, false) => {
+            // Vec<T> with a plain element — accept any IntoIterator<Item: Into<T>>.
+            quote! { ::cubos_sql::__private::into_flex_vec(#value_expr) }
+        }
+        (false, _, true) => {
+            quote! { ::std::option::Option::<#inner_rt>::from(#value_expr) }
+        }
+        (false, false, false) => quote! { Into::<#inner_rt>::into(#value_expr) },
     };
 
     Ok((field_type, value_expr))

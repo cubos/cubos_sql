@@ -659,3 +659,39 @@ fn preferred_type_ignores_non_string_category_when_only_non_preferred_in_string(
     // would return bytea. The filter keeps only bpchar.
     assert_single_param_ty(&db, "SELECT pick($p)", bpchar());
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: inferência de tipo em ANY/ALL($param)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn param_as_array_in_any_rhs() {
+    // id = ANY($ids): $ids deve ser inferido como int8[]
+    let db = setup();
+    let info = db
+        .analyze("SELECT * FROM users WHERE id = ANY($ids)")
+        .unwrap();
+    assert_params(&info, vec![p(array_of(int8()))]);
+}
+
+#[test]
+fn param_as_array_in_all_rhs() {
+    // id = ALL($ids): mesmo comportamento que ANY
+    let db = setup();
+    let info = db
+        .analyze("SELECT * FROM users WHERE id = ALL($ids)")
+        .unwrap();
+    assert_params(&info, vec![p(array_of(int8()))]);
+}
+
+#[test]
+fn param_as_element_in_any_lhs() {
+    // $tag = ANY(tags): $tag deve ser inferido como text (elemento do array)
+    let mut db = Database::new();
+    db.apply_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, tags TEXT[] NOT NULL)")
+        .unwrap();
+    let info = db
+        .analyze("SELECT * FROM items WHERE $tag = ANY(tags)")
+        .unwrap();
+    assert_params(&info, vec![p(text())]);
+}

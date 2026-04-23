@@ -757,6 +757,73 @@ fn infer_a_expr(
         "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~~" | "~~*" | "!~~" | "!~~*"
     );
 
+    // col = ANY($arr) / col = ALL($arr): lexpr is scalar, rexpr is array.
+    // The generic back-fill below would assign the wrong type (element ↔ array
+    // confusion), so we handle it first and return early.
+    if matches!(
+        protobuf::AExprKind::try_from(expr.kind),
+        Ok(protobuf::AExprKind::AexprOpAny) | Ok(protobuf::AExprKind::AexprOpAll)
+    ) {
+        let left = expr
+            .lexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
+            .transpose()?;
+        let right = expr
+            .rexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
+            .transpose()?;
+
+        let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
+        let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
+
+        // left is concrete T, right is unknown → right must be T[].
+        if left_oid != oid::UNKNOWN
+            && right_oid == oid::UNKNOWN
+            && let Some(arr_oid) = snapshot.array_type_of(left_oid)
+            && let Some(rexpr) = &expr.rexpr
+        {
+            let _ = infer_expr(
+                rexpr,
+                scope,
+                null_ctx,
+                snapshot,
+                params,
+                TypeGoal::implicit(arr_oid),
+            );
+        }
+
+        // right is concrete T[], left is unknown → left must be the element type T.
+        if right_oid != oid::UNKNOWN
+            && left_oid == oid::UNKNOWN
+            && let Some(elem_oid) = snapshot.types.get(&right_oid).and_then(|t| {
+                if let crate::schema::TypeKind::Array { element_type_oid } = t.kind {
+                    Some(element_type_oid)
+                } else {
+                    None
+                }
+            })
+            && let Some(lexpr) = &expr.lexpr
+        {
+            let _ = infer_expr(
+                lexpr,
+                scope,
+                null_ctx,
+                snapshot,
+                params,
+                TypeGoal::implicit(elem_oid),
+            );
+        }
+
+        let any_nullable =
+            left.as_ref().is_some_and(|l| l.nullable) || right.as_ref().is_some_and(|r| r.nullable);
+        return Ok(ExprType {
+            type_oid: oid::BOOL,
+            nullable: any_nullable,
+        });
+    }
+
     // Pass 1: infer both sides bottom-up.
     let left = expr
         .lexpr

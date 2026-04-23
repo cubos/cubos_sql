@@ -389,4 +389,50 @@ pub mod __private {
 
         to_sql_checked!();
     }
+
+    /// Converts a bare string-like value or an `Option<T: Into<String>>` into
+    /// `Option<String>` so callers of `sql!` can pass either at a site that
+    /// expects a nullable string parameter.
+    ///
+    /// Impls are concrete for common string types to avoid coherence
+    /// conflicts with a hypothetical future `Option<T>: Into<String>`.
+    pub trait IntoOptionString {
+        fn into_option_string(self) -> Option<String>;
+    }
+
+    impl IntoOptionString for &str {
+        fn into_option_string(self) -> Option<String> {
+            Some(self.to_owned())
+        }
+    }
+
+    impl IntoOptionString for String {
+        fn into_option_string(self) -> Option<String> {
+            Some(self)
+        }
+    }
+
+    impl IntoOptionString for &String {
+        fn into_option_string(self) -> Option<String> {
+            Some(self.clone())
+        }
+    }
+
+    impl<T: Into<String>> IntoOptionString for Option<T> {
+        fn into_option_string(self) -> Option<String> {
+            self.map(Into::into)
+        }
+    }
+
+    /// Collect any `IntoIterator` whose items convert into `T` into a
+    /// `Vec<T>`. Used by generated code for `Vec<T>` parameters so callers
+    /// can pass `Vec<&str>`, `[&str; N]`, `[T; N]`, etc., in addition to an
+    /// exact `Vec<T>`.
+    pub fn into_flex_vec<T, I>(iter: I) -> Vec<T>
+    where
+        I: IntoIterator,
+        I::Item: Into<T>,
+    {
+        iter.into_iter().map(Into::into).collect()
+    }
 }

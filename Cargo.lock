@@ -653,6 +653,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubos_sql_e2e"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cubos_sql",
+ "cubos_sql_core",
+ "deadpool-postgres",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
 name = "cubos_sql_example"
 version = "0.1.0"
 dependencies = [
@@ -3391,6 +3409,7 @@ version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
  "serde_core",
  "wasm-bindgen",
