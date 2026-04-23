@@ -1,12 +1,12 @@
 //! Parsing and orchestration for the `sql!` proc macro.
 //!
-//! Parses the macro input, builds a cached [`Database`] from migrations,
+//! Parses the macro input, builds a cached [`PgCatalog`] from migrations,
 //! runs static analysis, and generates typed Rust code.
 
 use std::cell::RefCell;
 use std::path::Path;
 
-use cubos_sql_analyzer::Database;
+use cubos_sql_analyzer::PgCatalog;
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitStr, Token};
@@ -14,37 +14,37 @@ use syn::{Expr, Ident, LitStr, Token};
 use crate::codegen::{self, ParamAssignment};
 
 // ---------------------------------------------------------------------------
-// Database caching
+// PgCatalog caching
 // ---------------------------------------------------------------------------
 
-struct CachedDatabase {
-    db: Database,
+struct CachedPgCatalog {
+    catalog: PgCatalog,
     /// Cache key: migration hash.
     migration_hash: String,
 }
 
 thread_local! {
-    static CACHED_DATABASE: RefCell<Option<CachedDatabase>> = const { RefCell::new(None) };
+    static CACHED_PG_CATALOG: RefCell<Option<CachedPgCatalog>> = const { RefCell::new(None) };
 }
 
-/// Build (or retrieve from cache) a [`Database`] from migration files.
-fn get_or_build_database(
+/// Build (or retrieve from cache) a [`PgCatalog`] from migration files.
+fn get_or_build_pg_catalog(
     migrations_dirs: &[&Path],
     migration_hash: &str,
-) -> Result<Database, syn::Error> {
-    CACHED_DATABASE.with(|cell| {
+) -> Result<PgCatalog, syn::Error> {
+    CACHED_PG_CATALOG.with(|cell| {
         let borrow = cell.borrow();
         if let Some(cached) = borrow.as_ref()
             && cached.migration_hash == migration_hash
         {
-            return Ok(cached.db.clone());
+            return Ok(cached.catalog.clone());
         }
         drop(borrow);
 
         let migrations = collect_migration_files(migrations_dirs)?;
-        let mut db = Database::new();
+        let mut catalog = PgCatalog::new();
         for (filename, sql) in &migrations {
-            db.apply_sql(sql).map_err(|e| {
+            catalog.apply_sql(sql).map_err(|e| {
                 syn::Error::new(
                     Span::call_site(),
                     format!("DDL interpretation failed in '{filename}': {e}"),
@@ -52,12 +52,12 @@ fn get_or_build_database(
             })?;
         }
 
-        cell.borrow_mut().replace(CachedDatabase {
-            db: db.clone(),
+        cell.borrow_mut().replace(CachedPgCatalog {
+            catalog: catalog.clone(),
             migration_hash: migration_hash.to_string(),
         });
 
-        Ok(db)
+        Ok(catalog)
     })
 }
 
@@ -196,7 +196,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         )
     })?;
 
-    // 2. Build (or reuse cached) Database from migrations.
+    // 2. Build (or reuse cached) PgCatalog from migrations.
     let migrations_dir = resolved.migrations_dir(manifest_path);
     let extra_dirs = resolved.extra_migrations_dirs(manifest_path);
     let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
@@ -206,10 +206,10 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
-    let database = get_or_build_database(&all_dirs, &migration_hash)?;
+    let catalog = get_or_build_pg_catalog(&all_dirs, &migration_hash)?;
 
     // 3. Analyze the SQL (lex + type inference in one pass).
-    let analyzed = database
+    let analyzed = catalog
         .analyze(&sql_str)
         .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
 

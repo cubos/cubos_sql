@@ -7,9 +7,9 @@ use crate::schema::FunctionEntry;
 
 use super::DdlError;
 use super::util::{extract_names, resolve_type_name};
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
-pub fn create_function(interp: &mut Database, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
+pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.funcname, &interp.snapshot);
 
     // Resolve parameter types (IN params only for the signature).

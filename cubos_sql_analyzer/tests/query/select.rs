@@ -3,8 +3,8 @@
 
 use crate::common::*;
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
          CREATE DOMAIN user_prefs AS JSONB;

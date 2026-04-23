@@ -9,12 +9,12 @@ use crate::schema::{CompositeField, RelationKind, TableColumn, TableEntry, TypeE
 use super::DdlError;
 use super::util::{range_var_key, range_var_names, resolve_type_name};
 use super::views;
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
 
 // ─── CREATE TABLE ───────────────────────────────────────────────────────────
 
-pub fn create_table(interp: &mut Database, stmt: &CreateStmt) -> Result<(), DdlError> {
+pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), DdlError> {
     let rv = stmt
         .relation
         .as_ref()
@@ -152,7 +152,7 @@ pub fn create_table(interp: &mut Database, stmt: &CreateStmt) -> Result<(), DdlE
 
 /// Parse a `ColumnDef` AST node into a `TableColumn`.
 fn parse_column_def(
-    interp: &Database,
+    interp: &PgCatalog,
     cd: &pg_query::protobuf::ColumnDef,
     pk_columns: &[String],
 ) -> Result<TableColumn, DdlError> {
@@ -228,7 +228,7 @@ fn parse_column_def(
 
 // ─── ALTER TABLE ────────────────────────────────────────────────────────────
 
-pub fn alter_table(interp: &mut Database, stmt: &AlterTableStmt) -> Result<(), DdlError> {
+pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), DdlError> {
     let rv = stmt
         .relation
         .as_ref()
@@ -255,7 +255,7 @@ pub fn alter_table(interp: &mut Database, stmt: &AlterTableStmt) -> Result<(), D
 }
 
 fn apply_alter_cmd(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -277,7 +277,7 @@ fn apply_alter_cmd(
 }
 
 fn add_column(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -318,7 +318,7 @@ fn add_column(
 }
 
 fn drop_column(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -369,7 +369,7 @@ fn drop_column(
 }
 
 fn set_not_null(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     col_name: &str,
     not_null: bool,
@@ -393,7 +393,7 @@ fn set_not_null(
 }
 
 fn set_default(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -418,7 +418,7 @@ fn set_default(
 }
 
 fn alter_column_type(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -501,7 +501,7 @@ fn alter_column_type(
 }
 
 fn add_constraint(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     table_key: &QualifiedName,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -571,7 +571,7 @@ fn add_constraint(
 }
 
 /// Sync the composite type fields with the table's columns.
-fn update_composite_for_table(interp: &mut Database, table_key: &QualifiedName) {
+fn update_composite_for_table(interp: &mut PgCatalog, table_key: &QualifiedName) {
     let Some(table) = interp.snapshot.tables.get(table_key) else {
         return;
     };

@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use cubos_sql_analyzer::schema::*;
-use cubos_sql_analyzer::{Database, QualifiedName};
+use cubos_sql_analyzer::{PgCatalog, QualifiedName};
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -615,7 +615,7 @@ fn populate_view_defs(
     snapshot: SchemaSnapshot,
     defs: Vec<(String, String, String)>,
 ) -> SchemaSnapshot {
-    let mut db = Database::from_snapshot(snapshot);
+    let mut db = PgCatalog::from_snapshot(snapshot);
 
     for (schema, name, definition) in &defs {
         let qn = QualifiedName::new(schema.clone(), name.clone());

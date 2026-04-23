@@ -4,12 +4,12 @@
 
 use crate::common::*;
 
-fn empty_db() -> Database {
-    Database::new()
+fn empty_db() -> PgCatalog {
+    PgCatalog::new()
 }
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE users (
             id         BIGINT PRIMARY KEY,
@@ -30,7 +30,7 @@ fn setup() -> Database {
 }
 
 /// Assert that the analyzer produces the expected param types.
-fn assert_param_types(db: &Database, sql: &str, expected: &[Type]) {
+fn assert_param_types(db: &PgCatalog, sql: &str, expected: &[Type]) {
     let info = db.analyze(sql).unwrap();
     assert_eq!(
         info.params.len(),
@@ -43,7 +43,7 @@ fn assert_param_types(db: &Database, sql: &str, expected: &[Type]) {
 }
 
 /// Assert the single param of `sql` resolves to the expected PG type.
-fn assert_single_param_ty(db: &Database, sql: &str, expected: Type) {
+fn assert_single_param_ty(db: &PgCatalog, sql: &str, expected: Type) {
     let info = db.analyze(sql).unwrap();
     assert_eq!(info.params.len(), 1, "expected exactly one param in: {sql}");
     assert_eq!(
@@ -638,7 +638,7 @@ fn preferred_type_text_wins_over_bytea_in_reverse_registration_order() {
     // bytea is category 'U' and text is the preferred type of category 'S'.
     // Registering bytea first puts it at Vec[0]; without the tie-break,
     // `pick($p)` would choose bytea and `$p` would become `Vec<u8>`.
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE FUNCTION public.pick(bytea) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -656,7 +656,7 @@ fn preferred_type_text_wins_over_bpchar_in_reverse_registration_order() {
     // without the tie-break we'd return bpchar (OID 1042) — even though
     // both map to `String` in Rust, the chosen PG OID differs and drives
     // downstream behavior (e.g. generated `::text` casts).
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE FUNCTION public.pick(bpchar) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -672,7 +672,7 @@ fn preferred_type_text_wins_over_varchar_in_reverse_registration_order() {
     // `varchar` and `text` share category 'S' and Rust type `String`; only
     // `text` is preferred. Without the tie-break, varchar would win since
     // it is registered first.
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE FUNCTION public.pick(varchar) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -689,7 +689,7 @@ fn preferred_type_ignores_non_string_category_when_only_non_preferred_in_string(
     // it is the only string-category (even though it is NOT preferred).
     // This exercises step 1 of the tie-break (category filter) independent
     // of step 2 (preferred-type filter).
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE FUNCTION public.pick(bytea) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -729,7 +729,7 @@ fn param_as_array_in_all_rhs() {
 #[test]
 fn param_as_element_in_any_lhs() {
     // $tag = ANY(tags): $tag deve ser inferido como text (elemento do array)
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, tags TEXT[] NOT NULL)")
         .unwrap();
     let info = db

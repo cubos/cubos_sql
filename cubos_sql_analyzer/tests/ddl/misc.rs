@@ -4,8 +4,8 @@
 
 use crate::common::*;
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,
@@ -39,7 +39,7 @@ fn snapshot_roundtrip() {
     assert_eq!(snapshot.casts.len(), restored.casts.len());
 
     // Analyze against both databases — results must match exactly.
-    let restored_db = Database::from_snapshot(restored);
+    let restored_db = PgCatalog::from_snapshot(restored);
     let sql = "SELECT id, name FROM users";
     let info1 = db.analyze(sql).unwrap();
     let info2 = restored_db.analyze(sql).unwrap();

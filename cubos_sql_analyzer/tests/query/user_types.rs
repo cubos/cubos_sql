@@ -6,8 +6,8 @@
 
 use crate::common::*;
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,
@@ -18,8 +18,8 @@ fn setup() -> Database {
     db
 }
 
-fn setup_user_types() -> Database {
-    let mut db = Database::new();
+fn setup_user_types() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
          CREATE DOMAIN user_prefs AS JSONB;
@@ -223,7 +223,7 @@ fn schema_qualified_domain_column() {
 #[test]
 fn text_array_column_type_resolves_to_array_kind() {
     // TEXT[] must land as an Array TypeKind in the snapshot (not OID 0).
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql("CREATE TABLE t (id INT NOT NULL, tags TEXT[] NOT NULL);")
         .unwrap();
     let snap = db.into_snapshot();
@@ -247,7 +247,7 @@ fn builtin_type_aliases_resolve_to_canonical_oid() {
     // PG accepts "integer"/"int"/"bigint"/"smallint"/"boolean"/"real" as
     // aliases for int4/int4/int8/int2/bool/float4. A column declared with
     // each alias must land on the canonical OID.
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE t (
             a integer NOT NULL,

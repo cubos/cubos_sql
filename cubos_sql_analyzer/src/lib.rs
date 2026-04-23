@@ -7,25 +7,25 @@
 //!
 //! # Public surface
 //!
-//! The entry point is [`Database`]. Everything else is either returned by
-//! [`Database::analyze`] or used to configure it:
+//! The entry point is [`PgCatalog`]. Everything else is either returned by
+//! [`PgCatalog::analyze`] or used to configure it:
 //!
 //! | Item | Role |
 //! |------|------|
-//! | [`Database`] | Mutable schema: seed the PG18 catalog, then apply DDL and analyze queries against it. |
+//! | [`PgCatalog`] | Mutable schema: seed the PG18 catalog, then apply DDL and analyze queries against it. |
 //! | [`AnalyzerConfig`] | Rust-type overrides for user-defined SQL types (domains, enums, custom types). |
 //! | [`AnalyzedQuery`] | Result of analysis: rewritten SQL + typed parameters, spreads, and output columns. |
 //! | [`AnalyzedParam`] | A named parameter with its inferred Rust type and the byte offsets where it appears. |
 //! | [`AnalyzedSpread`] | A `$..name { ... }` spread with its insertion offset and typed fields. |
 //! | [`AnalyzedSpreadField`] | A single field inside a spread. |
 //! | [`AnalyzedColumn`] | A single output column: name, Rust type, nullability. |
-//! | [`AnalyzeError`] | Errors returned by [`Database::analyze`]. |
-//! | [`DdlError`] | Errors returned by [`Database::apply_sql`]. |
+//! | [`AnalyzeError`] | Errors returned by [`PgCatalog::analyze`]. |
+//! | [`DdlError`] | Errors returned by [`PgCatalog::apply_sql`]. |
 //!
 //! # Typical flow
 //!
 //! ```ignore
-//! let mut db = Database::new();
+//! let mut db = PgCatalog::new();
 //! db.apply_sql("CREATE TABLE users (id bigint primary key, name text not null);")?;
 //! let result = db.analyze(
 //!     "SELECT id, name FROM users WHERE id = $id",
@@ -36,7 +36,6 @@
 //! ```
 
 mod coerce;
-mod database;
 mod ddl;
 mod error;
 mod expr;
@@ -45,6 +44,7 @@ mod lexer;
 mod nullability;
 mod param;
 mod param_collector;
+mod pg_catalog;
 mod resolve;
 mod scope;
 mod seed;
@@ -63,9 +63,9 @@ pub mod schema;
 mod schema;
 
 pub use cubos_sql_core::{ParseQualifiedNameError, QualifiedName};
-pub use database::Database;
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
+pub use pg_catalog::PgCatalog;
 pub use resolve::{
     AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread, AnalyzedSpreadField,
 };

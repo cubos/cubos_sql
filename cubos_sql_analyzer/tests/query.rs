@@ -1,7 +1,7 @@
 //! Query analysis test binary.
 //!
 //! Each submodule tests a specific SQL/Postgres feature by:
-//! 1. Building a minimal `Database` with only the schema it needs
+//! 1. Building a minimal `PgCatalog` with only the schema it needs
 //! 2. Analyzing a query
 //! 3. Asserting output columns, parameters, or a specific error variant
 //!

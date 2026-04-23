@@ -3,9 +3,9 @@
 use pg_query::protobuf::CreateSchemaStmt;
 
 use super::DdlError;
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
-pub fn create_schema(interp: &mut Database, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
+pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
     // Register the schema name so `DROP SCHEMA` can distinguish between
     // "schema is empty" and "schema doesn't exist".
     if !stmt.schemaname.is_empty() {

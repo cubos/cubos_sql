@@ -10,11 +10,11 @@ use crate::schema::{CompositeField, TypeEntry, TypeKind};
 
 use super::DdlError;
 use super::util::{extract_names, names_key, node_string, resolve_type_name};
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
 
-pub fn create_domain(interp: &mut Database, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
+pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.domainname, &interp.snapshot);
     let key = QualifiedName::new(&schema, &name);
 
@@ -62,7 +62,7 @@ pub fn create_domain(interp: &mut Database, stmt: &CreateDomainStmt) -> Result<(
 
 // ─── CREATE TYPE AS ENUM ────────────────────────────────────────────────────
 
-pub fn create_enum(interp: &mut Database, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
+pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.type_name, &interp.snapshot);
     let key = QualifiedName::new(&schema, &name);
 
@@ -102,7 +102,7 @@ pub fn create_enum(interp: &mut Database, stmt: &CreateEnumStmt) -> Result<(), D
 
 // ─── CREATE TYPE AS (composite) ─────────────────────────────────────────────
 
-pub fn create_composite(interp: &mut Database, stmt: &CompositeTypeStmt) -> Result<(), DdlError> {
+pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Result<(), DdlError> {
     let rv = stmt
         .typevar
         .as_ref()
@@ -167,7 +167,7 @@ pub fn create_composite(interp: &mut Database, stmt: &CompositeTypeStmt) -> Resu
 
 // ─── CREATE TYPE AS RANGE ───────────────────────────────────────────────────
 
-pub fn create_range(interp: &mut Database, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
+pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.type_name, &interp.snapshot);
     let key = QualifiedName::new(&schema, &name);
 
@@ -213,7 +213,7 @@ pub fn create_range(interp: &mut Database, stmt: &CreateRangeStmt) -> Result<(),
 
 // ─── ALTER TYPE ... ADD VALUE (enum) ────────────────────────────────────────
 
-pub fn alter_enum(interp: &mut Database, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
+pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
     let key = names_key(&stmt.type_name, &interp.snapshot);
 
     let Some(&oid) = interp.snapshot.type_by_name.get(&key) else {
@@ -258,7 +258,7 @@ pub fn alter_enum(interp: &mut Database, stmt: &AlterEnumStmt) -> Result<(), Ddl
 
 /// Handle `DefineStmt` which covers shell types (`CREATE TYPE citext;`) and
 /// full type definitions (`CREATE TYPE citext (INPUT = ..., OUTPUT = ...)`).
-pub fn define_type(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlError> {
+pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
     let obj_type = ObjectType::try_from(stmt.kind).unwrap_or(ObjectType::Undefined);
     if obj_type != ObjectType::ObjectType {
         // Not a type definition (could be an operator, aggregate, etc. via DefineStmt).
@@ -300,7 +300,7 @@ pub fn define_type(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlEr
 
 // ─── CREATE CAST ────────────────────────────────────────────────────────────
 
-pub fn create_cast(interp: &mut Database, stmt: &CreateCastStmt) -> Result<(), DdlError> {
+pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), DdlError> {
     let source_oid = stmt
         .sourcetype
         .as_ref()
@@ -346,7 +346,7 @@ pub fn create_cast(interp: &mut Database, stmt: &CreateCastStmt) -> Result<(), D
 
 /// Register an array type (`_name`) for a base type.
 fn register_array_type(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     array_oid: u32,
     schema: &str,
     base_name: &str,

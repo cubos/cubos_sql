@@ -1,4 +1,4 @@
-//! DDL interpreter: applies DDL statements to a [`Database`](crate::Database)
+//! DDL interpreter: applies DDL statements to a [`PgCatalog`](crate::PgCatalog)
 //! in memory.
 //!
 //! This module parses SQL migration files using `pg_query` and mutates the
@@ -18,7 +18,7 @@ pub mod views;
 
 use pg_query::protobuf::node;
 
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
 // ─── Error type ─────────────────────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ pub struct InstalledExtension {
 // ─── Dispatcher ─────────────────────────────────────────────────────────────
 
 /// Parse and apply all DDL statements in a SQL string.
-pub(crate) fn apply_sql_to(db: &mut Database, sql: &str) -> Result<(), DdlError> {
+pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
     let parsed = pg_query::parse(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
 
     for raw_stmt in &parsed.protobuf.stmts {
@@ -104,7 +104,7 @@ pub(crate) fn apply_sql_to(db: &mut Database, sql: &str) -> Result<(), DdlError>
 }
 
 /// Dispatch a single parsed statement.
-pub(crate) fn apply_statement(db: &mut Database, stmt: &node::Node) -> Result<(), DdlError> {
+pub(crate) fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
     match stmt {
         // ── Tables ──────────────────────────────────────────────────
         node::Node::CreateStmt(s) => tables::create_table(db, s),

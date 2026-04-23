@@ -3,8 +3,8 @@
 
 use crate::common::*;
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
          CREATE DOMAIN user_prefs AS JSONB;
@@ -36,19 +36,31 @@ fn setup() -> Database {
     db
 }
 
-// ── INSERT into a nonexistent column ─────────────────────────────────────────
+// ── Unknown column in DML — must match PostgreSQL's error ────────────────────
 //
-// The analyzer is allowed to either error out or fall back to an
-// unknown-typed parameter. The critical property we assert is that it does
-// *not* silently produce a wrong type — so we accept either outcome, as long
-// as the shape is sensible.
+// PG rejects `INSERT INTO t (ghost) VALUES (...)` and `UPDATE t SET ghost = ...`
+// with `column "ghost" of relation "t" does not exist`. The analyzer must do
+// the same — treating the column as unknown-typed and silently picking `text`
+// would mask a real bug in the caller's SQL.
 
 #[test]
-fn insert_into_nonexistent_column_does_not_silently_mistype() {
+fn insert_into_nonexistent_column_errors() {
     let db = setup();
-    let sql = "INSERT INTO users (nonexistent) VALUES ($p1)";
-    let result = db.analyze(sql);
-    panic!("probe: {result:?}");
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (nonexistent) VALUES ($p1)"),
+        AnalyzeError::UnknownColumn(_),
+        "users.nonexistent",
+    );
+}
+
+#[test]
+fn update_set_nonexistent_column_errors() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("UPDATE users SET nonexistent = $p1 WHERE id = $p2"),
+        AnalyzeError::UnknownColumn(_),
+        "users.nonexistent",
+    );
 }
 
 // ── INSERT … RETURNING ───────────────────────────────────────────────────────

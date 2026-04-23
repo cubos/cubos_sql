@@ -5,10 +5,10 @@ use pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 use super::DdlError;
 use super::util::{extract_names, node_string, resolve_type_name};
 use super::views;
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
 
-pub fn drop_objects(interp: &mut Database, stmt: &DropStmt) -> Result<(), DdlError> {
+pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlError> {
     let obj_type = ObjectType::try_from(stmt.remove_type).unwrap_or(ObjectType::Undefined);
     let cascade = matches!(
         DropBehavior::try_from(stmt.behavior),
@@ -57,7 +57,7 @@ pub fn drop_objects(interp: &mut Database, stmt: &DropStmt) -> Result<(), DdlErr
 }
 
 fn drop_relation(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
@@ -110,7 +110,7 @@ fn drop_relation(
 }
 
 fn drop_type(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
@@ -197,7 +197,7 @@ fn drop_type(
 }
 
 fn drop_extension(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     _cascade: bool,
@@ -246,7 +246,7 @@ fn drop_extension(
 /// PostgreSQL) but has no effect in the analyzer: functions are not allowed
 /// to participate in query-level dependencies that affect static typing.
 fn drop_function(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     _cascade: bool,
@@ -383,7 +383,7 @@ fn resolve_function_key(
 /// `cascade` is accepted for syntactic parity with PostgreSQL but has no
 /// effect here for the same reason as `drop_function`.
 fn drop_aggregate(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     _cascade: bool,
@@ -444,7 +444,7 @@ fn drop_aggregate(
 /// two objargs, with a `TypeName` whose names list is empty for NONE (prefix
 /// operators). We detect that by inspecting `names.is_empty()`.
 fn drop_operator(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
@@ -560,7 +560,7 @@ fn parse_operator_arg_types(
 /// DROP CAST (source AS target) — objects list contains a single `List`
 /// with two `TypeName` elements.
 fn drop_cast(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
@@ -621,7 +621,7 @@ fn format_arg_oids(oids: &[u32], snapshot: &crate::schema::SchemaSnapshot) -> St
 /// schema (transitively dropping views that depend on them via the normal
 /// `drop_views` machinery).
 fn drop_schema(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,

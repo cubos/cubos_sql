@@ -13,10 +13,10 @@ use crate::schema::{RelationKind, TableColumn, TableEntry, ViewDef};
 
 use super::DdlError;
 use super::util::range_var_names;
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
 
-pub fn create_view(interp: &mut Database, stmt: &ViewStmt) -> Result<(), DdlError> {
+pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlError> {
     let rv = stmt
         .view
         .as_ref()
@@ -70,7 +70,7 @@ pub fn create_view(interp: &mut Database, stmt: &ViewStmt) -> Result<(), DdlErro
     Ok(())
 }
 
-pub fn create_table_as(interp: &mut Database, stmt: &CreateTableAsStmt) -> Result<(), DdlError> {
+pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Result<(), DdlError> {
     let rv = stmt
         .into
         .as_ref()

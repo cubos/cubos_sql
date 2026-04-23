@@ -11,9 +11,9 @@ use crate::schema::FunctionEntry;
 
 use super::DdlError;
 use super::util::{extract_names, resolve_type_name};
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
-pub fn define_aggregate(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlError> {
+pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.defnames, &interp.snapshot);
 
     // Argument types come from `args`. The shape varies between

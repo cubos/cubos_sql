@@ -5,8 +5,8 @@
 
 use crate::common::*;
 
-fn setup() -> Database {
-    let mut db = Database::new();
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE users (
             id          BIGINT PRIMARY KEY,
@@ -320,7 +320,7 @@ fn exists_constant_without_from() {
 #[test]
 fn stress_annotation_on_left_join_star() {
     // Force nullable LEFT JOIN column to NOT NULL via annotation.
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,

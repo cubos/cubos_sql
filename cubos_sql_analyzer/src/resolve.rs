@@ -490,6 +490,20 @@ fn analyze_insert(
         })
         .collect();
 
+    // Validate every column mentioned in the INSERT target list exists on the
+    // table. PostgreSQL rejects unknown columns with a clear error; without
+    // this check the analyzer would silently treat the corresponding `$N`
+    // parameter as text via the UNKNOWN fallback, masking a real bug in the
+    // caller's SQL.
+    for col in &col_names {
+        if !table.columns.iter().any(|c| &c.name == col) {
+            return Err(AnalyzeError::UnknownColumn(format!(
+                "{}.{}",
+                table.name, col
+            )));
+        }
+    }
+
     // Build a minimal scope for expressions within VALUES (no table in scope
     // for VALUES, but we need scope for possible subqueries/functions).
     let scope = Scope::default();
@@ -619,17 +633,21 @@ fn analyze_update(
         if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
             && let Some(val) = &rt.val
         {
-            let goal = table
+            // Same reasoning as analyze_insert: reject unknown columns up
+            // front instead of letting the parameter fall back to text via
+            // the UNKNOWN path.
+            let tc = table
                 .columns
                 .iter()
                 .find(|c| c.name == rt.name)
-                .map(|tc| TypeGoal::assignment(tc.type_oid))
-                .unwrap_or(TypeGoal::NONE);
+                .ok_or_else(|| {
+                    AnalyzeError::UnknownColumn(format!("{}.{}", table.name, rt.name))
+                })?;
+            let goal = TypeGoal::assignment(tc.type_oid);
             expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
             // Infer nullable from column definition.
             if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-                && let Some(tc) = table.columns.iter().find(|c| c.name == rt.name)
                 && !tc.not_null
             {
                 params.infer_nullable(p.number, true);

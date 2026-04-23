@@ -11,12 +11,12 @@ use pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, node};
 use super::DdlError;
 use super::util::{node_string, resolve_type_name};
 use super::views;
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
 
 // ─── ALTER ... RENAME TO ────────────────────────────────────────────────────
 
-pub fn rename(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlError> {
+pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
     let rename_type = ObjectType::try_from(stmt.rename_type).unwrap_or(ObjectType::Undefined);
 
     match rename_type {
@@ -46,7 +46,7 @@ pub fn rename(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlError> 
     }
 }
 
-fn rename_relation(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlError> {
+fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
@@ -102,7 +102,7 @@ fn rename_relation(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlEr
     Ok(())
 }
 
-fn rename_column(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlError> {
+fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
@@ -131,7 +131,7 @@ fn rename_column(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlErro
 }
 
 fn rename_function_like(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     stmt: &RenameStmt,
     expected: ObjectType,
 ) -> Result<(), DdlError> {
@@ -222,7 +222,7 @@ fn find_function_key(
     None
 }
 
-fn rename_type_obj(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlError> {
+fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
     let Some(object) = stmt.object.as_deref() else {
         return Ok(());
     };
@@ -276,7 +276,7 @@ fn rename_type_obj(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlEr
     Ok(())
 }
 
-fn rename_schema(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlError> {
+fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
     let old = &stmt.subname;
     let new = &stmt.newname;
 
@@ -375,7 +375,7 @@ fn rename_schema(interp: &mut Database, stmt: &RenameStmt) -> Result<(), DdlErro
 
 // ─── ALTER ... SET SCHEMA ───────────────────────────────────────────────────
 
-pub fn set_schema(interp: &mut Database, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
+pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
     let object_type = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
     let new_schema = stmt.newschema.clone();
 
@@ -402,7 +402,7 @@ pub fn set_schema(interp: &mut Database, stmt: &AlterObjectSchemaStmt) -> Result
 }
 
 fn set_relation_schema(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
     new_schema: String,
 ) -> Result<(), DdlError> {
@@ -459,7 +459,7 @@ fn set_relation_schema(
 }
 
 fn set_function_like_schema(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
     new_schema: String,
     expected: ObjectType,
@@ -507,7 +507,7 @@ fn set_function_like_schema(
 }
 
 fn set_type_schema(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
     new_schema: String,
 ) -> Result<(), DdlError> {

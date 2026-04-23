@@ -4,7 +4,7 @@
 
 pub use cubos_sql_analyzer::schema::{RelationKind, SchemaSnapshot, TypeKind};
 pub use cubos_sql_analyzer::{
-    AnalyzeError, AnalyzedColumn, AnalyzedQuery, Database, DdlError, QualifiedName, Type,
+    AnalyzeError, AnalyzedColumn, AnalyzedQuery, DdlError, PgCatalog, QualifiedName, Type,
 };
 
 /// Terse helper for building a [`QualifiedName`] in tests.
@@ -23,10 +23,10 @@ pub fn build(migrations: &[(&str, &str)]) -> SchemaSnapshot {
     build_db(migrations).into_snapshot()
 }
 
-/// Apply a sequence of migrations and return the live [`Database`] — useful
+/// Apply a sequence of migrations and return the live [`PgCatalog`] — useful
 /// when the test also needs to analyze queries against the resulting schema.
-pub fn build_db(migrations: &[(&str, &str)]) -> Database {
-    let mut db = Database::new();
+pub fn build_db(migrations: &[(&str, &str)]) -> PgCatalog {
+    let mut db = PgCatalog::new();
     for (_, sql) in migrations {
         db.apply_sql(sql).unwrap();
     }
@@ -36,7 +36,7 @@ pub fn build_db(migrations: &[(&str, &str)]) -> Database {
 /// Apply a sequence of migrations and return the `Result` so tests can match
 /// on the specific [`DdlError`] variant.
 pub fn try_apply(migrations: &[(&str, &str)]) -> Result<(), DdlError> {
-    let mut db = Database::new();
+    let mut db = PgCatalog::new();
     for (_, sql) in migrations {
         db.apply_sql(sql)?;
     }
@@ -331,7 +331,7 @@ pub fn assert_identical(a: &AnalyzedQuery, b: &AnalyzedQuery, context: &str) {
 /// Assert a query fails with a `TypeMismatch` whose `actual`/`expected` fields
 /// match exactly. Used for the analyzer's structured type-coercion errors.
 #[track_caller]
-pub fn assert_type_mismatch(db: &Database, sql: &str, expect_actual: &str, expect_expected: &str) {
+pub fn assert_type_mismatch(db: &PgCatalog, sql: &str, expect_actual: &str, expect_expected: &str) {
     match db.analyze(sql) {
         Err(AnalyzeError::TypeMismatch {
             actual,

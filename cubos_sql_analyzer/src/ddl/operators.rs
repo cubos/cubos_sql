@@ -11,9 +11,9 @@ use crate::schema::OperatorEntry;
 
 use super::DdlError;
 use super::util::resolve_type_name;
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
-pub fn define_operator(interp: &mut Database, stmt: &DefineStmt) -> Result<(), DdlError> {
+pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
     // Operator name: `defnames` holds either `[name]` or `[schema, name]`.
     let parts: Vec<String> = stmt
         .defnames
@@ -129,7 +129,7 @@ fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, St
 /// Look up a procedure in the snapshot and return its result type, matching
 /// on the operator's operand types.
 fn resolve_procedure_return(
-    interp: &Database,
+    interp: &PgCatalog,
     schema: Option<&str>,
     name: &str,
     left: Option<u32>,

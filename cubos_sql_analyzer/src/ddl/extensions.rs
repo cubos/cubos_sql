@@ -13,7 +13,7 @@
 use pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt};
 
 use super::{DdlError, InstalledExtension};
-use crate::database::Database;
+use crate::pg_catalog::PgCatalog;
 
 // ─── Extension version graph ────────────────────────────────────────────────
 
@@ -1003,7 +1003,10 @@ static REGISTRY: &[ExtensionDef] = &[
 
 // ─── CREATE EXTENSION ───────────────────────────────────────────────────────
 
-pub fn create_extension(interp: &mut Database, stmt: &CreateExtensionStmt) -> Result<(), DdlError> {
+pub fn create_extension(
+    interp: &mut PgCatalog,
+    stmt: &CreateExtensionStmt,
+) -> Result<(), DdlError> {
     let name = &stmt.extname;
 
     // Check if already installed.
@@ -1094,7 +1097,7 @@ pub fn create_extension(interp: &mut Database, stmt: &CreateExtensionStmt) -> Re
 
 // ─── ALTER EXTENSION UPDATE ─────────────────────────────────────────────────
 
-pub fn alter_extension(interp: &mut Database, stmt: &AlterExtensionStmt) -> Result<(), DdlError> {
+pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Result<(), DdlError> {
     let name = &stmt.extname;
 
     let installed = interp
@@ -1214,7 +1217,7 @@ fn find_upgrade_path<'a>(
 
 /// Apply a list of SQL scripts with a temporary search_path override.
 fn apply_with_schema(
-    interp: &mut Database,
+    interp: &mut PgCatalog,
     schema: &str,
     scripts: &[&str],
 ) -> Result<(), DdlError> {

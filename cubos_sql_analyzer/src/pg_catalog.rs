@@ -1,7 +1,7 @@
-//! The [`Database`] type: a mutable in-memory PostgreSQL schema snapshot.
+//! The [`PgCatalog`] type: a mutable in-memory PostgreSQL schema snapshot.
 //!
-//! `Database` starts from the embedded PostgreSQL 18 seed catalog and evolves
-//! by applying DDL statements via [`Database::apply_sql`]. It is the single
+//! `PgCatalog` starts from the embedded PostgreSQL 18 seed catalog and evolves
+//! by applying DDL statements via [`PgCatalog::apply_sql`]. It is the single
 //! entry point for schema construction in the public API.
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use crate::seed::load_seed;
 /// A mutable in-memory schema. Applies DDL statements on top of a seed
 /// catalog and keeps the snapshot updated as each statement is processed.
 #[derive(Clone)]
-pub struct Database {
+pub struct PgCatalog {
     pub(crate) snapshot: SchemaSnapshot,
     pub(crate) next_oid: u32,
     pub(crate) installed_extensions: HashMap<String, InstalledExtension>,
@@ -25,14 +25,14 @@ pub struct Database {
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
 pub(crate) const USER_OID_START: u32 = 100_000;
 
-impl Default for Database {
+impl Default for PgCatalog {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Database {
-    /// Create a new database seeded with the PostgreSQL 18 built-in catalog.
+impl PgCatalog {
+    /// Create a new catalog seeded with the PostgreSQL 18 built-in catalog.
     pub fn new() -> Self {
         Self {
             snapshot: load_seed(),
@@ -47,7 +47,7 @@ impl Database {
         apply_sql_to(self, sql)
     }
 
-    /// Analyze a SQL query template against this database.
+    /// Analyze a SQL query template against this catalog.
     ///
     /// Lexes `sql` to extract named parameters (`$name`), spreads (`$..name`),
     /// and nullability annotations (`$foo?`, `$foo!`); rewrites the SQL with
@@ -95,7 +95,7 @@ impl Database {
 
     // ── Internal access for tests and the `internal` feature ────────────────
 
-    /// Build a [`Database`] from an existing [`SchemaSnapshot`] (e.g. one
+    /// Build a [`PgCatalog`] from an existing [`SchemaSnapshot`] (e.g. one
     /// restored from serialized JSON). Extension state is discarded.
     #[cfg(any(test, feature = "internal"))]
     pub fn from_snapshot(snapshot: SchemaSnapshot) -> Self {
@@ -106,19 +106,19 @@ impl Database {
         }
     }
 
-    /// Consume the database and return its internal [`SchemaSnapshot`].
+    /// Consume the catalog and return its internal [`SchemaSnapshot`].
     #[cfg(any(test, feature = "internal"))]
     pub fn into_snapshot(self) -> SchemaSnapshot {
         self.snapshot
     }
 
-    /// Borrow the database's internal [`SchemaSnapshot`].
+    /// Borrow the catalog's internal [`SchemaSnapshot`].
     #[cfg(any(test, feature = "internal"))]
     pub fn snapshot(&self) -> &SchemaSnapshot {
         &self.snapshot
     }
 
-    /// Mutably borrow the database's internal [`SchemaSnapshot`]. Exposed
+    /// Mutably borrow the catalog's internal [`SchemaSnapshot`]. Exposed
     /// for tests that need to simulate legacy/partial snapshot states.
     #[cfg(any(test, feature = "internal"))]
     pub fn snapshot_mut(&mut self) -> &mut SchemaSnapshot {
