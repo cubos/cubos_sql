@@ -225,15 +225,25 @@ fn find_polymorphic_match<'a>(
     }
 }
 
+// Polymorphic pseudo-type OIDs (stable across PG versions). The
+// `anycompatible*` family (PG14+) uses the same matching rules as the
+// older `any*` family but binds through PG's common-type algorithm
+// instead of per-position equality. For the analyzer's inference-only
+// use, either family can be unified by checking the shape of `actual`.
+pub(crate) const ANYELEMENT: u32 = 2283;
+pub(crate) const ANYARRAY: u32 = 2277;
+pub(crate) const ANYNONARRAY: u32 = 2776;
+pub(crate) const ANYENUM: u32 = 3500;
+pub(crate) const ANYRANGE: u32 = 3831;
+pub(crate) const ANYMULTIRANGE: u32 = 4537;
+pub(crate) const ANYCOMPATIBLE: u32 = 5077;
+pub(crate) const ANYCOMPATIBLEARRAY: u32 = 5078;
+pub(crate) const ANYCOMPATIBLENONARRAY: u32 = 5079;
+pub(crate) const ANYCOMPATIBLERANGE: u32 = 5080;
+pub(crate) const ANYCOMPATIBLEMULTIRANGE: u32 = 4538;
+
 /// Is `expected` a polymorphic pseudo-type that PG would accept `actual` for?
-fn matches_polymorphic(expected: u32, actual: u32, snapshot: &SchemaSnapshot) -> bool {
-    // Pseudo-type OIDs (stable across PG versions).
-    const ANYELEMENT: u32 = 2283;
-    const ANYARRAY: u32 = 2277;
-    const ANYNONARRAY: u32 = 2776;
-    const ANYENUM: u32 = 3500;
-    const ANYRANGE: u32 = 3831;
-    const ANYMULTIRANGE: u32 = 4537;
+pub(crate) fn matches_polymorphic(expected: u32, actual: u32, snapshot: &SchemaSnapshot) -> bool {
     // Historical array-shaped types that pg_cast doesn't mark as arrays in
     // the normal sense but still satisfy `anyarray` / `anynonarray` for
     // legacy catalog functions.
@@ -247,18 +257,115 @@ fn matches_polymorphic(expected: u32, actual: u32, snapshot: &SchemaSnapshot) ->
         || actual == OIDVECTOR;
 
     match expected {
-        ANYELEMENT => true,
-        ANYARRAY => actual_is_array,
-        ANYNONARRAY => !actual_is_array,
+        ANYELEMENT | ANYCOMPATIBLE => true,
+        ANYARRAY | ANYCOMPATIBLEARRAY => actual_is_array,
+        ANYNONARRAY | ANYCOMPATIBLENONARRAY => !actual_is_array,
         ANYENUM => matches!(
             snapshot.get_type(actual).map(|t| &t.kind),
             Some(crate::schema::TypeKind::Enum { .. })
         ),
-        ANYRANGE | ANYMULTIRANGE => matches!(
+        ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => matches!(
             snapshot.get_type(actual).map(|t| &t.kind),
             Some(crate::schema::TypeKind::Range { .. })
         ),
         _ => false,
+    }
+}
+
+/// Returns true if `oid` is any of the polymorphic pseudo-types.
+pub(crate) fn is_polymorphic(oid: u32) -> bool {
+    matches!(
+        oid,
+        ANYELEMENT
+            | ANYARRAY
+            | ANYNONARRAY
+            | ANYENUM
+            | ANYRANGE
+            | ANYMULTIRANGE
+            | ANYCOMPATIBLE
+            | ANYCOMPATIBLEARRAY
+            | ANYCOMPATIBLENONARRAY
+            | ANYCOMPATIBLERANGE
+            | ANYCOMPATIBLEMULTIRANGE
+    )
+}
+
+/// How "narrow" a polymorphic pseudo-type is. Higher = more specific.
+/// Used as a tie-breaker when multiple polymorphic signatures accept the
+/// same operands — PG prefers the most specific shape (e.g. picks
+/// `anycompatiblearray || anycompatiblearray` over
+/// `anycompatible || anycompatiblearray` when both sides are arrays).
+pub(crate) fn polymorphic_specificity(oid: u32) -> u8 {
+    match oid {
+        // Generic — accepts anything.
+        ANYELEMENT | ANYCOMPATIBLE => 1,
+        // Shape constraint (array vs non-array).
+        ANYARRAY | ANYNONARRAY | ANYCOMPATIBLEARRAY | ANYCOMPATIBLENONARRAY => 2,
+        // Kind constraint (enum / range / multirange).
+        ANYENUM | ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => 3,
+        // Concrete type — not polymorphic, counts as maximally specific.
+        _ => 10,
+    }
+}
+
+/// Given a polymorphic pseudo-type `expected` matched against concrete
+/// `actual`, substitute polymorphic slots on the result side (e.g. the
+/// operator/function return type) with the concrete type derived from
+/// `actual`.
+///
+/// Binding rules:
+/// - `anyelement` / `anynonarray` / `anyenum` / `anycompatible` /
+///   `anycompatiblenonarray` → the concrete arg OID.
+/// - `anyarray` / `anycompatiblearray` → the array OID directly, and the
+///   element OID becomes available for `anyelement`-shaped slots.
+/// - `anyrange` / `anymultirange` / `anycompatiblerange` /
+///   `anycompatiblemultirange` → the range OID.
+pub(crate) fn bind_polymorphic_from(
+    expected: u32,
+    actual: u32,
+    snapshot: &SchemaSnapshot,
+    bound_element: &mut Option<u32>,
+    bound_array: &mut Option<u32>,
+) {
+    match expected {
+        ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
+            bound_element.get_or_insert(actual);
+        }
+        ANYARRAY | ANYCOMPATIBLEARRAY => {
+            bound_array.get_or_insert(actual);
+            if let Some(crate::schema::TypeKind::Array { element_type_oid }) =
+                snapshot.get_type(actual).map(|t| t.kind.clone())
+            {
+                bound_element.get_or_insert(element_type_oid);
+            }
+        }
+        ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => {
+            bound_array.get_or_insert(actual);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve a polymorphic pseudo-type on the result side using bindings
+/// previously collected via [`bind_polymorphic_from`]. Returns `oid`
+/// unchanged if it isn't a polymorphic type.
+pub(crate) fn substitute_polymorphic(
+    oid: u32,
+    bound_element: Option<u32>,
+    bound_array: Option<u32>,
+    snapshot: &SchemaSnapshot,
+) -> u32 {
+    match oid {
+        ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
+            bound_element.unwrap_or(oid)
+        }
+        ANYARRAY | ANYCOMPATIBLEARRAY => bound_array
+            .or_else(|| bound_element.and_then(|e| snapshot.array_type_of(e)))
+            .unwrap_or(oid),
+        ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => {
+            bound_array.unwrap_or(oid)
+        }
+        _ => oid,
     }
 }
 
@@ -380,57 +487,28 @@ fn make_resolved_polymorphic(
     let mut bound_element: Option<u32> = None;
     let mut bound_array: Option<u32> = None;
 
-    const ANYELEMENT: u32 = 2283;
-    const ANYARRAY: u32 = 2277;
-    const ANYNONARRAY: u32 = 2776;
-    const ANYENUM: u32 = 3500;
-    const ANYRANGE: u32 = 3831;
-    const ANYMULTIRANGE: u32 = 4537;
-
     for (&expected, &actual) in f.arg_types.iter().zip(actual_args.iter()) {
-        match expected {
-            ANYELEMENT | ANYNONARRAY | ANYENUM => {
-                bound_element.get_or_insert(actual);
-            }
-            ANYARRAY => {
-                bound_array.get_or_insert(actual);
-                // Remember the element type too so `anyelement` in the
-                // return or out_args resolves consistently.
-                if let Some(crate::schema::TypeKind::Array { element_type_oid }) =
-                    snapshot.get_type(actual).map(|t| t.kind.clone())
-                {
-                    bound_element.get_or_insert(element_type_oid);
-                }
-            }
-            ANYRANGE | ANYMULTIRANGE => {
-                bound_array.get_or_insert(actual);
-            }
-            _ => {}
-        }
+        bind_polymorphic_from(
+            expected,
+            actual,
+            snapshot,
+            &mut bound_element,
+            &mut bound_array,
+        );
     }
 
-    let substitute = |oid: u32| -> u32 {
-        match oid {
-            ANYELEMENT | ANYNONARRAY | ANYENUM => bound_element.unwrap_or(oid),
-            ANYARRAY => {
-                // Prefer a direct `anyarray` binding; else derive the array
-                // type from the bound element.
-                bound_array
-                    .or_else(|| bound_element.and_then(|e| snapshot.array_type_of(e)))
-                    .unwrap_or(oid)
-            }
-            ANYRANGE | ANYMULTIRANGE => bound_array.unwrap_or(oid),
-            _ => oid,
-        }
-    };
-
-    let return_type_oid = substitute(f.agg_final_type_oid.unwrap_or(f.return_type_oid));
+    let return_type_oid = substitute_polymorphic(
+        f.agg_final_type_oid.unwrap_or(f.return_type_oid),
+        bound_element,
+        bound_array,
+        snapshot,
+    );
     let out_args = f
         .out_args
         .iter()
         .map(|field| crate::schema::CompositeField {
             name: field.name.clone(),
-            type_oid: substitute(field.type_oid),
+            type_oid: substitute_polymorphic(field.type_oid, bound_element, bound_array, snapshot),
             not_null: field.not_null,
         })
         .collect();
@@ -506,6 +584,21 @@ const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
     "coalesce",
     "greatest",
     "least",
+    // JSON constructors: non-strict, always produce a JSON/JSONB value
+    // (a JSON `null` entry for a SQL NULL argument — never SQL NULL).
+    "json_build_object",
+    "jsonb_build_object",
+    "json_build_array",
+    "jsonb_build_array",
+    // Ranking window functions: evaluate once per row and always yield an
+    // integer (`row_number`/`rank`/`dense_rank`/`ntile`) or a float
+    // (`percent_rank`/`cume_dist`). Never NULL.
+    "row_number",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "ntile",
 ];
 
 /// Returns true if a pg_catalog non-strict function is guaranteed to never

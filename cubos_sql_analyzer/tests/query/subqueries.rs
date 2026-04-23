@@ -75,6 +75,61 @@ fn in_subquery() {
     assert_cols(&s, vec![c("id", int8()), c("name", text())]);
 }
 
+#[test]
+fn not_in_subquery() {
+    let db = setup();
+    // NOT IN is a semi-anti-join — doesn't affect the outer row shape.
+    let s = db
+        .analyze(
+            "SELECT id FROM users \
+             WHERE id NOT IN (SELECT user_id FROM posts)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+// ── ANY / ALL (subquery) ─────────────────────────────────────────────────────
+
+#[test]
+fn any_subquery() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id FROM users \
+             WHERE id = ANY(SELECT user_id FROM posts)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn all_subquery() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id FROM users \
+             WHERE age < ALL(SELECT rating FROM comments)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+// ── NOT EXISTS ───────────────────────────────────────────────────────────────
+
+#[test]
+fn not_exists_subquery() {
+    let db = setup();
+    // NOT EXISTS, like EXISTS, returns a definite bool.
+    let s = db
+        .analyze(
+            "SELECT u.name, \
+                    NOT EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id) AS orphan \
+             FROM users u",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("name", text()), c("orphan", bool_ty())]);
+}
+
 // ── EXISTS subquery ──────────────────────────────────────────────────────────
 
 #[test]

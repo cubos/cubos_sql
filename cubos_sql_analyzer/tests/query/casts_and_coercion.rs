@@ -57,3 +57,55 @@ fn complex_cast_preserves_nullability() {
     // id is NOT NULL → id::text is NOT NULL.
     assert!(!col(&info, "id_text").nullable);
 }
+
+// ── Numeric tower: int2 → int4 → int8 → numeric → float4 → float8 ────────────
+
+#[test]
+fn numeric_tower_int2_to_int8() {
+    let db = setup();
+    let s = db.analyze("SELECT 1::int2::int8 AS n").unwrap();
+    assert_cols(&s, vec![c("n", int8())]);
+}
+
+#[test]
+fn numeric_tower_int4_to_numeric() {
+    let db = setup();
+    let s = db.analyze("SELECT 1::int4::numeric AS n").unwrap();
+    assert_cols(&s, vec![c("n", numeric())]);
+}
+
+#[test]
+fn numeric_tower_numeric_to_float8() {
+    let db = setup();
+    let s = db.analyze("SELECT (1::numeric)::float8 AS n").unwrap();
+    assert_cols(&s, vec![c("n", float8())]);
+}
+
+#[test]
+fn numeric_tower_float4_to_float8() {
+    let db = setup();
+    let s = db.analyze("SELECT (1.0::float4)::float8 AS n").unwrap();
+    assert_cols(&s, vec![c("n", float8())]);
+}
+
+// ── Array cast ───────────────────────────────────────────────────────────────
+
+#[test]
+fn cast_array_literal_to_int8_array() {
+    let db = setup();
+    let s = db.analyze("SELECT ARRAY[1,2]::int8[] AS xs").unwrap();
+    assert_cols(&s, vec![c("xs", array_of(int8()))]);
+}
+
+// ── Cast inside a VALUES list projected from a subquery ──────────────────────
+
+#[test]
+fn cast_in_values_subquery() {
+    let db = setup();
+    // VALUES infers the column type from the first row's expressions; the
+    // cast pins the element type so downstream consumers see int8.
+    let s = db
+        .analyze("SELECT x FROM (VALUES (1::int8), (2)) AS t(x)")
+        .unwrap();
+    assert_cols(&s, vec![c("x", int8())]);
+}

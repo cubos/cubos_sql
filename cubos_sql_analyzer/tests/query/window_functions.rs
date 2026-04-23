@@ -1,6 +1,155 @@
-//! Window functions — **coverage gap**.
-//!
-//! TODO: OVER clause, PARTITION BY, window ORDER BY, window frames
-//! (ROWS/RANGE/GROUPS), ranking functions (row_number, rank, dense_rank,
-//! ntile), value functions (lead, lag, first_value, last_value, nth_value),
-//! nullability rules for window functions over empty partitions.
+//! Window functions: `OVER`, `PARTITION BY`, ordering, and the return
+//! types of ranking (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`), value
+//! functions (`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`), and
+//! aggregate-over-window (`SUM`/`AVG`/`COUNT`) calls.
+
+use crate::common::*;
+
+fn setup() -> PgCatalog {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE posts (
+            id      BIGINT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            title   TEXT NOT NULL,
+            views   INT NOT NULL
+         );",
+    )
+    .unwrap();
+    db
+}
+
+// ── Ranking functions ───────────────────────────────────────────────────────
+
+#[test]
+fn row_number_over_order_by() {
+    let db = setup();
+    // Ranking functions always produce a value for every row — NOT NULL.
+    let s = db
+        .analyze("SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("rn", int8())]);
+}
+
+#[test]
+fn rank_over_partition_and_order() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT user_id, RANK() OVER (PARTITION BY user_id ORDER BY views DESC) AS r \
+             FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("user_id", int8()), c("r", int8())]);
+}
+
+#[test]
+fn dense_rank_returns_int8() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT DENSE_RANK() OVER (ORDER BY views) AS dr FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("dr", int8())]);
+}
+
+#[test]
+fn ntile_returns_int4() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT NTILE(4) OVER (ORDER BY views) AS bucket FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("bucket", int4())]);
+}
+
+// ── Aggregates used as window functions ──────────────────────────────────────
+
+#[test]
+fn sum_over_partition() {
+    let db = setup();
+    // SUM over an int4 column promotes to int8 — same rule as non-window SUM.
+    let s = db
+        .analyze("SELECT id, SUM(views) OVER (PARTITION BY user_id) AS total FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), cn("total", int8())]);
+}
+
+#[test]
+fn count_over_empty_partition() {
+    let db = setup();
+    // COUNT(*) is NOT NULL (and the analyzer agrees), even as a window
+    // function with an empty frame.
+    let s = db
+        .analyze("SELECT id, COUNT(*) OVER () AS total FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("total", int8())]);
+}
+
+#[test]
+fn avg_over_order_by() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT AVG(views) OVER (ORDER BY id) AS running FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("running", numeric())]);
+}
+
+// ── Value window functions ───────────────────────────────────────────────────
+//
+// `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` can return NULL at
+// the partition/frame edge even when the source column is NOT NULL:
+// `LAG(title)` is NULL on the first row of each partition. The analyzer
+// has to override the usual "strict pg_catalog function inherits arg
+// nullability" rule for these.
+
+#[test]
+fn lag_over_not_null_column_is_nullable() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT LAG(title) OVER (ORDER BY id) AS prev FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("prev", text())]);
+}
+
+#[test]
+fn lead_over_not_null_column_is_nullable() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT LEAD(views) OVER (ORDER BY id) AS next FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("next", int4())]);
+}
+
+#[test]
+fn first_value_is_nullable() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT FIRST_VALUE(title) OVER (PARTITION BY user_id ORDER BY id) AS first FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("first", text())]);
+}
+
+#[test]
+fn nth_value_is_nullable() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT NTH_VALUE(title, 2) OVER (ORDER BY id) AS second FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("second", text())]);
+}
+
+// ── Named window (WINDOW … AS …) ─────────────────────────────────────────────
+
+#[test]
+fn named_window_clause() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id, ROW_NUMBER() OVER w AS rn \
+             FROM posts \
+             WINDOW w AS (PARTITION BY user_id ORDER BY views DESC)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("rn", int8())]);
+}

@@ -287,6 +287,178 @@ fn lateral_subquery_sees_outer_scope() {
     assert_eq!(col(&info, "double_id").pg_type, int8());
 }
 
+#[test]
+fn lateral_subquery_multi_column() {
+    let db = setup();
+    // Multiple projected columns in the LATERAL body all inherit `u`'s
+    // scope and carry distinct types out.
+    let sql = "SELECT u.id, s.a, s.b \
+               FROM users u, LATERAL (SELECT u.id + 1 AS a, u.name AS b) s";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "id").pg_type, int8());
+    assert_eq!(col(&info, "a").pg_type, int8());
+    assert_eq!(col(&info, "b").pg_type, text());
+    assert!(!col(&info, "a").nullable);
+    assert!(!col(&info, "b").nullable);
+}
+
+#[test]
+fn lateral_subquery_with_column_alias_list() {
+    let db = setup();
+    // `AS s(x, y)` after a LATERAL subquery renames the projected columns
+    // positionally — same shape as the non-LATERAL path.
+    let sql = "SELECT u.id, s.x, s.y \
+               FROM users u, LATERAL (SELECT u.id, u.name) AS s(x, y)";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "x").pg_type, int8());
+    assert_eq!(col(&info, "y").pg_type, text());
+}
+
+#[test]
+fn lateral_subquery_with_param() {
+    let db = setup();
+    // A param inside the LATERAL body is typed from the outer arithmetic
+    // context; `u.id + $p1` pins `$p1` to int8.
+    let sql = "SELECT u.id, s.val \
+               FROM users u, LATERAL (SELECT u.id + $p1 AS val) s";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "val").pg_type, int8());
+    assert_eq!(info.params.len(), 1);
+    assert_eq!(info.params[0].pg_type, int8());
+}
+
+#[test]
+fn lateral_subquery_with_row_to_json() {
+    let db = setup();
+    // `row_to_json(u.*)` inside LATERAL sees the composite row of `u` via
+    // the inherited scope — result is a non-null json.
+    let sql = "SELECT u.id, j.doc \
+               FROM users u, LATERAL (SELECT row_to_json(u.*) AS doc) j";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "doc").pg_type, json_ty());
+    assert!(!col(&info, "doc").nullable);
+}
+
+// ── LATERAL with JOIN — table alias sees rows on the left ────────────────────
+
+#[test]
+fn cross_join_lateral_with_limit_1() {
+    let db = setup();
+    // Classic "for each user, fetch their top comment author" — the inner
+    // SELECT is correlated and LIMIT 1 makes it produce at most one row per
+    // outer row.
+    let sql = "SELECT u.id, top_c.author_name \
+               FROM users u \
+               CROSS JOIN LATERAL ( \
+                   SELECT c.author_name FROM comments c \
+                   WHERE c.post_id = u.id \
+                   ORDER BY c.id DESC LIMIT 1 \
+               ) top_c";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "id").pg_type, int8());
+    assert_eq!(col(&info, "author_name").pg_type, text());
+    assert!(!col(&info, "author_name").nullable);
+}
+
+#[test]
+fn left_join_lateral_produces_nullable_columns() {
+    let db = setup();
+    // LEFT JOIN LATERAL: if the inner SELECT yields zero rows for a given
+    // outer row, those columns come back NULL — so the join reporter must
+    // mark them nullable even when the inner `author_name` is NOT NULL.
+    let sql = "SELECT u.id, top_c.author_name \
+               FROM users u \
+               LEFT JOIN LATERAL ( \
+                   SELECT c.author_name FROM comments c \
+                   WHERE c.post_id = u.id \
+                   ORDER BY c.id DESC LIMIT 1 \
+               ) top_c ON true";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "id").pg_type, int8());
+    assert_eq!(col(&info, "author_name").pg_type, text());
+    assert!(col(&info, "author_name").nullable);
+}
+
+#[test]
+fn lateral_correlated_aggregate() {
+    let db = setup();
+    // COUNT(*) in a correlated LATERAL: every outer row still gets a row
+    // back (COUNT returns 0 for empty input), so the result is NOT NULL.
+    let sql = "SELECT u.id, agg.total \
+               FROM users u \
+               CROSS JOIN LATERAL ( \
+                   SELECT COUNT(*) AS total FROM comments c WHERE c.post_id = u.id \
+               ) agg";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "total").pg_type, int8());
+    assert!(!col(&info, "total").nullable);
+}
+
+#[test]
+fn left_join_lateral_aggregate_becomes_nullable() {
+    let db = setup();
+    // Semantically COUNT(*) always produces a row, so `total` should stay
+    // NOT NULL even under LEFT JOIN LATERAL. The analyzer conservatively
+    // treats every LEFT JOIN'd column as nullable because it doesn't
+    // reason about "this subquery is guaranteed non-empty". That matches
+    // PG's own planner output (columns from a LEFT JOIN'd relation are
+    // reported as nullable in ROW descriptions), so we freeze the
+    // conservative behavior here.
+    let sql = "SELECT u.id, agg.total \
+               FROM users u \
+               LEFT JOIN LATERAL ( \
+                   SELECT COUNT(*) AS total FROM comments c WHERE c.post_id = u.id \
+               ) agg ON true";
+    let info = db.analyze(sql).unwrap();
+    assert!(col(&info, "total").nullable);
+}
+
+// ── LATERAL on an SRF (RangeFunction) ────────────────────────────────────────
+
+#[test]
+fn lateral_unnest_correlated_array_built_from_outer_column() {
+    let db = setup();
+    // `ARRAY[u.name, 'extra']` is an outer-correlated array expression
+    // whose element type (`text`) must reach the SRF. Without the LATERAL
+    // scope wiring for RangeFunction args, `u.name` would resolve to
+    // UNKNOWN and `unnest` would pick the wrong polymorphic overload
+    // (`anymultirange -> anyrange`).
+    let sql = "SELECT u.id, t.tag \
+               FROM users u, LATERAL unnest(ARRAY[u.name, 'extra']) AS t(tag)";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "id").pg_type, int8());
+    assert_eq!(col(&info, "tag").pg_type, text());
+    assert!(col(&info, "tag").nullable);
+}
+
+// ── Nested LATERAL ───────────────────────────────────────────────────────────
+
+#[test]
+fn nested_lateral_inner_sees_outermost_scope() {
+    let db = setup();
+    // Inner LATERAL sees both its immediate parent (the middle LATERAL)
+    // and the outermost `users u`. The chain of scope inheritance has to
+    // reach all the way out.
+    let sql = "SELECT u.id, outer_s.inner_val \
+               FROM users u, LATERAL ( \
+                   SELECT inner_s.v AS inner_val FROM LATERAL (SELECT u.id * 3 AS v) inner_s \
+               ) outer_s";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "inner_val").pg_type, int8());
+}
+
+// ── Plain (non-LATERAL) FROM does NOT inherit scope ──────────────────────────
+
+#[test]
+fn non_lateral_subquery_cannot_see_outer_scope() {
+    let db = setup();
+    // Without LATERAL the inner subquery can't reference `u.id` — PG
+    // rejects this, and so should the analyzer.
+    let sql = "SELECT u.name, s.double_id \
+               FROM users u, (SELECT u.id * 2 AS double_id) s";
+    assert_analyze_err!(db.analyze(sql), AnalyzeError::UnknownColumn(_), "u.id");
+}
+
 // ── Subquery column alias list overrides inner names ─────────────────────────
 
 #[test]
@@ -321,6 +493,45 @@ fn exists_constant_without_from() {
     assert_eq!(info.columns.len(), 1);
     assert!(!info.columns[0].nullable, "EXISTS should be NOT NULL");
     assert_eq!(info.columns[0].pg_type, bool_ty());
+}
+
+// ── Duplicate output aliases ─────────────────────────────────────────────────
+//
+// PG allows the same column name to appear twice in SELECT; the analyzer
+// should surface both without collapsing them or erroring.
+
+#[test]
+fn duplicate_output_column_name() {
+    let db = setup();
+    let s = db.analyze("SELECT id, id FROM users").unwrap();
+    // Both columns survive with identical name + type.
+    assert_cols(&s, vec![c("id", int8()), c("id", int8())]);
+}
+
+#[test]
+fn duplicate_explicit_alias() {
+    let db = setup();
+    let s = db.analyze("SELECT id AS x, name AS x FROM users").unwrap();
+    assert_cols(&s, vec![c("x", int8()), c("x", text())]);
+}
+
+// ── SRF in the SELECT list ───────────────────────────────────────────────────
+
+#[test]
+fn srf_unnest_in_select_list_returns_single_column() {
+    let db = setup();
+    // `SELECT unnest(ARRAY[1,2,3])` — an SRF in the projection expands into
+    // a single column using the function name as the alias.
+    let s = db.analyze("SELECT unnest(ARRAY[1,2,3])").unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "unnest").pg_type, int4());
+}
+
+#[test]
+fn srf_generate_series_int() {
+    let db = setup();
+    let s = db.analyze("SELECT generate_series(1, 10) AS n").unwrap();
+    assert_cols(&s, vec![c("n", int4())]);
 }
 
 // ── Annotations on LEFT JOIN ─────────────────────────────────────────────────

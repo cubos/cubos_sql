@@ -250,6 +250,16 @@ pub struct OperatorEntry {
     pub result_type_oid: u32,
 }
 
+/// Result of operator resolution: the operand and result OIDs with any
+/// polymorphic pseudo-types (`anyelement`, `anycompatiblearray`, …)
+/// already substituted by the concrete types of the arguments.
+#[derive(Debug, Clone)]
+pub struct ResolvedOperator {
+    pub left_type_oid: Option<u32>,
+    pub right_type_oid: u32,
+    pub result_type_oid: u32,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Casts
 // ──────────────────────────────────────────────────────────────────────────────
@@ -501,7 +511,7 @@ impl SchemaSnapshot {
         name: &str,
         left_oid: Option<u32>,
         right_oid: u32,
-    ) -> Option<&OperatorEntry> {
+    ) -> Option<ResolvedOperator> {
         use self::oid;
 
         let mut candidate_buf: Vec<&OperatorEntry> = Vec::new();
@@ -531,7 +541,7 @@ impl SchemaSnapshot {
             .iter()
             .find(|o| o.left_type_oid == left_oid && o.right_type_oid == right_oid)
         {
-            return Some(op);
+            return Some(concretize_operator(op, left_oid, right_oid, self));
         }
 
         // Step 2: match via implicit casts (non-UNKNOWN operands only).
@@ -543,7 +553,69 @@ impl SchemaSnapshot {
             };
             left_ok && self.has_implicit_cast(right_oid, o.right_type_oid)
         }) {
-            return Some(op);
+            return Some(concretize_operator(op, left_oid, right_oid, self));
+        }
+
+        // Step 2b: polymorphic match. Operators declared over pseudo-types
+        // (`anyarray || anyarray`, `anycompatible || anycompatiblearray`, …)
+        // never appear as exact matches — PG resolves them by checking the
+        // shape of the concrete operands against the pseudo-type's
+        // constraint, then substitutes the bound types into the result.
+        //
+        // We narrow candidates to exactly one polymorphic match; if the
+        // catalog has more than one (e.g. `anycompatible || anycompatiblearray`
+        // vs `anycompatiblearray || anycompatible`), we rely on the actual
+        // array-vs-element shape of the operands to pick the single right one.
+        let poly_matches: Vec<&OperatorEntry> = candidates
+            .iter()
+            .filter(|o| {
+                let left_ok = match (o.left_type_oid, left_oid) {
+                    (Some(expected), Some(actual))
+                        if crate::functions::is_polymorphic(expected) =>
+                    {
+                        crate::functions::matches_polymorphic(expected, actual, self)
+                    }
+                    (Some(expected), Some(actual)) => {
+                        expected == actual || self.has_implicit_cast(actual, expected)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                let right_ok = if crate::functions::is_polymorphic(o.right_type_oid) {
+                    crate::functions::matches_polymorphic(o.right_type_oid, right_oid, self)
+                } else {
+                    o.right_type_oid == right_oid
+                        || self.has_implicit_cast(right_oid, o.right_type_oid)
+                };
+                let has_any_poly = o
+                    .left_type_oid
+                    .is_some_and(crate::functions::is_polymorphic)
+                    || crate::functions::is_polymorphic(o.right_type_oid);
+                has_any_poly && left_ok && right_ok
+            })
+            .copied()
+            .collect();
+        // PG tie-break: among polymorphic candidates, pick the most specific
+        // signature. Sum the per-position specificity and keep only
+        // candidates that tie at the maximum.
+        if !poly_matches.is_empty() {
+            let score = |o: &&OperatorEntry| -> u16 {
+                let l = o
+                    .left_type_oid
+                    .map(crate::functions::polymorphic_specificity)
+                    .unwrap_or(10) as u16;
+                let r = crate::functions::polymorphic_specificity(o.right_type_oid) as u16;
+                l + r
+            };
+            let max_score = poly_matches.iter().map(&score).max().unwrap();
+            let best: Vec<&OperatorEntry> = poly_matches
+                .iter()
+                .filter(|o| score(o) == max_score)
+                .copied()
+                .collect();
+            if best.len() == 1 {
+                return Some(concretize_operator(best[0], left_oid, right_oid, self));
+            }
         }
 
         // Step 3 (PG §10.2 step 3): UNKNOWN-aware resolution.
@@ -571,7 +643,10 @@ impl SchemaSnapshot {
             .collect();
 
         if remaining.len() <= 1 {
-            return remaining.into_iter().next();
+            return remaining
+                .into_iter()
+                .next()
+                .map(|o| concretize_operator(o, left_oid, right_oid, self));
         }
 
         // 3b. If one side is known, keep only candidates that accept exactly
@@ -598,7 +673,10 @@ impl SchemaSnapshot {
         }
 
         if remaining.len() <= 1 {
-            return remaining.into_iter().next();
+            return remaining
+                .into_iter()
+                .next()
+                .map(|o| concretize_operator(o, left_oid, right_oid, self));
         }
 
         // 3c (PG §10.2 step 3e-f). For each UNKNOWN position, check if all
@@ -619,7 +697,7 @@ impl SchemaSnapshot {
         }
 
         if remaining.len() == 1 {
-            return Some(remaining[0]);
+            return Some(concretize_operator(remaining[0], left_oid, right_oid, self));
         }
 
         // 3d. Final fallback: resolve UNKNOWN positions to `text`, since
@@ -649,7 +727,12 @@ impl SchemaSnapshot {
             .copied()
             .collect();
         if text_matches.len() == 1 {
-            return Some(text_matches[0]);
+            return Some(concretize_operator(
+                text_matches[0],
+                resolved_left,
+                resolved_right,
+                self,
+            ));
         }
 
         // Truly ambiguous — return None so callers can use fallback logic.
@@ -694,5 +777,57 @@ impl SchemaSnapshot {
             .copied()
             .collect();
         preferred
+    }
+}
+
+/// Turn an [`OperatorEntry`] — which may declare polymorphic pseudo-types on
+/// its operands and result — into a [`ResolvedOperator`] whose OIDs are
+/// already substituted with the concrete types derived from the caller's
+/// operands. For non-polymorphic operators the result just mirrors the
+/// entry's declared OIDs.
+fn concretize_operator(
+    op: &OperatorEntry,
+    left_actual: Option<u32>,
+    right_actual: u32,
+    snapshot: &SchemaSnapshot,
+) -> ResolvedOperator {
+    let mut bound_element: Option<u32> = None;
+    let mut bound_array: Option<u32> = None;
+    if let (Some(expected_l), Some(actual_l)) = (op.left_type_oid, left_actual)
+        && crate::functions::is_polymorphic(expected_l)
+    {
+        crate::functions::bind_polymorphic_from(
+            expected_l,
+            actual_l,
+            snapshot,
+            &mut bound_element,
+            &mut bound_array,
+        );
+    }
+    if crate::functions::is_polymorphic(op.right_type_oid) {
+        crate::functions::bind_polymorphic_from(
+            op.right_type_oid,
+            right_actual,
+            snapshot,
+            &mut bound_element,
+            &mut bound_array,
+        );
+    }
+    ResolvedOperator {
+        left_type_oid: op.left_type_oid.map(|o| {
+            crate::functions::substitute_polymorphic(o, bound_element, bound_array, snapshot)
+        }),
+        right_type_oid: crate::functions::substitute_polymorphic(
+            op.right_type_oid,
+            bound_element,
+            bound_array,
+            snapshot,
+        ),
+        result_type_oid: crate::functions::substitute_polymorphic(
+            op.result_type_oid,
+            bound_element,
+            bound_array,
+            snapshot,
+        ),
     }
 }

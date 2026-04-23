@@ -21,7 +21,6 @@ use crate::types::Type;
 pub(crate) struct ParamInfo {
     pub pg_type: Type,
     pub nullable: bool,
-    pub cast_type: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -48,10 +47,6 @@ pub struct AnalyzedParam {
     pub sql_offsets: Vec<usize>,
     pub pg_type: Type,
     pub nullable: bool,
-    /// PostgreSQL type name for explicit cast (`::jsonb`, `::int8`, …).
-    /// Derived from [`AnalyzedParam::pg_type`] — domains are unwrapped to
-    /// their base type.
-    pub cast_type: Option<String>,
 }
 
 /// A field inside a spread parameter (`$..name { field1, field2 }`), with
@@ -61,7 +56,6 @@ pub struct AnalyzedSpreadField {
     pub name: String,
     pub pg_type: Type,
     pub nullable: bool,
-    pub cast_type: Option<String>,
 }
 
 /// A spread parameter (`$..name { ... }`) with its offset in the rewritten SQL
@@ -143,7 +137,6 @@ pub(crate) fn fuse(
             sql_offsets: p.sql_offsets,
             pg_type: pi.pg_type.clone(),
             nullable: pi.nullable,
-            cast_type: pi.cast_type.clone(),
         });
     }
 
@@ -159,7 +152,6 @@ pub(crate) fn fuse(
                 name: lf.name,
                 pg_type: pi.pg_type.clone(),
                 nullable: pi.nullable,
-                cast_type: pi.cast_type.clone(),
             });
             spread_param_cursor += 1;
         }
@@ -298,6 +290,7 @@ fn infer_expr_propagate_mismatch(
 // Raw output types (before Rust type mapping)
 // ──────────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub(crate) struct RawColumn {
     pub name: String,
     pub type_oid: u32,
@@ -353,7 +346,7 @@ fn analyze_select_with_ctes_and_outer(
     if let Some(with) = &sel.with_clause {
         for cte_node in &with.ctes {
             if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                let cte_columns = analyze_cte(cte, snapshot, params, &cte_scopes)?;
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
                 cte_scopes.insert(cte.ctename.clone(), cte_columns);
             }
         }
@@ -572,6 +565,53 @@ fn analyze_insert(
         }
     }
 
+    // `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`.
+    //
+    // DO UPDATE exposes a virtual `EXCLUDED` relation holding the proposed
+    // row. We model it in scope as a second alias over the target table:
+    // the columns share names and types, and nullability follows the real
+    // columns because PG rejects an INSERT that violates NOT NULL before
+    // the conflict handler runs.
+    if let Some(on_conflict) = &ins.on_conflict_clause {
+        let mut conflict_scope = Scope::default();
+        let target_qn = crate::qualified_name::QualifiedName::new(&table.schema, &table.name);
+        conflict_scope.add_dml_target(&relation.relname, target_qn.clone(), &table.columns);
+        conflict_scope.add_dml_target("excluded", target_qn, &table.columns);
+        let conflict_null_ctx = NullabilityContext::default();
+        for set_item in &on_conflict.target_list {
+            if let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref()
+                && let Some(val) = &rt.val
+            {
+                // Find the target column's type so the rhs param can be
+                // inferred — mirrors the VALUES path above.
+                let goal = table
+                    .columns
+                    .iter()
+                    .find(|c| c.name == rt.name)
+                    .map(|tc| TypeGoal::assignment(tc.type_oid))
+                    .unwrap_or(TypeGoal::NONE);
+                let _ = expr::infer_expr(
+                    val,
+                    &conflict_scope,
+                    &conflict_null_ctx,
+                    snapshot,
+                    params,
+                    goal,
+                );
+            }
+        }
+        if let Some(where_clause) = &on_conflict.where_clause {
+            let _ = expr::infer_expr(
+                where_clause,
+                &conflict_scope,
+                &conflict_null_ctx,
+                snapshot,
+                params,
+                TypeGoal::implicit(oid::BOOL),
+            );
+        }
+    }
+
     // Resolve RETURNING list.
     let mut ret_scope = Scope::default();
     let ret_null_ctx = NullabilityContext::default();
@@ -778,6 +818,7 @@ fn analyze_set_operation(
 
 fn analyze_cte(
     cte: &protobuf::CommonTableExpr,
+    with_recursive: bool,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     existing_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -788,9 +829,69 @@ fn analyze_cte(
         .and_then(|n| n.node.as_ref())
         .ok_or_else(|| AnalyzeError::Unsupported("CTE without query".into()))?;
 
+    // `WITH RECURSIVE` — the recursive branch references the CTE by name, so
+    // we have to seed the scope before analyzing it. pg_query's AST doesn't
+    // set `cterecursive` on individual CTEs without full parse analysis, so
+    // we rely on the enclosing `WithClause.recursive` flag (true when the
+    // user wrote `WITH RECURSIVE`) plus the UNION shape of the inner query.
+    // We (1) analyze the seed arm alone to type the CTE's columns,
+    // (2) register those columns in a temporary scope, (3) analyze the
+    // recursive arm against that scope, (4) unify the two arms' column
+    // types via `find_common_type` — matching PG's common-type resolution.
+    if with_recursive
+        && let node::Node::SelectStmt(sel) = cte_query
+        && sel.op != SetOperation::SetopNone as i32
+        && let (Some(larg), Some(rarg)) = (sel.larg.as_ref(), sel.rarg.as_ref())
+    {
+        let (seed_cols, _) = analyze_select_with_ctes(larg, snapshot, params, existing_ctes)?;
+        let seed_cols = apply_cte_column_aliases(seed_cols, &cte.aliascolnames);
+
+        // Register the CTE against its seed types so the recursive arm can
+        // resolve `FROM t`.
+        let mut scopes_with_self = existing_ctes.clone();
+        let self_scope: Vec<ScopeColumn> = seed_cols
+            .iter()
+            .cloned()
+            .map(|rc| ScopeColumn {
+                name: rc.name,
+                type_oid: rc.type_oid,
+                base_not_null: !rc.nullable,
+                table_alias: cte.ctename.clone(),
+                record_fields: rc.record_fields,
+            })
+            .collect();
+        scopes_with_self.insert(cte.ctename.clone(), self_scope);
+
+        let (rec_cols, _) = analyze_select_with_ctes(rarg, snapshot, params, &scopes_with_self)?;
+        if seed_cols.len() != rec_cols.len() {
+            return Err(AnalyzeError::Unsupported(
+                "recursive CTE branches have different column counts".into(),
+            ));
+        }
+
+        let unified: Vec<ScopeColumn> = seed_cols
+            .into_iter()
+            .zip(rec_cols)
+            .map(|(s, r)| {
+                let type_oid = crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
+                    .unwrap_or(s.type_oid);
+                ScopeColumn {
+                    name: s.name,
+                    type_oid,
+                    // Either arm producing NULL makes the column nullable.
+                    base_not_null: !(s.nullable || r.nullable),
+                    table_alias: cte.ctename.clone(),
+                    record_fields: s.record_fields,
+                }
+            })
+            .collect();
+        return Ok(unified);
+    }
+
     match cte_query {
         node::Node::SelectStmt(sel) => {
             let (cols, _) = analyze_select_with_ctes(sel, snapshot, params, existing_ctes)?;
+            let cols = apply_cte_column_aliases(cols, &cte.aliascolnames);
             Ok(cols
                 .into_iter()
                 .map(|rc| ScopeColumn {
@@ -845,6 +946,31 @@ fn analyze_cte(
             "CTE with unsupported statement type".into(),
         )),
     }
+}
+
+/// Rename `cols` using the `aliascolnames` from `WITH name(col1, col2) AS …`
+/// if present. PG uses positional matching; if the CTE has fewer aliases
+/// than columns, the trailing columns keep their inner names.
+fn apply_cte_column_aliases(cols: Vec<RawColumn>, aliases: &[protobuf::Node]) -> Vec<RawColumn> {
+    if aliases.is_empty() {
+        return cols;
+    }
+    let names: Vec<String> = aliases
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    cols.into_iter()
+        .enumerate()
+        .map(|(i, c)| RawColumn {
+            name: names.get(i).cloned().unwrap_or(c.name),
+            type_oid: c.type_oid,
+            nullable: c.nullable,
+            record_fields: c.record_fields,
+        })
+        .collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1038,6 +1164,15 @@ fn process_range_function(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
+    // In LATERAL position (`FROM users u, LATERAL unnest(u.tags) …`) the SRF
+    // args see the previously-listed FROM items, same as a LATERAL subquery.
+    // Without this the arg would resolve to UNKNOWN and overload selection
+    // would collapse into the wrong polymorphic candidate.
+    let arg_scope_sources = if rf.lateral {
+        scope.sources.clone()
+    } else {
+        Vec::new()
+    };
     // Each entry in `functions` is a 2-element `List` — [FuncCall, coldeflist].
     // We support only the simple form: a single function call, no explicit
     // column definitions. `ROWS FROM (…)` with multiple functions or user-
@@ -1097,15 +1232,15 @@ fn process_range_function(
         .unwrap_or_default();
 
     // Infer arg types so overload resolution can pick the right function.
-    // Args of a top-level SRF call don't see the FROM scope of the enclosing
-    // SELECT (same rule PG applies), so use an empty scope.
-    let empty_scope = Scope::default();
+    // Non-LATERAL SRF args can't see the enclosing FROM; LATERAL args can.
+    let mut arg_scope = Scope::default();
+    arg_scope.sources.extend(arg_scope_sources);
     let empty_null_ctx = NullabilityContext::default();
     let mut arg_types = Vec::with_capacity(func_call.args.len());
     for arg in &func_call.args {
         let t = expr::infer_expr(
             arg,
-            &empty_scope,
+            &arg_scope,
             &empty_null_ctx,
             snapshot,
             params,
@@ -1416,12 +1551,7 @@ fn build_param_info(
     snapshot: &SchemaSnapshot,
 ) -> Result<ParamInfo, AnalyzeError> {
     let pg_type = resolve_type(type_oid, snapshot)?;
-    let cast_type = pg_type.cast_name();
-    Ok(ParamInfo {
-        pg_type,
-        nullable,
-        cast_type,
-    })
+    Ok(ParamInfo { pg_type, nullable })
 }
 
 /// Build the PG-facing [`Type`] for an OID, recursing through Domain/Array

@@ -147,6 +147,126 @@ fn where_comparison_operators() {
     assert_params(&s, vec![p(int4()), p(int4()), p(text())]);
 }
 
+// ── BETWEEN ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn where_between_literals() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE age BETWEEN 18 AND 65")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![]);
+}
+
+#[test]
+fn where_between_params() {
+    let db = setup();
+    // Both bounds are walked with the lhs column type as the inference goal,
+    // so `$p1`/`$p2` resolve to `int4` (the type of `age`).
+    let s = db
+        .analyze("SELECT id FROM users WHERE age BETWEEN $p1 AND $p2")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int4()), p(int4())]);
+}
+
+#[test]
+fn where_not_between_params() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE age NOT BETWEEN $p1 AND $p2")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int4()), p(int4())]);
+}
+
+#[test]
+fn where_between_symmetric_with_params() {
+    let db = setup();
+    // BETWEEN SYMMETRIC should route through the same walker as plain BETWEEN.
+    let s = db
+        .analyze("SELECT id FROM users WHERE age BETWEEN SYMMETRIC $p1 AND $p2")
+        .unwrap();
+    assert_params(&s, vec![p(int4()), p(int4())]);
+}
+
+// ── IS [NOT] DISTINCT FROM ──────────────────────────────────────────────────
+
+#[test]
+fn where_is_distinct_from_literal() {
+    let db = setup();
+    // PG defines `IS DISTINCT FROM` to be NULL-aware and to always produce
+    // a definite boolean, so `d` is NOT NULL even though `age` is nullable.
+    let s = db
+        .analyze("SELECT id, age IS DISTINCT FROM 10 AS d FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("d", bool_ty())]);
+}
+
+#[test]
+fn where_is_not_distinct_from_null() {
+    let db = setup();
+    // `col IS NOT DISTINCT FROM NULL` is effectively `col IS NULL` — still
+    // always-definite, so the result column is NOT NULL.
+    let s = db
+        .analyze("SELECT id, age IS NOT DISTINCT FROM NULL AS d FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("d", bool_ty())]);
+}
+
+#[test]
+fn where_is_distinct_from_with_param() {
+    let db = setup();
+    // The rhs param is walked and inferred from the lhs column type.
+    // Matches the convention used by other WHERE-clause param tests: params
+    // default to NOT NULL unless the caller annotates them with `$p1?`.
+    let s = db
+        .analyze("SELECT id FROM users WHERE age IS DISTINCT FROM $p1")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int4())]);
+}
+
+// ── POSIX regex + SIMILAR TO ─────────────────────────────────────────────────
+
+#[test]
+fn where_regex_match() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE name ~ '^foo'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn where_regex_imatch_with_param() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE name ~* $p1")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(text())]);
+}
+
+#[test]
+fn where_regex_not_match() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE name !~ 'bar'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn where_similar_to() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE name SIMILAR TO 'ab%'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
 // ── Stress ───────────────────────────────────────────────────────────────────
 
 #[test]

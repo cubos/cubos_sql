@@ -279,6 +279,107 @@ fn complex_insert_select_with_join() {
     );
 }
 
+// ── DEFAULT keyword ─────────────────────────────────────────────────────────
+
+#[test]
+fn insert_values_with_default_keyword() {
+    let db = setup();
+    // `DEFAULT` replaces a VALUES item and adopts the target column's type.
+    // Only the $p1 param surfaces in the bindings — DEFAULT is not a param.
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email, role) VALUES ($p1, $p2, DEFAULT) \
+             RETURNING id, role",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("id", int8()),
+            c(
+                "role",
+                enum_ty("public", "user_role", &["admin", "editor", "viewer"]),
+            ),
+        ],
+    );
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+fn update_set_column_to_default() {
+    let db = setup();
+    // `UPDATE … SET col = DEFAULT` is PG's spelling for "reset to the
+    // column default". The analyzer must accept it without erroring out.
+    let s = db
+        .analyze(
+            "UPDATE users SET role = DEFAULT WHERE id = $p1 \
+             RETURNING id, role",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("id", int8()),
+            c(
+                "role",
+                enum_ty("public", "user_role", &["admin", "editor", "viewer"]),
+            ),
+        ],
+    );
+    assert_params(&s, vec![p(int8())]);
+}
+
+// ── INSERT … ON CONFLICT ────────────────────────────────────────────────────
+
+#[test]
+fn insert_on_conflict_do_nothing() {
+    let db = setup();
+    // DO NOTHING with no RETURNING surfaces only as a param-typed statement.
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (email) DO NOTHING",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+fn insert_on_conflict_do_update_with_excluded() {
+    let db = setup();
+    // `EXCLUDED.name` refers to the row the INSERT was trying to add — the
+    // analyzer must resolve it against the target table's schema so the
+    // SET assignment type-checks.
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name \
+             RETURNING id, name, email",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![c("id", int8()), c("name", text()), c("email", text())],
+    );
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+fn insert_on_conflict_do_update_with_param_expression() {
+    let db = setup();
+    // `SET age = EXCLUDED.age + $p3` mixes a column reference with a new
+    // param — the param must be inferred as int4 (the column's type).
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) \
+             ON CONFLICT (email) DO UPDATE SET age = EXCLUDED.age + $p4 \
+             RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(text()), p(text()), pn(int4()), p(int4())]);
+}
+
 // ── Stress ───────────────────────────────────────────────────────────────────
 
 #[test]

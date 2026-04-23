@@ -53,6 +53,14 @@ pub enum AnalyzeError {
     #[error("unsupported join type: {0}")]
     UnsupportedJoinType(i32),
 
+    /// An analyzer invariant was violated — typically because a placeholder
+    /// survived lexing but was not walked during type inference (e.g. it sat
+    /// inside an AST node the analyzer does not yet traverse). Surfaced as an
+    /// error instead of a panic so callers can report the offending SQL
+    /// without crashing the macro host process.
+    #[error("internal analyzer error: {0}")]
+    Internal(String),
+
     /// JSON serialization/deserialization error.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),

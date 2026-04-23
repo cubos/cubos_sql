@@ -193,8 +193,11 @@ fn domain_param_insert_surfaces_as_domain_type() {
             pn(domain("public", "user_prefs", jsonb())),
         ],
     );
-    // cast_type unwraps the domain to its schema-qualified base name.
-    assert_eq!(s.params[2].cast_type.as_deref(), Some("pg_catalog.jsonb"));
+    // `Type::cast_name` unwraps the domain to its schema-qualified base name.
+    assert_eq!(
+        s.params[2].pg_type.cast_name().as_deref(),
+        Some("pg_catalog.jsonb"),
+    );
 }
 
 #[test]
@@ -313,5 +316,8 @@ fn schema_qualified_domain_param() {
         &s,
         vec![p(int8()), pn(domain("whatsapp", "health_data", jsonb()))],
     );
-    assert_eq!(s.params[1].cast_type.as_deref(), Some("pg_catalog.jsonb"));
+    assert_eq!(
+        s.params[1].pg_type.cast_name().as_deref(),
+        Some("pg_catalog.jsonb"),
+    );
 }

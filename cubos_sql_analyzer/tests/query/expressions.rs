@@ -342,6 +342,75 @@ fn operator_concat_nullable_arg() {
     assert_cols(&info, vec![cn("combined", text())]);
 }
 
+// ── Nullability of strict comparisons ────────────────────────────────────────
+//
+// Comparison operators (`=`, `<`, `<>`, …) are strict — any NULL operand
+// makes the result NULL. The analyzer tracks this through the usual
+// `any_arg_nullable` path.
+
+#[test]
+fn comparison_both_sides_not_null() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id = user_id AS same FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("same", bool_ty())]);
+}
+
+#[test]
+fn comparison_with_nullable_column() {
+    let db = setup();
+    // `age` (nullable) `= 18` → bool but nullable.
+    let s = db.analyze("SELECT age = 18 AS adult FROM users").unwrap();
+    assert_cols(&s, vec![cn("adult", bool_ty())]);
+}
+
+#[test]
+fn comparison_with_nullable_both_sides() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT p.body = u.name AS match FROM posts p JOIN users u ON u.id = p.user_id")
+        .unwrap();
+    // `body` is nullable, `name` is NOT NULL — result nullable (any-nullable).
+    assert_cols(&s, vec![cn("match", bool_ty())]);
+}
+
+// ── Interval / date arithmetic ───────────────────────────────────────────────
+
+#[test]
+fn timestamptz_plus_interval() {
+    let db = setup();
+    // `now()` is NOT NULL and `INTERVAL 'n'` is a constant, so the sum
+    // stays NOT NULL.
+    let s = db
+        .analyze("SELECT now() + INTERVAL '1 day' AS later")
+        .unwrap();
+    assert_cols(&s, vec![c("later", timestamptz())]);
+}
+
+#[test]
+fn age_between_two_timestamps() {
+    let db = setup();
+    let s = db.analyze("SELECT age(now(), now()) AS delta").unwrap();
+    assert_cols(&s, vec![c("delta", interval())]);
+}
+
+#[test]
+fn extract_year_from_now() {
+    let db = setup();
+    // EXTRACT returns numeric (PG14+) — independent of whether the source
+    // field is nullable.
+    let s = db.analyze("SELECT EXTRACT(YEAR FROM now()) AS y").unwrap();
+    assert_cols(&s, vec![c("y", numeric())]);
+}
+
+#[test]
+fn date_trunc_on_timestamptz() {
+    let db = setup();
+    let s = db.analyze("SELECT date_trunc('day', now()) AS d").unwrap();
+    assert_cols(&s, vec![c("d", timestamptz())]);
+}
+
 // ── Non-strict pg_catalog functions that never return NULL ───────────────────
 
 #[test]

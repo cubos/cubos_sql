@@ -87,21 +87,22 @@ impl PgCatalog {
         // materialized spread fields). A mismatch means the analyzer missed
         // a placeholder during walk — e.g. hit an unsupported node and
         // swallowed the error — which would silently drop params from
-        // generated types.
+        // generated types. Surface as an `Internal` error rather than a
+        // panic so the macro host process can report it cleanly.
         let expected_param_count = lex_output.params.len()
             + lex_output
                 .spreads
                 .iter()
                 .map(|s| s.fields.as_ref().map(|f| f.len()).unwrap_or(0))
                 .sum::<usize>();
-        assert_eq!(
-            info_params.len(),
-            expected_param_count,
-            "analyzer param count ({}) does not match lexer placeholder count ({}) \
-             for SQL: {analysis_sql}",
-            info_params.len(),
-            expected_param_count,
-        );
+        if info_params.len() != expected_param_count {
+            return Err(AnalyzeError::Internal(format!(
+                "analyzer param count ({}) does not match lexer placeholder count ({}) \
+                 for SQL: {analysis_sql}",
+                info_params.len(),
+                expected_param_count,
+            )));
+        }
 
         // Merge explicit $foo? / $foo! annotations from the lexer on top of
         // the analyzer's inferred nullability (explicit always wins).

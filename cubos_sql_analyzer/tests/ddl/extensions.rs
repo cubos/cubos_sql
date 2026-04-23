@@ -100,8 +100,8 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
     assert!(!embedding.nullable);
 
     // A query using the `<=>` operator infers the parameter's type as vector
-    // via the operator's left operand; cast_type reports the PG name so the
-    // macro can emit `::vector` in the rewritten SQL.
+    // via the operator's left operand; `Type::cast_name` reports the PG name
+    // so the macro can emit `::vector` in the rewritten SQL.
     let info = db
         .analyze("SELECT id, (embedding <=> $q) AS dist FROM items ORDER BY embedding <=> $q")
         .unwrap();
@@ -124,7 +124,10 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
             extension: Some("vector".into()),
         }
     );
-    assert_eq!(info.params[0].cast_type.as_deref(), Some("public.vector"));
+    assert_eq!(
+        info.params[0].pg_type.cast_name().as_deref(),
+        Some("public.vector"),
+    );
 }
 
 #[test]

@@ -138,6 +138,21 @@ pub(crate) fn infer_expr(
         }),
         node::Node::AIndirection(ind) => infer_indirection(ind, scope, null_ctx, snapshot, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, scope, null_ctx, snapshot, params),
+        node::Node::SetToDefault(_) => {
+            // `DEFAULT` placeholder in INSERT VALUES / UPDATE SET. The actual
+            // default expression lives on the column definition and is
+            // trusted to produce a valid value of the column's type, so we
+            // adopt the assignment goal here. Nullability defers to the
+            // goal's NOT NULL reasoning in the caller.
+            Ok(ExprType {
+                type_oid: if goal.has_expectation() {
+                    goal.type_oid
+                } else {
+                    oid::UNKNOWN
+                },
+                nullable: false,
+            })
+        }
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)
@@ -710,10 +725,71 @@ fn infer_func_call(
         }
     }
 
-    let nullable = if resolved.is_aggregate {
+    // Walk aggregate modifiers so any `$N` placeholders they contain get
+    // their types inferred. FILTER must be bool (like a WHERE clause),
+    // per-aggregate ORDER BY items have no specific goal, and the WINDOW
+    // `OVER (…)` clause is walked separately below.
+    if let Some(filter) = &func.agg_filter {
+        let _ = infer_expr(
+            filter,
+            scope,
+            null_ctx,
+            snapshot,
+            params,
+            TypeGoal::implicit(oid::BOOL),
+        );
+    }
+    for order_item in &func.agg_order {
+        let _ = infer_expr(
+            order_item,
+            scope,
+            null_ctx,
+            snapshot,
+            params,
+            TypeGoal::NONE,
+        );
+    }
+    if let Some(over) = &func.over {
+        for item in &over.partition_clause {
+            let _ = infer_expr(item, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+        }
+        for item in &over.order_clause {
+            let _ = infer_expr(item, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+        }
+        if let Some(start) = &over.start_offset {
+            let _ = infer_expr(start, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+        }
+        if let Some(end) = &over.end_offset {
+            let _ = infer_expr(end, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+        }
+    }
+
+    // Value window functions (`lag`/`lead`/`first_value`/`last_value`/
+    // `nth_value`) can return NULL at partition/frame edges even when the
+    // source column is NOT NULL — `lag(title) OVER (ORDER BY id)` produces
+    // NULL for the first row of each partition. Without this override the
+    // analyzer would inherit the strict pg_catalog nullability rule and
+    // mark the result as NOT NULL, matching PG with the wrong sign.
+    let is_value_window = func.over.is_some()
+        && matches!(
+            name,
+            "lag" | "lead" | "first_value" | "last_value" | "nth_value"
+        );
+
+    let nullable = if is_value_window {
+        true
+    } else if resolved.is_aggregate {
+        // A FILTER clause can eliminate every row in the group, leaving the
+        // aggregate with an empty set. Every aggregate except COUNT returns
+        // NULL for an empty set, so FILTER forces non-COUNT aggregates to
+        // nullable even when the source column is NOT NULL and there's a
+        // GROUP BY.
+        let has_filter = func.agg_filter.is_some();
         if name == "count" {
-            // COUNT is never NULL (returns 0 for empty input).
+            // COUNT is never NULL (returns 0 for empty input, even with FILTER).
             false
+        } else if has_filter {
+            true
         } else if null_ctx.has_group_by {
             any_arg_nullable
         } else {
@@ -756,6 +832,79 @@ fn infer_a_expr(
         op_name,
         "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~~" | "~~*" | "!~~" | "!~~*"
     );
+
+    // `expr IS [NOT] DISTINCT FROM other` — shares op_name "=" with ordinary
+    // equality but PG guarantees the result is ALWAYS bool NOT NULL (the
+    // whole point of the construct is NULL-aware comparison). Handle before
+    // the generic `is_comparison` branch, which would otherwise let the
+    // operand nullability bleed into the result.
+    if matches!(
+        protobuf::AExprKind::try_from(expr.kind),
+        Ok(protobuf::AExprKind::AexprDistinct) | Ok(protobuf::AExprKind::AexprNotDistinct)
+    ) {
+        let left = expr
+            .lexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
+            .transpose()?;
+        let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
+        let rhs_goal = if left_oid != oid::UNKNOWN {
+            TypeGoal::implicit(left_oid)
+        } else {
+            TypeGoal::NONE
+        };
+        let _ = expr
+            .rexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, rhs_goal))
+            .transpose()?;
+        return Ok(ExprType {
+            type_oid: oid::BOOL,
+            nullable: false,
+        });
+    }
+
+    // `expr [NOT] BETWEEN lo AND hi` (and the SYM variants) — rexpr is a
+    // `Node::List` holding the two bounds. The generic Pass 1 below walks
+    // rexpr as a single expression, hits the `_` fallback for List, and
+    // silently drops any `$N` placeholders inside. Handle it up front: infer
+    // the lhs first, then re-enter each bound with the lhs type as the
+    // inference goal so param OIDs resolve correctly.
+    if matches!(
+        protobuf::AExprKind::try_from(expr.kind),
+        Ok(protobuf::AExprKind::AexprBetween)
+            | Ok(protobuf::AExprKind::AexprNotBetween)
+            | Ok(protobuf::AExprKind::AexprBetweenSym)
+            | Ok(protobuf::AExprKind::AexprNotBetweenSym)
+    ) {
+        let left = expr
+            .lexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
+            .transpose()?;
+        let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
+
+        let mut any_bound_nullable = false;
+        if let Some(rexpr) = &expr.rexpr
+            && let Some(node::Node::List(list)) = rexpr.node.as_ref()
+        {
+            let goal = if left_oid != oid::UNKNOWN {
+                TypeGoal::implicit(left_oid)
+            } else {
+                TypeGoal::NONE
+            };
+            for item in &list.items {
+                let t = infer_expr(item, scope, null_ctx, snapshot, params, goal)?;
+                any_bound_nullable = any_bound_nullable || t.nullable;
+            }
+        }
+
+        let any_nullable = left.as_ref().is_some_and(|l| l.nullable) || any_bound_nullable;
+        return Ok(ExprType {
+            type_oid: oid::BOOL,
+            nullable: any_nullable,
+        });
+    }
 
     // col IN ($1, $2, ...) / col NOT IN (...): rexpr is a Node::List whose
     // items need to be inferred with the left side's type as the goal so any

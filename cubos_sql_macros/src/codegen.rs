@@ -1042,7 +1042,7 @@ fn cast_params(analyzed: &AnalyzedQuery) -> String {
     let mut insertions: Vec<(usize, String)> = Vec::new();
 
     for param in &analyzed.params {
-        if let Some(pg_type) = &param.cast_type {
+        if let Some(pg_type) = param.pg_type.cast_name() {
             let cast_str = format!("::{pg_type}");
             for &offset in &param.sql_offsets {
                 insertions.push((offset, cast_str.clone()));

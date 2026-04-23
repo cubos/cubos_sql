@@ -178,9 +178,10 @@ pub fn void() -> Type {
 // Column / param specs for concise shape asserts
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// What a test expects a column to look like. Compared against
-/// [`AnalyzedColumn`] ignoring fields the analyzer reasonably derives (none
-/// today — everything we track is in the spec).
+/// What a test expects a column to look like. The PG cast name is
+/// mechanically derived from [`Type`] via [`Type::cast_name`], so it isn't
+/// spelled out here — consumers that care about the cast can call it
+/// directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColSpec {
     pub name: String,
@@ -226,27 +227,19 @@ pub fn assert_cols(analyzed: &AnalyzedQuery, expected: Vec<ColSpec>) {
 pub struct ParamSpec {
     pub ty: Type,
     pub nullable: bool,
-    pub cast_type: Option<String>,
 }
 
 /// Non-null param, no cast.
 pub fn p(ty: Type) -> ParamSpec {
-    let cast_type = ty.cast_name();
     ParamSpec {
         ty,
         nullable: false,
-        cast_type,
     }
 }
 
 /// Nullable param, no cast.
 pub fn pn(ty: Type) -> ParamSpec {
-    let cast_type = ty.cast_name();
-    ParamSpec {
-        ty,
-        nullable: true,
-        cast_type,
-    }
+    ParamSpec { ty, nullable: true }
 }
 
 /// Assert the query's params match the expected specs (order-sensitive).
@@ -258,7 +251,6 @@ pub fn assert_params(analyzed: &AnalyzedQuery, expected: Vec<ParamSpec>) {
         .map(|p| ParamSpec {
             ty: p.pg_type.clone(),
             nullable: p.nullable,
-            cast_type: p.cast_type.clone(),
         })
         .collect();
     assert_eq!(actual, expected, "params mismatch");
@@ -267,6 +259,27 @@ pub fn assert_params(analyzed: &AnalyzedQuery, expected: Vec<ParamSpec>) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Lookup helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Assert an individual column by name has the expected type + nullability
+/// without having to spell out every sibling column — useful for stress
+/// tests that project dozens of columns but only care about a few.
+///
+/// ```ignore
+/// assert_col!(info, "next_id", int8(), nullable = false);
+/// assert_col!(info, "safe_age", int4(), nullable = true);
+/// ```
+#[macro_export]
+macro_rules! assert_col {
+    ($info:expr, $name:expr, $ty:expr, nullable = $nullable:expr $(,)?) => {{
+        let col = $crate::common::col($info, $name);
+        assert_eq!(col.pg_type, $ty, "column '{}' type mismatch", $name);
+        assert_eq!(
+            col.nullable, $nullable,
+            "column '{}' nullability mismatch",
+            $name
+        );
+    }};
+}
 
 pub fn col<'a>(info: &'a AnalyzedQuery, name: &str) -> &'a AnalyzedColumn {
     info.columns
