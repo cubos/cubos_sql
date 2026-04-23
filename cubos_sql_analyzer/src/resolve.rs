@@ -8,6 +8,7 @@ use pg_query::protobuf::{self, JoinType, SetOperation, node};
 
 use crate::error::AnalyzeError;
 use crate::expr::{self, TypeGoal};
+use crate::functions;
 use crate::nullability::{self, NullabilityContext};
 use crate::param::LexOutput;
 use crate::param_collector::ParamCollector;
@@ -316,6 +317,11 @@ pub(crate) struct RawColumn {
     pub name: String,
     pub type_oid: u32,
     pub nullable: bool,
+    /// When the column is produced by a call to an SRF / OUT-arg function
+    /// that returns `record`, this carries the named output columns. Lets
+    /// downstream `(x).field` on a subquery-produced column resolve without
+    /// re-running the analyzer — we just look the field up here.
+    pub record_fields: Option<Vec<crate::schema::CompositeField>>,
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.
@@ -330,7 +336,7 @@ pub(crate) fn analyze_select(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes(sel, snapshot, params, &HashMap::new())
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[])
 }
 
 fn analyze_select_with_ctes(
@@ -338,6 +344,22 @@ fn analyze_select_with_ctes(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[])
+}
+
+/// Core SELECT analyzer.
+///
+/// `outer_sources` seeds the initial scope with pre-visible table sources
+/// (non-empty only for `LATERAL` subqueries, which inherit the outer FROM
+/// clause's scope per PG's LATERAL semantics). Empty for regular SELECTs
+/// and CTEs, which start with an empty scope.
+fn analyze_select_with_ctes_and_outer(
+    sel: &protobuf::SelectStmt,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+    outer_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
@@ -357,7 +379,23 @@ fn analyze_select_with_ctes(
         return analyze_set_operation(sel, snapshot, params, &cte_scopes);
     }
 
+    // Handle `VALUES (…), (…), …` — a `SelectStmt` without a FROM/target
+    // list, carrying rows in `values_lists`. Column types are derived from
+    // the first row; names default to `column1`/`column2`/… (PG convention)
+    // and are typically overridden by a `AS alias(col1, col2)` column list
+    // at the RangeSubselect that wraps the VALUES.
+    if !sel.values_lists.is_empty() {
+        return Ok((
+            analyze_values_lists(&sel.values_lists, snapshot, params)?,
+            None,
+        ));
+    }
+
     let mut scope = Scope::default();
+    // LATERAL subqueries see their enclosing FROM clause's sources as if
+    // they were already in scope. We seed those up-front so column/row refs
+    // resolve normally through the rest of the SELECT analysis.
+    scope.sources.extend(outer_sources.iter().cloned());
     let mut null_ctx = NullabilityContext::default();
     null_ctx.has_group_by = !sel.group_clause.is_empty();
 
@@ -538,7 +576,11 @@ fn analyze_insert(
     // Resolve RETURNING list.
     let mut ret_scope = Scope::default();
     let ret_null_ctx = NullabilityContext::default();
-    ret_scope.add_table_columns(&relation.relname, &table.columns);
+    ret_scope.add_dml_target(
+        &relation.relname,
+        crate::qualified_name::QualifiedName::new(&table.schema, &table.name),
+        &table.columns,
+    );
 
     let columns = resolve_target_list(
         &ins.returning_list,
@@ -580,7 +622,11 @@ fn analyze_update(
         .as_ref()
         .map(|a| a.aliasname.as_str())
         .unwrap_or(&relation.relname);
-    scope.add_table_columns(alias, &table.columns);
+    scope.add_dml_target(
+        alias,
+        crate::qualified_name::QualifiedName::new(&table.schema, &table.name),
+        &table.columns,
+    );
 
     // Process FROM clause (UPDATE ... FROM ... WHERE ...).
     let empty_ctes = HashMap::new();
@@ -655,7 +701,11 @@ fn analyze_delete(
 
     let mut scope = Scope::default();
     let null_ctx = NullabilityContext::default();
-    scope.add_table_columns(&relation.relname, &table.columns);
+    scope.add_dml_target(
+        &relation.relname,
+        crate::qualified_name::QualifiedName::new(&table.schema, &table.name),
+        &table.columns,
+    );
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {
@@ -711,6 +761,7 @@ fn analyze_set_operation(
                 name: l.name,
                 type_oid,
                 nullable: l.nullable || r.nullable,
+                record_fields: None,
             }
         })
         .collect();
@@ -744,6 +795,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    record_fields: rc.record_fields,
                 })
                 .collect())
         }
@@ -756,6 +808,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    record_fields: rc.record_fields,
                 })
                 .collect())
         }
@@ -768,6 +821,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    record_fields: rc.record_fields,
                 })
                 .collect())
         }
@@ -780,6 +834,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    record_fields: rc.record_fields,
                 })
                 .collect())
         }
@@ -897,21 +952,62 @@ fn process_from_item(
                 .map(|a| a.aliasname.as_str())
                 .unwrap_or("_subquery");
 
+            // `AS foo(a, b, c)` overrides the subquery's own output names.
+            // Common in information_schema views that rename columns at the
+            // FROM boundary instead of in the SELECT list.
+            let col_aliases: Vec<String> = sub
+                .alias
+                .as_ref()
+                .map(|a| {
+                    a.colnames
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref()? {
+                            node::Node::String(s) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             if let Some(subquery) = &sub.subquery
                 && let Some(node::Node::SelectStmt(sel)) = subquery.node.as_ref()
             {
-                let (cols, _) = analyze_select(sel, snapshot, params)?;
-                let scope_cols: Vec<ScopeColumn> = cols
+                // A LATERAL subquery inherits the visible FROM items to its
+                // left — including the enclosing SELECT's scope we already
+                // built — so column refs like `s.oid` inside
+                // `JOIN LATERAL (… s.oid …)` resolve properly.
+                let lateral_sources: Vec<_> = if sub.lateral {
+                    scope.sources.clone()
+                } else {
+                    Vec::new()
+                };
+                let (cols, _) = analyze_select_with_ctes_and_outer(
+                    sel,
+                    snapshot,
+                    params,
+                    cte_scopes,
+                    &lateral_sources,
+                )?;
+                let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
                     .map(|rc| ScopeColumn {
                         name: rc.name,
                         type_oid: rc.type_oid,
                         base_not_null: !rc.nullable,
                         table_alias: alias.to_owned(),
+                        record_fields: rc.record_fields,
                     })
                     .collect();
+                for (i, alias_name) in col_aliases.iter().enumerate() {
+                    if let Some(c) = scope_cols.get_mut(i) {
+                        c.name = alias_name.clone();
+                    }
+                }
                 scope.add_virtual_table(alias, scope_cols);
             }
+        }
+        node::Node::RangeFunction(rf) => {
+            process_range_function(rf, scope, snapshot, params)?;
         }
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
@@ -920,6 +1016,172 @@ fn process_from_item(
             )));
         }
     }
+    Ok(())
+}
+
+/// `FROM func(args)` — resolve the SRF and populate `scope` with its output
+/// columns. Handles three cases:
+/// - Function has `out_args` (TABLE/OUT) → one scope column per out_arg.
+/// - Function returns a registered composite type → expand the composite's
+///   fields as scope columns.
+/// - Otherwise (scalar or plain `record`) → a single scope column named after
+///   the function, typed with its return OID.
+///
+/// Also honors `WITH ORDINALITY` by adding a trailing `ordinality BIGINT NOT NULL`
+/// column when the flag is set.
+fn process_range_function(
+    rf: &protobuf::RangeFunction,
+    scope: &mut Scope,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    // Each entry in `functions` is a 2-element `List` — [FuncCall, coldeflist].
+    // We support only the simple form: a single function call, no explicit
+    // column definitions. `ROWS FROM (…)` with multiple functions or user-
+    // supplied coldeflists are rarer and fall through to Unsupported so we
+    // don't silently lose column shape.
+    let list = rf
+        .functions
+        .first()
+        .and_then(|n| n.node.as_ref())
+        .and_then(|n| {
+            if let node::Node::List(l) = n {
+                Some(l)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| AnalyzeError::Unsupported("RangeFunction without function call".into()))?;
+
+    let func_call_node = list
+        .items
+        .first()
+        .ok_or_else(|| AnalyzeError::Unsupported("RangeFunction function list is empty".into()))?;
+    let func_call = match func_call_node.node.as_ref() {
+        Some(node::Node::FuncCall(fc)) => fc,
+        _ => {
+            return Err(AnalyzeError::Unsupported(
+                "RangeFunction item is not a FuncCall".into(),
+            ));
+        }
+    };
+
+    // Alias: `FROM f() AS t(col1, col2)` gives aliases both for the relation
+    // and for its columns. Fall back to the function's last name component.
+    let func_name_parts = expr::extract_string_fields(&func_call.funcname);
+    let default_alias = func_name_parts
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "_srf".into());
+    let alias_owned = rf
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .unwrap_or_else(|| default_alias.clone());
+    let alias = alias_owned.as_str();
+    let col_aliases: Vec<String> = rf
+        .alias
+        .as_ref()
+        .map(|a| {
+            a.colnames
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Infer arg types so overload resolution can pick the right function.
+    // Args of a top-level SRF call don't see the FROM scope of the enclosing
+    // SELECT (same rule PG applies), so use an empty scope.
+    let empty_scope = Scope::default();
+    let empty_null_ctx = NullabilityContext::default();
+    let mut arg_types = Vec::with_capacity(func_call.args.len());
+    for arg in &func_call.args {
+        let t = expr::infer_expr(
+            arg,
+            &empty_scope,
+            &empty_null_ctx,
+            snapshot,
+            params,
+            crate::expr::TypeGoal::NONE,
+        )
+        .map(|e| e.type_oid)
+        .unwrap_or(oid::UNKNOWN);
+        arg_types.push(t);
+    }
+
+    let (schema, name) = match func_name_parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => {
+            return Err(AnalyzeError::UnresolvedFunction(format!(
+                "invalid function name in FROM: {func_name_parts:?}"
+            )));
+        }
+    };
+
+    let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, false)?;
+
+    // Build the scope columns.
+    let mut cols: Vec<ScopeColumn> = if !resolved.out_args.is_empty() {
+        resolved
+            .out_args
+            .iter()
+            .map(|f| ScopeColumn {
+                name: f.name.clone(),
+                type_oid: f.type_oid,
+                base_not_null: f.not_null,
+                table_alias: alias.to_owned(),
+                record_fields: None,
+            })
+            .collect()
+    } else if let Some(crate::schema::TypeKind::Composite { fields }) =
+        snapshot.get_type(resolved.return_type_oid).map(|t| &t.kind)
+    {
+        fields
+            .iter()
+            .map(|f| ScopeColumn {
+                name: f.name.clone(),
+                type_oid: f.type_oid,
+                base_not_null: f.not_null,
+                table_alias: alias.to_owned(),
+                record_fields: None,
+            })
+            .collect()
+    } else {
+        vec![ScopeColumn {
+            name: name.to_owned(),
+            type_oid: resolved.return_type_oid,
+            base_not_null: false,
+            table_alias: alias.to_owned(),
+            record_fields: None,
+        }]
+    };
+
+    // WITH ORDINALITY appends a trailing BIGINT NOT NULL row number. Do this
+    // before the alias override so `AS t(val, ord)` can rename the ordinality
+    // column too.
+    if rf.ordinality {
+        cols.push(ScopeColumn {
+            name: "ordinality".into(),
+            type_oid: oid::INT8,
+            base_not_null: true,
+            table_alias: alias.to_owned(),
+            record_fields: None,
+        });
+    }
+
+    // User-supplied column aliases override the names above, in order.
+    for (i, alias_name) in col_aliases.iter().enumerate() {
+        if let Some(c) = cols.get_mut(i) {
+            c.name = alias_name.clone();
+        }
+    }
+
+    scope.add_virtual_table(alias, cols);
     Ok(())
 }
 
@@ -977,6 +1239,7 @@ fn resolve_target_list(
                     name: col.name.clone(),
                     type_oid: col.type_oid,
                     nullable,
+                    record_fields: col.record_fields.clone(),
                 });
             }
             continue;
@@ -992,14 +1255,124 @@ fn resolve_target_list(
             infer_column_name(val).unwrap_or_else(|| format!("_column{i}_"))
         };
 
+        // If the expression is a FuncCall returning a `record` and we know
+        // its named output columns (TABLE/OUT args), propagate those through
+        // the scope so downstream `(alias.col).field` can look them up.
+        let record_fields = if let Some(node::Node::FuncCall(fc)) = val.node.as_ref() {
+            resolve_funccall_record_fields(fc, snapshot, params)
+        } else {
+            None
+        };
+
         columns.push(RawColumn {
             name,
             type_oid: expr_type.type_oid,
             nullable: expr_type.nullable,
+            record_fields,
         });
     }
 
     Ok(columns)
+}
+
+/// Analyze a `VALUES (…), (…)` list. Each row must have the same arity;
+/// column types are unified across rows via `coerce::find_common_type`.
+/// Nullability is `true` if any row's element at that position is nullable.
+fn analyze_values_lists(
+    values_lists: &[protobuf::Node],
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+) -> Result<Vec<RawColumn>, AnalyzeError> {
+    // Each entry in `values_lists` is a `List` of per-column expressions for
+    // one row. An empty VALUES list would be a grammar error in PG, but we
+    // guard anyway for robustness.
+    let first = values_lists
+        .iter()
+        .find_map(|n| match n.node.as_ref()? {
+            node::Node::List(l) => Some(l),
+            _ => None,
+        })
+        .ok_or_else(|| AnalyzeError::Unsupported("empty VALUES list".into()))?;
+
+    let arity = first.items.len();
+    let empty_scope = Scope::default();
+    let empty_null = NullabilityContext::default();
+
+    let mut column_types: Vec<Vec<u32>> = vec![Vec::new(); arity];
+    let mut column_nullable: Vec<bool> = vec![false; arity];
+
+    for row_node in values_lists {
+        let Some(node::Node::List(row)) = row_node.node.as_ref() else {
+            continue;
+        };
+        for (i, item) in row.items.iter().enumerate() {
+            if i >= arity {
+                break;
+            }
+            let t = expr::infer_expr(
+                item,
+                &empty_scope,
+                &empty_null,
+                snapshot,
+                params,
+                TypeGoal::NONE,
+            )?;
+            column_types[i].push(t.type_oid);
+            column_nullable[i] |= t.nullable;
+        }
+    }
+
+    let columns = (0..arity)
+        .map(|i| RawColumn {
+            name: format!("column{}", i + 1),
+            type_oid: crate::coerce::find_common_type(&column_types[i], snapshot)
+                .unwrap_or(oid::UNKNOWN),
+            nullable: column_nullable[i],
+            record_fields: None,
+        })
+        .collect();
+
+    Ok(columns)
+}
+
+/// Look up the named output columns (TABLE/OUT args) of `fc`, if any.
+/// Used by the target-list walker so a `SELECT _pg_expandarray(…) AS x`
+/// records the field list on the produced column.
+fn resolve_funccall_record_fields(
+    fc: &protobuf::FuncCall,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+) -> Option<Vec<crate::schema::CompositeField>> {
+    let parts = expr::extract_string_fields(&fc.funcname);
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => return None,
+    };
+    // Args inferred in an empty scope — we only need their types to drive
+    // overload resolution, and FuncCall args don't see the enclosing FROM.
+    let empty_scope = Scope::default();
+    let empty_null = NullabilityContext::default();
+    let mut arg_types = Vec::with_capacity(fc.args.len());
+    for a in &fc.args {
+        let t = expr::infer_expr(
+            a,
+            &empty_scope,
+            &empty_null,
+            snapshot,
+            params,
+            TypeGoal::NONE,
+        )
+        .map(|e| e.type_oid)
+        .unwrap_or(oid::UNKNOWN);
+        arg_types.push(t);
+    }
+    let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, false).ok()?;
+    if resolved.out_args.is_empty() {
+        None
+    } else {
+        Some(resolved.out_args)
+    }
 }
 
 /// Try to infer a default column name from an expression (for unaliased columns).

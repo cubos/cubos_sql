@@ -100,6 +100,7 @@ pub fn define_aggregate(interp: &mut Database, stmt: &DefineStmt) -> Result<(), 
         is_strict: false,
         is_procedure: false,
         agg_final_type_oid: final_return,
+        out_args: Vec::new(),
     };
 
     let key = crate::qualified_name::QualifiedName::new(&entry.schema, &entry.name);

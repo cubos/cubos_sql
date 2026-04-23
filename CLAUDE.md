@@ -4,19 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Test Commands
 
+Always use `cargo nextest run` instead of `cargo test` — it aggregates results across test binaries into a single summary with total count and elapsed time, which `cargo test` does not provide natively.
+
 ```bash
-cargo build                            # build all crates
-cargo build -p cubos_sql               # build specific crate
-cargo test                             # all tests (no Docker needed)
-cargo test -p cubos_sql_core           # core crate only
-cargo test -p cubos_sql_macros         # macro crate only
-cargo test -p cubos_sql_analyzer       # analyzer crate only
-cargo test -p cubos_sql                # runtime crate only
-cargo test --test migrate_integration  # integration tests (requires Docker)
-cargo test -- test_name                # run a single test by name
+cargo build                                  # build all crates
+cargo build -p cubos_sql                     # build specific crate
+cargo nextest run                            # all tests (no Docker needed)
+cargo nextest run -p cubos_sql_core          # core crate only
+cargo nextest run -p cubos_sql_macros        # macro crate only
+cargo nextest run -p cubos_sql_analyzer      # analyzer crate only
+cargo nextest run -p cubos_sql               # runtime crate only
+cargo nextest run --test migrate_integration # integration tests (requires Docker)
+cargo nextest run test_name                  # run a single test by name
 ```
 
 All compile-time tests run without Docker. Integration tests for the runtime migration runner use `testcontainers-modules` and require a running Docker daemon.
+
+Note: doctests are not supported by nextest — for those, fall back to `cargo test --doc`.
 
 ## Architecture
 

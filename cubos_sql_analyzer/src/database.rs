@@ -124,6 +124,13 @@ impl Database {
         &self.snapshot
     }
 
+    /// Mutably borrow the database's internal [`SchemaSnapshot`]. Exposed
+    /// for tests that need to simulate legacy/partial snapshot states.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn snapshot_mut(&mut self) -> &mut SchemaSnapshot {
+        &mut self.snapshot
+    }
+
     // ── Internal helpers used by the DDL submodules ─────────────────────────
 
     pub(crate) fn alloc_oid(&mut self) -> u32 {

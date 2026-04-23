@@ -102,7 +102,7 @@ pub(crate) fn infer_expr(
         .ok_or_else(|| AnalyzeError::Unsupported("empty node".into()))?;
 
     let result = match inner {
-        node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, scope, null_ctx),
+        node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, scope, null_ctx, snapshot),
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => infer_type_cast(cast, scope, null_ctx, snapshot, params),
         node::Node::FuncCall(func) => infer_func_call(func, scope, null_ctx, snapshot, params),
@@ -137,6 +137,8 @@ pub(crate) fn infer_expr(
             type_oid: mm.minmaxtype,
             nullable: true,
         }),
+        node::Node::AIndirection(ind) => infer_indirection(ind, scope, null_ctx, snapshot, params),
+        node::Node::AArrayExpr(arr) => infer_array_expr(arr, scope, null_ctx, snapshot, params),
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)
@@ -203,7 +205,20 @@ fn infer_column_ref(
     col_ref: &protobuf::ColumnRef,
     scope: &Scope,
     null_ctx: &NullabilityContext,
+    snapshot: &SchemaSnapshot,
 ) -> Result<ExprType, AnalyzeError> {
+    // Star expansion in expression context. `alias.*` in PG becomes the
+    // composite type of the relation referenced by `alias`. `*` alone
+    // (no qualifier) could expand to a ROW of every visible source but
+    // the semantic is ambiguous enough that we leave it unsupported.
+    let has_star = col_ref
+        .fields
+        .iter()
+        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
+    if has_star {
+        return infer_star_ref(col_ref, scope, snapshot);
+    }
+
     let parts = extract_string_fields(&col_ref.fields);
 
     let (table, column) = match parts.as_slice() {
@@ -218,23 +233,362 @@ fn infer_column_ref(
         }
     };
 
-    // Handle SELECT * (AStar node in fields).
-    if col_ref
+    match scope.resolve_column(table, column) {
+        Ok(col) => {
+            let nullable = null_ctx.is_nullable(&col.table_alias, col.base_not_null);
+            Ok(ExprType {
+                type_oid: col.type_oid,
+                nullable,
+            })
+        }
+        Err(e) => {
+            // PG row-reference fallback: a single unqualified identifier can
+            // name a whole row from the FROM clause (`SELECT u FROM users u`
+            // or `(u).name`). Only kick in when the column lookup failed AND
+            // the identifier matches a table alias in scope — otherwise we'd
+            // shadow legitimate UnknownColumn errors.
+            if table.is_none()
+                && let Some(src) = scope.find_source(column)
+                && let Some(qn) = src.source_qn.as_ref()
+                && let Some(&composite_oid) = snapshot.type_by_name.get(qn)
+            {
+                return Ok(ExprType {
+                    type_oid: composite_oid,
+                    nullable: false,
+                });
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Resolve `alias.*` (or `schema.alias.*`) to the composite type of the
+/// underlying relation. The composite is the per-table `TypeEntry` that
+/// `create_table` registers alongside the table — same OID that a call site
+/// like `row_to_json(alias.*)` would see at runtime.
+fn infer_star_ref(
+    col_ref: &protobuf::ColumnRef,
+    scope: &Scope,
+    snapshot: &SchemaSnapshot,
+) -> Result<ExprType, AnalyzeError> {
+    // The alias/relname qualifying the star is the last String field before
+    // AStar. For `t.*` it's index 0; for `schema.t.*` it's index 1.
+    let alias = col_ref
         .fields
         .iter()
-        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
-    {
-        return Err(AnalyzeError::Unsupported(
-            "star expansion in expression context".into(),
-        ));
+        .rev()
+        .skip_while(|f| !matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        .nth(1)
+        .and_then(|f| match f.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            AnalyzeError::Unsupported("unqualified * has no relation — use alias.* instead".into())
+        })?;
+
+    let source = scope
+        .find_source(alias)
+        .ok_or_else(|| AnalyzeError::UnknownRelation(format!("no table named {alias} in scope")))?;
+
+    let qn = source.source_qn.as_ref().ok_or_else(|| {
+        AnalyzeError::Unsupported(format!(
+            "cannot use {alias}.* here: {alias} is a CTE or subquery, not a real relation"
+        ))
+    })?;
+
+    let composite_oid =
+        snapshot
+            .type_by_name
+            .get(qn)
+            .copied()
+            .ok_or_else(|| AnalyzeError::UnknownType {
+                oid: 0,
+                context: format!("composite type for {qn}"),
+            })?;
+
+    // A row value from a real relation is never NULL (it exists as soon as
+    // the row is produced); individual fields may be null, but the composite
+    // value itself isn't.
+    Ok(ExprType {
+        type_oid: composite_oid,
+        nullable: false,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Indirection (`(expr).field`, `(expr)[i]`)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Resolve `(expr).field1.field2…` chains. Each step either names a field in
+/// a composite (String) or subscripts an array (`AIndices`). Array subscript
+/// support is intentionally limited to the common `arr[n]` → element type
+/// case; more exotic slicing (`arr[1:3]`) falls back to unsupported so we
+/// don't silently return the wrong shape.
+fn infer_indirection(
+    ind: &protobuf::AIndirection,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    let arg = ind
+        .arg
+        .as_deref()
+        .ok_or_else(|| AnalyzeError::Unsupported("indirection without arg".into()))?;
+
+    // Two shortcut paths for `record`-typed args whose fields aren't stored
+    // in a composite `TypeEntry`:
+    //
+    // 1. `(func(...)).field` — direct FuncCall with `out_args` (TABLE/OUT).
+    // 2. `(alias.col).field` — ColumnRef whose scope entry carries
+    //    `record_fields` (populated when the subquery's target expr was a
+    //    FuncCall with out_args).
+    //
+    // Consume leading String steps against those named fields; fall through
+    // to the generic walker for any remaining steps (e.g. nested composite
+    // unwrap, subscript on a scalar out_arg).
+    let from_direct_funccall = if let Some(node::Node::FuncCall(fc)) = arg.node.as_ref() {
+        resolve_funccall_out_args(fc, snapshot, params)?
+    } else {
+        None
+    };
+    let from_column_record = if from_direct_funccall.is_none() {
+        if let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref() {
+            column_ref_record_fields(cr, scope)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let leading_fields = from_direct_funccall
+        .as_ref()
+        .or(from_column_record.as_ref());
+    let (start_step, mut current) = if let Some(fields) = leading_fields {
+        let mut idx = 0usize;
+        let mut current = None;
+        while idx < ind.indirection.len() {
+            let Some(node::Node::String(s)) = ind.indirection[idx].node.as_ref() else {
+                break;
+            };
+            let field = fields
+                .iter()
+                .find(|f| f.name == s.sval)
+                .ok_or_else(|| AnalyzeError::UnknownColumn(format!("record field {}", s.sval)))?;
+            current = Some(ExprType {
+                type_oid: field.type_oid,
+                nullable: !field.not_null,
+            });
+            idx += 1;
+        }
+        (idx, current)
+    } else {
+        (0, None)
+    };
+
+    let mut current = match current.take() {
+        Some(c) => c,
+        None => infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?,
+    };
+
+    for step in ind.indirection.iter().skip(start_step) {
+        match step.node.as_ref() {
+            Some(node::Node::String(s)) => {
+                current = resolve_composite_field(&current, &s.sval, snapshot)?;
+            }
+            Some(node::Node::AIndices(ai)) => {
+                // Plain subscript `arr[i]`: both bounds absent except `uidx`
+                // alone means PG's shorthand for a single element.
+                let is_slice = ai.is_slice;
+                if is_slice {
+                    return Err(AnalyzeError::Unsupported(
+                        "array slice indirection (arr[a:b]) not supported".into(),
+                    ));
+                }
+                current = resolve_array_element(&current, snapshot)?;
+            }
+            _ => {
+                return Err(AnalyzeError::Unsupported(format!(
+                    "unsupported indirection step: {:?}",
+                    step.node.as_ref().map(std::mem::discriminant)
+                )));
+            }
+        }
     }
 
-    let col = scope.resolve_column(table, column)?;
-    let nullable = null_ctx.is_nullable(&col.table_alias, col.base_not_null);
+    Ok(current)
+}
+
+/// Look up `record_fields` for a `ColumnRef` that resolves to a scope column
+/// carrying named output columns (set when its producing expression was a
+/// FuncCall with `out_args`). Returns `None` if the ref doesn't resolve or
+/// the column isn't a record.
+fn column_ref_record_fields(
+    cr: &protobuf::ColumnRef,
+    scope: &Scope,
+) -> Option<Vec<crate::schema::CompositeField>> {
+    let parts = extract_string_fields(&cr.fields);
+    let (table, column) = match parts.as_slice() {
+        [col] => (None, col.as_str()),
+        [tbl, col] => (Some(tbl.as_str()), col.as_str()),
+        [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
+        _ => return None,
+    };
+    let col = scope.resolve_column(table, column).ok()?;
+    col.record_fields.clone()
+}
+
+/// If `fc` names a function with declared `out_args` (TABLE/OUT args),
+/// return them so indirection steps can match against named output columns.
+/// Returns `Ok(None)` when the function has no out_args — the caller should
+/// fall back to generic composite/record handling.
+fn resolve_funccall_out_args(
+    fc: &protobuf::FuncCall,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+) -> Result<Option<Vec<crate::schema::CompositeField>>, AnalyzeError> {
+    let parts = extract_string_fields(&fc.funcname);
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => return Ok(None),
+    };
+
+    // Infer arg types in an empty scope so overload resolution can run.
+    // Function args inside a scalar call don't see a FROM scope in the
+    // typical use sites of this helper.
+    let empty_scope = Scope::default();
+    let empty_null_ctx = NullabilityContext::default();
+    let mut arg_types = Vec::with_capacity(fc.args.len());
+    for arg in &fc.args {
+        let t = infer_expr(
+            arg,
+            &empty_scope,
+            &empty_null_ctx,
+            snapshot,
+            params,
+            TypeGoal::NONE,
+        )
+        .map(|e| e.type_oid)
+        .unwrap_or(oid::UNKNOWN);
+        arg_types.push(t);
+    }
+
+    let resolved =
+        match crate::functions::resolve_function(snapshot, schema, name, &arg_types, false) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+    if resolved.out_args.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(resolved.out_args))
+    }
+}
+
+/// Look up `field_name` inside a composite type's field list. The resulting
+/// nullability is the combination of the enclosing value being nullable AND
+/// the field's own `not_null` declaration — either one being nullable makes
+/// the access nullable.
+fn resolve_composite_field(
+    current: &ExprType,
+    field_name: &str,
+    snapshot: &SchemaSnapshot,
+) -> Result<ExprType, AnalyzeError> {
+    // Domain-over-composite needs unwrapping to see the composite fields.
+    let base_oid = snapshot.unwrap_domain(current.type_oid);
+    let type_entry = snapshot
+        .get_type(base_oid)
+        .ok_or_else(|| AnalyzeError::UnknownType {
+            oid: base_oid,
+            context: format!("composite field access .{field_name}"),
+        })?;
+
+    let fields = match &type_entry.kind {
+        crate::schema::TypeKind::Composite { fields } => fields,
+        _ => {
+            return Err(AnalyzeError::Unsupported(format!(
+                "field access .{field_name} on non-composite type '{}'",
+                type_entry.name
+            )));
+        }
+    };
+
+    let field = fields
+        .iter()
+        .find(|f| f.name == field_name)
+        .ok_or_else(|| AnalyzeError::UnknownColumn(format!("{}.{field_name}", type_entry.name)))?;
 
     Ok(ExprType {
-        type_oid: col.type_oid,
-        nullable,
+        type_oid: field.type_oid,
+        nullable: current.nullable || !field.not_null,
+    })
+}
+
+/// `ARRAY[expr1, expr2, …]` literal — result type is the common element type
+/// promoted to its array. Empty arrays fall back to `UNKNOWN` so that the
+/// enclosing cast (`ARRAY[]::text[]`) takes over.
+fn infer_array_expr(
+    arr: &protobuf::AArrayExpr,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    if arr.elements.is_empty() {
+        return Ok(ExprType {
+            type_oid: oid::UNKNOWN,
+            nullable: false,
+        });
+    }
+    let mut element_types = Vec::with_capacity(arr.elements.len());
+    let mut any_nullable = false;
+    for elem in &arr.elements {
+        let t = infer_expr(elem, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+        element_types.push(t.type_oid);
+        any_nullable |= t.nullable;
+    }
+    let common = coerce::find_common_type(&element_types, snapshot).unwrap_or(oid::UNKNOWN);
+    let array_oid = snapshot.array_type_of(common).unwrap_or(oid::UNKNOWN);
+    Ok(ExprType {
+        type_oid: array_oid,
+        // An ARRAY[...] constructor is never NULL itself — it's always at
+        // least an empty array. Element nullability is tracked separately by
+        // Rust's `Option<T>` inside `Vec<T>`.
+        nullable: {
+            let _ = any_nullable;
+            false
+        },
+    })
+}
+
+/// `arr[i]` — the result is an element of the array. Nullable because SQL
+/// subscripts out of bounds return NULL rather than erroring.
+fn resolve_array_element(
+    current: &ExprType,
+    snapshot: &SchemaSnapshot,
+) -> Result<ExprType, AnalyzeError> {
+    let type_entry =
+        snapshot
+            .get_type(current.type_oid)
+            .ok_or_else(|| AnalyzeError::UnknownType {
+                oid: current.type_oid,
+                context: "array subscript".into(),
+            })?;
+    let elem_oid = match &type_entry.kind {
+        crate::schema::TypeKind::Array { element_type_oid } => *element_type_oid,
+        _ => {
+            return Err(AnalyzeError::Unsupported(format!(
+                "subscript on non-array type '{}'",
+                type_entry.name
+            )));
+        }
+    };
+    Ok(ExprType {
+        type_oid: elem_oid,
+        nullable: true,
     })
 }
 
@@ -784,6 +1138,26 @@ fn infer_sublink(
             type_oid: oid::BOOL,
             nullable: true,
         }),
+        protobuf::SubLinkType::ArraySublink => {
+            // `ARRAY(SELECT expr FROM …)` — returns an array of the subquery's
+            // first output column. The array itself is always NOT NULL (an
+            // empty result produces `{}`, not NULL), even though individual
+            // elements may be nullable.
+            let mut elem_oid = oid::UNKNOWN;
+            if let Some(subselect) = &sub.subselect
+                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
+            {
+                let (cols, _) = crate::resolve::analyze_select(sel, snapshot, params)?;
+                if let Some(first) = cols.first() {
+                    elem_oid = first.type_oid;
+                }
+            }
+            let array_oid = snapshot.array_type_of(elem_oid).unwrap_or(oid::UNKNOWN);
+            Ok(ExprType {
+                type_oid: array_oid,
+                nullable: false,
+            })
+        }
         _ => Err(AnalyzeError::Unsupported(format!(
             "sublink type: {:?}",
             sub_type

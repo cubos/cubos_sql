@@ -825,6 +825,104 @@ fn view_alter_unrelated_column_succeeds() {
     assert_eq!(view.columns.len(), 2);
 }
 
+// ─── Binary coercibility ────────────────────────────────────────────────────
+
+#[test]
+fn binary_coercible_reflexive_and_domain() {
+    let snap = build(&[("0001.sql", "CREATE DOMAIN user_id AS INT;")]);
+
+    let int4 = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let int8 = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int8")
+        .unwrap()
+        .oid;
+    let user_id = snap.resolve_type_by_name(None, "user_id").unwrap().oid;
+
+    // Reflexive.
+    assert!(snap.is_binary_coercible(int4, int4));
+    // Domain to its base type.
+    assert!(snap.is_binary_coercible(user_id, int4));
+    // Not binary coercible: different base types (pg_cast is 'f'/Function).
+    assert!(!snap.is_binary_coercible(int4, int8));
+    // Domain to an unrelated base is not binary coercible.
+    assert!(!snap.is_binary_coercible(user_id, int8));
+}
+
+#[test]
+fn binary_coercible_user_defined_cast_without_function() {
+    // `CREATE CAST (a AS b) WITHOUT FUNCTION AS IMPLICIT` is the exact syntax
+    // that flags castmethod='b'/castcontext='i' — the pair that makes the
+    // cast binary coercible.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TYPE color_a AS ENUM ('red');
+         CREATE TYPE color_b AS ENUM ('red');
+         CREATE CAST (color_a AS color_b) WITHOUT FUNCTION AS IMPLICIT;",
+    )]);
+
+    let a = snap.resolve_type_by_name(None, "color_a").unwrap().oid;
+    let b = snap.resolve_type_by_name(None, "color_b").unwrap().oid;
+
+    assert!(snap.is_binary_coercible(a, b));
+    // The reverse direction wasn't declared; should be false.
+    assert!(!snap.is_binary_coercible(b, a));
+}
+
+#[test]
+fn alter_column_type_binary_coercible_with_view_succeeds() {
+    // Domain user_id over int4 → changing the column to plain int4 is
+    // binary coercible (PG's IsBinaryCoercible rule), so the dependent view
+    // must survive the ALTER.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE DOMAIN user_id AS INT;
+             CREATE TABLE t (id user_id NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t ALTER COLUMN id TYPE INT;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    assert_eq!(view.columns.len(), 1, "view must survive the ALTER");
+    let int4 = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    assert_eq!(
+        view.columns[0].type_oid, int4,
+        "view column OID should be updated to the new base type",
+    );
+}
+
+#[test]
+fn alter_column_type_non_binary_coercible_with_view_fails_with_hint() {
+    // int → bigint is a Function cast, not Binary — must fail with a hint
+    // that mentions binary coercibility so the user knows why PG rejects it.
+    let result = try_apply(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, amount INT);
+             CREATE VIEW v AS SELECT amount FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t ALTER COLUMN amount TYPE BIGINT;"),
+    ]);
+
+    let err = result.expect_err("non-binary-coercible ALTER TYPE with view must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("binary coercible"),
+        "error should cite the binary-coercibility rule: {msg}",
+    );
+    assert!(
+        msg.contains("drop"),
+        "error should hint at drop-and-recreate: {msg}",
+    );
+}
+
 // ─── DROP TABLE with view dependency ────────────────────────────────────────
 
 #[test]
@@ -857,6 +955,657 @@ fn view_drop_table_cascade_drops_view() {
 
     assert!(snap.resolve_table(None, "t").is_none());
     assert!(snap.resolve_table(None, "v").is_none());
+}
+
+// ─── Structured dependency tracking ─────────────────────────────────────────
+
+#[test]
+fn view_with_invalid_column_fails_migration() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE users (id INT NOT NULL);
+         CREATE VIEW bad AS SELECT nao_existe FROM users;",
+    )]);
+
+    let err = result.expect_err("CREATE VIEW with unknown column must fail the migration");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, DdlError::ViewAnalysis { .. }),
+        "expected ViewAnalysis variant, got: {msg}",
+    );
+    assert!(
+        msg.contains("public.bad") || msg.contains("bad"),
+        "error should mention the offending view: {msg}",
+    );
+}
+
+#[test]
+fn view_deps_only_track_referenced_columns() {
+    // Both users and orders have a column named `id`; the view only uses
+    // users.id. The structured walker must not list (orders, id) as a dep.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL);
+         CREATE TABLE orders (id INT NOT NULL, user_id INT NOT NULL);
+         CREATE VIEW v AS
+             SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id;",
+    )]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().expect("view_def must be present");
+
+    let users = QualifiedName::new("public", "users");
+    let orders = QualifiedName::new("public", "orders");
+
+    assert!(vd.depends_on_tables.contains(&users));
+    assert!(vd.depends_on_tables.contains(&orders));
+
+    // The SELECT list references users.id only; join predicate touches
+    // orders.user_id and users.id. orders.id must NOT be in the dep list.
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &users && c == "id"),
+        "users.id must be tracked: {:?}",
+        vd.depends_on_columns
+    );
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &orders && c == "user_id"),
+        "orders.user_id must be tracked: {:?}",
+        vd.depends_on_columns
+    );
+    assert!(
+        !vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &orders && c == "id"),
+        "orders.id must NOT be tracked — it was never referenced: {:?}",
+        vd.depends_on_columns
+    );
+}
+
+#[test]
+fn view_deps_track_schema_qualified_columns() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE SCHEMA app;
+         CREATE TABLE app.users (id INT NOT NULL, name TEXT NOT NULL);
+         CREATE VIEW v AS SELECT app.users.id FROM app.users;",
+    )]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let users = QualifiedName::new("app", "users");
+
+    assert!(vd.depends_on_tables.contains(&users));
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &users && c == "id"),
+        "schema-qualified column ref must resolve to (app.users, id): {:?}",
+        vd.depends_on_columns
+    );
+}
+
+#[test]
+fn view_deps_dedup_on_self_join() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE t (id INT NOT NULL, parent_id INT);
+         CREATE VIEW v AS
+             SELECT a.id, b.id AS parent_id
+             FROM t a JOIN t b ON b.id = a.parent_id;",
+    )]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let t = QualifiedName::new("public", "t");
+
+    // After dedup, the self-joined table appears only once in the table list.
+    let t_count = vd.depends_on_tables.iter().filter(|k| *k == &t).count();
+    assert_eq!(
+        t_count, 1,
+        "self-joined table must be dedup'd: {:?}",
+        vd.depends_on_tables
+    );
+
+    // Column deps for id and parent_id are present exactly once.
+    let id_count = vd
+        .depends_on_columns
+        .iter()
+        .filter(|(k, c)| k == &t && c == "id")
+        .count();
+    let parent_count = vd
+        .depends_on_columns
+        .iter()
+        .filter(|(k, c)| k == &t && c == "parent_id")
+        .count();
+    assert_eq!(id_count, 1);
+    assert_eq!(parent_count, 1);
+}
+
+#[test]
+fn view_with_cte_does_not_treat_cte_as_table_dep() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL);
+         CREATE VIEW v AS
+             WITH u AS (SELECT id, name FROM users)
+             SELECT id, name FROM u;",
+    )]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+
+    // The underlying users table is the only real dep.
+    let users = QualifiedName::new("public", "users");
+    assert!(vd.depends_on_tables.contains(&users));
+    assert_eq!(vd.depends_on_tables.len(), 1);
+
+    // And users.id / users.name are the columns — the CTE alias `u` must not
+    // sneak in as a qualified name key.
+    assert!(
+        vd.depends_on_columns.iter().all(|(k, _)| k == &users),
+        "no CTE-qualified entries should appear: {:?}",
+        vd.depends_on_columns,
+    );
+}
+
+// ─── RENAME / SET SCHEMA propagation into view deps ─────────────────────────
+
+#[test]
+fn view_deps_updated_after_rename_table() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
+             CREATE VIEW v AS SELECT id, name FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME TO t2;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let old = QualifiedName::new("public", "t");
+    let new = QualifiedName::new("public", "t2");
+
+    assert!(!vd.depends_on_tables.contains(&old));
+    assert!(vd.depends_on_tables.contains(&new));
+    assert!(
+        vd.depends_on_columns.iter().all(|(k, _)| k != &old),
+        "no dep should still point at old key: {:?}",
+        vd.depends_on_columns,
+    );
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &new && c == "id"),
+    );
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &new && c == "name"),
+    );
+}
+
+#[test]
+fn view_deps_updated_after_rename_column() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
+             CREATE VIEW v AS SELECT id, name FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME COLUMN name TO full_name;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let t = QualifiedName::new("public", "t");
+
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &t && c == "full_name"),
+        "renamed column must appear in deps: {:?}",
+        vd.depends_on_columns,
+    );
+    assert!(
+        vd.depends_on_columns.iter().all(|(_, c)| c != "name"),
+        "old column name must be gone from deps: {:?}",
+        vd.depends_on_columns,
+    );
+}
+
+#[test]
+fn view_deps_updated_after_set_schema() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA app;
+             CREATE TABLE t (id INT NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t SET SCHEMA app;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let old = QualifiedName::new("public", "t");
+    let new = QualifiedName::new("app", "t");
+
+    assert!(!vd.depends_on_tables.contains(&old));
+    assert!(vd.depends_on_tables.contains(&new));
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &new && c == "id"),
+    );
+    assert!(vd.depends_on_columns.iter().all(|(k, _)| k != &old));
+}
+
+#[test]
+fn view_deps_updated_after_rename_schema() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA app;
+             CREATE TABLE app.users (id INT NOT NULL, name TEXT NOT NULL);
+             CREATE VIEW app.v AS SELECT id, name FROM app.users;",
+        ),
+        ("0002.sql", "ALTER SCHEMA app RENAME TO core;"),
+    ]);
+
+    let view = snap.resolve_table(Some("core"), "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let old = QualifiedName::new("app", "users");
+    let new = QualifiedName::new("core", "users");
+
+    assert!(!vd.depends_on_tables.contains(&old));
+    assert!(vd.depends_on_tables.contains(&new));
+    assert!(vd.depends_on_columns.iter().all(|(k, _)| k.schema != "app"));
+    assert!(
+        vd.depends_on_columns.iter().any(|(k, _)| k == &new),
+        "at least one column dep should now point at core.users: {:?}",
+        vd.depends_on_columns,
+    );
+}
+
+#[test]
+fn view_deps_unchanged_on_unrelated_rename() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL);
+             CREATE TABLE other (id INT NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE other RENAME TO other2;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let t = QualifiedName::new("public", "t");
+
+    assert_eq!(vd.depends_on_tables, vec![t.clone()]);
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .all(|(k, c)| k == &t && c == "id"),
+    );
+}
+
+#[test]
+fn view_deps_rename_column_unrelated_is_noop() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, age INT);
+             CREATE VIEW v AS SELECT id, name FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME COLUMN age TO years;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let t = QualifiedName::new("public", "t");
+
+    // Only id and name are deps — age/years was never referenced.
+    let names: Vec<&str> = vd
+        .depends_on_columns
+        .iter()
+        .filter(|(k, _)| k == &t)
+        .map(|(_, c)| c.as_str())
+        .collect();
+    assert!(names.contains(&"id"));
+    assert!(names.contains(&"name"));
+    assert!(!names.contains(&"age"));
+    assert!(!names.contains(&"years"));
+}
+
+#[test]
+fn view_deps_rename_preserves_self_join_dedup() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, parent_id INT);
+             CREATE VIEW v AS
+                 SELECT a.id, b.id AS parent_id
+                 FROM t a JOIN t b ON b.id = a.parent_id;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME TO nodes;"),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    let nodes = QualifiedName::new("public", "nodes");
+
+    let count = vd.depends_on_tables.iter().filter(|k| *k == &nodes).count();
+    assert_eq!(
+        count, 1,
+        "self-join dedup must survive rename: {:?}",
+        vd.depends_on_tables
+    );
+
+    assert!(!vd.depends_on_tables.iter().any(|k| k.name == "t"));
+}
+
+#[test]
+fn rename_table_preserves_cascade_detection() {
+    // End-to-end: rename underlying table, then DROP it — CASCADE must still
+    // find the dependent view through the rewritten deps.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME TO t2;"),
+        ("0003.sql", "DROP TABLE t2 CASCADE;"),
+    ]);
+
+    assert!(snap.resolve_table(None, "t2").is_none());
+    assert!(
+        snap.resolve_table(None, "v").is_none(),
+        "view should have been dropped via CASCADE through the renamed dep",
+    );
+}
+
+#[test]
+fn rename_table_without_cascade_still_blocks_drop() {
+    let result = try_apply(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME TO t2;"),
+        ("0003.sql", "DROP TABLE t2;"),
+    ]);
+
+    assert!(
+        result.is_err(),
+        "DROP TABLE without CASCADE must still fail after rename",
+    );
+}
+
+// ─── Stored AST + serde roundtrip ───────────────────────────────────────────
+
+#[test]
+fn view_def_stores_resolved_ast() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE t (id INT NOT NULL);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let vd = view.view_def.as_ref().unwrap();
+    assert!(
+        !vd.resolved_ast.is_empty(),
+        "resolved_ast should be populated for freshly-created views",
+    );
+}
+
+#[test]
+fn view_def_serde_roundtrip_preserves_ast() {
+    // Serializing the snapshot to JSON and back must reproduce the AST
+    // byte-for-byte. Base64 is load-bearing: without it the JSON blows
+    // up to one int per byte.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE t (id INT NOT NULL, name TEXT);
+         CREATE VIEW v AS SELECT id, name FROM t;",
+    )]);
+
+    let json = serde_json::to_string(&snap).unwrap();
+    let back: SchemaSnapshot = serde_json::from_str(&json).unwrap();
+
+    let original = snap
+        .resolve_table(None, "v")
+        .unwrap()
+        .view_def
+        .as_ref()
+        .unwrap();
+    let restored = back
+        .resolve_table(None, "v")
+        .unwrap()
+        .view_def
+        .as_ref()
+        .unwrap();
+    assert_eq!(original.resolved_ast, restored.resolved_ast);
+    assert_eq!(original.depends_on_tables, restored.depends_on_tables);
+    assert_eq!(original.depends_on_columns, restored.depends_on_columns);
+}
+
+#[test]
+fn view_def_accepts_legacy_json_without_resolved_ast() {
+    // Older snapshots predate `resolved_ast`. Loading them must still work;
+    // the absent field just defaults to empty, disabling rename propagation
+    // into the AST (the deps arrays still cover CASCADE detection).
+    let legacy = r#"{
+        "types": {},
+        "type_by_name": {},
+        "tables": {
+            "public.t": {
+                "name": "t",
+                "schema": "public",
+                "kind": "Table",
+                "columns": [
+                    {"name": "id", "type_oid": 23, "not_null": true, "has_default": false}
+                ]
+            },
+            "public.v": {
+                "name": "v",
+                "schema": "public",
+                "kind": "View",
+                "columns": [
+                    {"name": "id", "type_oid": 23, "not_null": true, "has_default": false}
+                ],
+                "view_def": {
+                    "depends_on_tables": ["public.t"],
+                    "depends_on_columns": [["public.t", "id"]]
+                }
+            }
+        },
+        "functions_by_name": {},
+        "operators_by_name": {},
+        "casts": {},
+        "search_path": ["public"]
+    }"#;
+
+    let snap: SchemaSnapshot = serde_json::from_str(legacy).unwrap();
+    let vd = snap
+        .resolve_table(None, "v")
+        .unwrap()
+        .view_def
+        .as_ref()
+        .unwrap();
+    assert!(vd.resolved_ast.is_empty());
+    assert_eq!(vd.depends_on_tables.len(), 1);
+}
+
+// ─── Reanalyze via AST on binary-coercible ALTER TYPE ──────────────────────
+
+#[test]
+fn alter_column_type_reanalyzes_view_column_oid() {
+    // View exposes the column with its domain OID. The ALTER collapses the
+    // domain to int4 (binary coercible), and reanalyze must refresh the
+    // view's column OID to the new base type.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE DOMAIN user_id AS INT;
+             CREATE TABLE t (id user_id NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t ALTER COLUMN id TYPE INT;"),
+    ]);
+
+    let int4 = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let view = snap.resolve_table(None, "v").unwrap();
+    assert_eq!(view.columns[0].type_oid, int4);
+}
+
+#[test]
+fn alter_column_type_reanalyze_is_noop_for_legacy_view() {
+    // Simulate a legacy snapshot where resolved_ast was never populated:
+    // the ALTER path must still succeed (best-effort), not blow up.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN user_id AS INT;
+         CREATE TABLE t (id user_id NOT NULL);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )]);
+
+    let key = QualifiedName::new("public", "v");
+    db.snapshot_mut()
+        .tables
+        .get_mut(&key)
+        .unwrap()
+        .view_def
+        .as_mut()
+        .unwrap()
+        .resolved_ast
+        .clear();
+
+    db.apply_sql("ALTER TABLE t ALTER COLUMN id TYPE INT;")
+        .unwrap();
+}
+
+// ─── AST rename propagation ────────────────────────────────────────────────
+
+#[test]
+fn rename_table_rewrites_view_ast() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME TO nodes;"),
+    ]);
+
+    let vd = snap
+        .resolve_table(None, "v")
+        .unwrap()
+        .view_def
+        .as_ref()
+        .unwrap();
+    assert!(!vd.resolved_ast.is_empty());
+    assert!(
+        !vd.depends_on_tables
+            .iter()
+            .any(|k| k.name == "t" && k.schema == "public"),
+    );
+    assert!(
+        vd.depends_on_tables
+            .iter()
+            .any(|k| k.name == "nodes" && k.schema == "public"),
+    );
+}
+
+#[test]
+fn rename_column_rewrites_deps_with_self_join() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, parent_id INT);
+             CREATE VIEW v AS
+                 SELECT a.id, b.id AS parent_id
+                 FROM t a JOIN t b ON b.id = a.parent_id;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME COLUMN id TO node_id;"),
+    ]);
+
+    let vd = snap
+        .resolve_table(None, "v")
+        .unwrap()
+        .view_def
+        .as_ref()
+        .unwrap();
+    let t = QualifiedName::new("public", "t");
+    assert!(
+        vd.depends_on_columns
+            .iter()
+            .any(|(k, c)| k == &t && c == "node_id"),
+    );
+    assert!(vd.depends_on_columns.iter().all(|(_, c)| c != "id"));
+}
+
+#[test]
+fn rename_schema_rewrites_view_ast() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA app;
+             CREATE TABLE app.t (id INT NOT NULL);
+             CREATE VIEW app.v AS SELECT id FROM app.t;",
+        ),
+        ("0002.sql", "ALTER SCHEMA app RENAME TO core;"),
+    ]);
+
+    let vd = snap
+        .resolve_table(Some("core"), "v")
+        .unwrap()
+        .view_def
+        .as_ref()
+        .unwrap();
+    let old = QualifiedName::new("app", "t");
+    let new = QualifiedName::new("core", "t");
+    assert!(!vd.depends_on_tables.contains(&old));
+    assert!(vd.depends_on_tables.contains(&new));
+}
+
+#[test]
+fn rename_then_alter_type_reanalyzes_through_renamed_ast() {
+    // End-to-end: rename the table, then ALTER a column's type binary-
+    // coercibly. Without AST rewriting on rename, reanalyze would choke on
+    // "unknown relation t" after step 2 and the ALTER would fail.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE DOMAIN user_id AS INT;
+             CREATE TABLE t (id user_id NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME TO accounts;"),
+        ("0003.sql", "ALTER TABLE accounts ALTER COLUMN id TYPE INT;"),
+    ]);
+
+    let int4 = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    let view = snap.resolve_table(None, "v").unwrap();
+    assert_eq!(
+        view.columns[0].type_oid, int4,
+        "reanalyze must work after rename",
+    );
 }
 
 // ─── CREATE OR REPLACE VIEW ─────────────────────────────────────────────────

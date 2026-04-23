@@ -14,63 +14,149 @@ use common::*;
 fn identical_simple_select() {
     let db = setup();
     let sql = "SELECT id, name, age FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert!(!col(&s, "id").nullable);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert!(col(&s, "age").nullable);
 }
 
 #[test]
 fn identical_select_with_params() {
     let db = setup();
     let sql = "SELECT id, name FROM users WHERE age > $p1 AND name = $p2";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "i32");
+    assert_eq!(s.params[1].rust_type, "String");
 }
 
 #[test]
 fn identical_select_star() {
     let db = setup();
     let sql = "SELECT * FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 7);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "email").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert_eq!(col(&s, "role").rust_type, "String");
+    assert_eq!(col(&s, "preferences").rust_type, "::serde_json::Value");
+    assert_eq!(
+        col(&s, "created_at").rust_type,
+        "::chrono::DateTime<::chrono::Utc>"
+    );
+    assert!(col(&s, "age").nullable);
+    assert!(col(&s, "preferences").nullable);
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "email").nullable);
+    assert!(!col(&s, "role").nullable);
+    assert!(!col(&s, "created_at").nullable);
 }
 
 #[test]
 fn identical_select_star_from_posts() {
     let db = setup();
     let sql = "SELECT * FROM posts";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 5);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "user_id").rust_type, "i64");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert_eq!(col(&s, "body").rust_type, "String");
+    assert_eq!(
+        col(&s, "published_at").rust_type,
+        "::chrono::DateTime<::chrono::Utc>"
+    );
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "user_id").nullable);
+    assert!(!col(&s, "title").nullable);
+    assert!(col(&s, "body").nullable);
+    assert!(col(&s, "published_at").nullable);
 }
 
 #[test]
 fn identical_select_star_from_comments() {
     let db = setup();
     let sql = "SELECT * FROM comments";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 5);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "post_id").rust_type, "i64");
+    assert_eq!(col(&s, "author_name").rust_type, "String");
+    assert_eq!(col(&s, "content").rust_type, "String");
+    assert_eq!(col(&s, "rating").rust_type, "i32");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "post_id").nullable);
+    assert!(!col(&s, "author_name").nullable);
+    assert!(!col(&s, "content").nullable);
+    assert!(col(&s, "rating").nullable);
 }
 
 #[test]
 fn identical_select_aliased_columns() {
     let db = setup();
     let sql = "SELECT id AS user_id, name AS user_name FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "user_id").rust_type, "i64");
+    assert!(!col(&s, "user_id").nullable);
+    assert_eq!(col(&s, "user_name").rust_type, "String");
+    assert!(!col(&s, "user_name").nullable);
 }
 
 #[test]
 fn identical_select_table_qualified() {
     let db = setup();
     let sql = "SELECT users.id, users.name FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
 fn identical_select_alias_qualified() {
     let db = setup();
     let sql = "SELECT u.id, u.name, u.age FROM users u";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
+    assert!(col(&s, "age").nullable);
 }
 
 #[test]
 fn identical_select_all_columns_explicit() {
     let db = setup();
     let sql = "SELECT id, name, email, age, created_at FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 5);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "email").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert_eq!(
+        col(&s, "created_at").rust_type,
+        "::chrono::DateTime<::chrono::Utc>"
+    );
+    assert!(col(&s, "age").nullable);
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "email").nullable);
+    assert!(!col(&s, "created_at").nullable);
 }
 
 #[test]
@@ -89,6 +175,9 @@ fn identical_where_is_not_null() {
     let db = setup();
     let sql = "SELECT id, age FROM users WHERE age IS NOT NULL";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    // The analyzer doesn't narrow nullability through WHERE clauses.
     assert!(col(&s, "age").nullable);
 }
 
@@ -96,49 +185,76 @@ fn identical_where_is_not_null() {
 fn identical_where_and() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE name = $p1 AND email = $p2";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
 }
 
 #[test]
 fn identical_where_or() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE name = $p1 OR email = $p2";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
 }
 
 #[test]
 fn identical_where_in_list() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE age IN (1, 2, 3)";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert!(!col(&s, "id").nullable);
 }
 
 #[test]
 fn identical_where_like() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE name LIKE $p1";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 1);
+    assert_eq!(s.params[0].rust_type, "String");
 }
 
 #[test]
 fn identical_where_not() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE NOT (age > $p1)";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 1);
+    assert_eq!(s.params[0].rust_type, "i32");
 }
 
 #[test]
 fn identical_where_is_null() {
     let db = setup();
     let sql = "SELECT id, name FROM users WHERE age IS NULL";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
 fn identical_where_comparison_operators() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE age >= $p1 AND age <= $p2 AND name <> $p3";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 3);
+    assert_eq!(s.params[0].rust_type, "i32");
+    assert_eq!(s.params[1].rust_type, "i32");
+    assert_eq!(s.params[2].rust_type, "String");
 }
 
 // ── JOINs ─────────────────────────────────────────────────────────────
@@ -147,7 +263,12 @@ fn identical_where_comparison_operators() {
 fn identical_inner_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u INNER JOIN posts p ON p.user_id = u.id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "title").nullable);
 }
 
 #[test]
@@ -157,14 +278,26 @@ fn identical_inner_join_three_tables() {
                FROM users u \
                INNER JOIN posts p ON p.user_id = u.id \
                INNER JOIN comments c ON c.post_id = p.id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert_eq!(col(&s, "content").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "title").nullable);
+    assert!(!col(&s, "content").nullable);
 }
 
 #[test]
 fn identical_cross_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u CROSS JOIN posts p";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "title").nullable);
 }
 
 #[test]
@@ -172,14 +305,24 @@ fn identical_self_join() {
     let db = setup();
     let sql = "SELECT a.name AS name_a, b.name AS name_b \
                FROM users a INNER JOIN users b ON a.id <> b.id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name_a").rust_type, "String");
+    assert_eq!(col(&s, "name_b").rust_type, "String");
+    assert!(!col(&s, "name_a").nullable);
+    assert!(!col(&s, "name_b").nullable);
 }
 
 #[test]
 fn identical_implicit_cross_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u, posts p";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "title").nullable);
 }
 
 // ── ORDER BY / LIMIT / OFFSET ─────────────────────────────────────────
@@ -188,21 +331,34 @@ fn identical_implicit_cross_join() {
 fn identical_order_by() {
     let db = setup();
     let sql = "SELECT id, name FROM users ORDER BY name ASC, id DESC";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
 fn identical_limit_offset_literals() {
     let db = setup();
     let sql = "SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 5";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
 }
 
 #[test]
 fn identical_limit_offset_params() {
     let db = setup();
     let sql = "SELECT id FROM users ORDER BY id LIMIT $p1 OFFSET $p2";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 2);
+    // LIMIT/OFFSET take int8.
+    assert_eq!(s.params[0].rust_type, "i64");
+    assert_eq!(s.params[1].rust_type, "i64");
 }
 
 // ── DML ───────────────────────────────────────────────────────────────
@@ -211,28 +367,62 @@ fn identical_limit_offset_params() {
 fn identical_insert_returning() {
     let db = setup();
     let sql = "INSERT INTO users (name, email) VALUES ($p1, $p2) RETURNING id, name, age";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
+    assert!(col(&s, "age").nullable);
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
 }
 
 #[test]
 fn identical_insert_all_columns() {
     let db = setup();
     let sql = "INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) RETURNING *";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 7);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "role").rust_type, "String");
+    assert_eq!(col(&s, "preferences").rust_type, "::serde_json::Value");
+    assert_eq!(s.params.len(), 3);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
+    assert_eq!(s.params[2].rust_type, "i32");
 }
 
 #[test]
 fn identical_insert_multiple_rows() {
     let db = setup();
     let sql = "INSERT INTO users (name, email) VALUES ($p1, $p2), ($p3, $p4) RETURNING id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert!(!col(&s, "id").nullable);
+    assert_eq!(s.params.len(), 4);
+    for p in &s.params {
+        assert_eq!(p.rust_type, "String");
+    }
 }
 
 #[test]
 fn identical_insert_into_posts() {
     let db = setup();
     let sql = "INSERT INTO posts (user_id, title, body) VALUES ($p1, $p2, $p3) RETURNING id, title";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "title").nullable);
+    assert_eq!(s.params.len(), 3);
+    assert_eq!(s.params[0].rust_type, "i64");
+    assert_eq!(s.params[1].rust_type, "String");
+    assert_eq!(s.params[2].rust_type, "String");
 }
 
 #[test]
@@ -240,21 +430,44 @@ fn identical_insert_into_comments() {
     let db = setup();
     let sql = "INSERT INTO comments (post_id, author_name, content, rating) \
                VALUES ($p1, $p2, $p3, $p4) RETURNING *";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 5);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "rating").rust_type, "i32");
+    assert!(col(&s, "rating").nullable);
+    assert_eq!(s.params.len(), 4);
+    assert_eq!(s.params[0].rust_type, "i64");
+    assert_eq!(s.params[1].rust_type, "String");
+    assert_eq!(s.params[2].rust_type, "String");
+    assert_eq!(s.params[3].rust_type, "i32");
 }
 
 #[test]
 fn identical_update_returning() {
     let db = setup();
     let sql = "UPDATE users SET age = $p1 WHERE id = $p2 RETURNING id, name, age";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert!(col(&s, "age").nullable);
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "i32");
+    assert_eq!(s.params[1].rust_type, "i64");
 }
 
 #[test]
 fn identical_update_multiple_columns() {
     let db = setup();
     let sql = "UPDATE users SET name = $p1, email = $p2, age = $p3 WHERE id = $p4 RETURNING *";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 7);
+    assert_eq!(s.params.len(), 4);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
+    assert_eq!(s.params[2].rust_type, "i32");
+    assert_eq!(s.params[3].rust_type, "i64");
 }
 
 #[test]
@@ -263,28 +476,59 @@ fn identical_update_with_from() {
     let sql = "UPDATE posts SET title = $p1 \
                FROM users u WHERE posts.user_id = u.id AND u.name = $p2 \
                RETURNING posts.id, posts.title";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "title").nullable);
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
 }
 
 #[test]
 fn identical_delete_returning() {
     let db = setup();
     let sql = "DELETE FROM users WHERE id = $p1 RETURNING id, name, age";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
+    assert!(col(&s, "age").nullable);
+    assert_eq!(s.params.len(), 1);
+    assert_eq!(s.params[0].rust_type, "i64");
 }
 
 #[test]
 fn identical_delete_returning_star() {
     let db = setup();
     let sql = "DELETE FROM comments WHERE post_id = $p1 RETURNING *";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 5);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "post_id").rust_type, "i64");
+    assert_eq!(col(&s, "rating").rust_type, "i32");
+    assert!(col(&s, "rating").nullable);
+    assert_eq!(s.params.len(), 1);
+    assert_eq!(s.params[0].rust_type, "i64");
 }
 
 #[test]
 fn identical_delete_returning_subset() {
     let db = setup();
     let sql = "DELETE FROM posts WHERE user_id = $p1 RETURNING id, title";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "title").nullable);
+    assert_eq!(s.params.len(), 1);
+    assert_eq!(s.params[0].rust_type, "i64");
 }
 
 // ── CTEs ──────────────────────────────────────────────────────────────
@@ -294,7 +538,12 @@ fn identical_cte_simple() {
     let db = setup();
     let sql = "WITH active AS (SELECT id, name FROM users WHERE age > 18) \
                SELECT * FROM active";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
@@ -305,7 +554,12 @@ fn identical_cte_multiple() {
                  p AS (SELECT user_id, title FROM posts) \
                SELECT u.name, p.title \
                FROM u INNER JOIN p ON p.user_id = u.id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "title").nullable);
 }
 
 #[test]
@@ -314,7 +568,15 @@ fn identical_cte_with_insert_returning() {
     let sql = "WITH new_user AS (\
                  INSERT INTO users (name, email) VALUES ($p1, $p2) RETURNING id, name\
                ) SELECT * FROM new_user";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
 }
 
 // ── DISTINCT / DISTINCT ON ────────────────────────────────────────────
@@ -323,7 +585,10 @@ fn identical_cte_with_insert_returning() {
 fn identical_select_distinct() {
     let db = setup();
     let sql = "SELECT DISTINCT name FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
@@ -331,7 +596,12 @@ fn identical_distinct_on() {
     let db = setup();
     let sql = "SELECT DISTINCT ON (user_id) user_id, title \
                FROM posts ORDER BY user_id, published_at DESC NULLS LAST";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "user_id").rust_type, "i64");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "user_id").nullable);
+    assert!(!col(&s, "title").nullable);
 }
 
 // ── Mixed param types ─────────────────────────────────────────────────
@@ -341,14 +611,24 @@ fn identical_params_all_types() {
     let db = setup();
     let sql = "SELECT id FROM users \
                WHERE name = $p1 AND age = $p2 AND id > $p3 AND created_at > $p4";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 4);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "i32");
+    assert_eq!(s.params[2].rust_type, "i64");
+    assert_eq!(s.params[3].rust_type, "::chrono::DateTime<::chrono::Utc>");
 }
 
 #[test]
 fn identical_params_with_cast() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE name = $p1::text AND age > $p2::int4";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "i32");
 }
 
 // ── Complex combined queries ──────────────────────────────────────────
@@ -361,7 +641,15 @@ fn identical_join_with_where_and_limit() {
                WHERE u.age > $p1 \
                ORDER BY p.published_at DESC NULLS LAST \
                LIMIT $p2";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "title").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
+    assert!(!col(&s, "title").nullable);
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].rust_type, "i32");
+    assert_eq!(s.params[1].rust_type, "i64");
 }
 
 #[test]
@@ -370,7 +658,14 @@ fn identical_insert_select() {
     let sql = "INSERT INTO comments (post_id, author_name, content) \
                SELECT p.id, $p1, $p2 FROM posts p WHERE p.user_id = $p3 \
                RETURNING id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert!(!col(&s, "id").nullable);
+    assert_eq!(s.params.len(), 3);
+    assert_eq!(s.params[0].rust_type, "String");
+    assert_eq!(s.params[1].rust_type, "String");
+    assert_eq!(s.params[2].rust_type, "i64");
 }
 
 #[test]
@@ -378,7 +673,12 @@ fn identical_subquery_in_from() {
     let db = setup();
     let sql = "SELECT sub.name, sub.age \
                FROM (SELECT name, age FROM users WHERE age IS NOT NULL) sub";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert_eq!(col(&s, "age").rust_type, "i32");
+    assert!(!col(&s, "name").nullable);
+    assert!(col(&s, "age").nullable);
 }
 
 #[test]
@@ -386,7 +686,12 @@ fn identical_in_subquery() {
     let db = setup();
     let sql = "SELECT id, name FROM users \
                WHERE id IN (SELECT user_id FROM posts)";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
@@ -394,7 +699,12 @@ fn identical_exists_subquery() {
     let db = setup();
     let sql = "SELECT id, name FROM users u \
                WHERE EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id)";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -409,6 +719,8 @@ fn types_match_integer_literal() {
     let db = setup();
     let sql = "SELECT 42 AS val";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "val").rust_type, "i32");
     assert!(!col(&s, "val").nullable, "literal 42 is NOT NULL");
 }
 
@@ -417,6 +729,9 @@ fn types_match_boolean_literal() {
     let db = setup();
     let sql = "SELECT true AS flag, false AS other";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "flag").rust_type, "bool");
+    assert_eq!(col(&s, "other").rust_type, "bool");
     assert!(!col(&s, "flag").nullable);
     assert!(!col(&s, "other").nullable);
 }
@@ -428,6 +743,9 @@ fn types_match_arithmetic() {
     let db = setup();
     let sql = "SELECT id + 1 AS next_id, age * 2 AS double_age FROM users";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "next_id").rust_type, "i64");
+    assert_eq!(col(&s, "double_age").rust_type, "i32");
     assert!(!col(&s, "next_id").nullable, "id+1: id is NOT NULL");
     assert!(col(&s, "double_age").nullable, "age*2: age is nullable");
 }
@@ -436,7 +754,10 @@ fn types_match_arithmetic() {
 fn types_match_string_concat() {
     let db = setup();
     let sql = "SELECT name || ' <' || email || '>' AS display FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "display").rust_type, "String");
+    assert!(!col(&s, "display").nullable);
 }
 
 // ── Type casts ────────────────────────────────────────────────────────
@@ -445,14 +766,20 @@ fn types_match_string_concat() {
 fn types_match_cast_int_to_text() {
     let db = setup();
     let sql = "SELECT age::text AS age_text FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "age_text").rust_type, "String");
+    assert!(col(&s, "age_text").nullable, "age is nullable");
 }
 
 #[test]
 fn types_match_cast_bigint_to_int() {
     let db = setup();
     let sql = "SELECT id::int4 AS short_id FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "short_id").rust_type, "i32");
+    assert!(!col(&s, "short_id").nullable);
 }
 
 #[test]
@@ -460,6 +787,8 @@ fn types_match_cast_literal() {
     let db = setup();
     let sql = "SELECT '123'::int4 AS val";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "val").rust_type, "i32");
     assert!(!col(&s, "val").nullable, "literal cast is NOT NULL");
 }
 
@@ -470,6 +799,8 @@ fn types_match_count_star() {
     let db = setup();
     let sql = "SELECT count(*) AS total FROM users";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "total").rust_type, "i64");
     assert!(!col(&s, "total").nullable, "COUNT is never NULL");
 }
 
@@ -477,14 +808,25 @@ fn types_match_count_star() {
 fn types_match_upper_lower() {
     let db = setup();
     let sql = "SELECT upper(name) AS up, lower(email) AS lo FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "up").rust_type, "String");
+    assert_eq!(col(&s, "lo").rust_type, "String");
+    assert!(!col(&s, "up").nullable);
+    assert!(!col(&s, "lo").nullable);
 }
 
 #[test]
 fn types_match_length() {
     let db = setup();
     let sql = "SELECT length(name) AS len FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "len").rust_type, "i32");
+    assert!(
+        !col(&s, "len").nullable,
+        "length of NOT NULL text is NOT NULL"
+    );
 }
 
 #[test]
@@ -492,6 +834,8 @@ fn types_match_coalesce_with_literal() {
     let db = setup();
     let sql = "SELECT COALESCE(age, 0) AS age_or_zero FROM users";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "age_or_zero").rust_type, "i32");
     assert!(
         !col(&s, "age_or_zero").nullable,
         "COALESCE with NOT NULL fallback"
@@ -503,6 +847,8 @@ fn types_match_now() {
     let db = setup();
     let sql = "SELECT now() AS ts";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "ts").rust_type, "::chrono::DateTime<::chrono::Utc>");
     assert!(!col(&s, "ts").nullable, "now() is never NULL");
 }
 
@@ -512,14 +858,22 @@ fn types_match_now() {
 fn types_match_case_with_else() {
     let db = setup();
     let sql = "SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END AS category FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "category").rust_type, "String");
+    assert!(
+        !col(&s, "category").nullable,
+        "CASE with ELSE and all-literal branches is NOT NULL"
+    );
 }
 
 #[test]
 fn types_match_case_expression() {
     let db = setup();
     let sql = "SELECT CASE WHEN age IS NULL THEN 0 ELSE age END AS safe_age FROM users";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "safe_age").rust_type, "i32");
 }
 
 // ── Boolean / NULL tests ──────────────────────────────────────────────
@@ -529,6 +883,10 @@ fn types_match_null_test() {
     let db = setup();
     let sql = "SELECT id, age IS NULL AS is_null, age IS NOT NULL AS is_not_null FROM users";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "is_null").rust_type, "bool");
+    assert_eq!(col(&s, "is_not_null").rust_type, "bool");
     assert!(!col(&s, "is_null").nullable, "IS NULL is never NULL");
     assert!(
         !col(&s, "is_not_null").nullable,
@@ -541,7 +899,11 @@ fn types_match_boolean_test() {
     let db = setup();
     let sql = "SELECT (age > 18) IS TRUE AS adult, (age > 18) IS NOT TRUE AS not_adult FROM users";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "adult").rust_type, "bool");
+    assert_eq!(col(&s, "not_adult").rust_type, "bool");
     assert!(!col(&s, "adult").nullable, "IS TRUE is never NULL");
+    assert!(!col(&s, "not_adult").nullable, "IS NOT TRUE is never NULL");
 }
 
 // ── GROUP BY / HAVING ─────────────────────────────────────────────────
@@ -551,6 +913,10 @@ fn types_match_group_by_count() {
     let db = setup();
     let sql = "SELECT user_id, count(*) AS post_count FROM posts GROUP BY user_id";
     let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "user_id").rust_type, "i64");
+    assert_eq!(col(&s, "post_count").rust_type, "i64");
+    assert!(!col(&s, "user_id").nullable);
     assert!(!col(&s, "post_count").nullable, "COUNT is never NULL");
 }
 
@@ -559,7 +925,17 @@ fn types_match_group_by_multiple_aggregates() {
     let db = setup();
     let sql = "SELECT user_id, count(*) AS cnt, max(published_at) AS latest \
                FROM posts GROUP BY user_id";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 3);
+    assert_eq!(col(&s, "user_id").rust_type, "i64");
+    assert_eq!(col(&s, "cnt").rust_type, "i64");
+    assert_eq!(
+        col(&s, "latest").rust_type,
+        "::chrono::DateTime<::chrono::Utc>"
+    );
+    assert!(!col(&s, "cnt").nullable);
+    // max() is nullable — returns NULL for empty groups.
+    assert!(col(&s, "latest").nullable);
 }
 
 // ── UNION / INTERSECT / EXCEPT ────────────────────────────────────────
@@ -570,7 +946,12 @@ fn types_match_union_all() {
     let sql = "SELECT id, name FROM users WHERE age > 20 \
                UNION ALL \
                SELECT id, name FROM users WHERE age <= 20";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 2);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "id").nullable);
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
@@ -579,7 +960,10 @@ fn types_match_union_distinct() {
     let sql = "SELECT name FROM users \
                UNION \
                SELECT title FROM posts";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
@@ -588,7 +972,10 @@ fn types_match_intersect() {
     let sql = "SELECT name FROM users \
                INTERSECT \
                SELECT title FROM posts";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
 }
 
 #[test]
@@ -597,7 +984,10 @@ fn types_match_except() {
     let sql = "SELECT name FROM users \
                EXCEPT \
                SELECT title FROM posts";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
 }
 
 // ── CTE + UNION ───────────────────────────────────────────────────────
@@ -611,7 +1001,10 @@ fn types_match_cte_union() {
                  SELECT author_name AS name FROM comments\
                ) \
                SELECT name FROM all_names";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "name").rust_type, "String");
+    assert!(!col(&s, "name").nullable);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -760,7 +1153,10 @@ fn identical_domain_param_with_config() {
 fn identical_domain_in_where() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE preferences IS NOT NULL";
-    let _s = db.analyze(sql, &default_config()).unwrap();
+    let s = db.analyze(sql, &default_config()).unwrap();
+    assert_eq!(s.columns.len(), 1);
+    assert_eq!(col(&s, "id").rust_type, "i64");
+    assert!(!col(&s, "id").nullable);
 }
 
 #[test]

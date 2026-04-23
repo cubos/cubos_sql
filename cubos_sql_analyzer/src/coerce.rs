@@ -1,6 +1,6 @@
 //! Type coercion and common-type resolution.
 
-use crate::schema::{CastContext, SchemaSnapshot};
+use crate::schema::{CastContext, CastInfo, SchemaSnapshot};
 use crate::type_map::oid;
 
 /// Describes the level of implicit coercion allowed in a given context.
@@ -37,8 +37,19 @@ pub(crate) fn can_coerce(
     let key = format!("{source}:{target_unwrapped}");
     matches!(
         (context, snapshot.casts.get(&key)),
-        (_, Some(CastContext::Implicit))
-            | (CoercionContext::Assignment, Some(CastContext::Assignment))
+        (
+            _,
+            Some(CastInfo {
+                context: CastContext::Implicit,
+                ..
+            })
+        ) | (
+            CoercionContext::Assignment,
+            Some(CastInfo {
+                context: CastContext::Assignment,
+                ..
+            })
+        )
     )
 }
 

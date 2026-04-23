@@ -80,6 +80,7 @@ pub fn create_function(interp: &mut Database, stmt: &CreateFunctionStmt) -> Resu
         is_strict,
         is_procedure: stmt.is_procedure,
         agg_final_type_oid: None,
+        out_args: Vec::new(),
     };
 
     // Check for existing entry with same (signature, kind). Functions and

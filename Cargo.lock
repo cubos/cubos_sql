@@ -616,8 +616,10 @@ dependencies = [
 name = "cubos_sql_analyzer"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cubos_sql_analyzer",
  "pg_query",
+ "prost 0.13.5",
  "serde",
  "serde_json",
  "tempfile",

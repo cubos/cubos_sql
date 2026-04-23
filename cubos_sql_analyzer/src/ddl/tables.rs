@@ -64,7 +64,6 @@ pub fn create_table(interp: &mut Database, stmt: &CreateStmt) -> Result<(), DdlE
     }
 
     // Second pass: process columns.
-    let mut attnum: i16 = 0;
     let mut seen_names = std::collections::HashSet::new();
     for elt in &stmt.table_elts {
         let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() else {
@@ -78,8 +77,7 @@ pub fn create_table(interp: &mut Database, stmt: &CreateStmt) -> Result<(), DdlE
             )));
         }
 
-        attnum += 1;
-        let col = parse_column_def(interp, cd, attnum, &pk_columns)?;
+        let col = parse_column_def(interp, cd, &pk_columns)?;
         columns.push(col);
     }
 
@@ -156,7 +154,6 @@ pub fn create_table(interp: &mut Database, stmt: &CreateStmt) -> Result<(), DdlE
 fn parse_column_def(
     interp: &Database,
     cd: &pg_query::protobuf::ColumnDef,
-    attnum: i16,
     pk_columns: &[String],
 ) -> Result<TableColumn, DdlError> {
     // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — pg_query keeps the
@@ -226,7 +223,6 @@ fn parse_column_def(
         type_oid,
         not_null,
         has_default,
-        attnum,
     })
 }
 
@@ -297,7 +293,6 @@ fn add_column(
         .tables
         .get(table_key)
         .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-    let next_attnum = table.columns.iter().map(|c| c.attnum).max().unwrap_or(0) + 1;
 
     // Check for duplicate column.
     if table.columns.iter().any(|c| c.name == cd.colname) {
@@ -310,7 +305,7 @@ fn add_column(
         )));
     }
 
-    let col = parse_column_def(interp, cd, next_attnum, &[])?;
+    let col = parse_column_def(interp, cd, &[])?;
 
     // Mutate table and composite type.
     let table = interp.snapshot.tables.get_mut(table_key).unwrap();
@@ -444,14 +439,36 @@ fn alter_column_type(
         return Err(DdlError::TableNotFound(table_key.to_string()));
     }
 
-    // In PostgreSQL, ALTER COLUMN TYPE always fails if views depend on the column.
-    // The user must DROP VIEW first, ALTER TYPE, then recreate the view.
+    // Pull the current OID before mutating, so we can decide whether PG would
+    // allow the ALTER in the presence of dependent views.
+    let old_type_oid = interp
+        .snapshot
+        .tables
+        .get(table_key)
+        .and_then(|t| t.columns.iter().find(|c| c.name == cmd.name))
+        .map(|c| c.type_oid)
+        .ok_or_else(|| {
+            DdlError::Parse(format!(
+                "column \"{}\" of relation does not exist",
+                cmd.name
+            ))
+        })?;
+
+    // PG's rule (parse_coerce.c:IsBinaryCoercible): ALTER COLUMN TYPE is
+    // allowed when the new type is binary coercible with the old one — no
+    // table rewrite, so dependent views keep working. Any other change
+    // fails unless the user drops the view first.
     let dependent_views =
         views::find_views_depending_on_column(&interp.snapshot, table_key, &cmd.name);
-    if !dependent_views.is_empty() {
+    if !dependent_views.is_empty()
+        && !interp
+            .snapshot
+            .is_binary_coercible(old_type_oid, new_type_oid)
+    {
         let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
         return Err(DdlError::DependencyError(format!(
             "cannot alter type of column {}.{} because view(s) {} depend on it \
+             and the new type is not binary coercible with the old one \
              (hint: drop the view(s) first, alter the column, then recreate)",
             table_key,
             cmd.name,
@@ -459,19 +476,27 @@ fn alter_column_type(
         )));
     }
 
+    // Apply the type change.
     let table = interp.snapshot.tables.get_mut(table_key).unwrap();
     let col = table
         .columns
         .iter_mut()
         .find(|c| c.name == cmd.name)
-        .ok_or_else(|| {
-            DdlError::Parse(format!(
-                "column \"{}\" of relation does not exist",
-                cmd.name
-            ))
-        })?;
+        .unwrap();
     col.type_oid = new_type_oid;
     update_composite_for_table(interp, table_key);
+
+    // Re-analyze each dependent view against the updated snapshot so its
+    // column OIDs follow the new base type. This is where having the view's
+    // AST paid off — the analyzer sees the post-ALTER world without needing
+    // the original SQL. If a view lacks a stored AST (legacy snapshot), the
+    // call is a no-op and the stale-OID hazard remains, but that only
+    // affects snapshots that haven't been regenerated since the upgrade.
+    let _ = old_type_oid; // no longer needed for the view fix-up path
+    for view_key in &dependent_views {
+        views::reanalyze_view(&mut interp.snapshot, view_key)?;
+    }
+
     Ok(())
 }
 

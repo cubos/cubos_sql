@@ -35,6 +35,10 @@ pub enum DdlError {
     DuplicateObject(String),
     ExtensionError(String),
     DependencyError(String),
+    ViewAnalysis {
+        view: String,
+        source: Box<crate::error::AnalyzeError>,
+    },
 }
 
 impl std::fmt::Display for DdlError {
@@ -50,6 +54,9 @@ impl std::fmt::Display for DdlError {
             DdlError::DuplicateObject(name) => write!(f, "duplicate object: {name}"),
             DdlError::ExtensionError(msg) => write!(f, "extension error: {msg}"),
             DdlError::DependencyError(msg) => write!(f, "{msg}"),
+            DdlError::ViewAnalysis { view, source } => {
+                write!(f, "cannot analyze view '{view}': {source}")
+            }
         }
     }
 }
@@ -58,6 +65,7 @@ impl std::error::Error for DdlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DdlError::Migration { source, .. } => Some(source.as_ref()),
+            DdlError::ViewAnalysis { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

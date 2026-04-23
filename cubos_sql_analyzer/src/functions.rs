@@ -1,7 +1,7 @@
 //! Function and aggregate resolution.
 
 use crate::error::AnalyzeError;
-use crate::schema::{FunctionEntry, SchemaSnapshot};
+use crate::schema::{CompositeField, FunctionEntry, SchemaSnapshot};
 use crate::type_map::oid;
 
 /// Resolved function call result.
@@ -12,6 +12,9 @@ pub(crate) struct ResolvedFunction {
     pub schema: String,
     pub is_aggregate: bool,
     pub is_strict: bool,
+    /// Named output columns for SRFs / OUT-arg functions, copied from the
+    /// matched `FunctionEntry`. Empty for plain scalar returns.
+    pub out_args: Vec<CompositeField>,
 }
 
 /// pg_catalog strict functions that can still return NULL with non-null inputs.
@@ -86,6 +89,7 @@ pub(crate) fn resolve_function(
             schema: "pg_catalog".into(),
             is_aggregate: true,
             is_strict: true,
+            out_args: Vec::new(),
         });
     }
 
@@ -116,6 +120,14 @@ pub(crate) fn resolve_function(
     // Phase 2: match with implicit casts.
     if let Some(f) = find_cast_match(&candidates, arg_types, snapshot) {
         return Ok(make_resolved(f));
+    }
+
+    // Phase 2b: polymorphic pseudo-types (`anyelement`, `anyarray`, …). These
+    // never appear as concrete arg types, so `find_exact_match`/`find_cast_match`
+    // miss them. Matching `_pg_expandarray(anyarray)` against a concrete
+    // `int4[]` lives here.
+    if let Some(f) = find_polymorphic_match(&candidates, arg_types, snapshot) {
+        return Ok(make_resolved_polymorphic(f, arg_types, snapshot));
     }
 
     // Phase 3: for single-candidate aggregates with zero args (e.g., COUNT),
@@ -176,6 +188,79 @@ fn find_exact_match<'a>(
         .iter()
         .find(|f| f.arg_types == arg_types)
         .copied()
+}
+
+/// Find a candidate where every parameter type either equals the caller's
+/// actual type OR is a polymorphic pseudo-type (`anyelement`, `anyarray`,
+/// `anyenum`, `anyrange`, `anymultirange`, `anynonarray`) compatible with
+/// the actual. Consistency across positions (PG's rule that all `anyelement`
+/// positions must resolve to the same type) is intentionally NOT enforced:
+/// our goal is type inference for view columns, not full call-site checking.
+fn find_polymorphic_match<'a>(
+    candidates: &[&'a FunctionEntry],
+    arg_types: &[u32],
+    snapshot: &SchemaSnapshot,
+) -> Option<&'a FunctionEntry> {
+    let matching: Vec<&FunctionEntry> = candidates
+        .iter()
+        .filter(|f| f.arg_types.len() == arg_types.len())
+        .filter(|f| {
+            f.arg_types
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(&expected, &actual)| {
+                    expected == actual
+                        || actual == oid::UNKNOWN
+                        || matches_polymorphic(expected, actual, snapshot)
+                })
+        })
+        .copied()
+        .collect();
+    if matching.len() == 1 {
+        Some(matching[0])
+    } else {
+        // If more than one polymorphic candidate matches, we can't
+        // disambiguate without tracking per-position consistency — return
+        // None rather than guessing.
+        None
+    }
+}
+
+/// Is `expected` a polymorphic pseudo-type that PG would accept `actual` for?
+fn matches_polymorphic(expected: u32, actual: u32, snapshot: &SchemaSnapshot) -> bool {
+    // Pseudo-type OIDs (stable across PG versions).
+    const ANYELEMENT: u32 = 2283;
+    const ANYARRAY: u32 = 2277;
+    const ANYNONARRAY: u32 = 2776;
+    const ANYENUM: u32 = 3500;
+    const ANYRANGE: u32 = 3831;
+    const ANYMULTIRANGE: u32 = 4537;
+    // Historical array-shaped types that pg_cast doesn't mark as arrays in
+    // the normal sense but still satisfy `anyarray` / `anynonarray` for
+    // legacy catalog functions.
+    const INT2VECTOR: u32 = 22;
+    const OIDVECTOR: u32 = 30;
+
+    let actual_is_array = matches!(
+        snapshot.get_type(actual).map(|t| &t.kind),
+        Some(crate::schema::TypeKind::Array { .. })
+    ) || actual == INT2VECTOR
+        || actual == OIDVECTOR;
+
+    match expected {
+        ANYELEMENT => true,
+        ANYARRAY => actual_is_array,
+        ANYNONARRAY => !actual_is_array,
+        ANYENUM => matches!(
+            snapshot.get_type(actual).map(|t| &t.kind),
+            Some(crate::schema::TypeKind::Enum { .. })
+        ),
+        ANYRANGE | ANYMULTIRANGE => matches!(
+            snapshot.get_type(actual).map(|t| &t.kind),
+            Some(crate::schema::TypeKind::Range { .. })
+        ),
+        _ => false,
+    }
 }
 
 fn find_cast_match<'a>(
@@ -271,6 +356,93 @@ fn make_resolved(f: &FunctionEntry) -> ResolvedFunction {
         schema: f.schema.clone(),
         is_aggregate: f.is_aggregate,
         is_strict: f.is_strict,
+        out_args: f.out_args.clone(),
+    }
+}
+
+/// Build a `ResolvedFunction` after a polymorphic match, substituting every
+/// `any*` OID in the return type and `out_args` with the concrete type
+/// bound at the matching arg position.
+///
+/// The binding rules (simplified vs. PG's full §10.3.4 algorithm):
+/// - `anyelement` / `anynonarray` / `anyenum` → bind to the concrete arg OID.
+/// - `anyarray` → bind to the array OID *and* derive its element OID for
+///   downstream `anyelement` slots.
+/// - `anyrange` / `anymultirange` → bind to the range OID.
+///
+/// If multiple positions leave the bindings inconsistent we keep the first
+/// we see — consistency enforcement happens in the caller via the single-
+/// match rule in `find_polymorphic_match`.
+fn make_resolved_polymorphic(
+    f: &FunctionEntry,
+    actual_args: &[u32],
+    snapshot: &SchemaSnapshot,
+) -> ResolvedFunction {
+    let mut bound_element: Option<u32> = None;
+    let mut bound_array: Option<u32> = None;
+
+    const ANYELEMENT: u32 = 2283;
+    const ANYARRAY: u32 = 2277;
+    const ANYNONARRAY: u32 = 2776;
+    const ANYENUM: u32 = 3500;
+    const ANYRANGE: u32 = 3831;
+    const ANYMULTIRANGE: u32 = 4537;
+
+    for (&expected, &actual) in f.arg_types.iter().zip(actual_args.iter()) {
+        match expected {
+            ANYELEMENT | ANYNONARRAY | ANYENUM => {
+                bound_element.get_or_insert(actual);
+            }
+            ANYARRAY => {
+                bound_array.get_or_insert(actual);
+                // Remember the element type too so `anyelement` in the
+                // return or out_args resolves consistently.
+                if let Some(crate::schema::TypeKind::Array { element_type_oid }) =
+                    snapshot.get_type(actual).map(|t| t.kind.clone())
+                {
+                    bound_element.get_or_insert(element_type_oid);
+                }
+            }
+            ANYRANGE | ANYMULTIRANGE => {
+                bound_array.get_or_insert(actual);
+            }
+            _ => {}
+        }
+    }
+
+    let substitute = |oid: u32| -> u32 {
+        match oid {
+            ANYELEMENT | ANYNONARRAY | ANYENUM => bound_element.unwrap_or(oid),
+            ANYARRAY => {
+                // Prefer a direct `anyarray` binding; else derive the array
+                // type from the bound element.
+                bound_array
+                    .or_else(|| bound_element.and_then(|e| snapshot.array_type_of(e)))
+                    .unwrap_or(oid)
+            }
+            ANYRANGE | ANYMULTIRANGE => bound_array.unwrap_or(oid),
+            _ => oid,
+        }
+    };
+
+    let return_type_oid = substitute(f.agg_final_type_oid.unwrap_or(f.return_type_oid));
+    let out_args = f
+        .out_args
+        .iter()
+        .map(|field| crate::schema::CompositeField {
+            name: field.name.clone(),
+            type_oid: substitute(field.type_oid),
+            not_null: field.not_null,
+        })
+        .collect();
+
+    ResolvedFunction {
+        return_type_oid,
+        arg_types: f.arg_types.clone(),
+        schema: f.schema.clone(),
+        is_aggregate: f.is_aggregate,
+        is_strict: f.is_strict,
+        out_args,
     }
 }
 

@@ -17,18 +17,41 @@
 //! | `int4`          | 23    | `i32`                           |
 //! | `text`          | 25    | `String`                        |
 //! | `oid`           | 26    | `u32`                           |
+//! | `xid`           | 28    | `u32`                           |
 //! | `json`          | 114   | `serde_json::Value`             |
+//! | `cidr`          | 650   | `String`                        |
 //! | `float4`        | 700   | `f32`                           |
 //! | `float8`        | 701   | `f64`                           |
+//! | `macaddr`       | 829   | `String`                        |
+//! | `inet`          | 869   | `String`                        |
 //! | `char` (bpchar) | 1042  | `String`                        |
 //! | `varchar`       | 1043  | `String`                        |
 //! | `date`          | 1082  | `chrono::NaiveDate`             |
 //! | `time`          | 1083  | `chrono::NaiveTime`             |
 //! | `timestamp`     | 1114  | `chrono::NaiveDateTime`         |
 //! | `timestamptz`   | 1184  | `chrono::DateTime<chrono::Utc>` |
+//! | `interval`      | 1186  | `String`                        |
+//! | `timetz`        | 1266  | `String`                        |
+//! | `anyelement`    | 2276  | `String`                        |
+//! | `anyarray`      | 2277  | `String`                        |
+//! | `regproc`       | 2202  | `u32`                           |
+//! | `regprocedure`  | 2203  | `u32`                           |
+//! | `regoper`       | 2204  | `u32`                           |
+//! | `regoperator`   | 2205  | `u32`                           |
+//! | `regclass`      | 2206  | `u32`                           |
+//! | `regtype`       | 2207  | `u32`                           |
 //! | `uuid`          | 2950  | `uuid::Uuid`                    |
-//! | `uuid`          | 2950  | `uuid::Uuid`                    |
+//! | `pg_lsn`        | 3220  | `String`                        |
+//! | `pg_ndistinct`  | 3361  | `String`                        |
+//! | `pg_dependencies` | 3402 | `String`                       |
+//! | `pg_mcv_list`   | 5017  | `String`                        |
 //! | `jsonb`         | 3802  | `serde_json::Value`             |
+//! | `xid8`          | 5069  | `u64`                           |
+//! | `regnamespace`  | 4089  | `u32`                           |
+//! | `regrole`       | 4096  | `u32`                           |
+//! | `regcollation`  | 4191  | `u32`                           |
+//! | `regconfig`     | 4194  | `u32`                           |
+//! | `regdictionary` | 4195  | `u32`                           |
 //!
 //! Array types (e.g. `int4[]`, `text[]`, `uuid[]`) are resolved generically
 //! by the proc macro via `Kind::Array` — each element is mapped to the
@@ -82,6 +105,14 @@ static PG_TYPES: &[PgTypeInfo] = &[
         pg_name: "bytea",
         rust_type: "Vec<u8>",
     },
+    // Internal single-byte `"char"` — distinct from SQL's `char(n)` (bpchar).
+    // Wire representation is a single i8; we expose it as `String` so
+    // downstream users don't need a custom newtype.
+    PgTypeInfo {
+        oid: 18,
+        pg_name: "char",
+        rust_type: "String",
+    },
     PgTypeInfo {
         oid: 19,
         pg_name: "name",
@@ -91,6 +122,18 @@ static PG_TYPES: &[PgTypeInfo] = &[
         oid: 20,
         pg_name: "int8",
         rust_type: "i64",
+    },
+    // Transaction IDs — 32-bit unsigned counters; tokio-postgres exposes them
+    // as `u32` (same wire format as `oid`).
+    PgTypeInfo {
+        oid: 28,
+        pg_name: "xid",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 5069,
+        pg_name: "xid8",
+        rust_type: "u64",
     },
     PgTypeInfo {
         oid: 21,
@@ -117,6 +160,14 @@ static PG_TYPES: &[PgTypeInfo] = &[
         pg_name: "json",
         rust_type: "::serde_json::Value",
     },
+    // IP address / CIDR — we store the textual form (`inet_ntoa` equivalent).
+    // Clients that need structured access can re-parse into `std::net::IpAddr`
+    // themselves; mapping to `String` keeps the default path zero-dependency.
+    PgTypeInfo {
+        oid: 650,
+        pg_name: "cidr",
+        rust_type: "String",
+    },
     PgTypeInfo {
         oid: 700,
         pg_name: "float4",
@@ -126,6 +177,16 @@ static PG_TYPES: &[PgTypeInfo] = &[
         oid: 701,
         pg_name: "float8",
         rust_type: "f64",
+    },
+    PgTypeInfo {
+        oid: 829,
+        pg_name: "macaddr",
+        rust_type: "String",
+    },
+    PgTypeInfo {
+        oid: 869,
+        pg_name: "inet",
+        rust_type: "String",
     },
     PgTypeInfo {
         oid: 1042,
@@ -157,15 +218,125 @@ static PG_TYPES: &[PgTypeInfo] = &[
         pg_name: "timestamptz",
         rust_type: "::chrono::DateTime<::chrono::Utc>",
     },
+    // PG `interval` doesn't cleanly map to `chrono::Duration` (PG separates
+    // months, days and microseconds). Expose the textual form — downstream
+    // code can parse it via crates like `postgres-interval` if needed.
+    PgTypeInfo {
+        oid: 1186,
+        pg_name: "interval",
+        rust_type: "String",
+    },
+    PgTypeInfo {
+        oid: 1266,
+        pg_name: "timetz",
+        rust_type: "String",
+    },
     PgTypeInfo {
         oid: 1700,
         pg_name: "numeric",
         rust_type: "::rust_decimal::Decimal",
     },
+    // Object identifier type aliases (`reg*`). Each is a `u32` on the wire —
+    // PG formats it as a human-readable name at display time, but the raw OID
+    // is what gets read/written by clients. Mapping them all to `u32` matches
+    // `tokio-postgres`/`postgres` behavior (they expose `regclass` etc. as
+    // `Oid = u32`).
+    PgTypeInfo {
+        oid: 2202,
+        pg_name: "regproc",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 2203,
+        pg_name: "regprocedure",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 2204,
+        pg_name: "regoper",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 2205,
+        pg_name: "regoperator",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 2206,
+        pg_name: "regclass",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 2207,
+        pg_name: "regtype",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 4089,
+        pg_name: "regnamespace",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 4096,
+        pg_name: "regrole",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 4191,
+        pg_name: "regcollation",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 4194,
+        pg_name: "regconfig",
+        rust_type: "u32",
+    },
+    PgTypeInfo {
+        oid: 4195,
+        pg_name: "regdictionary",
+        rust_type: "u32",
+    },
+    // `anyarray` / `anyelement` are pseudo-types used in polymorphic function
+    // signatures. They occasionally leak into `pg_catalog.pg_stats` columns
+    // like `most_common_vals`. We can't know the element type statically, so
+    // surface the raw textual representation PG would otherwise print.
+    PgTypeInfo {
+        oid: 2276,
+        pg_name: "anyelement",
+        rust_type: "String",
+    },
+    PgTypeInfo {
+        oid: 2277,
+        pg_name: "anyarray",
+        rust_type: "String",
+    },
     PgTypeInfo {
         oid: 2950,
         pg_name: "uuid",
         rust_type: "::uuid::Uuid",
+    },
+    PgTypeInfo {
+        oid: 3220,
+        pg_name: "pg_lsn",
+        rust_type: "String",
+    },
+    // Extended-statistics payloads — opaque internal types that PG renders
+    // as text when asked. Surfaced as `String` so pg_statistic_ext views
+    // (pg_stats_ext, pg_stats_ext_exprs) can project them verbatim.
+    PgTypeInfo {
+        oid: 3361,
+        pg_name: "pg_ndistinct",
+        rust_type: "String",
+    },
+    PgTypeInfo {
+        oid: 3402,
+        pg_name: "pg_dependencies",
+        rust_type: "String",
+    },
+    PgTypeInfo {
+        oid: 5017,
+        pg_name: "pg_mcv_list",
+        rust_type: "String",
     },
     PgTypeInfo {
         oid: 3802,
@@ -336,5 +507,62 @@ mod tests {
     fn from_oid_unknown_returns_none() {
         assert!(from_oid(99999).is_none());
         assert!(from_oid(0).is_none());
+    }
+
+    #[test]
+    fn from_oid_xid_and_xid8() {
+        assert_eq!(from_oid(28).unwrap().rust_type, "u32");
+        assert_eq!(from_oid(5069).unwrap().rust_type, "u64");
+    }
+
+    #[test]
+    fn from_oid_network_types_are_strings() {
+        for (oid, name) in [(650, "cidr"), (829, "macaddr"), (869, "inet")] {
+            let info = from_oid(oid).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(info.pg_name, name);
+            assert_eq!(info.rust_type, "String");
+        }
+    }
+
+    #[test]
+    fn from_oid_interval_and_timetz_are_strings() {
+        assert_eq!(from_oid(1186).unwrap().rust_type, "String");
+        assert_eq!(from_oid(1266).unwrap().rust_type, "String");
+    }
+
+    #[test]
+    fn from_oid_pg_lsn_is_string() {
+        let info = from_oid(3220).unwrap();
+        assert_eq!(info.pg_name, "pg_lsn");
+        assert_eq!(info.rust_type, "String");
+    }
+
+    #[test]
+    fn from_oid_anyelement_and_anyarray_are_strings() {
+        // Pseudo-types — leak into catalogs like pg_stats; surface as text.
+        assert_eq!(from_oid(2276).unwrap().rust_type, "String");
+        assert_eq!(from_oid(2277).unwrap().rust_type, "String");
+    }
+
+    #[test]
+    fn from_oid_reg_types_are_u32() {
+        // All `reg*` object-identifier aliases share the OID u32 representation.
+        for (oid, name) in [
+            (2202, "regproc"),
+            (2203, "regprocedure"),
+            (2204, "regoper"),
+            (2205, "regoperator"),
+            (2206, "regclass"),
+            (2207, "regtype"),
+            (4089, "regnamespace"),
+            (4096, "regrole"),
+            (4191, "regcollation"),
+            (4194, "regconfig"),
+            (4195, "regdictionary"),
+        ] {
+            let info = from_oid(oid).unwrap_or_else(|| panic!("{name} (oid {oid}) missing"));
+            assert_eq!(info.pg_name, name);
+            assert_eq!(info.rust_type, "u32");
+        }
     }
 }

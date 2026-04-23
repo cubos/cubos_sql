@@ -77,11 +77,6 @@ pub fn default_config() -> AnalyzerConfig {
 // Analyze helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Run `Database::analyze` on a query with the default config and unwrap.
-pub fn static_analyze(db: &Database, sql: &str) -> AnalyzedQuery {
-    db.analyze(sql, &default_config()).unwrap()
-}
-
 pub fn col<'a>(info: &'a AnalyzedQuery, name: &str) -> &'a AnalyzedColumn {
     info.columns
         .iter()

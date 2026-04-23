@@ -13,8 +13,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use cubos_sql_analyzer::QualifiedName;
 use cubos_sql_analyzer::schema::*;
+use cubos_sql_analyzer::{Database, QualifiedName};
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -58,6 +58,17 @@ fn main() {
         ops.sort_by_key(|o| (o.left_type_oid.unwrap_or(0), o.right_type_oid));
     }
 
+    // Second pass: populate `view_def` on every relation that `pg_class`
+    // reported as a view/matview by re-applying its `CREATE VIEW` through the
+    // analyzer's own DDL pipeline. The pass-1 snapshot already has the view
+    // columns from `pg_attribute`, so resolution of one view against another
+    // works without ordering.
+    eprintln!("Exporting view definitions...");
+    let view_defs =
+        export_view_definitions(&mut client).expect("failed to export view definitions");
+    eprintln!("Populating view_def for {} view(s)...", view_defs.len());
+    let snapshot = populate_view_defs(snapshot, view_defs);
+
     // Serialize via BTreeMap for sorted keys.
     let ordered = OrderedSnapshot::from(snapshot);
     let json = serde_json::to_string(&ordered).expect("failed to serialize snapshot");
@@ -94,7 +105,7 @@ struct OrderedSnapshot {
     tables: BTreeMap<String, TableEntry>,
     functions_by_name: BTreeMap<String, Vec<FunctionEntry>>,
     operators_by_name: BTreeMap<String, Vec<OperatorEntry>>,
-    casts: BTreeMap<String, CastContext>,
+    casts: BTreeMap<String, CastInfo>,
     search_path: Vec<String>,
 }
 
@@ -150,11 +161,11 @@ fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgr
         operators_by_name.entry(key).or_default().push(o);
     }
 
-    let casts_map: HashMap<String, CastContext> = casts
+    let casts_map: HashMap<String, CastInfo> = casts
         .into_iter()
         .map(|c| {
             let key = format!("{}:{}", c.source_type_oid, c.target_type_oid);
-            (key, c.context)
+            (key, CastInfo::new(c.context, c.method))
         })
         .collect();
 
@@ -326,7 +337,7 @@ fn export_tables(
     )?;
 
     let col_rows = client.query(
-        "SELECT a.attrelid, a.attname, a.atttypid, a.attnotnull, a.atthasdef, a.attnum \
+        "SELECT a.attrelid, a.attname, a.atttypid, a.attnotnull, a.atthasdef \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -346,7 +357,6 @@ fn export_tables(
             type_oid: row.get(2),
             not_null: row.get(3),
             has_default: row.get(4),
-            attnum: row.get(5),
         });
     }
 
@@ -383,14 +393,19 @@ fn export_tables(
 }
 
 fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>, postgres::Error> {
+    // `proallargtypes` / `proargmodes` / `proargnames` are NULL for plain
+    // functions that only take IN args (PG sets them non-NULL only when at
+    // least one arg is OUT/INOUT/TABLE/VARIADIC). Read them as nullable
+    // arrays and fall back to an empty slice when absent.
     let rows = client.query(
         "SELECT p.oid, p.proname, n.nspname, \
                 p.proargtypes::int4[]::int4[], p.prorettype, \
                 p.proisstrict, p.proretset, p.provariadic != 0 as is_variadic, \
-                p.prokind \
+                p.prokind, \
+                p.proallargtypes::int4[], p.proargmodes, p.proargnames \
          FROM pg_catalog.pg_proc p \
          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname NOT IN ('information_schema', 'pg_toast') \
+         WHERE n.nspname NOT IN ('pg_toast') \
          ORDER BY p.oid",
         &[],
     )?;
@@ -424,6 +439,10 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
         let is_set_returning: bool = row.get(6);
         let is_variadic: bool = row.get(7);
         let prokind: i8 = row.get(8);
+        let all_arg_types: Option<Vec<i32>> = row.get(9);
+        // `proargmodes` is `char[]` → Vec<i8> with one byte per arg.
+        let arg_modes: Option<Vec<i8>> = row.get(10);
+        let arg_names: Option<Vec<String>> = row.get(11);
 
         let is_aggregate = prokind as u8 as char == 'a';
         let is_window = prokind as u8 as char == 'w';
@@ -433,7 +452,12 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
             None
         };
 
-        let _ = oid; // Only used for the agg_final lookup above.
+        let out_args = extract_out_args(
+            all_arg_types.as_deref(),
+            arg_modes.as_deref(),
+            arg_names.as_deref(),
+        );
+
         functions.push(FunctionEntry {
             name,
             schema,
@@ -446,10 +470,47 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
             is_strict,
             is_procedure: false,
             agg_final_type_oid,
+            out_args,
         });
     }
 
     Ok(functions)
+}
+
+/// Extract OUT/INOUT/TABLE args from `pg_proc.{proallargtypes, proargmodes,
+/// proargnames}` into a list of `CompositeField`s keyed by name.
+/// - All three arrays share one index per formal arg.
+/// - `proargmodes`: `'i'` IN, `'o'` OUT, `'b'` INOUT, `'v'` VARIADIC, `'t'` TABLE.
+/// - We only keep OUT, INOUT and TABLE entries — those are the columns
+///   visible from `(func(...)).field` or `FROM func(...)`.
+/// - `proargnames[i]` may be an empty string; skip those since they can't
+///   appear in a named field lookup anyway.
+fn extract_out_args(
+    all_types: Option<&[i32]>,
+    modes: Option<&[i8]>,
+    names: Option<&[String]>,
+) -> Vec<CompositeField> {
+    let (Some(types), Some(modes), Some(names)) = (all_types, modes, names) else {
+        return Vec::new();
+    };
+    let len = types.len().min(modes.len()).min(names.len());
+    let mut out = Vec::new();
+    for i in 0..len {
+        let mode = modes[i] as u8 as char;
+        if !matches!(mode, 'o' | 'b' | 't') {
+            continue;
+        }
+        let name = &names[i];
+        if name.is_empty() {
+            continue;
+        }
+        out.push(CompositeField {
+            name: name.clone(),
+            type_oid: types[i] as u32,
+            not_null: false,
+        });
+    }
+    out
 }
 
 fn export_operators(client: &mut postgres::Client) -> Result<Vec<OperatorEntry>, postgres::Error> {
@@ -480,11 +541,12 @@ struct CastEntry {
     source_type_oid: u32,
     target_type_oid: u32,
     context: CastContext,
+    method: CastMethod,
 }
 
 fn export_casts(client: &mut postgres::Client) -> Result<Vec<CastEntry>, postgres::Error> {
     let rows = client.query(
-        "SELECT c.castsource, c.casttarget, c.castcontext \
+        "SELECT c.castsource, c.casttarget, c.castcontext, c.castmethod \
          FROM pg_catalog.pg_cast c",
         &[],
     )?;
@@ -493,6 +555,7 @@ fn export_casts(client: &mut postgres::Client) -> Result<Vec<CastEntry>, postgre
         .iter()
         .map(|row| {
             let ctx: i8 = row.get(2);
+            let method: i8 = row.get(3);
             CastEntry {
                 source_type_oid: row.get(0),
                 target_type_oid: row.get(1),
@@ -501,9 +564,132 @@ fn export_casts(client: &mut postgres::Client) -> Result<Vec<CastEntry>, postgre
                     'a' => CastContext::Assignment,
                     _ => CastContext::Explicit,
                 },
+                method: match method as u8 as char {
+                    'b' => CastMethod::Binary,
+                    'i' => CastMethod::InOut,
+                    _ => CastMethod::Function,
+                },
             }
         })
         .collect();
 
     Ok(casts)
+}
+
+// ─── View definitions (second pass) ────────────────────────────────────────────
+
+/// Read every view and materialized view definition from the pristine catalog.
+/// `pg_views` / `pg_matviews` already cover `pg_catalog`, `information_schema`
+/// and any other schema visible to the superuser.
+fn export_view_definitions(
+    client: &mut postgres::Client,
+) -> Result<Vec<(String, String, String)>, postgres::Error> {
+    let rows = client.query(
+        "SELECT schemaname, viewname, definition FROM pg_catalog.pg_views \
+         UNION ALL \
+         SELECT schemaname, matviewname, definition FROM pg_catalog.pg_matviews \
+         ORDER BY 1, 2",
+        &[],
+    )?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let schema: String = r.get(0);
+            let name: String = r.get(1);
+            let definition: String = r.get(2);
+            (schema, name, definition)
+        })
+        .collect())
+}
+
+/// Enrich `snapshot` by re-applying each view's `CREATE VIEW` through the
+/// analyzer. This drives `ddl::views::create_view`, which populates
+/// `TableEntry.view_def` (resolved AST + deps) the same way user migrations do.
+///
+/// Fail-fast: any analyzer failure or column drift aborts the seed with the
+/// offending view's name, error, and full SQL definition. The expectation is
+/// that every system view round-trips cleanly — otherwise the analyzer has
+/// regressed or a new PG release introduced a construct we don't cover.
+fn populate_view_defs(
+    snapshot: SchemaSnapshot,
+    defs: Vec<(String, String, String)>,
+) -> SchemaSnapshot {
+    let mut db = Database::from_snapshot(snapshot);
+
+    for (schema, name, definition) in &defs {
+        let qn = QualifiedName::new(schema.clone(), name.clone());
+
+        // Keep the pass-1 column list so we can diff against the reanalyzed
+        // version below.
+        let before: Vec<TableColumn> = db
+            .snapshot()
+            .tables
+            .get(&qn)
+            .map(|t| t.columns.clone())
+            .unwrap_or_default();
+
+        // `pg_views.definition` always contains just the SELECT body; wrap it
+        // with CREATE OR REPLACE so the DDL pipeline treats it as a view
+        // replacement (overwriting the pass-1 `TableEntry` with one that
+        // carries `view_def`).
+        let sql = format!(
+            "CREATE OR REPLACE VIEW {qn} AS {body}",
+            qn = qn,
+            body = definition.trim_end().trim_end_matches(';'),
+        );
+
+        if let Err(err) = db.apply_sql(&sql) {
+            abort_on_view_failure(&qn, &err.to_string(), definition);
+        }
+
+        let after: Vec<TableColumn> = db
+            .snapshot()
+            .tables
+            .get(&qn)
+            .map(|t| t.columns.clone())
+            .unwrap_or_default();
+
+        if let Some(drift) = describe_column_drift(&before, &after) {
+            abort_on_view_failure(&qn, &format!("column drift: {drift}"), definition);
+        }
+    }
+
+    db.into_snapshot()
+}
+
+/// Print the offending view's error and SQL, then panic. Formatted the same
+/// way regardless of whether the failure came from `apply_sql` or from the
+/// column-drift check so the caller's log layout stays consistent.
+fn abort_on_view_failure(qn: &QualifiedName, error: &str, definition: &str) -> ! {
+    eprintln!();
+    eprintln!("--- {qn} ---");
+    eprintln!("  error: {error}");
+    eprintln!("  definition:");
+    for line in definition.lines() {
+        eprintln!("    {line}");
+    }
+    panic!("view reanalysis failed for {qn}");
+}
+
+/// Diff pass-1 and post-reanalysis column lists on shape: count, order,
+/// names, and type OIDs. `not_null` is intentionally skipped — our analyzer
+/// derives stricter nullability from expression structure than
+/// `pg_attribute.attnotnull`, so drift on that field is expected.
+fn describe_column_drift(before: &[TableColumn], after: &[TableColumn]) -> Option<String> {
+    if before.len() != after.len() {
+        return Some(format!("column count {} → {}", before.len(), after.len()));
+    }
+    for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+        if b.name != a.name {
+            return Some(format!("column #{i} name {:?} → {:?}", b.name, a.name));
+        }
+        if b.type_oid != a.type_oid {
+            return Some(format!(
+                "column #{i} {:?} type_oid {} → {}",
+                b.name, b.type_oid, a.type_oid
+            ));
+        }
+    }
+    None
 }

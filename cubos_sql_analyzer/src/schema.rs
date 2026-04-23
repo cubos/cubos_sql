@@ -29,8 +29,8 @@ pub struct SchemaSnapshot {
     /// Operators indexed by their schema-qualified name. Each key maps to
     /// the list of overloads (by operand types) defined under that name.
     pub operators_by_name: HashMap<QualifiedName, Vec<OperatorEntry>>,
-    /// Cast rules: `"source_oid:target_oid"` → context for O(1) lookup.
-    pub casts: HashMap<String, CastContext>,
+    /// Cast rules: `"source_oid:target_oid"` → cast info for O(1) lookup.
+    pub casts: HashMap<String, CastInfo>,
     /// Current `search_path` schemas, in order.
     pub search_path: Vec<String>,
     /// Set of all schema names known to the snapshot. Populated by
@@ -131,6 +131,33 @@ pub struct ViewDef {
     pub depends_on_tables: Vec<QualifiedName>,
     /// Specific columns this view depends on: `(table, column_name)`.
     pub depends_on_columns: Vec<(QualifiedName, String)>,
+    /// Serialized `pg_query::protobuf::Node` of the view's SELECT. All
+    /// `RangeVar`/`ColumnRef`/`TypeName`/`FuncCall`/operator references are
+    /// already resolved to their current schema-qualified form at view
+    /// creation time. This is the analog of PG's `pg_rewrite` Query tree —
+    /// lets RENAME handlers rewrite references in place and lets
+    /// `ALTER COLUMN TYPE` re-analyze the view without the original SQL.
+    ///
+    /// Stored as protobuf bytes; `serde_base64` keeps the JSON snapshot
+    /// compact instead of emitting a giant `[int, int, …]` array.
+    #[serde(default, with = "serde_base64", skip_serializing_if = "Vec::is_empty")]
+    pub resolved_ast: Vec<u8>,
+}
+
+/// Serde adapter that encodes `Vec<u8>` as a base64 string in JSON while
+/// staying a plain byte buffer in memory.
+pub(crate) mod serde_base64 {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(de)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 /// The kind of relation.
@@ -149,7 +176,6 @@ pub struct TableColumn {
     pub type_oid: u32,
     pub not_null: bool,
     pub has_default: bool,
-    pub attnum: i16,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -177,6 +203,17 @@ pub struct FunctionEntry {
     /// For aggregates: the actual return type (may differ from prorettype
     /// when a finalfn transforms the transition state).
     pub agg_final_type_oid: Option<u32>,
+    /// Output columns for SRFs with TABLE args (e.g. `pg_options_to_table`
+    /// returns `TABLE(option_name text, option_value text)`) or for functions
+    /// declared with OUT/INOUT args. Empty for functions that just return a
+    /// scalar or a registered composite. Populated from `pg_proc.proargnames`
+    /// + `pg_proc.proargmodes` (modes 'o', 'b', 't').
+    ///
+    /// This is what lets `(pg_options_to_table(x)).option_name` resolve: the
+    /// outer `record`/`setof record` return type is opaque, but `out_args`
+    /// carries the real named columns PG would expand into at runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_args: Vec<CompositeField>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -208,6 +245,68 @@ pub enum CastContext {
     Assignment,
     /// Cast requires explicit `::type` or `CAST(... AS type)`.
     Explicit,
+}
+
+/// How a cast is physically performed. Mirrors `pg_cast.castmethod`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CastMethod {
+    /// `'f'` — cast uses a conversion function from `pg_proc`.
+    Function,
+    /// `'b'` — binary coercible: source and target share the same
+    /// in-memory representation, so no conversion is needed. This is what
+    /// lets `ALTER COLUMN TYPE` skip a table rewrite (and by extension
+    /// keeps dependent views valid without re-analysis).
+    Binary,
+    /// `'i'` — cast goes through the I/O (text) representation.
+    InOut,
+}
+
+fn default_cast_method() -> CastMethod {
+    CastMethod::Function
+}
+
+/// Combined cast information from `pg_cast`. Keeps `context` (when the cast
+/// fires) and `method` (how it's executed) in one place.
+///
+/// Serialization accepts two shapes to keep older snapshot JSONs loadable:
+/// - New: `{ "context": "Implicit", "method": "Binary" }`
+/// - Legacy: `"Implicit"` (just the context; method defaults to `Function`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CastInfo {
+    pub context: CastContext,
+    #[serde(default = "default_cast_method")]
+    pub method: CastMethod,
+}
+
+impl<'de> Deserialize<'de> for CastInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            Full {
+                context: CastContext,
+                #[serde(default = "default_cast_method")]
+                method: CastMethod,
+            },
+            Legacy(CastContext),
+        }
+        Ok(match Form::deserialize(deserializer)? {
+            Form::Full { context, method } => CastInfo { context, method },
+            Form::Legacy(context) => CastInfo {
+                context,
+                method: CastMethod::Function,
+            },
+        })
+    }
+}
+
+impl CastInfo {
+    pub fn new(context: CastContext, method: CastMethod) -> Self {
+        Self { context, method }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -270,6 +369,16 @@ impl SchemaSnapshot {
         self.types.get(&oid)
     }
 
+    /// Find the OID of the array type whose elements are `element_oid`, if
+    /// one is registered. Mirrors PG's automatic `_<name>` array type that
+    /// gets created for every base/composite/domain type.
+    pub fn array_type_of(&self, element_oid: u32) -> Option<u32> {
+        self.types.values().find_map(|t| match t.kind {
+            TypeKind::Array { element_type_oid } if element_type_oid == element_oid => Some(t.oid),
+            _ => None,
+        })
+    }
+
     /// Unwrap domains to find the base type OID.
     pub fn unwrap_domain(&self, oid: u32) -> u32 {
         let mut current = oid;
@@ -291,7 +400,43 @@ impl SchemaSnapshot {
             return true;
         }
         let key = format!("{source}:{target}");
-        matches!(self.casts.get(&key), Some(CastContext::Implicit))
+        matches!(
+            self.casts.get(&key),
+            Some(CastInfo {
+                context: CastContext::Implicit,
+                ..
+            })
+        )
+    }
+
+    /// Check if `source` is binary-coercible to `target` — the PG rule that
+    /// lets `ALTER COLUMN TYPE` skip a table rewrite and keep dependent views
+    /// intact. See `src/backend/parser/parse_coerce.c:IsBinaryCoercible`.
+    ///
+    /// True when:
+    /// - `source == target`
+    /// - `source` is a domain whose base type is `target` (unwrap one level)
+    /// - `pg_cast` has an implicit, binary-method entry from `source` to `target`
+    pub fn is_binary_coercible(&self, source: u32, target: u32) -> bool {
+        if source == target {
+            return true;
+        }
+        if let Some(TypeEntry {
+            kind: TypeKind::Domain { base_type_oid },
+            ..
+        }) = self.get_type(source)
+            && *base_type_oid == target
+        {
+            return true;
+        }
+        let key = format!("{source}:{target}");
+        matches!(
+            self.casts.get(&key),
+            Some(CastInfo {
+                context: CastContext::Implicit,
+                method: CastMethod::Binary,
+            })
+        )
     }
 
     /// Find all functions matching a name, searching the `search_path`.

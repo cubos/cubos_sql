@@ -321,8 +321,23 @@ pub fn create_cast(interp: &mut Database, stmt: &CreateCastStmt) -> Result<(), D
         _ => crate::schema::CastContext::Explicit,
     };
 
+    // Map `CREATE CAST` syntax to pg_cast.castmethod:
+    // - WITH FUNCTION f(...)  → 'f' (Function)
+    // - WITH INOUT            → 'i' (InOut)
+    // - WITHOUT FUNCTION      → 'b' (Binary)
+    let method = if stmt.inout {
+        crate::schema::CastMethod::InOut
+    } else if stmt.func.is_some() {
+        crate::schema::CastMethod::Function
+    } else {
+        crate::schema::CastMethod::Binary
+    };
+
     let key = format!("{src}:{tgt}");
-    interp.snapshot.casts.insert(key, context);
+    interp
+        .snapshot
+        .casts
+        .insert(key, crate::schema::CastInfo::new(context, method));
 
     Ok(())
 }
