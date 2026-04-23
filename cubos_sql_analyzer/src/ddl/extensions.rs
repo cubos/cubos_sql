@@ -1001,29 +1001,6 @@ static REGISTRY: &[ExtensionDef] = &[
     },
 ];
 
-// ─── Extension type → Rust type mapping ────────────────────────────────────
-//
-// Static mapping used by `resolve_rust_type` to route extension-defined types
-// to crate-specific Rust types. The Rust type path is emitted *literally* in
-// generated code, so consumers only need to add the corresponding crate to
-// their own `Cargo.toml` if they use one of these types in a query.
-// `cubos_sql` itself has no dependency on these crates.
-static EXTENSION_TYPE_MAP: &[(&str, &str, &str)] = &[
-    // (extension_name, pg_type_name, rust_type_path)
-    ("vector", "vector", "pgvector::Vector"),
-    ("vector", "halfvec", "pgvector::HalfVector"),
-    ("vector", "sparsevec", "pgvector::SparseVector"),
-];
-
-/// Look up the Rust type for a type created by a known extension.
-/// Returns `None` if the extension/type pair is not in the static map.
-pub fn extension_type_rust_type(extension: &str, type_name: &str) -> Option<&'static str> {
-    EXTENSION_TYPE_MAP
-        .iter()
-        .find(|(ext, ty, _)| *ext == extension && *ty == type_name)
-        .map(|(_, _, rust)| *rust)
-}
-
 // ─── CREATE EXTENSION ───────────────────────────────────────────────────────
 
 pub fn create_extension(interp: &mut Database, stmt: &CreateExtensionStmt) -> Result<(), DdlError> {

@@ -9,9 +9,7 @@ use std::collections::HashMap;
 use crate::ddl::{DdlError, InstalledExtension, apply_sql_to};
 use crate::error::AnalyzeError;
 use crate::lexer::lex;
-use crate::resolve::{
-    AnalyzedQuery, AnalyzerConfig, analyze_static, build_spread_sample_sql, fuse,
-};
+use crate::resolve::{AnalyzedQuery, analyze_static, build_spread_sample_sql, fuse};
 use crate::schema::SchemaSnapshot;
 use crate::seed::load_seed;
 
@@ -55,11 +53,7 @@ impl Database {
     /// and nullability annotations (`$foo?`, `$foo!`); rewrites the SQL with
     /// positional placeholders; infers parameter and output column types; and
     /// returns everything combined in an [`AnalyzedQuery`].
-    pub fn analyze(
-        &self,
-        sql: &str,
-        config: &AnalyzerConfig,
-    ) -> Result<AnalyzedQuery, AnalyzeError> {
+    pub fn analyze(&self, sql: &str) -> Result<AnalyzedQuery, AnalyzeError> {
         let lex_output = lex(sql)?;
 
         // Collect explicit nullability annotations from the lexer, ordered by
@@ -86,7 +80,7 @@ impl Database {
         };
 
         let (columns, mut info_params) =
-            analyze_static(&self.snapshot, &analysis_sql, config, &param_nullability)?;
+            analyze_static(&self.snapshot, &analysis_sql, &param_nullability)?;
 
         // Merge explicit $foo? / $foo! annotations from the lexer on top of
         // the analyzer's inferred nullability (explicit always wins).

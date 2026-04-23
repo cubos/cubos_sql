@@ -10,6 +10,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::qualified_name::QualifiedName;
 
+/// Well-known OIDs for builtin PostgreSQL types. Used by the analyzer to
+/// drive coercion, operator resolution, and pseudo-type detection.
+pub(crate) mod oid {
+    pub const BOOL: u32 = 16;
+    pub const BYTEA: u32 = 17;
+    pub const NAME: u32 = 19;
+    pub const INT8: u32 = 20;
+    pub const INT2: u32 = 21;
+    pub const INT4: u32 = 23;
+    pub const TEXT: u32 = 25;
+    pub const FLOAT4: u32 = 700;
+    pub const FLOAT8: u32 = 701;
+    pub const UNKNOWN: u32 = 705;
+    pub const BPCHAR: u32 = 1042;
+    pub const VARCHAR: u32 = 1043;
+    pub const NUMERIC: u32 = 1700;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Top-level snapshot
 // ──────────────────────────────────────────────────────────────────────────────
@@ -484,7 +502,7 @@ impl SchemaSnapshot {
         left_oid: Option<u32>,
         right_oid: u32,
     ) -> Option<&OperatorEntry> {
-        use super::type_map::oid;
+        use self::oid;
 
         let mut candidate_buf: Vec<&OperatorEntry> = Vec::new();
         if !self.search_path.iter().any(|s| s == "pg_catalog")

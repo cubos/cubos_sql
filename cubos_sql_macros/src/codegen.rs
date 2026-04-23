@@ -7,7 +7,12 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse_str;
 
-use cubos_sql_analyzer::{AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField};
+use cubos_sql_analyzer::{
+    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, Type,
+};
+use cubos_sql_core::config::ResolvedConfig;
+
+use crate::pg_type_map;
 
 /// Rust keywords that cannot be used as identifiers without the `r#` prefix.
 const RUST_KEYWORDS: &[&str] = &[
@@ -83,39 +88,213 @@ pub struct ParamAssignment {
 
 /// Small accessors so the same helpers work for regular params and spread fields.
 trait TypedParam {
-    fn rust_type(&self) -> &str;
+    fn pg_type(&self) -> &Type;
     fn nullable(&self) -> bool;
-    fn domain_rust_type(&self) -> Option<&str>;
-    fn enum_rust_type(&self) -> Option<&str>;
 }
 
 impl TypedParam for AnalyzedParam {
-    fn rust_type(&self) -> &str {
-        &self.rust_type
+    fn pg_type(&self) -> &Type {
+        &self.pg_type
     }
     fn nullable(&self) -> bool {
         self.nullable
-    }
-    fn domain_rust_type(&self) -> Option<&str> {
-        self.domain_rust_type.as_deref()
-    }
-    fn enum_rust_type(&self) -> Option<&str> {
-        self.enum_rust_type.as_deref()
     }
 }
 
 impl TypedParam for AnalyzedSpreadField {
-    fn rust_type(&self) -> &str {
-        &self.rust_type
+    fn pg_type(&self) -> &Type {
+        &self.pg_type
     }
     fn nullable(&self) -> bool {
         self.nullable
     }
-    fn domain_rust_type(&self) -> Option<&str> {
-        self.domain_rust_type.as_deref()
-    }
-    fn enum_rust_type(&self) -> Option<&str> {
-        self.enum_rust_type.as_deref()
+}
+
+// ---------------------------------------------------------------------------
+// Type mapping: PG Type -> Rust
+// ---------------------------------------------------------------------------
+
+/// Resolved Rust mapping for a PG [`Type`], used by both columns and params.
+///
+/// `strategy` tells the codegen how to (de)serialize the value at the
+/// tokio-postgres boundary — plain `ToSql`/`FromSql`, JSONB-backed domain,
+/// enum-as-string, or a collection thereof.
+#[derive(Debug, Clone)]
+struct RustMapping {
+    rust_type: syn::Type,
+    strategy: DeserStrategy,
+}
+
+#[derive(Debug, Clone)]
+enum DeserStrategy {
+    /// Value implements `tokio_postgres::{ToSql, FromSql}` directly.
+    /// `accepts_into_string` is set for text-like types so params can take
+    /// `impl Into<String>`.
+    Plain { accepts_into_string: bool },
+    /// JSONB-backed domain. Value is serialized via `serde_json::to_value` on
+    /// the way in and deserialized with `serde_json::from_value::<T>` on the
+    /// way out.
+    JsonbDomain { target: syn::Type },
+    /// Enum represented as its label string. Value is stringified via
+    /// `ToString` on the way in and parsed via `FromStr` on the way out.
+    EnumAsString { target: syn::Type },
+    /// Homogeneous collection of JSONB-backed domain values.
+    VecOfJsonbDomain { inner: syn::Type },
+    /// Homogeneous collection of enum values.
+    VecOfEnumAsString { inner: syn::Type },
+}
+
+/// Entry point: resolve the Rust mapping for a PG [`Type`] at a given site,
+/// consulting the user's [`ResolvedConfig`] for domain/enum/type overrides.
+fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMapping, syn::Error> {
+    match ty {
+        Type::Domain {
+            schema, name, base, ..
+        } => {
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            if let Some(path) = config.domains.get(&qn) {
+                let target: syn::Type = parse_str(path)?;
+                return Ok(RustMapping {
+                    rust_type: target.clone(),
+                    strategy: DeserStrategy::JsonbDomain { target },
+                });
+            }
+            // Transparent domain: recurse into base.
+            resolve_type_mapping(base, config)
+        }
+        Type::Enum { schema, name, .. } => {
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            if let Some(path) = config.enums.get(&qn) {
+                let target: syn::Type = parse_str(path)?;
+                return Ok(RustMapping {
+                    rust_type: target.clone(),
+                    strategy: DeserStrategy::EnumAsString { target },
+                });
+            }
+            // No mapping: surface as String.
+            Ok(RustMapping {
+                rust_type: parse_str("String")?,
+                strategy: DeserStrategy::Plain {
+                    accepts_into_string: true,
+                },
+            })
+        }
+        Type::Array { element } => {
+            let inner = resolve_type_mapping(element, config)?;
+            match inner.strategy {
+                DeserStrategy::Plain { .. } => {
+                    let rt = inner.rust_type;
+                    Ok(RustMapping {
+                        rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
+                        strategy: DeserStrategy::Plain {
+                            accepts_into_string: false,
+                        },
+                    })
+                }
+                DeserStrategy::JsonbDomain { target } => {
+                    let rt = inner.rust_type;
+                    Ok(RustMapping {
+                        rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
+                        strategy: DeserStrategy::VecOfJsonbDomain { inner: target },
+                    })
+                }
+                DeserStrategy::EnumAsString { target } => {
+                    let rt = inner.rust_type;
+                    Ok(RustMapping {
+                        rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
+                        strategy: DeserStrategy::VecOfEnumAsString { inner: target },
+                    })
+                }
+                DeserStrategy::VecOfJsonbDomain { .. }
+                | DeserStrategy::VecOfEnumAsString { .. } => Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "nested arrays of domain/enum types are not supported",
+                )),
+            }
+        }
+        Type::Range {
+            schema,
+            name,
+            subtype,
+            ..
+        } => {
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            if let Some(path) = config.types.get(&qn) {
+                let target: syn::Type = parse_str(path)?;
+                return Ok(RustMapping {
+                    rust_type: target,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: false,
+                    },
+                });
+            }
+            // No override: map to postgres_range::Range<T>.
+            let inner = resolve_type_mapping(subtype, config)?;
+            let inner_rt = inner.rust_type;
+            Ok(RustMapping {
+                rust_type: parse_str(&format!(
+                    "::postgres_range::Range<{}>",
+                    quote::quote! { #inner_rt }
+                ))?,
+                strategy: DeserStrategy::Plain {
+                    accepts_into_string: false,
+                },
+            })
+        }
+        Type::Basic {
+            schema,
+            name,
+            extension,
+        } => {
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            // 1. User override in [types].
+            if let Some(path) = config.types.get(&qn) {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: false,
+                    },
+                });
+            }
+            // 2. Known extension type.
+            if let Some(ext) = extension.as_deref()
+                && let Some(path) = pg_type_map::lookup_extension(ext, name)
+            {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: false,
+                    },
+                });
+            }
+            // 3. Built-in PG catalog type.
+            if let Some(path) = pg_type_map::lookup_builtin(schema, name) {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: pg_type_map::is_string_like(schema, name),
+                    },
+                });
+            }
+            Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "no Rust mapping for PostgreSQL type {qn} — add it to \
+                     [package.metadata.cubos_sql.types] in your Cargo.toml"
+                ),
+            ))
+        }
+        Type::AnonymousRecord { .. } => {
+            // Anonymous record without a named Rust type: fall back to String
+            // so the generated struct compiles. Callers that need structured
+            // access can cast to a concrete composite at SQL level.
+            Ok(RustMapping {
+                rust_type: parse_str("String")?,
+                strategy: DeserStrategy::Plain {
+                    accepts_into_string: false,
+                },
+            })
+        }
     }
 }
 
@@ -125,31 +304,33 @@ impl TypedParam for AnalyzedSpreadField {
 
 pub fn generate(
     analyzed: &AnalyzedQuery,
+    config: &ResolvedConfig,
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
     if analyzed.spreads.is_empty() {
-        generate_regular(analyzed, executor_expr, assignments)
+        generate_regular(analyzed, config, executor_expr, assignments)
     } else {
-        generate_spread(analyzed, executor_expr, assignments)
+        generate_spread(analyzed, config, executor_expr, assignments)
     }
 }
 
 /// Generate code for a regular query (no spreads).
 fn generate_regular(
     analyzed: &AnalyzedQuery,
+    config: &ResolvedConfig,
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
-    let output_struct = build_output_struct(&analyzed.columns)?;
-    let (param_field_defs, param_field_inits) = build_param_fields(analyzed, assignments)?;
-    let params_slice = build_params_slice(analyzed)?;
-    let row_mapping = build_row_mapping(&analyzed.columns)?;
+    let output_struct = build_output_struct(&analyzed.columns, config)?;
+    let (param_field_defs, param_field_inits) = build_param_fields(analyzed, config, assignments)?;
+    let params_slice = build_params_slice(analyzed, config)?;
+    let row_mapping = build_row_mapping(&analyzed.columns, config)?;
 
     let sql_str = cast_params(analyzed);
     let sql_limited = wrap_with_limit(&sql_str).unwrap_or_else(|| sql_str.clone());
 
-    let fetch_value_method = build_fetch_value_method(&analyzed.columns)?;
+    let fetch_value_method = build_fetch_value_method(&analyzed.columns, config)?;
 
     let ts = quote! {
         {
@@ -298,11 +479,12 @@ fn generate_regular(
 
 fn generate_spread(
     analyzed: &AnalyzedQuery,
+    config: &ResolvedConfig,
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
-    let output_struct = build_output_struct(&analyzed.columns)?;
-    let row_mapping = build_row_mapping(&analyzed.columns)?;
+    let output_struct = build_output_struct(&analyzed.columns, config)?;
+    let row_mapping = build_row_mapping(&analyzed.columns, config)?;
     let num_regular_params = analyzed.params.len();
     let num_spreads = analyzed.spreads.len();
 
@@ -312,15 +494,18 @@ fn generate_spread(
     let mut regular_param_pushes = TokenStream::new();
     for (idx, param) in analyzed.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
-        let (field_type, value_expr) =
-            build_field_type_and_value(param, &resolve_param_value(&param.name, assignments)?)?;
+        let (field_type, value_expr) = build_field_type_and_value(
+            param,
+            config,
+            &resolve_param_value(&param.name, assignments)?,
+        )?;
 
         regular_param_fields.extend(quote! { #field_name: #field_type, });
         let param_ident = format_ident!("__{}", param.name);
         regular_param_inits.extend(quote! {
             #field_name: { let #param_ident: #field_type = #value_expr; #param_ident },
         });
-        regular_param_pushes.extend(push_param(param, &quote! { self.#field_name }));
+        regular_param_pushes.extend(push_param(param, config, &quote! { self.#field_name })?);
     }
 
     // ── Per-spread: generics, fields, inits, push exprs, SQL pieces ────
@@ -381,7 +566,7 @@ fn generate_spread(
         for field in &spread.fields {
             let accessor_ident = format_ident!("{}", field.name);
             let accessor: TokenStream = quote! { __item.#accessor_ident };
-            item_pushes.extend(push_param(field, &accessor));
+            item_pushes.extend(push_param(field, config, &accessor)?);
         }
 
         spread_param_pushes.extend(quote! {
@@ -446,7 +631,7 @@ fn generate_spread(
             = __params.iter().map(|p| p.as_ref()).collect();
     };
 
-    let fetch_value_method = build_fetch_value_method(&analyzed.columns)?;
+    let fetch_value_method = build_fetch_value_method(&analyzed.columns, config)?;
 
     let ts = quote! {
         {
@@ -582,13 +767,16 @@ fn generate_spread(
 // Helper: fetch_value() method (single-column queries only)
 // ---------------------------------------------------------------------------
 
-fn build_fetch_value_method(columns: &[AnalyzedColumn]) -> Result<TokenStream, syn::Error> {
+fn build_fetch_value_method(
+    columns: &[AnalyzedColumn],
+    config: &ResolvedConfig,
+) -> Result<TokenStream, syn::Error> {
     if columns.len() != 1 {
         return Ok(TokenStream::new());
     }
 
     let col = &columns[0];
-    let return_type = column_rust_type(col)?;
+    let return_type = column_rust_type(col, config)?;
     let field_name = make_field_ident(&col.name);
 
     let optional_body = if col.nullable {
@@ -629,12 +817,15 @@ fn build_fetch_value_method(columns: &[AnalyzedColumn]) -> Result<TokenStream, s
 // Helper: output struct fields
 // ---------------------------------------------------------------------------
 
-fn build_output_struct(columns: &[AnalyzedColumn]) -> Result<TokenStream, syn::Error> {
+fn build_output_struct(
+    columns: &[AnalyzedColumn],
+    config: &ResolvedConfig,
+) -> Result<TokenStream, syn::Error> {
     let mut fields = TokenStream::new();
 
     for col in columns {
         let field_name = make_field_ident(&col.name);
-        let field_type = column_rust_type(col)?;
+        let field_type = column_rust_type(col, config)?;
 
         fields.extend(quote! {
             pub #field_name: #field_type,
@@ -650,6 +841,7 @@ fn build_output_struct(columns: &[AnalyzedColumn]) -> Result<TokenStream, syn::E
 
 fn build_param_fields(
     analyzed: &AnalyzedQuery,
+    config: &ResolvedConfig,
     assignments: &[ParamAssignment],
 ) -> Result<(TokenStream, TokenStream), syn::Error> {
     let mut defs = TokenStream::new();
@@ -658,7 +850,7 @@ fn build_param_fields(
     for (idx, param) in analyzed.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
         let value_expr = resolve_param_value(&param.name, assignments)?;
-        let (field_type, value_expr) = build_field_type_and_value(param, &value_expr)?;
+        let (field_type, value_expr) = build_field_type_and_value(param, config, &value_expr)?;
 
         defs.extend(quote! {
             #field_name: #field_type,
@@ -677,28 +869,26 @@ fn build_param_fields(
 /// query parameter.
 fn build_field_type_and_value<P: TypedParam>(
     param: &P,
+    config: &ResolvedConfig,
     value_expr: &TokenStream,
 ) -> Result<(syn::Type, TokenStream), syn::Error> {
+    let mapping = resolve_type_mapping(param.pg_type(), config)?;
     let is_nullable = param.nullable();
-    let is_domain = param.domain_rust_type().is_some();
-    let is_enum = param.enum_rust_type().is_some();
 
-    let inner_type_str = if let Some(domain) = param.domain_rust_type() {
-        domain.to_string()
-    } else if let Some(enum_ty) = param.enum_rust_type() {
-        enum_ty.to_string()
-    } else {
-        param.rust_type().to_string()
-    };
-
+    let inner_rt = &mapping.rust_type;
     let field_type: syn::Type = if is_nullable {
-        parse_str(&format!("::std::option::Option<{inner_type_str}>"))?
+        parse_str(&format!("::std::option::Option<{}>", quote! { #inner_rt }))?
     } else {
-        parse_str(&inner_type_str)?
+        mapping.rust_type.clone()
     };
 
-    let is_string_field = param.rust_type() == "String" && !is_domain && !is_enum;
-    let value_expr = if is_string_field {
+    let accepts_into_string = matches!(
+        mapping.strategy,
+        DeserStrategy::Plain {
+            accepts_into_string: true
+        }
+    );
+    let value_expr = if accepts_into_string {
         if is_nullable {
             quote! { (#value_expr).map(Into::<String>::into) }
         } else {
@@ -715,47 +905,94 @@ fn build_field_type_and_value<P: TypedParam>(
 ///
 /// `accessor` is the expression that evaluates to the value (e.g. `self.p0`
 /// for regular params or `__item.name` for spread fields).
-fn push_param<P: TypedParam>(param: &P, accessor: &TokenStream) -> TokenStream {
+fn push_param<P: TypedParam>(
+    param: &P,
+    config: &ResolvedConfig,
+    accessor: &TokenStream,
+) -> Result<TokenStream, syn::Error> {
+    let mapping = resolve_type_mapping(param.pg_type(), config)?;
     let is_nullable = param.nullable();
-    let is_domain = param.domain_rust_type().is_some();
-    let is_enum = param.enum_rust_type().is_some();
+    let to_sql_ty = quote! {
+        Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>
+    };
 
-    if is_domain {
-        if is_nullable {
-            quote! {
-                __params.push(Box::new(match &#accessor {
-                    Some(__v) => Some(::serde_json::to_value(__v)
+    let ts = match mapping.strategy {
+        DeserStrategy::JsonbDomain { .. } => {
+            if is_nullable {
+                quote! {
+                    __params.push(Box::new(match &#accessor {
+                        Some(__v) => Some(::serde_json::to_value(__v)
+                            .map_err(|e| cubos_sql::Error::Serialize(
+                                format!("failed to serialize domain type to JSON: {e}")))?),
+                        None => None,
+                    }) as #to_sql_ty);
+                }
+            } else {
+                quote! {
+                    __params.push(Box::new(::serde_json::to_value(&#accessor)
                         .map_err(|e| cubos_sql::Error::Serialize(
-                            format!("failed to serialize domain type to JSON: {e}")))?),
-                    None => None,
-                }) as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
-            }
-        } else {
-            quote! {
-                __params.push(Box::new(::serde_json::to_value(&#accessor)
-                    .map_err(|e| cubos_sql::Error::Serialize(
-                        format!("failed to serialize domain type to JSON: {e}")))?)
-                    as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+                            format!("failed to serialize domain type to JSON: {e}")))?)
+                        as #to_sql_ty);
+                }
             }
         }
-    } else if is_enum {
-        if is_nullable {
-            quote! {
-                __params.push(Box::new(#accessor.as_ref().map(|__v| __v.to_string()))
-                    as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
-            }
-        } else {
-            quote! {
-                __params.push(Box::new(#accessor.to_string())
-                    as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+        DeserStrategy::EnumAsString { .. } => {
+            if is_nullable {
+                quote! {
+                    __params.push(Box::new(#accessor.as_ref().map(|__v| __v.to_string()))
+                        as #to_sql_ty);
+                }
+            } else {
+                quote! {
+                    __params.push(Box::new(#accessor.to_string()) as #to_sql_ty);
+                }
             }
         }
-    } else {
-        quote! {
-            __params.push(Box::new(#accessor.clone())
-                as Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>);
+        DeserStrategy::VecOfJsonbDomain { .. } => {
+            if is_nullable {
+                quote! {
+                    __params.push(Box::new(match &#accessor {
+                        Some(__vec) => Some(__vec.iter()
+                            .map(|__v| ::serde_json::to_value(__v)
+                                .map_err(|e| cubos_sql::Error::Serialize(
+                                    format!("failed to serialize domain type to JSON: {e}"))))
+                            .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?),
+                        None => None,
+                    }) as #to_sql_ty);
+                }
+            } else {
+                quote! {
+                    __params.push(Box::new(#accessor.iter()
+                        .map(|__v| ::serde_json::to_value(__v)
+                            .map_err(|e| cubos_sql::Error::Serialize(
+                                format!("failed to serialize domain type to JSON: {e}"))))
+                        .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?)
+                        as #to_sql_ty);
+                }
+            }
         }
-    }
+        DeserStrategy::VecOfEnumAsString { .. } => {
+            if is_nullable {
+                quote! {
+                    __params.push(Box::new(#accessor.as_ref().map(|__vec|
+                        __vec.iter().map(|__v| __v.to_string()).collect::<Vec<String>>()))
+                        as #to_sql_ty);
+                }
+            } else {
+                quote! {
+                    __params.push(Box::new(
+                        #accessor.iter().map(|__v| __v.to_string()).collect::<Vec<String>>())
+                        as #to_sql_ty);
+                }
+            }
+        }
+        DeserStrategy::Plain { .. } => {
+            quote! {
+                __params.push(Box::new(#accessor.clone()) as #to_sql_ty);
+            }
+        }
+    };
+    Ok(ts)
 }
 
 /// Produces the value expression that will be stored in the query struct field.
@@ -813,48 +1050,98 @@ fn cast_params(analyzed: &AnalyzedQuery) -> String {
 // Helper: `&[&(dyn ToSql + Sync)]` slice
 // ---------------------------------------------------------------------------
 
-fn build_params_slice(analyzed: &AnalyzedQuery) -> Result<TokenStream, syn::Error> {
+fn build_params_slice(
+    analyzed: &AnalyzedQuery,
+    config: &ResolvedConfig,
+) -> Result<TokenStream, syn::Error> {
     let mut elems = TokenStream::new();
+    let to_sql = quote! {
+        &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync)
+    };
 
     for idx in 0..analyzed.params.len() {
         let field_name = format_ident!("p{}", idx);
         let pi = &analyzed.params[idx];
+        let mapping = resolve_type_mapping(&pi.pg_type, config)?;
+        let nullable = pi.nullable;
 
-        if pi.domain_rust_type.is_some() {
-            if pi.nullable {
-                elems.extend(quote! {
-                    &match &self.#field_name {
-                        Some(__v) => Some(::serde_json::to_value(__v)
+        let elem = match mapping.strategy {
+            DeserStrategy::JsonbDomain { .. } => {
+                if nullable {
+                    quote! {
+                        &match &self.#field_name {
+                            Some(__v) => Some(::serde_json::to_value(__v)
+                                .map_err(|e| cubos_sql::Error::Serialize(
+                                    format!("failed to serialize domain type to JSON: {e}")))?),
+                            None => None,
+                        } as #to_sql,
+                    }
+                } else {
+                    quote! {
+                        &::serde_json::to_value(&self.#field_name)
                             .map_err(|e| cubos_sql::Error::Serialize(
-                                format!("failed to serialize domain type to JSON: {e}")))?),
-                        None => None,
-                    } as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
-                });
-            } else {
-                elems.extend(quote! {
-                    &::serde_json::to_value(&self.#field_name)
-                        .map_err(|e| cubos_sql::Error::Serialize(
-                            format!("failed to serialize domain type to JSON: {e}")))?
-                        as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
-                });
+                                format!("failed to serialize domain type to JSON: {e}")))?
+                            as #to_sql,
+                    }
+                }
             }
-        } else if pi.enum_rust_type.is_some() {
-            if pi.nullable {
-                elems.extend(quote! {
-                    &self.#field_name.as_ref().map(|__v| ::cubos_sql::__private::EnumString(__v.to_string()))
-                        as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
-                });
-            } else {
-                elems.extend(quote! {
-                    &::cubos_sql::__private::EnumString(self.#field_name.to_string())
-                        as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
-                });
+            DeserStrategy::EnumAsString { .. } => {
+                if nullable {
+                    quote! {
+                        &self.#field_name.as_ref().map(|__v|
+                            ::cubos_sql::__private::EnumString(__v.to_string()))
+                            as #to_sql,
+                    }
+                } else {
+                    quote! {
+                        &::cubos_sql::__private::EnumString(self.#field_name.to_string())
+                            as #to_sql,
+                    }
+                }
             }
-        } else {
-            elems.extend(quote! {
-                &self.#field_name as &(dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync),
-            });
-        }
+            DeserStrategy::VecOfJsonbDomain { .. } => {
+                if nullable {
+                    quote! {
+                        &match &self.#field_name {
+                            Some(__vec) => Some(__vec.iter()
+                                .map(|__v| ::serde_json::to_value(__v)
+                                    .map_err(|e| cubos_sql::Error::Serialize(
+                                        format!("failed to serialize domain type to JSON: {e}"))))
+                                .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?),
+                            None => None,
+                        } as #to_sql,
+                    }
+                } else {
+                    quote! {
+                        &self.#field_name.iter()
+                            .map(|__v| ::serde_json::to_value(__v)
+                                .map_err(|e| cubos_sql::Error::Serialize(
+                                    format!("failed to serialize domain type to JSON: {e}"))))
+                            .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?
+                            as #to_sql,
+                    }
+                }
+            }
+            DeserStrategy::VecOfEnumAsString { .. } => {
+                if nullable {
+                    quote! {
+                        &self.#field_name.as_ref().map(|__vec|
+                            __vec.iter().map(|__v| __v.to_string()).collect::<Vec<String>>())
+                            as #to_sql,
+                    }
+                } else {
+                    quote! {
+                        &self.#field_name.iter()
+                            .map(|__v| __v.to_string()).collect::<Vec<String>>()
+                            as #to_sql,
+                    }
+                }
+            }
+            DeserStrategy::Plain { .. } => {
+                quote! { &self.#field_name as #to_sql, }
+            }
+        };
+        elems.extend(elem);
     }
 
     Ok(elems)
@@ -864,12 +1151,15 @@ fn build_params_slice(analyzed: &AnalyzedQuery) -> Result<TokenStream, syn::Erro
 // Helper: row mapping inside `map(|__row| { ... })`
 // ---------------------------------------------------------------------------
 
-fn build_row_mapping(columns: &[AnalyzedColumn]) -> Result<TokenStream, syn::Error> {
+fn build_row_mapping(
+    columns: &[AnalyzedColumn],
+    config: &ResolvedConfig,
+) -> Result<TokenStream, syn::Error> {
     let mut mappings = TokenStream::new();
 
     for (idx, col) in columns.iter().enumerate() {
         let field_name = make_field_ident(&col.name);
-        let get_expr = column_get_expr(col, idx)?;
+        let get_expr = column_get_expr(col, config, idx)?;
 
         mappings.extend(quote! {
             #field_name: #get_expr,
@@ -883,89 +1173,141 @@ fn build_row_mapping(columns: &[AnalyzedColumn]) -> Result<TokenStream, syn::Err
 // Type helpers
 // ---------------------------------------------------------------------------
 
-fn column_rust_type(col: &AnalyzedColumn) -> Result<syn::Type, syn::Error> {
-    let inner_type_str = if let Some(domain) = col.domain_rust_type.as_deref() {
-        domain.to_string()
-    } else if let Some(enum_ty) = col.enum_rust_type.as_deref() {
-        enum_ty.to_string()
-    } else {
-        col.rust_type.clone()
-    };
-
-    let inner_type: syn::Type = parse_str(&inner_type_str)?;
-
+fn column_rust_type(
+    col: &AnalyzedColumn,
+    config: &ResolvedConfig,
+) -> Result<syn::Type, syn::Error> {
+    let mapping = resolve_type_mapping(&col.pg_type, config)?;
+    let inner = mapping.rust_type;
     if col.nullable {
         Ok(parse_str(&format!(
             "::std::option::Option<{}>",
-            inner_type_str
+            quote! { #inner }
         ))?)
     } else {
-        Ok(inner_type)
+        Ok(inner)
     }
 }
 
-fn column_get_expr(col: &AnalyzedColumn, idx: usize) -> Result<TokenStream, syn::Error> {
+fn column_get_expr(
+    col: &AnalyzedColumn,
+    config: &ResolvedConfig,
+    idx: usize,
+) -> Result<TokenStream, syn::Error> {
     let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+    let mapping = resolve_type_mapping(&col.pg_type, config)?;
+    let nullable = col.nullable;
 
-    if let Some(domain_type_str) = &col.domain_rust_type {
-        let domain_type: syn::Type = parse_str(domain_type_str)?;
-
-        if col.nullable {
-            Ok(quote! {
-                {
-                    let __json_val = __row.get::<_, ::std::option::Option<::serde_json::Value>>(#idx_lit);
-                    match __json_val {
-                        Some(__v) => Some(::serde_json::from_value::<#domain_type>(__v)
-                            .map_err(|e| cubos_sql::Error::Deserialize(
-                                format!("failed to deserialize {}: {e}", stringify!(#domain_type))))?),
-                        None => None,
+    match mapping.strategy {
+        DeserStrategy::JsonbDomain { target } => {
+            if nullable {
+                Ok(quote! {
+                    {
+                        let __json_val = __row.get::<_, ::std::option::Option<::serde_json::Value>>(#idx_lit);
+                        match __json_val {
+                            Some(__v) => Some(::serde_json::from_value::<#target>(__v)
+                                .map_err(|e| cubos_sql::Error::Deserialize(
+                                    format!("failed to deserialize {}: {e}", stringify!(#target))))?),
+                            None => None,
+                        }
                     }
-                }
-            })
-        } else {
-            Ok(quote! {
-                ::serde_json::from_value::<#domain_type>(
-                    __row.get::<_, ::serde_json::Value>(#idx_lit)
-                ).map_err(|e| cubos_sql::Error::Deserialize(
-                    format!("failed to deserialize {}: {e}", stringify!(#domain_type))))?
-            })
+                })
+            } else {
+                Ok(quote! {
+                    ::serde_json::from_value::<#target>(
+                        __row.get::<_, ::serde_json::Value>(#idx_lit)
+                    ).map_err(|e| cubos_sql::Error::Deserialize(
+                        format!("failed to deserialize {}: {e}", stringify!(#target))))?
+                })
+            }
         }
-    } else if let Some(enum_type_str) = &col.enum_rust_type {
-        let enum_type: syn::Type = parse_str(enum_type_str)?;
-
-        if col.nullable {
-            Ok(quote! {
-                {
-                    let __enum_val = __row.get::<_, ::std::option::Option<::cubos_sql::__private::EnumString>>(#idx_lit);
-                    match __enum_val {
-                        Some(__v) => Some(__v.0.parse::<#enum_type>()
-                            .map_err(|e| cubos_sql::Error::Deserialize(
-                                format!("failed to parse enum {}: {e}", stringify!(#enum_type))))?),
-                        None => None,
+        DeserStrategy::EnumAsString { target } => {
+            if nullable {
+                Ok(quote! {
+                    {
+                        let __enum_val = __row.get::<_, ::std::option::Option<::cubos_sql::__private::EnumString>>(#idx_lit);
+                        match __enum_val {
+                            Some(__v) => Some(__v.0.parse::<#target>()
+                                .map_err(|e| cubos_sql::Error::Deserialize(
+                                    format!("failed to parse enum {}: {e}", stringify!(#target))))?),
+                            None => None,
+                        }
                     }
-                }
-            })
-        } else {
-            Ok(quote! {
-                {
-                    let __enum_val = __row.get::<_, ::cubos_sql::__private::EnumString>(#idx_lit);
-                    __enum_val.0.parse::<#enum_type>()
-                        .map_err(|e| cubos_sql::Error::Deserialize(
-                            format!("failed to parse enum {}: {e}", stringify!(#enum_type))))?
-                }
-            })
+                })
+            } else {
+                Ok(quote! {
+                    {
+                        let __enum_val = __row.get::<_, ::cubos_sql::__private::EnumString>(#idx_lit);
+                        __enum_val.0.parse::<#target>()
+                            .map_err(|e| cubos_sql::Error::Deserialize(
+                                format!("failed to parse enum {}: {e}", stringify!(#target))))?
+                    }
+                })
+            }
         }
-    } else {
-        let base_type: syn::Type = parse_str(&col.rust_type)?;
-
-        if col.nullable {
-            Ok(quote! {
-                __row.get::<_, ::std::option::Option<#base_type>>(#idx_lit)
-            })
-        } else {
-            Ok(quote! {
-                __row.get::<_, #base_type>(#idx_lit)
-            })
+        DeserStrategy::VecOfJsonbDomain { inner } => {
+            if nullable {
+                Ok(quote! {
+                    {
+                        let __json_vec = __row.get::<_, ::std::option::Option<Vec<::serde_json::Value>>>(#idx_lit);
+                        match __json_vec {
+                            Some(__vs) => Some(__vs.into_iter()
+                                .map(|__v| ::serde_json::from_value::<#inner>(__v)
+                                    .map_err(|e| cubos_sql::Error::Deserialize(
+                                        format!("failed to deserialize {}: {e}", stringify!(#inner)))))
+                                .collect::<::std::result::Result<Vec<#inner>, _>>()?),
+                            None => None,
+                        }
+                    }
+                })
+            } else {
+                Ok(quote! {
+                    __row.get::<_, Vec<::serde_json::Value>>(#idx_lit)
+                        .into_iter()
+                        .map(|__v| ::serde_json::from_value::<#inner>(__v)
+                            .map_err(|e| cubos_sql::Error::Deserialize(
+                                format!("failed to deserialize {}: {e}", stringify!(#inner)))))
+                        .collect::<::std::result::Result<Vec<#inner>, _>>()?
+                })
+            }
+        }
+        DeserStrategy::VecOfEnumAsString { inner } => {
+            if nullable {
+                Ok(quote! {
+                    {
+                        let __str_vec = __row.get::<_, ::std::option::Option<Vec<String>>>(#idx_lit);
+                        match __str_vec {
+                            Some(__vs) => Some(__vs.into_iter()
+                                .map(|__v| __v.parse::<#inner>()
+                                    .map_err(|e| cubos_sql::Error::Deserialize(
+                                        format!("failed to parse enum {}: {e}", stringify!(#inner)))))
+                                .collect::<::std::result::Result<Vec<#inner>, _>>()?),
+                            None => None,
+                        }
+                    }
+                })
+            } else {
+                Ok(quote! {
+                    __row.get::<_, Vec<String>>(#idx_lit)
+                        .into_iter()
+                        .map(|__v| __v.parse::<#inner>()
+                            .map_err(|e| cubos_sql::Error::Deserialize(
+                                format!("failed to parse enum {}: {e}", stringify!(#inner)))))
+                        .collect::<::std::result::Result<Vec<#inner>, _>>()?
+                })
+            }
+        }
+        DeserStrategy::Plain { .. } => {
+            let base_type = mapping.rust_type;
+            if nullable {
+                Ok(quote! {
+                    __row.get::<_, ::std::option::Option<#base_type>>(#idx_lit)
+                })
+            } else {
+                Ok(quote! {
+                    __row.get::<_, #base_type>(#idx_lit)
+                })
+            }
         }
     }
 }

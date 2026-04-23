@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::AnalyzeError;
-use crate::type_map::oid;
+use crate::schema::oid;
 
 /// Collects type constraints for positional parameters ($1, $2, ...).
 #[derive(Debug, Default)]

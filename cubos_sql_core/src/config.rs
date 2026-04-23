@@ -40,6 +40,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::qualified_name::{ParseQualifiedNameError, QualifiedName};
+
 /// Top-level configuration for `cubos_sql`, read from `[package.metadata.cubos_sql]` in `Cargo.toml`.
 ///
 /// Load this from a `Cargo.toml` file with [`Config::from_cargo_toml`], or
@@ -302,6 +304,13 @@ pub enum ConfigError {
     InvalidTable { table: String, reason: String },
     #[error("unknown database '{0}' — not found in [package.metadata.cubos_sql.databases]")]
     UnknownDatabase(String),
+    #[error("invalid qualified name in [{section}] key '{key}': {source}")]
+    InvalidQualifiedName {
+        section: &'static str,
+        key: String,
+        #[source]
+        source: ParseQualifiedNameError,
+    },
 }
 
 impl std::str::FromStr for Config {
@@ -359,9 +368,9 @@ impl Config {
             None => Ok(ResolvedConfig {
                 database: &self.database,
                 migrations: &self.migrations,
-                domains: qualify_keys(&self.domains),
-                enums: qualify_keys(&self.enums),
-                types: qualify_keys(&self.types),
+                domains: qualify_keys(&self.domains, "domains")?,
+                enums: qualify_keys(&self.enums, "enums")?,
+                types: qualify_keys(&self.types, "types")?,
             }),
             Some(name) => {
                 let entry = self
@@ -371,9 +380,9 @@ impl Config {
                 Ok(ResolvedConfig {
                     database: &entry.database,
                     migrations: &entry.migrations,
-                    domains: qualify_keys(&entry.domains),
-                    enums: qualify_keys(&entry.enums),
-                    types: qualify_keys(&entry.types),
+                    domains: qualify_keys(&entry.domains, "domains")?,
+                    enums: qualify_keys(&entry.enums, "enums")?,
+                    types: qualify_keys(&entry.types, "types")?,
                 })
             }
         }
@@ -384,26 +393,37 @@ impl Config {
 ///
 /// Returned by [`Config::resolve`]. Borrows database/migration settings from the
 /// parent [`Config`], but owns the type-mapping HashMaps because keys are normalized
-/// to always be schema-qualified (`schema.name`). Unqualified names default to `public.`.
+/// into [`QualifiedName`]s. Bare names in Cargo.toml default to the `public` schema.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig<'a> {
     pub database: &'a DatabaseConfig,
     pub migrations: &'a MigrationsConfig,
-    pub domains: HashMap<String, String>,
-    pub enums: HashMap<String, String>,
-    pub types: HashMap<String, String>,
+    pub domains: HashMap<QualifiedName, String>,
+    pub enums: HashMap<QualifiedName, String>,
+    pub types: HashMap<QualifiedName, String>,
 }
 
-/// Normalize type-mapping keys to always be schema-qualified.
-/// Keys that already contain a dot are left as-is; bare names get `public.` prefix.
-fn qualify_keys(map: &HashMap<String, String>) -> HashMap<String, String> {
+/// Parse type-mapping keys into [`QualifiedName`]s.
+///
+/// Respects PostgreSQL quoting rules (`"My Schema"."My Type"`). Bare names
+/// without a dot are interpreted as living in the `public` schema.
+fn qualify_keys(
+    map: &HashMap<String, String>,
+    section: &'static str,
+) -> Result<HashMap<QualifiedName, String>, ConfigError> {
     map.iter()
         .map(|(k, v)| {
-            if k.contains('.') {
-                (k.clone(), v.clone())
+            let key = if k.contains('.') {
+                k.parse::<QualifiedName>()
+                    .map_err(|source| ConfigError::InvalidQualifiedName {
+                        section,
+                        key: k.clone(),
+                        source,
+                    })?
             } else {
-                (format!("public.{k}"), v.clone())
-            }
+                QualifiedName::new("public", k.clone())
+            };
+            Ok((key, v.clone()))
         })
         .collect()
 }
@@ -748,15 +768,19 @@ migrations = "./migrations/analytics"
         let resolved = config.resolve(None).unwrap();
         // Unqualified "user_preferences" becomes "public.user_preferences"
         assert_eq!(
-            resolved.domains.get("public.user_preferences").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("public", "user_preferences"))
+                .unwrap(),
             "crate::domains::UserPreferences"
         );
         assert_eq!(
-            resolved.domains.get("public.order_metadata").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("public", "order_metadata"))
+                .unwrap(),
             "crate::domains::OrderMetadata"
         );
-        // Original unqualified key should not exist
-        assert!(!resolved.domains.contains_key("user_preferences"));
     }
 
     #[test]
@@ -779,16 +803,25 @@ user_preferences = "crate::domains::UserPreferences"
         let resolved = config.resolve(None).unwrap();
         // Schema-qualified keys are preserved as-is
         assert_eq!(
-            resolved.domains.get("whatsapp.health_data").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("whatsapp", "health_data"))
+                .unwrap(),
             "crate::domains::HealthData"
         );
         assert_eq!(
-            resolved.domains.get("whatsapp.qr_data").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("whatsapp", "qr_data"))
+                .unwrap(),
             "crate::domains::QrData"
         );
         // Unqualified key gets "public." prefix
         assert_eq!(
-            resolved.domains.get("public.user_preferences").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("public", "user_preferences"))
+                .unwrap(),
             "crate::domains::UserPreferences"
         );
     }
@@ -816,16 +849,34 @@ point = "crate::Point"
         let resolved = config.resolve(None).unwrap();
 
         assert_eq!(
-            resolved.enums.get("public.user_role").unwrap(),
+            resolved
+                .enums
+                .get(&QualifiedName::new("public", "user_role"))
+                .unwrap(),
             "crate::UserRole"
         );
         assert_eq!(
-            resolved.enums.get("custom_schema.status").unwrap(),
+            resolved
+                .enums
+                .get(&QualifiedName::new("custom_schema", "status"))
+                .unwrap(),
             "crate::Status"
         );
 
-        assert_eq!(resolved.types.get("public.point").unwrap(), "crate::Point");
-        assert_eq!(resolved.types.get("geo.polygon").unwrap(), "crate::Polygon");
+        assert_eq!(
+            resolved
+                .types
+                .get(&QualifiedName::new("public", "point"))
+                .unwrap(),
+            "crate::Point"
+        );
+        assert_eq!(
+            resolved
+                .types
+                .get(&QualifiedName::new("geo", "polygon"))
+                .unwrap(),
+            "crate::Polygon"
+        );
     }
 
     #[test]
@@ -849,11 +900,17 @@ event_data = "crate::EventData"
         let config = Config::from_str(toml).unwrap();
         let resolved = config.resolve(Some("analytics")).unwrap();
         assert_eq!(
-            resolved.domains.get("public.event_data").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("public", "event_data"))
+                .unwrap(),
             "crate::EventData"
         );
         assert_eq!(
-            resolved.domains.get("stats.metric").unwrap(),
+            resolved
+                .domains
+                .get(&QualifiedName::new("stats", "metric"))
+                .unwrap(),
             "crate::Metric"
         );
     }

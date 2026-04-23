@@ -1,7 +1,7 @@
 //! Unit tests for the DDL interpreter.
 
 use cubos_sql_analyzer::schema::{RelationKind, SchemaSnapshot, TypeKind};
-use cubos_sql_analyzer::{AnalyzerConfig, Database, DdlError, QualifiedName};
+use cubos_sql_analyzer::{Database, DdlError, QualifiedName, Type};
 
 fn build_db(migrations: &[(&str, &str)]) -> Database {
     let mut db = Database::new();
@@ -450,34 +450,48 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
              embedding vector NOT NULL
          );",
     )]);
-    let config = AnalyzerConfig::default();
 
-    // Column of type `vector` is mapped to `pgvector::Vector`.
-    let info = db
-        .analyze("SELECT id, embedding FROM items", &config)
-        .unwrap();
+    // Column of type `vector` surfaces as a Basic type tagged with the
+    // extension name; the macro crate is responsible for routing it to
+    // `pgvector::Vector`.
+    let info = db.analyze("SELECT id, embedding FROM items").unwrap();
     let embedding = info.columns.iter().find(|c| c.name == "embedding").unwrap();
-    assert_eq!(embedding.rust_type, "pgvector::Vector");
+    assert_eq!(
+        embedding.pg_type,
+        Type::Basic {
+            schema: "public".into(),
+            name: "vector".into(),
+            extension: Some("vector".into()),
+        }
+    );
     assert!(!embedding.nullable);
 
     // A query using the `<=>` operator infers the parameter's type as vector
-    // (via the operator's left operand), and the parameter's Rust type is
-    // mapped to `pgvector::Vector`.
+    // via the operator's left operand; cast_type reports the PG name so the
+    // macro can emit `::vector` in the rewritten SQL.
     let info = db
-        .analyze(
-            "SELECT id, (embedding <=> $q) AS dist FROM items ORDER BY embedding <=> $q",
-            &config,
-        )
+        .analyze("SELECT id, (embedding <=> $q) AS dist FROM items ORDER BY embedding <=> $q")
         .unwrap();
     let dist = info.columns.iter().find(|c| c.name == "dist").unwrap();
-    assert_eq!(dist.rust_type, "f64", "cosine_distance returns float8");
-    assert_eq!(info.params.len(), 1);
-    assert_eq!(info.params[0].rust_type, "pgvector::Vector");
     assert_eq!(
-        info.params[0].cast_type.as_deref(),
-        Some("vector"),
-        "cast_type should fall through to the snapshot type name for extension types"
+        dist.pg_type,
+        Type::Basic {
+            schema: "pg_catalog".into(),
+            name: "float8".into(),
+            extension: None
+        },
+        "cosine_distance returns float8"
     );
+    assert_eq!(info.params.len(), 1);
+    assert_eq!(
+        info.params[0].pg_type,
+        Type::Basic {
+            schema: "public".into(),
+            name: "vector".into(),
+            extension: Some("vector".into()),
+        }
+    );
+    assert_eq!(info.params[0].cast_type.as_deref(), Some("public.vector"));
 }
 
 #[test]
@@ -1951,7 +1965,7 @@ fn procedure_is_not_callable_in_expressions() {
         "CREATE PROCEDURE do_thing(x int) LANGUAGE SQL AS $$ SELECT $1 $$;",
     )]);
 
-    let result = db.analyze("SELECT do_thing(1)", &AnalyzerConfig::default());
+    let result = db.analyze("SELECT do_thing(1)");
     assert!(
         result.is_err(),
         "procedures must not resolve as expression functions"
@@ -2238,13 +2252,17 @@ fn param_only_in_order_by_is_inferred() {
     )]);
 
     let info = db
-        .analyze(
-            "SELECT id FROM items ORDER BY embedding <=> $q LIMIT 10",
-            &AnalyzerConfig::default(),
-        )
+        .analyze("SELECT id FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("ORDER BY param should be resolvable");
     assert_eq!(info.params.len(), 1);
-    assert_eq!(info.params[0].rust_type, "pgvector::Vector");
+    assert_eq!(
+        info.params[0].pg_type,
+        Type::Basic {
+            schema: "public".into(),
+            name: "vector".into(),
+            extension: Some("vector".into()),
+        }
+    );
 }
 
 #[test]
@@ -2262,11 +2280,17 @@ fn param_in_group_by_and_having_is_inferred() {
              FROM orders
              GROUP BY total
              HAVING COUNT(*) > $min",
-            &AnalyzerConfig::default(),
         )
         .expect("HAVING param should be resolvable");
     assert_eq!(info.params.len(), 1);
-    assert_eq!(info.params[0].rust_type, "i64");
+    assert_eq!(
+        info.params[0].pg_type,
+        Type::Basic {
+            schema: "pg_catalog".into(),
+            name: "int8".into(),
+            extension: None,
+        }
+    );
 }
 
 #[test]

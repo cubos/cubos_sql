@@ -618,6 +618,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "cubos_sql_analyzer",
+ "cubos_sql_core",
  "pg_query",
  "prost 0.13.5",
  "serde",
@@ -646,6 +647,7 @@ name = "cubos_sql_core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "toml",
 ]

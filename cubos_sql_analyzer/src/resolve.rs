@@ -12,19 +12,15 @@ use crate::functions;
 use crate::nullability::{self, NullabilityContext};
 use crate::param::LexOutput;
 use crate::param_collector::ParamCollector;
-use crate::qualified_name::QualifiedName;
-use crate::schema::{SchemaSnapshot, TypeKind};
+use crate::schema::{SchemaSnapshot, TypeKind, oid};
 use crate::scope::{Scope, ScopeColumn};
-use crate::type_map::{self, oid};
+use crate::types::Type;
 
 /// Internal parameter representation produced by [`analyze_static`] before
 /// being fused with lexer-side info (name, sql offsets) into [`AnalyzedParam`].
 pub(crate) struct ParamInfo {
-    pub pg_type_oid: u32,
-    pub rust_type: String,
+    pub pg_type: Type,
     pub nullable: bool,
-    pub domain_rust_type: Option<String>,
-    pub enum_rust_type: Option<String>,
     pub cast_type: Option<String>,
 }
 
@@ -32,41 +28,12 @@ pub(crate) struct ParamInfo {
 // Public API
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Rust-type mappings for user-defined PostgreSQL types.
-///
-/// Values are fully-qualified Rust type paths
-/// (e.g. `"crate::domains::UserPreferences"`) that will be emitted verbatim
-/// into generated code.
-///
-/// Keys are [`QualifiedName`]s — always schema-qualified. When deserializing
-/// from TOML/JSON, keys go through PostgreSQL's identifier-lexer rules: use
-/// `public.vector` for pgvector's `vector` type, or
-/// `"My Schema"."My Table"` to escape identifiers containing special
-/// characters. See [`QualifiedName`] for the full quoting grammar.
-///
-/// Unqualified names like `"vector"` are rejected: always qualify with the
-/// schema that owns the type (usually `public` for extensions).
-#[derive(Debug, Clone, Default)]
-pub struct AnalyzerConfig {
-    /// Mappings for JSONB-backed domain types. The value is the Rust struct
-    /// that `serde_json` will (de)serialize the JSONB payload to.
-    pub domains: HashMap<QualifiedName, String>,
-    /// Mappings for enum types. The value is the Rust enum that implements
-    /// `ToString` / `FromStr` for the SQL labels.
-    pub enums: HashMap<QualifiedName, String>,
-    /// Mappings for other custom types (e.g. pgvector's `vector`).
-    pub types: HashMap<QualifiedName, String>,
-}
-
 /// A single output column of an analyzed query.
 #[derive(Debug, Clone)]
 pub struct AnalyzedColumn {
     pub name: String,
-    pub pg_type_oid: u32,
-    pub rust_type: String,
+    pub pg_type: Type,
     pub nullable: bool,
-    pub domain_rust_type: Option<String>,
-    pub enum_rust_type: Option<String>,
 }
 
 /// A named query parameter (`$name`) with lexer position plus inferred type.
@@ -79,12 +46,11 @@ pub struct AnalyzedParam {
     /// type casts (e.g. `::jsonb`). A param referenced multiple times has
     /// multiple offsets.
     pub sql_offsets: Vec<usize>,
-    pub pg_type_oid: u32,
-    pub rust_type: String,
+    pub pg_type: Type,
     pub nullable: bool,
-    pub domain_rust_type: Option<String>,
-    pub enum_rust_type: Option<String>,
     /// PostgreSQL type name for explicit cast (`::jsonb`, `::int8`, …).
+    /// Derived from [`AnalyzedParam::pg_type`] — domains are unwrapped to
+    /// their base type.
     pub cast_type: Option<String>,
 }
 
@@ -93,11 +59,8 @@ pub struct AnalyzedParam {
 #[derive(Debug, Clone)]
 pub struct AnalyzedSpreadField {
     pub name: String,
-    pub pg_type_oid: u32,
-    pub rust_type: String,
+    pub pg_type: Type,
     pub nullable: bool,
-    pub domain_rust_type: Option<String>,
-    pub enum_rust_type: Option<String>,
     pub cast_type: Option<String>,
 }
 
@@ -178,11 +141,8 @@ pub(crate) fn fuse(
         params.push(AnalyzedParam {
             name: p.name,
             sql_offsets: p.sql_offsets,
-            pg_type_oid: pi.pg_type_oid,
-            rust_type: pi.rust_type.clone(),
+            pg_type: pi.pg_type.clone(),
             nullable: pi.nullable,
-            domain_rust_type: pi.domain_rust_type.clone(),
-            enum_rust_type: pi.enum_rust_type.clone(),
             cast_type: pi.cast_type.clone(),
         });
     }
@@ -197,11 +157,8 @@ pub(crate) fn fuse(
             let pi = &info_params[spread_param_cursor];
             fields.push(AnalyzedSpreadField {
                 name: lf.name,
-                pg_type_oid: pi.pg_type_oid,
-                rust_type: pi.rust_type.clone(),
+                pg_type: pi.pg_type.clone(),
                 nullable: pi.nullable,
-                domain_rust_type: pi.domain_rust_type.clone(),
-                enum_rust_type: pi.enum_rust_type.clone(),
                 cast_type: pi.cast_type.clone(),
             });
             spread_param_cursor += 1;
@@ -233,9 +190,36 @@ pub(crate) fn fuse(
 pub(crate) fn analyze_static(
     snapshot: &SchemaSnapshot,
     sql: &str,
-    config: &AnalyzerConfig,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>), AnalyzeError> {
+    let (raw_columns, raw_params) = analyze_raw(snapshot, sql, param_nullability)?;
+
+    let columns = raw_columns
+        .into_iter()
+        .map(|rc| build_column(rc, snapshot))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let params_info = raw_params
+        .into_iter()
+        .map(|(_, type_oid, nullable)| build_param_info(type_oid, nullable, snapshot))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((columns, params_info))
+}
+
+/// A positional parameter slot: `(position, type_oid, nullable)`. Shared by
+/// the analyzer internals that thread params through overload resolution
+/// before they are merged with lexer-side info.
+pub(crate) type RawParam = (i32, u32, bool);
+
+/// Lower-level analyzer entry point: returns the raw columns (keyed by OID)
+/// and sorted param list without converting to [`Type`]. Used by the DDL
+/// view handling, which only needs OIDs to rebuild catalog entries.
+pub(crate) fn analyze_raw(
+    snapshot: &SchemaSnapshot,
+    sql: &str,
+    param_nullability: &[Option<bool>],
+) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
     let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(e.to_string()))?;
 
     let stmt = parsed
@@ -268,21 +252,12 @@ pub(crate) fn analyze_static(
         }
     };
 
-    let columns = raw_columns
-        .into_iter()
-        .map(|rc| build_column(rc, snapshot, config))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let param_list = match raw_params {
+    let raw_params = match raw_params {
         Some(p) => p,
         None => params.into_sorted()?,
     };
-    let params_info = param_list
-        .into_iter()
-        .map(|(_, type_oid, nullable)| build_param_info(type_oid, nullable, snapshot, config))
-        .collect::<Result<Vec<_>, _>>()?;
 
-    Ok((columns, params_info))
+    Ok((raw_columns, raw_params))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1391,27 +1366,19 @@ fn infer_column_name(node: &protobuf::Node) -> Option<String> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Rust type mapping
+// Type resolution
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn build_column(
-    rc: RawColumn,
-    snapshot: &SchemaSnapshot,
-    config: &AnalyzerConfig,
-) -> Result<AnalyzedColumn, AnalyzeError> {
-    let (rust_type, domain_rust_type, enum_rust_type) =
-        resolve_rust_type(rc.type_oid, snapshot, config)?;
+fn build_column(rc: RawColumn, snapshot: &SchemaSnapshot) -> Result<AnalyzedColumn, AnalyzeError> {
+    let pg_type = resolve_type(rc.type_oid, snapshot)?;
 
     // Handle nullability annotations (! and ?).
     let (name, nullable) = parse_nullability_annotation(&rc.name, rc.nullable);
 
     Ok(AnalyzedColumn {
         name,
-        pg_type_oid: rc.type_oid,
-        rust_type,
+        pg_type,
         nullable,
-        domain_rust_type,
-        enum_rust_type,
     })
 }
 
@@ -1419,87 +1386,79 @@ fn build_param_info(
     type_oid: u32,
     nullable: bool,
     snapshot: &SchemaSnapshot,
-    config: &AnalyzerConfig,
 ) -> Result<ParamInfo, AnalyzeError> {
-    let (rust_type, domain_rust_type, enum_rust_type) =
-        resolve_rust_type(type_oid, snapshot, config)?;
-
-    // Resolve cast_type: unwrap domains to base type, then look up pg_name.
-    // Prefer the static type_map (built-in PG types) but fall back to the
-    // snapshot's type name for extension-defined types like `vector`.
-    let base_oid = snapshot.unwrap_domain(type_oid);
-    let cast_type = type_map::from_oid(base_oid)
-        .map(|ti| ti.pg_name.to_string())
-        .or_else(|| {
-            snapshot
-                .get_type(base_oid)
-                .and_then(|te| te.extension.is_some().then(|| te.name.clone()))
-        });
-
+    let pg_type = resolve_type(type_oid, snapshot)?;
+    let cast_type = pg_type.cast_name();
     Ok(ParamInfo {
-        pg_type_oid: type_oid,
-        rust_type,
+        pg_type,
         nullable,
-        domain_rust_type,
-        enum_rust_type,
         cast_type,
     })
 }
 
-fn resolve_rust_type(
-    type_oid: u32,
-    snapshot: &SchemaSnapshot,
-    config: &AnalyzerConfig,
-) -> Result<(String, Option<String>, Option<String>), AnalyzeError> {
-    // Check type kind in snapshot.
+/// Build the PG-facing [`Type`] for an OID, recursing through Domain/Array
+/// wrappers. Unknown OIDs (pseudo `UNKNOWN` included) are surfaced as
+/// [`Type::Basic`] named `pg_catalog.unknown` so consumers can fall back to
+/// `String` without the analyzer having to know about Rust.
+fn resolve_type(type_oid: u32, snapshot: &SchemaSnapshot) -> Result<Type, AnalyzeError> {
     if let Some(te) = snapshot.get_type(type_oid) {
-        let qualified_name = QualifiedName::new(&te.schema, &te.name);
         match &te.kind {
             TypeKind::Domain { base_type_oid } => {
-                if let Some(rust_path) = config.domains.get(&qualified_name) {
-                    // JSONB domain.
-                    return Ok((
-                        "::serde_json::Value".to_owned(),
-                        Some(rust_path.clone()),
-                        None,
-                    ));
-                }
-                // Non-JSONB domain: unwrap to base type.
-                return resolve_rust_type(*base_type_oid, snapshot, config);
-            }
-            TypeKind::Enum { .. } => {
-                let enum_rt = config.enums.get(&qualified_name).cloned();
-                return Ok(("String".to_owned(), None, enum_rt));
+                let base = resolve_type(*base_type_oid, snapshot)?;
+                return Ok(Type::Domain {
+                    schema: te.schema.clone(),
+                    name: te.name.clone(),
+                    base: Box::new(base),
+                    extension: te.extension.clone(),
+                });
             }
             TypeKind::Array { element_type_oid } => {
-                let (elem_rt, _, _) = resolve_rust_type(*element_type_oid, snapshot, config)?;
-                return Ok((format!("Vec<{elem_rt}>"), None, None));
+                let element = resolve_type(*element_type_oid, snapshot)?;
+                return Ok(Type::Array {
+                    element: Box::new(element),
+                });
             }
-            _ => {}
-        }
-
-        // Check custom types config. Keys must be schema-qualified.
-        if let Some(rt) = config.types.get(&qualified_name) {
-            return Ok((rt.clone(), None, None));
-        }
-
-        // Built-in mapping for types defined by known extensions
-        // (e.g. pgvector's `vector` → `pgvector::Vector`).
-        if let Some(ext_name) = te.extension.as_deref()
-            && let Some(rt) = crate::ddl::extensions::extension_type_rust_type(ext_name, &te.name)
-        {
-            return Ok((rt.to_owned(), None, None));
+            TypeKind::Enum { labels } => {
+                return Ok(Type::Enum {
+                    schema: te.schema.clone(),
+                    name: te.name.clone(),
+                    labels: labels.clone(),
+                    extension: te.extension.clone(),
+                });
+            }
+            TypeKind::Range { subtype_oid } => {
+                let subtype = resolve_type(*subtype_oid, snapshot)?;
+                return Ok(Type::Range {
+                    schema: te.schema.clone(),
+                    name: te.name.clone(),
+                    subtype: Box::new(subtype),
+                    extension: te.extension.clone(),
+                });
+            }
+            TypeKind::Composite { fields } => {
+                let mut attributes = Vec::with_capacity(fields.len());
+                for f in fields {
+                    attributes.push((f.name.clone(), resolve_type(f.type_oid, snapshot)?));
+                }
+                return Ok(Type::AnonymousRecord { attributes });
+            }
+            TypeKind::Base | TypeKind::Pseudo => {
+                return Ok(Type::Basic {
+                    schema: te.schema.clone(),
+                    name: te.name.clone(),
+                    extension: te.extension.clone(),
+                });
+            }
         }
     }
 
-    // Static type_map lookup.
-    if let Some(info) = type_map::from_oid(type_oid) {
-        return Ok((info.rust_type.to_owned(), None, None));
-    }
-
-    // Unknown type fallback.
+    // Fallback for the pseudo UNKNOWN OID when not present in the snapshot.
     if type_oid == oid::UNKNOWN {
-        return Ok(("String".to_owned(), None, None));
+        return Ok(Type::Basic {
+            schema: "pg_catalog".to_owned(),
+            name: "unknown".to_owned(),
+            extension: None,
+        });
     }
 
     Err(AnalyzeError::UnknownType {

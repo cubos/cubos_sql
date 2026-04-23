@@ -1,7 +1,6 @@
 //! Type coercion and common-type resolution.
 
-use crate::schema::{CastContext, CastInfo, SchemaSnapshot};
-use crate::type_map::oid;
+use crate::schema::{CastContext, CastInfo, SchemaSnapshot, oid};
 
 /// Describes the level of implicit coercion allowed in a given context.
 ///

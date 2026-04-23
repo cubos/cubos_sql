@@ -14,7 +14,7 @@ use common::*;
 fn more_precise_left_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u LEFT JOIN posts p ON p.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // posts.title is NOT NULL in the table, but LEFT JOIN makes it nullable.
     assert!(
@@ -27,7 +27,7 @@ fn more_precise_left_join() {
 fn more_precise_right_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u RIGHT JOIN posts p ON p.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         col(&static_info, "name").nullable,
@@ -39,7 +39,7 @@ fn more_precise_right_join() {
 fn more_precise_full_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u FULL OUTER JOIN posts p ON p.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(col(&static_info, "name").nullable, "static: CORRECT");
     assert!(col(&static_info, "title").nullable, "static: CORRECT");
@@ -49,7 +49,7 @@ fn more_precise_full_join() {
 fn more_precise_count() {
     let db = setup();
     let sql = "SELECT COUNT(*) as cnt FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "cnt").nullable,
@@ -61,7 +61,7 @@ fn more_precise_count() {
 fn more_precise_coalesce() {
     let db = setup();
     let sql = "SELECT COALESCE(age, 0) as safe_age FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "safe_age").nullable,
@@ -73,7 +73,7 @@ fn more_precise_coalesce() {
 fn more_precise_literal() {
     let db = setup();
     let sql = "SELECT id, 'constant' as label FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "label").nullable,
@@ -85,7 +85,7 @@ fn more_precise_literal() {
 fn more_precise_case_with_else() {
     let db = setup();
     let sql = "SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END as category FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "category").nullable,
@@ -97,7 +97,7 @@ fn more_precise_case_with_else() {
 fn more_precise_union_all_not_null() {
     let db = setup();
     let sql = "SELECT name as val FROM users UNION ALL SELECT title as val FROM posts";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "val").nullable,
@@ -114,7 +114,7 @@ fn more_precise_cte_dml_left_join() {
     SELECT ins.id, u.name \
     FROM ins \
     LEFT JOIN users u ON u.id = ins.user_id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         col(&static_info, "name").nullable,
@@ -130,7 +130,7 @@ fn more_precise_cte_dml_left_join() {
 fn identical_case_without_else() {
     let db = setup();
     let sql = "SELECT CASE WHEN age > 18 THEN 'adult' END as category FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // CASE without ELSE is nullable because there's no ELSE branch.
     assert!(col(&static_info, "category").nullable);
@@ -144,7 +144,7 @@ fn identical_case_without_else() {
 fn identical_union_nullable_branch() {
     let db = setup();
     let sql = "SELECT name as val FROM users UNION ALL SELECT body as val FROM posts";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // nullable because body is nullable
     assert!(col(&static_info, "val").nullable);
@@ -163,7 +163,7 @@ fn complex_chained_left_joins_cascade_nullability() {
                FROM users u \
                INNER JOIN posts p ON p.user_id = u.id \
                LEFT JOIN comments c ON c.post_id = p.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // INNER JOIN columns stay NOT NULL.
     assert!(!col(&static_info, "name").nullable);
@@ -190,7 +190,7 @@ fn complex_three_table_mixed_joins() {
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id \
                RIGHT JOIN comments c ON c.post_id = p.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // users.name: RIGHT JOIN makes left side (users+posts) nullable.
     assert!(
@@ -218,7 +218,7 @@ fn complex_subquery_in_from() {
                    INNER JOIN posts p ON p.user_id = u.id \
                    GROUP BY u.name \
                ) sub";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // user_name comes from NOT NULL column → NOT NULL through subquery.
     assert!(!col(&static_info, "user_name").nullable);
@@ -235,7 +235,7 @@ fn complex_arithmetic_on_nullable() {
     let db = setup();
     // age is nullable → age + 1 should also be nullable.
     let sql = "SELECT id, age + 1 as age_plus_one FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // age + 1 is nullable (age can be NULL → NULL + 1 = NULL).
     assert!(col(&static_info, "age_plus_one").nullable);
@@ -246,7 +246,7 @@ fn complex_arithmetic_on_not_null() {
     let db = setup();
     // id is NOT NULL → id + 1 should also be NOT NULL.
     let sql = "SELECT id + 1 as next_id FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "next_id").nullable,
@@ -259,7 +259,7 @@ fn complex_coalesce_in_arithmetic() {
     let db = setup();
     // COALESCE(age, 0) is NOT NULL → adding 10 should stay NOT NULL.
     let sql = "SELECT COALESCE(age, 0) + 10 as safe_age_plus FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "safe_age_plus").nullable,
@@ -272,7 +272,7 @@ fn complex_boolean_with_nullable_input() {
     let db = setup();
     // age IS NOT NULL → bool, NOT NULL. age > 18 → bool, nullable (age can be NULL).
     let sql = "SELECT age IS NOT NULL as has_age, age > 18 as is_adult FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // IS NOT NULL is always NOT NULL (returns true/false, never NULL).
     assert!(
@@ -289,13 +289,13 @@ fn exists_without_from() {
     let db = setup();
     // SELECT EXISTS(...) without FROM — always returns exactly 1 row, never NULL.
     let sql = "SELECT EXISTS(SELECT 1 FROM users WHERE id = $p1)";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
     assert_eq!(static_info.columns.len(), 1);
     assert!(
         !static_info.columns[0].nullable,
         "EXISTS should be NOT NULL"
     );
-    assert_eq!(static_info.columns[0].rust_type, "bool");
+    assert_eq!(static_info.columns[0].pg_type, bool_ty());
 }
 
 #[test]
@@ -303,13 +303,13 @@ fn exists_constant_without_from() {
     let db = setup();
     // SELECT EXISTS(SELECT 1) — pure constant, no table reference at all.
     let sql = "SELECT EXISTS(SELECT 1)";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
     assert_eq!(static_info.columns.len(), 1);
     assert!(
         !static_info.columns[0].nullable,
         "EXISTS should be NOT NULL"
     );
-    assert_eq!(static_info.columns[0].rust_type, "bool");
+    assert_eq!(static_info.columns[0].pg_type, bool_ty());
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn complex_exists_subquery() {
     let db = setup();
     let sql = "SELECT u.name, EXISTS(SELECT 1 FROM posts p WHERE p.user_id = u.id) as has_posts \
                FROM users u";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // EXISTS always returns bool, never NULL.
     assert!(
@@ -332,7 +332,7 @@ fn complex_scalar_subquery_always_nullable() {
     let sql = "SELECT u.name, \
                       (SELECT p.title FROM posts p WHERE p.user_id = u.id LIMIT 1) as first_post \
                FROM users u";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // scalar subquery is always nullable (zero rows → NULL).
     assert!(col(&static_info, "first_post").nullable);
@@ -343,7 +343,7 @@ fn complex_cast_preserves_nullability() {
     let db = setup();
     // Casting a nullable column preserves nullability.
     let sql = "SELECT age::text as age_text, id::text as id_text FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // age is nullable → age::text is nullable.
     assert!(col(&static_info, "age_text").nullable);
@@ -360,12 +360,12 @@ fn complex_multiple_params_from_different_contexts() {
     let db = setup();
     // $p1 from WHERE, $p2 from SET-like context via comparison, $p3 from another comparison.
     let sql = "SELECT id, name FROM users WHERE id = $p1 AND age > $p2 AND email = $p3";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert_eq!(static_info.params.len(), 3);
-    assert_eq!(static_info.params[0].rust_type, "i64"); // id is BIGINT
-    assert_eq!(static_info.params[1].rust_type, "i32"); // age is INT
-    assert_eq!(static_info.params[2].rust_type, "String"); // email is TEXT
+    assert_eq!(static_info.params[0].pg_type, int8()); // id is BIGINT
+    assert_eq!(static_info.params[1].pg_type, int4()); // age is INT
+    assert_eq!(static_info.params[2].pg_type, text()); // email is TEXT
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn complex_mixed_computed_and_direct_cols() {
                FROM users u \
                INNER JOIN posts p ON p.user_id = u.id \
                GROUP BY u.id, u.name, u.age, u.email";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // Direct columns.
     assert!(!col(&static_info, "id").nullable);
@@ -410,7 +410,7 @@ fn complex_cte_chain() {
                        INNER JOIN posts p ON p.user_id = au.id \
                    ) \
                SELECT name, title FROM user_posts";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // CTE chain: types propagate correctly.
     assert!(!col(&static_info, "name").nullable);
@@ -425,7 +425,7 @@ fn complex_union_three_branches() {
                SELECT title as label FROM posts \
                UNION ALL \
                SELECT author_name as label FROM comments";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // All three are NOT NULL → union is NOT NULL.
     assert!(!col(&static_info, "label").nullable, "static: CORRECT");
@@ -440,7 +440,7 @@ fn complex_insert_select_with_join() {
                FROM posts p \
                WHERE p.user_id = $p3 \
                RETURNING id, post_id, author_name";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "post_id").nullable);
@@ -457,7 +457,7 @@ fn complex_left_join_with_subquery() {
                    FROM posts \
                    ORDER BY user_id, published_at DESC NULLS LAST \
                ) latest ON latest.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // latest_title: NOT NULL in posts but LEFT JOIN makes it nullable.
     assert!(
@@ -477,7 +477,7 @@ fn stress_nested_coalesce() {
     let db = setup();
     // COALESCE(COALESCE(nullable, nullable), literal) → NOT NULL
     let sql = "SELECT COALESCE(COALESCE(age, age), 0) as val FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(
         !col(&info, "val").nullable,
         "nested COALESCE with final literal → NOT NULL"
@@ -489,7 +489,7 @@ fn stress_coalesce_all_nullable() {
     let db = setup();
     // COALESCE(nullable, nullable) → still nullable (no non-null fallback)
     let sql = "SELECT COALESCE(age, age) as val FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(
         col(&info, "val").nullable,
         "COALESCE of only nullable args → nullable"
@@ -501,7 +501,7 @@ fn stress_case_with_null_branch() {
     let db = setup();
     // CASE with one branch returning NULL explicitly
     let sql = "SELECT CASE WHEN age > 18 THEN name ELSE NULL END as val FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "val").nullable, "CASE with NULL ELSE → nullable");
 }
 
@@ -511,7 +511,7 @@ fn stress_case_mixing_nullable_branches() {
     // CASE with one NOT NULL branch and one nullable branch
     let sql = "SELECT CASE WHEN id > 0 THEN name ELSE body END as val \
                FROM users u INNER JOIN posts p ON p.user_id = u.id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // name is NOT NULL but body is nullable → result is nullable
     assert!(
         col(&info, "val").nullable,
@@ -528,7 +528,7 @@ fn stress_star_with_left_join() {
     let sql = "SELECT u.id, u.name, p.title, p.body \
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "name").nullable);
@@ -544,7 +544,7 @@ fn stress_star_with_left_join() {
 fn stress_select_without_from() {
     let db = setup();
     let sql = "SELECT 1 as one, 'hello' as greeting, TRUE as flag";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "one").nullable);
     assert!(!col(&static_info, "greeting").nullable);
@@ -555,7 +555,7 @@ fn stress_select_without_from() {
 fn stress_select_null_literal() {
     let db = setup();
     let sql = "SELECT NULL as nothing";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "nothing").nullable, "NULL literal is nullable");
 }
 
@@ -567,7 +567,7 @@ fn stress_ambiguous_id_columns() {
     // Both tables have 'id' — must use aliases to disambiguate
     let sql = "SELECT u.id as user_id, p.id as post_id \
                FROM users u INNER JOIN posts p ON p.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "user_id").nullable);
     assert!(!col(&static_info, "post_id").nullable);
@@ -583,7 +583,7 @@ fn stress_deeply_nested_subquery() {
                        SELECT id, name, age FROM users \
                    ) inner_sq \
                ) outer_sq";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "name").nullable);
@@ -599,7 +599,7 @@ fn stress_subquery_with_left_join_inside() {
                    FROM users u \
                    LEFT JOIN posts p ON p.user_id = u.id \
                ) sq";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // title is nullable because of LEFT JOIN inside subquery.
     assert!(
@@ -617,7 +617,7 @@ fn stress_union_with_null_literal_branch() {
     let sql = "SELECT name as val FROM users \
                UNION ALL \
                SELECT NULL as val";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(
         col(&info, "val").nullable,
         "UNION with NULL branch → nullable"
@@ -631,7 +631,7 @@ fn stress_union_mixed_types() {
     let sql = "SELECT age as num FROM users \
                UNION ALL \
                SELECT id as num FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // age is nullable → union is nullable (even though id is NOT NULL)
     assert!(col(&static_info, "num").nullable);
@@ -646,7 +646,7 @@ fn stress_cte_used_in_union() {
                SELECT name FROM active \
                UNION ALL \
                SELECT title as name FROM posts";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // Both branches NOT NULL
     assert!(!col(&info, "name").nullable);
 }
@@ -658,7 +658,7 @@ fn stress_update_returning_expression() {
     let db = setup();
     let sql = "UPDATE users SET age = $p1 WHERE id = $p2 \
                RETURNING id, COALESCE(age, 0) as safe_age, name || '!' as excited";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     // COALESCE in RETURNING
@@ -674,7 +674,7 @@ fn stress_delete_returning_all_columns() {
     let db = setup();
     let sql = "DELETE FROM users WHERE id = $p1 \
                RETURNING id, name, email, age, created_at";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "name").nullable);
@@ -693,7 +693,7 @@ fn stress_cte_insert_returning_coalesce() {
                    RETURNING id, age \
                ) \
                SELECT id, COALESCE(age, 0) as safe_age FROM ins";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     // COALESCE on CTE column: static knows it's NOT NULL
@@ -706,21 +706,21 @@ fn stress_cte_insert_returning_coalesce() {
 fn stress_param_from_insert_values() {
     let db = setup();
     let sql = "INSERT INTO posts (user_id, title, body) VALUES ($p1, $p2, $p3) RETURNING id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert_eq!(static_info.params.len(), 3);
-    assert_eq!(static_info.params[0].rust_type, "i64"); // user_id BIGINT
-    assert_eq!(static_info.params[1].rust_type, "String"); // title TEXT
-    assert_eq!(static_info.params[2].rust_type, "String"); // body TEXT
+    assert_eq!(static_info.params[0].pg_type, int8()); // user_id BIGINT
+    assert_eq!(static_info.params[1].pg_type, text()); // title TEXT
+    assert_eq!(static_info.params[2].pg_type, text()); // body TEXT
 }
 
 #[test]
 fn stress_param_with_cast() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE id = $p1::bigint";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
-    assert_eq!(static_info.params[0].rust_type, "i64");
+    assert_eq!(static_info.params[0].pg_type, int8());
 }
 
 // ── Self-join ──────────────────────────────────────────────────────────
@@ -731,7 +731,7 @@ fn stress_self_join() {
     let sql = "SELECT a.name as name_a, b.name as name_b \
                FROM users a \
                INNER JOIN users b ON a.id = b.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "name_a").nullable);
     assert!(!col(&static_info, "name_b").nullable);
@@ -743,7 +743,7 @@ fn stress_self_join() {
 fn stress_cross_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u CROSS JOIN posts p";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // CROSS JOIN doesn't make anything nullable
     assert!(!col(&static_info, "name").nullable);
@@ -756,7 +756,7 @@ fn stress_cross_join() {
 fn stress_implicit_cross_join() {
     let db = setup();
     let sql = "SELECT u.name, p.title FROM users u, posts p WHERE p.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "name").nullable);
     assert!(!col(&static_info, "title").nullable);
@@ -769,7 +769,7 @@ fn stress_complex_where_params() {
     let db = setup();
     let sql = "SELECT id FROM users \
                WHERE (name = $p1 OR email = $p2) AND age > $p3";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert_eq!(static_info.params.len(), 3);
 }
@@ -780,7 +780,7 @@ fn stress_complex_where_params() {
 fn stress_insert_returning_star() {
     let db = setup();
     let sql = "INSERT INTO posts (user_id, title) VALUES ($p1, $p2) RETURNING *";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "user_id").nullable);
@@ -797,7 +797,7 @@ fn stress_subquery_computed_columns() {
     let sql = "SELECT sq.cnt, sq.max_age FROM ( \
                    SELECT COUNT(*) as cnt, MAX(age) as max_age FROM users \
                ) sq";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // COUNT is NOT NULL, MAX is nullable
     assert!(!col(&static_info, "cnt").nullable, "static: CORRECT");
@@ -810,7 +810,7 @@ fn stress_subquery_computed_columns() {
 fn stress_limit_offset() {
     let db = setup();
     let sql = "SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 5";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "name").nullable);
@@ -824,7 +824,7 @@ fn stress_annotation_on_left_join_star() {
     // Force nullable LEFT JOIN column to NOT NULL via annotation
     let sql = "SELECT u.name, p.title as \"title!\" \
                FROM users u LEFT JOIN posts p ON p.user_id = u.id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(
         !col(&info, "title").nullable,
         "! overrides LEFT JOIN nullable"
@@ -838,7 +838,7 @@ fn stress_distinct_on() {
     let db = setup();
     let sql = "SELECT DISTINCT ON (user_id) user_id, title, body \
                FROM posts ORDER BY user_id, published_at DESC NULLS LAST";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "user_id").nullable);
     assert!(!col(&static_info, "title").nullable);
@@ -853,7 +853,7 @@ fn stress_aggregate_subquery_in_select() {
     let sql = "SELECT u.name, \
                       (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) as post_count \
                FROM users u";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // Static analyzer knows: aggregate without GROUP BY → exactly 1 row,
     // and COUNT is NOT NULL → scalar subquery result is NOT NULL.
@@ -866,7 +866,7 @@ fn stress_aggregate_subquery_in_select() {
 fn stress_insert_minimal() {
     let db = setup();
     let sql = "INSERT INTO users (name, email) VALUES ($p1, $p2) RETURNING id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert_eq!(static_info.params.len(), 2);
     assert!(!col(&static_info, "id").nullable);
@@ -889,7 +889,7 @@ fn stress_cte_dml_chain() {
                SELECT nu.name, np.title, np.post_id \
                FROM new_user nu \
                INNER JOIN new_post np ON np.user_id = nu.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "name").nullable);
     assert!(!col(&static_info, "title").nullable);
@@ -902,7 +902,7 @@ fn stress_cte_dml_chain() {
 fn stress_aggregates_no_group_by() {
     let db = setup();
     let sql = "SELECT COUNT(*) as cnt, SUM(age) as total_age, MAX(name) as last_name FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // COUNT is NOT NULL
     assert!(!col(&static_info, "cnt").nullable, "static: CORRECT");
@@ -924,7 +924,7 @@ fn torture_union_in_subquery_in_from() {
                    UNION ALL \
                    SELECT title as val FROM posts \
                ) sq";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // Both NOT NULL → union NOT NULL → subquery NOT NULL.
     assert!(!col(&static_info, "val").nullable, "static: CORRECT");
@@ -942,7 +942,7 @@ fn torture_left_join_on_union_subquery() {
                    SELECT p.user_id, c.content as val FROM comments c \
                    INNER JOIN posts p ON p.id = c.post_id \
                ) all_content ON all_content.user_id = u.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // val is NOT NULL in the union, but LEFT JOIN makes it nullable.
     assert!(
@@ -962,7 +962,7 @@ fn torture_cte_with_union_and_left_join() {
                SELECT u.id, an.name as other_name \
                FROM users u \
                LEFT JOIN all_names an ON true";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     // LEFT JOIN on CTE → nullable
@@ -977,7 +977,7 @@ fn torture_nested_case_in_coalesce() {
                    CASE WHEN age > 18 THEN age END, \
                    0 \
                ) as val FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // CASE without ELSE is nullable, but COALESCE with 0 fallback makes it NOT NULL.
     assert!(!col(&info, "val").nullable);
 }
@@ -989,7 +989,7 @@ fn torture_triple_left_join() {
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id \
                LEFT JOIN comments c ON c.post_id = p.id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "name").nullable);
     assert!(col(&static_info, "title").nullable, "1st LEFT JOIN");
@@ -1007,7 +1007,7 @@ fn torture_full_join_with_coalesce_fix() {
     let sql = "SELECT COALESCE(u.name, p.title, 'unknown') as label \
                FROM users u \
                FULL OUTER JOIN posts p ON p.user_id = u.id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // Both u.name and p.title are nullable due to FULL JOIN,
     // but COALESCE with 'unknown' fallback → NOT NULL.
     assert!(!col(&info, "label").nullable);
@@ -1017,7 +1017,7 @@ fn torture_full_join_with_coalesce_fix() {
 fn torture_param_in_coalesce() {
     let db = setup();
     let sql = "SELECT COALESCE(age, $p1) as val FROM users";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // $p1 is NOT NULL by default → COALESCE has a NOT NULL arg → NOT NULL.
     assert!(!col(&static_info, "val").nullable);
@@ -1032,7 +1032,7 @@ fn torture_multiple_ctes_cross_reference() {
                    c AS (SELECT b.name, b.title, cm.content \
                          FROM b LEFT JOIN comments cm ON true) \
                SELECT name, title, content FROM c";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "name").nullable);
     assert!(!col(&info, "title").nullable);
     assert!(col(&info, "content").nullable, "LEFT JOIN in CTE c");
@@ -1045,7 +1045,7 @@ fn torture_update_from_join() {
                FROM users u \
                WHERE posts.user_id = u.id AND u.name = $p2 \
                RETURNING posts.id, posts.title, posts.body";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     assert!(!col(&static_info, "title").nullable);
@@ -1060,7 +1060,7 @@ fn torture_select_from_cte_left_join_cte() {
                    p AS (SELECT user_id, title FROM posts) \
                SELECT u.name, p.title \
                FROM u LEFT JOIN p ON p.user_id = u.id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "name").nullable);
     assert!(col(&info, "title").nullable, "LEFT JOIN between CTEs");
 }
@@ -1073,7 +1073,7 @@ fn torture_count_with_group_by() {
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id \
                GROUP BY u.name";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(
         !col(&static_info, "post_count").nullable,
@@ -1088,7 +1088,7 @@ fn torture_expression_in_insert_returning() {
                RETURNING id, \
                          name || ' (' || email || ')' as display, \
                          CASE WHEN age >= 18 THEN true ELSE false END as is_adult";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     assert!(!col(&static_info, "id").nullable);
     // concat of NOT NULL → NOT NULL
@@ -1109,7 +1109,7 @@ fn torture_deeply_nested_cte_union_join() {
                SELECT n.val, u.age \
                FROM names n \
                LEFT JOIN users u ON u.name = n.val";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "val").nullable, "CTE UNION of NOT NULL");
     assert!(col(&info, "age").nullable, "LEFT JOIN + nullable col");
 }
@@ -1124,7 +1124,7 @@ fn subquery_count_star_not_null() {
     let sql = "SELECT u.name, \
                       (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) as cnt \
                FROM users u";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // Static: aggregate without GROUP BY → guaranteed 1 row, COUNT is NOT NULL.
     assert!(!col(&static_info, "cnt").nullable);
@@ -1137,7 +1137,7 @@ fn subquery_count_plus_one_not_null() {
     let sql = "SELECT u.name, \
                       (SELECT COUNT(*) + 1 FROM posts p WHERE p.user_id = u.id) as cnt \
                FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "cnt").nullable);
 }
 
@@ -1146,7 +1146,7 @@ fn subquery_count_cast_not_null() {
     let db = setup();
     // COUNT(*)::int wraps aggregate in TypeCast.
     let sql = "SELECT (SELECT COUNT(*)::int FROM posts) as cnt FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "cnt").nullable);
 }
 
@@ -1157,7 +1157,7 @@ fn subquery_coalesce_sum_not_null() {
     // SUM is nullable (empty group), but COALESCE with literal → NOT NULL.
     // Also: aggregate without GROUP BY → guaranteed 1 row.
     let sql = "SELECT (SELECT COALESCE(SUM(rating), 0) FROM comments) as total";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "total").nullable);
 }
 
@@ -1167,7 +1167,7 @@ fn subquery_sum_nullable() {
     // SUM without COALESCE: aggregate != COUNT → nullable result.
     // Even though guaranteed 1 row, SUM itself returns NULL for empty input.
     let sql = "SELECT (SELECT SUM(rating) FROM comments) as total";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "total").nullable);
 }
 
@@ -1178,7 +1178,7 @@ fn subquery_with_group_by_still_nullable() {
     let sql = "SELECT u.name, \
                       (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id GROUP BY p.user_id) as cnt \
                FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "cnt").nullable);
 }
 
@@ -1189,7 +1189,7 @@ fn subquery_non_aggregate_still_nullable() {
     let sql = "SELECT u.name, \
                       (SELECT p.title FROM posts p WHERE p.user_id = u.id LIMIT 1) as first_title \
                FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "first_title").nullable);
 }
 
@@ -1198,7 +1198,7 @@ fn subquery_case_wrapping_count_not_null() {
     let db = setup();
     // CASE WHEN ... THEN COUNT(*) ELSE 0 END — aggregate inside CASE with ELSE.
     let sql = "SELECT (SELECT CASE WHEN true THEN COUNT(*) ELSE 0 END FROM posts) as cnt";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "cnt").nullable);
 }
 
@@ -1211,7 +1211,7 @@ fn agg_sum_with_group_by_not_null_input() {
     let db = setup();
     // user_id is NOT NULL + GROUP BY → SUM guaranteed non-null.
     let sql = "SELECT user_id, SUM(user_id) as total FROM posts GROUP BY user_id";
-    let static_info = db.analyze(sql, &default_config()).unwrap();
+    let static_info = db.analyze(sql).unwrap();
 
     // Static: GROUP BY + NOT NULL input → NOT NULL.
     assert!(!col(&static_info, "total").nullable);
@@ -1222,7 +1222,7 @@ fn agg_sum_with_group_by_nullable_input() {
     let db = setup();
     // rating is nullable + GROUP BY → SUM still nullable (all rows in group could be NULL).
     let sql = "SELECT post_id, SUM(rating) as total FROM comments GROUP BY post_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "total").nullable);
 }
 
@@ -1232,7 +1232,7 @@ fn agg_min_max_with_group_by_not_null() {
     // title is NOT NULL + GROUP BY → MIN/MAX are NOT NULL.
     let sql = "SELECT user_id, MIN(title) as first_title, MAX(title) as last_title \
                FROM posts GROUP BY user_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "first_title").nullable);
     assert!(!col(&info, "last_title").nullable);
 }
@@ -1242,7 +1242,7 @@ fn agg_avg_with_group_by_not_null() {
     let db = setup();
     // id is NOT NULL + GROUP BY → AVG is NOT NULL.
     let sql = "SELECT user_id, AVG(id) as avg_id FROM posts GROUP BY user_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "avg_id").nullable);
 }
 
@@ -1251,7 +1251,7 @@ fn agg_count_with_group_by() {
     let db = setup();
     // COUNT is always NOT NULL, with or without GROUP BY.
     let sql = "SELECT user_id, COUNT(*) as cnt FROM posts GROUP BY user_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "cnt").nullable);
 }
 
@@ -1260,7 +1260,7 @@ fn agg_count_without_group_by() {
     let db = setup();
     // COUNT without GROUP BY: still NOT NULL (returns 0).
     let sql = "SELECT COUNT(*) as cnt FROM posts";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "cnt").nullable);
 }
 
@@ -1270,7 +1270,7 @@ fn agg_sum_without_group_by_always_nullable() {
     // SUM without GROUP BY: table could be empty → NULL.
     // Even with NOT NULL input.
     let sql = "SELECT SUM(id) as total FROM posts";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "total").nullable);
 }
 
@@ -1284,7 +1284,7 @@ fn agg_mixed_nullability_with_group_by() {
                       MIN(author_name) as first_author, \
                       MAX(rating) as max_rating \
                FROM comments GROUP BY post_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "cnt").nullable); // COUNT: always NOT NULL
     assert!(col(&info, "sum_rating").nullable); // SUM(nullable): nullable
     assert!(!col(&info, "first_author").nullable); // MIN(NOT NULL): NOT NULL
@@ -1300,7 +1300,7 @@ fn agg_with_group_by_and_left_join() {
                FROM users u \
                LEFT JOIN posts p ON p.user_id = u.id \
                GROUP BY u.id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "post_count").nullable); // COUNT: always NOT NULL
     assert!(col(&info, "last_title").nullable); // MAX(nullable from LEFT JOIN): nullable
 }
@@ -1312,7 +1312,7 @@ fn agg_string_agg_with_group_by_not_null() {
     // The literal ', ' has type UNKNOWN — resolved via UNKNOWN-compatible matching.
     let sql = "SELECT post_id, string_agg(author_name, ', ') as authors \
                FROM comments GROUP BY post_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "authors").nullable);
 }
 
@@ -1325,7 +1325,7 @@ fn strict_pg_catalog_function_not_null() {
     let db = setup();
     // length(text) is pg_catalog, strict, not in exceptions → NOT NULL with NOT NULL input.
     let sql = "SELECT length(name) as len FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "len").nullable);
 }
 
@@ -1334,7 +1334,7 @@ fn strict_pg_catalog_function_nullable_with_nullable_arg() {
     let db = setup();
     // length(text) is strict: nullable input → nullable output.
     let sql = "SELECT length(body) as len FROM posts";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "len").nullable);
 }
 
@@ -1343,7 +1343,7 @@ fn strict_pg_catalog_upper_not_null() {
     let db = setup();
     // upper(text) is pg_catalog, strict → NOT NULL with NOT NULL input.
     let sql = "SELECT upper(name) as uname FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "uname").nullable);
 }
 
@@ -1352,7 +1352,7 @@ fn operator_plus_not_null() {
     let db = setup();
     // 1 + 1: both non-null, operator not in exceptions → NOT NULL.
     let sql = "SELECT 1 + 1 as result";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "result").nullable);
 }
 
@@ -1361,7 +1361,7 @@ fn operator_plus_nullable_arg() {
     let db = setup();
     // age is nullable → result is nullable.
     let sql = "SELECT age + 1 as next_age FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "next_age").nullable);
 }
 
@@ -1370,7 +1370,7 @@ fn operator_concat_not_null() {
     let db = setup();
     // || with two NOT NULL → NOT NULL.
     let sql = "SELECT name || ' <' || email || '>' as display FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "display").nullable);
 }
 
@@ -1379,7 +1379,7 @@ fn operator_concat_nullable_arg() {
     let db = setup();
     // body is nullable → concat is nullable.
     let sql = "SELECT title || body as combined FROM posts";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "combined").nullable);
 }
 
@@ -1392,7 +1392,7 @@ fn nonstrict_concat_never_null() {
     let db = setup();
     // concat is non-strict but never returns NULL (treats NULLs as '').
     let sql = "SELECT concat(p.title, ' ', p.body) as full_text FROM posts p";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "full_text").nullable);
 }
 
@@ -1400,7 +1400,7 @@ fn nonstrict_concat_never_null() {
 fn nonstrict_concat_ws_never_null() {
     let db = setup();
     let sql = "SELECT concat_ws(', '::text, name, email) as combined FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "combined").nullable);
 }
 
@@ -1408,7 +1408,7 @@ fn nonstrict_concat_ws_never_null() {
 fn nonstrict_now_never_null() {
     let db = setup();
     let sql = "SELECT now() as ts";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "ts").nullable);
 }
 
@@ -1416,6 +1416,6 @@ fn nonstrict_now_never_null() {
 fn nonstrict_random_never_null() {
     let db = setup();
     let sql = "SELECT random() as r";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "r").nullable);
 }

@@ -14,8 +14,8 @@ fn unknown_literal_in_function_call() {
     // ', ' is UNKNOWN type — should resolve string_agg(text, text) unambiguously.
     let sql = "SELECT post_id, string_agg(author_name, ', ') as authors \
                FROM comments GROUP BY post_id";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "authors").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "authors").pg_type, text());
 }
 
 #[test]
@@ -23,8 +23,8 @@ fn unknown_literal_in_replace() {
     let db = setup();
     // replace(text, text, text) — two UNKNOWN literals.
     let sql = "SELECT replace(name, 'foo', 'bar') as replaced FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "replaced").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "replaced").pg_type, text());
     assert!(!col(&info, "replaced").nullable);
 }
 
@@ -33,7 +33,7 @@ fn unknown_literal_in_position() {
     let db = setup();
     // position(text in text) — UNKNOWN in first arg.
     let sql = "SELECT position('x' in name) as pos FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "pos").nullable);
 }
 
@@ -47,8 +47,8 @@ fn unknown_literal_in_position() {
 fn unknown_operator_jsonb_exists() {
     let db = setup();
     let sql = "SELECT id FROM users WHERE preferences ? 'theme'";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "id").rust_type, "i64");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "id").pg_type, int8());
 }
 
 /// jsonb `->>` with a typed left side and UNKNOWN right resolves to
@@ -57,8 +57,8 @@ fn unknown_operator_jsonb_exists() {
 fn unknown_operator_jsonb_arrow_text() {
     let db = setup();
     let sql = "SELECT preferences->>'theme' as theme FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "theme").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "theme").pg_type, text());
     assert!(col(&info, "theme").nullable);
 }
 
@@ -70,11 +70,11 @@ fn unknown_param_jsonb_exists_then_arrow() {
     let sql = "UPDATE whatsapp.contacts SET \
                name = CASE WHEN $p1 ? 'name' THEN $p1->>'name' ELSE name END \
                WHERE channel_id = $p2 AND id = $p3";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // $p1 should be inferred as jsonb via the `?` operator
-    assert_eq!(info.params[0].rust_type, "::serde_json::Value");
-    assert_eq!(info.params[1].rust_type, "i64");
-    assert_eq!(info.params[2].rust_type, "String");
+    assert_eq!(info.params[0].pg_type, jsonb());
+    assert_eq!(info.params[1].pg_type, int8());
+    assert_eq!(info.params[2].pg_type, text());
 }
 
 /// Multiple CASE WHEN branches using `?` and `->>` with the same param.
@@ -86,10 +86,10 @@ fn unknown_param_jsonb_multiple_case_branches() {
                pushname = CASE WHEN $p1 ? 'pushname' THEN $p1->>'pushname' ELSE pushname END, \
                is_business = CASE WHEN $p1 ? 'is_business' THEN ($p1->>'is_business')::boolean ELSE is_business END \
                WHERE channel_id = $p2 AND id = $p3";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(info.params[0].rust_type, "::serde_json::Value");
-    assert_eq!(info.params[1].rust_type, "i64");
-    assert_eq!(info.params[2].rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(info.params[0].pg_type, jsonb());
+    assert_eq!(info.params[1].pg_type, int8());
+    assert_eq!(info.params[2].pg_type, text());
 }
 
 /// Operator `->` (returns jsonb) with UNKNOWN right side should resolve.
@@ -97,9 +97,9 @@ fn unknown_param_jsonb_multiple_case_branches() {
 fn unknown_operator_jsonb_arrow() {
     let db = setup();
     let sql = "SELECT preferences->'theme' as theme FROM users";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // -> returns jsonb (when left is jsonb)
-    assert_eq!(col(&info, "theme").rust_type, "::serde_json::Value");
+    assert_eq!(col(&info, "theme").pg_type, jsonb());
 }
 
 /// Query against pg_catalog table with obj_description function.
@@ -107,12 +107,12 @@ fn unknown_operator_jsonb_arrow() {
 fn pg_catalog_obj_description_with_param() {
     let db = setup();
     let sql = "SELECT obj_description(oid) as comment FROM pg_namespace WHERE nspname = $p1";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // obj_description returns nullable text → Option<String>
-    assert_eq!(col(&info, "comment").rust_type, "String");
+    assert_eq!(col(&info, "comment").pg_type, text());
     assert!(col(&info, "comment").nullable);
-    // $p1 compared with nspname (type name) → String
-    assert_eq!(info.params[0].rust_type, "String");
+    // $p1 compared with nspname (type name) → name column.
+    assert_eq!(info.params[0].pg_type, name_ty());
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -125,15 +125,15 @@ fn star_expr_resolves_to_composite_type_via_row_to_json() {
     // `u.*` here feeds into row_to_json, which takes `record` / any composite.
     // The analyzer should recognize the composite and produce JSON.
     let sql = "SELECT row_to_json(u.*) AS payload FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "payload").rust_type, "::serde_json::Value");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "payload").pg_type, json_ty());
 }
 
 #[test]
 fn star_expr_not_null_because_row_is_always_present() {
     let db = setup();
     let sql = "SELECT row_to_json(u.*) AS payload FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     // `alias.*` is a composite value that exists iff the row exists, which
     // by definition it does for every returned tuple → NOT NULL.
     assert!(!col(&info, "payload").nullable);
@@ -145,7 +145,7 @@ fn star_expr_on_cte_is_unsupported() {
     // CTE rows don't have a registered composite type — analyzer should error.
     let sql = "WITH u AS (SELECT id, name FROM users) \
                SELECT row_to_json(u.*) FROM u";
-    let err = db.analyze(sql, &default_config()).unwrap_err();
+    let err = db.analyze(sql).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("CTE") || msg.contains("subquery") || msg.contains("real relation"),
@@ -157,7 +157,7 @@ fn star_expr_on_cte_is_unsupported() {
 fn star_expr_on_unknown_alias_fails() {
     let db = setup();
     let sql = "SELECT row_to_json(nope.*) FROM users u";
-    assert!(db.analyze(sql, &default_config()).is_err());
+    assert!(db.analyze(sql).is_err());
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -172,8 +172,8 @@ fn indirection_field_on_composite_column() {
     // stresses the subquery→composite→field chain.
     let db = setup();
     let sql = "SELECT (u).name AS the_name FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "the_name").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "the_name").pg_type, text());
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn indirection_field_nullability_honors_field_not_null() {
     // `users.age` is nullable in the shared fixture; `.age` field of the
     // composite should preserve that.
     let sql = "SELECT (u).age AS the_age FROM users u";
-    let info = db.analyze(sql, &default_config()).unwrap();
+    let info = db.analyze(sql).unwrap();
     assert!(col(&info, "the_age").nullable);
 }
 
@@ -190,7 +190,7 @@ fn indirection_field_nullability_honors_field_not_null() {
 fn indirection_field_unknown_errors() {
     let db = setup();
     let sql = "SELECT (u).nao_existe FROM users u";
-    assert!(db.analyze(sql, &default_config()).is_err());
+    assert!(db.analyze(sql).is_err());
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -201,8 +201,8 @@ fn indirection_field_unknown_errors() {
 fn array_sublink_of_text_returns_text_array() {
     let db = setup();
     let sql = "SELECT ARRAY(SELECT name FROM users) AS names";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "names").rust_type, "Vec<String>");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "names").pg_type, array_of(text()));
     // An ARRAY() subquery always returns a non-null array (empty if no rows).
     assert!(!col(&info, "names").nullable);
 }
@@ -211,8 +211,8 @@ fn array_sublink_of_text_returns_text_array() {
 fn array_sublink_of_int4_returns_int4_array() {
     let db = setup();
     let sql = "SELECT ARRAY(SELECT age FROM users WHERE age IS NOT NULL) AS ages";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "ages").rust_type, "Vec<i32>");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "ages").pg_type, array_of(int4()));
     assert!(!col(&info, "ages").nullable);
 }
 
@@ -226,8 +226,8 @@ fn range_function_scalar_srf_exposes_single_column() {
     // `generate_series(int4, int4)` is a scalar SRF with no named out-args.
     // The FROM clause should expose a single column named after the function.
     let sql = "SELECT generate_series FROM generate_series(1, 10)";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "generate_series").rust_type, "i32");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "generate_series").pg_type, int4());
 }
 
 #[test]
@@ -237,26 +237,26 @@ fn range_function_with_out_args_exposes_named_columns() {
     // option_value text). Both columns must be visible from the FROM scope.
     let sql = "SELECT option_name, option_value \
                FROM pg_options_to_table(ARRAY['a=b', 'c=d']::text[])";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "option_name").rust_type, "String");
-    assert_eq!(col(&info, "option_value").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "option_name").pg_type, text());
+    assert_eq!(col(&info, "option_value").pg_type, text());
 }
 
 #[test]
 fn range_function_column_alias_list_overrides_names() {
     let db = setup();
     let sql = "SELECT n FROM generate_series(1, 5) AS t(n)";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "n").rust_type, "i32");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "n").pg_type, int4());
 }
 
 #[test]
 fn range_function_with_ordinality_appends_bigint_column() {
     let db = setup();
     let sql = "SELECT n, ord FROM generate_series(1, 3) WITH ORDINALITY AS t(n, ord)";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "n").rust_type, "i32");
-    assert_eq!(col(&info, "ord").rust_type, "i64");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "n").pg_type, int4());
+    assert_eq!(col(&info, "ord").pg_type, int8());
     assert!(!col(&info, "ord").nullable);
 }
 
@@ -268,8 +268,8 @@ fn range_function_with_ordinality_appends_bigint_column() {
 fn indirection_on_srf_with_out_args_resolves_named_field() {
     let db = setup();
     let sql = "SELECT (pg_options_to_table(ARRAY['a=b']::text[])).option_name AS opt";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "opt").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "opt").pg_type, text());
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -283,9 +283,9 @@ fn values_in_from_with_column_alias_list() {
     // analyzer must see `em.num` and `em.text` in scope.
     let sql = "SELECT em.num, em.text \
                FROM (VALUES (4, 'INSERT'::text), (8, 'DELETE'::text)) AS em(num, text)";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "num").rust_type, "i32");
-    assert_eq!(col(&info, "text").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "num").pg_type, int4());
+    assert_eq!(col(&info, "text").pg_type, text());
 }
 
 #[test]
@@ -296,9 +296,9 @@ fn lateral_subquery_sees_outer_scope() {
     // fail to resolve.
     let sql = "SELECT u.name, s.double_id \
                FROM users u, LATERAL (SELECT u.id * 2 AS double_id) s";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "name").rust_type, "String");
-    assert_eq!(col(&info, "double_id").rust_type, "i64");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "name").pg_type, text());
+    assert_eq!(col(&info, "double_id").pg_type, int8());
 }
 
 #[test]
@@ -308,9 +308,9 @@ fn subquery_column_alias_list_overrides_inner_names() {
     // scope must see the aliases, not the subquery's own column names.
     let sql = "SELECT x.user_id, x.user_name \
                FROM (SELECT id, name FROM users) AS x(user_id, user_name)";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "user_id").rust_type, "i64");
-    assert_eq!(col(&info, "user_name").rust_type, "String");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "user_id").pg_type, int8());
+    assert_eq!(col(&info, "user_name").pg_type, text());
 }
 
 #[test]
@@ -322,15 +322,15 @@ fn indirection_on_subquery_record_column() {
     let db = setup();
     let sql = "SELECT (ta.x).n AS idx \
                FROM (SELECT information_schema._pg_expandarray(ARRAY[1, 2]) AS x) ta";
-    let info = db.analyze(sql, &default_config()).unwrap();
-    assert_eq!(col(&info, "idx").rust_type, "i32");
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "idx").pg_type, int4());
 }
 
 #[test]
 fn indirection_on_srf_unknown_field_errors() {
     let db = setup();
     let sql = "SELECT (pg_options_to_table(ARRAY['a=b']::text[])).nao_existe";
-    assert!(db.analyze(sql, &default_config()).is_err());
+    assert!(db.analyze(sql).is_err());
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -361,9 +361,8 @@ fn snapshot_roundtrip() {
 
     // Analyze through a Database backed by the restored snapshot: same result.
     let restored_db = Database::from_snapshot(restored);
-    let config = default_config();
     let sql = "SELECT id, name FROM users";
-    let info1 = db.analyze(sql, &config).unwrap();
-    let info2 = restored_db.analyze(sql, &config).unwrap();
+    let info1 = db.analyze(sql).unwrap();
+    let info2 = restored_db.analyze(sql).unwrap();
     assert_identical(&info1, &info2, "snapshot roundtrip");
 }

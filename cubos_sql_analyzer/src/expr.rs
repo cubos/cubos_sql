@@ -18,9 +18,8 @@ use crate::error::AnalyzeError;
 use crate::functions;
 use crate::nullability::NullabilityContext;
 use crate::param_collector::ParamCollector;
-use crate::schema::SchemaSnapshot;
+use crate::schema::{SchemaSnapshot, oid};
 use crate::scope::Scope;
-use crate::type_map::oid;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // TypeGoal

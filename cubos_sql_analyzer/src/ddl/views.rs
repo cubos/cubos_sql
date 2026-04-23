@@ -143,16 +143,14 @@ fn resolve_view_now(
     query_node: &protobuf::Node,
     aliases: &[String],
 ) -> Result<(Vec<TableColumn>, Option<ViewDef>), DdlError> {
-    let config = crate::resolve::AnalyzerConfig::default();
-
-    let analyzed_columns = crate::resolve::analyze_static(snapshot, sql, &config, &[])
-        .map(|(cols, _)| cols)
-        .map_err(|source| DdlError::ViewAnalysis {
+    let (raw_columns, _) = crate::resolve::analyze_raw(snapshot, sql, &[]).map_err(|source| {
+        DdlError::ViewAnalysis {
             view: String::new(), // filled in by caller
             source: Box::new(source),
-        })?;
+        }
+    })?;
 
-    let columns: Vec<TableColumn> = analyzed_columns
+    let columns: Vec<TableColumn> = raw_columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -163,7 +161,7 @@ fn resolve_view_now(
             };
             TableColumn {
                 name,
-                type_oid: col.pg_type_oid,
+                type_oid: col.type_oid,
                 not_null: !col.nullable,
                 has_default: false,
             }
@@ -234,13 +232,12 @@ pub(crate) fn reanalyze_view(
         return Ok(());
     };
 
-    let config = crate::resolve::AnalyzerConfig::default();
-    let cols = crate::resolve::analyze_static(snapshot, &sql, &config, &[])
-        .map(|(cols, _)| cols)
-        .map_err(|source| DdlError::ViewAnalysis {
+    let (cols, _) = crate::resolve::analyze_raw(snapshot, &sql, &[]).map_err(|source| {
+        DdlError::ViewAnalysis {
             view: view_key.to_string(),
             source: Box::new(source),
-        })?;
+        }
+    })?;
 
     if let Some(view) = snapshot.tables.get_mut(view_key) {
         // Preserve existing user-supplied aliases (set at view creation time
@@ -249,7 +246,7 @@ pub(crate) fn reanalyze_view(
         // AST itself changed arity, which no RENAME/ALTER TYPE can do.
         for (i, new_col) in cols.iter().enumerate() {
             if let Some(existing) = view.columns.get_mut(i) {
-                existing.type_oid = new_col.pg_type_oid;
+                existing.type_oid = new_col.type_oid;
                 existing.not_null = !new_col.nullable;
             }
         }

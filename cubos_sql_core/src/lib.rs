@@ -10,5 +10,9 @@
 //! # Modules
 //!
 //! - [`config`] -- Parses `[package.metadata.cubos_sql]` from `Cargo.toml`.
+//! - [`qualified_name`] -- PostgreSQL schema-qualified identifiers.
 
 pub mod config;
+mod qualified_name;
+
+pub use qualified_name::{ParseQualifiedNameError, QualifiedName};

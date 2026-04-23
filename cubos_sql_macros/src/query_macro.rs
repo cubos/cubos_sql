@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 
-use cubos_sql_analyzer::{AnalyzerConfig, Database, QualifiedName};
+use cubos_sql_analyzer::Database;
 use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitStr, Token};
@@ -25,28 +25,6 @@ struct CachedDatabase {
 
 thread_local! {
     static CACHED_DATABASE: RefCell<Option<CachedDatabase>> = const { RefCell::new(None) };
-}
-
-/// Parse each key of a TOML-sourced type-mapping map into a
-/// [`QualifiedName`]. The `field` argument names the section (e.g. `"types"`)
-/// for nicer error messages.
-fn parse_qualified_map(
-    map: &std::collections::HashMap<String, String>,
-    field: &str,
-) -> Result<std::collections::HashMap<QualifiedName, String>, syn::Error> {
-    map.iter()
-        .map(|(k, v)| {
-            let q: QualifiedName = k.parse().map_err(|e| {
-                syn::Error::new(
-                    Span::call_site(),
-                    format!(
-                        "invalid qualified name in [package.metadata.cubos_sql.{field}] key {k:?}: {e}"
-                    ),
-                )
-            })?;
-            Ok((q, v.clone()))
-        })
-        .collect()
 }
 
 /// Build (or retrieve from cache) a [`Database`] from migration files.
@@ -231,18 +209,8 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     let database = get_or_build_database(&all_dirs, &migration_hash)?;
 
     // 3. Analyze the SQL (lex + type inference in one pass).
-    //
-    // Convert the string-keyed maps from Cargo.toml into the analyzer's
-    // QualifiedName keys. Bare names have already been prefixed with
-    // `public.` by `Config::resolve`, so here we just parse each key.
-    let analyzer_config = AnalyzerConfig {
-        domains: parse_qualified_map(&resolved.domains, "domains")?,
-        enums: parse_qualified_map(&resolved.enums, "enums")?,
-        types: parse_qualified_map(&resolved.types, "types")?,
-    };
-
     let analyzed = database
-        .analyze(&sql_str, &analyzer_config)
+        .analyze(&sql_str)
         .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
 
     // 4. Validate that all assignments match SQL params/spreads.
@@ -288,5 +256,5 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     }
 
     // 6. Generate typed Rust code.
-    codegen::generate(&analyzed, &input.executor, &input.assignments)
+    codegen::generate(&analyzed, &resolved, &input.executor, &input.assignments)
 }

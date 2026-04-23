@@ -1,8 +1,7 @@
 //! Function and aggregate resolution.
 
 use crate::error::AnalyzeError;
-use crate::schema::{CompositeField, FunctionEntry, SchemaSnapshot};
-use crate::type_map::oid;
+use crate::schema::{CompositeField, FunctionEntry, SchemaSnapshot, oid};
 
 /// Resolved function call result.
 pub(crate) struct ResolvedFunction {

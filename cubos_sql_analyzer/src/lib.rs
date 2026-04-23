@@ -45,22 +45,28 @@ mod lexer;
 mod nullability;
 mod param;
 mod param_collector;
-mod qualified_name;
 mod resolve;
 mod scope;
 mod seed;
-mod type_map;
+mod types;
+
+/// Re-exports of types defined in `cubos_sql_core` but used pervasively by
+/// the analyzer. Kept here so downstream crates (and tests) can depend only
+/// on `cubos_sql_analyzer`.
+pub(crate) mod qualified_name {
+    pub use cubos_sql_core::QualifiedName;
+}
 
 #[cfg(any(test, feature = "internal"))]
 pub mod schema;
 #[cfg(not(any(test, feature = "internal")))]
 mod schema;
 
+pub use cubos_sql_core::{ParseQualifiedNameError, QualifiedName};
 pub use database::Database;
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
-pub use qualified_name::{ParseQualifiedNameError, QualifiedName};
 pub use resolve::{
     AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread, AnalyzedSpreadField,
-    AnalyzerConfig,
 };
+pub use types::Type;

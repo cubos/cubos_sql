@@ -8,6 +8,7 @@ description = "Static SQL type and nullability analyzer for cubos_sql"
 internal = []
 
 [dependencies]
+cubos_sql_core = { path = "../cubos_sql_core" }
 pg_query = "6"
 prost = "0.13"
 base64 = "0.22"

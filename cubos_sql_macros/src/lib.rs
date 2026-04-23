@@ -10,6 +10,7 @@ extern crate proc_macro;
 mod codegen;
 mod from_row;
 mod migrations_hash;
+mod pg_type_map;
 mod query_macro;
 
 /// Compile-time verified SQL query with named parameters.
