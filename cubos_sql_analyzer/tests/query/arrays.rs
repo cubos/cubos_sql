@@ -1,11 +1,11 @@
-//! Array operations: constructor, element access, length/cardinality,
-//! concatenation, `ANY`/`ALL` on arrays, `unnest` in the projection,
-//! `array_position` / `array_length` return types.
+//! Array operations: constructor, element access, slicing, length /
+//! cardinality, concatenation, `ANY`/`ALL` on arrays, `unnest` in the
+//! projection, `array_position` / `array_length` return types.
 //!
-//! Known gaps (not covered here — produce `Unsupported`/`UnknownColumn`
-//! today): array slicing `arr[1:2]`, `unnest(arr)` used as a relation in
-//! `FROM` (the resulting column is not bound by name). These should move
-//! out of this file's ignore list as the analyzer learns them.
+//! Known gaps (not covered here — produce `Unsupported`/`UndefinedColumn`
+//! today): `unnest(arr)` used as a relation in `FROM` (the resulting column
+//! is not bound by name). These should move out of this file's ignore list
+//! as the analyzer learns them.
 
 use crate::common::*;
 
@@ -58,6 +58,45 @@ fn array_element_access_not_null_array() {
     // Even when the array column itself is NOT NULL, the element is nullable.
     let s = db.analyze("SELECT nums[1] AS first FROM users").unwrap();
     assert_cols(&s, vec![cn("first", int4())]);
+}
+
+// ── Slice `arr[lo:hi]` ───────────────────────────────────────────────────────
+
+#[test]
+fn array_slice_returns_same_array_type() {
+    let db = setup();
+    // `nums[1:3]` on an INT[] NOT NULL column with non-null int literal
+    // bounds stays an INT[] NOT NULL (out-of-range → empty array, still
+    // non-null).
+    let s = db.analyze("SELECT nums[1:3] AS slice FROM users").unwrap();
+    assert_cols(&s, vec![c("slice", array_of(int4()))]);
+}
+
+#[test]
+fn array_slice_of_nullable_array_is_nullable() {
+    let db = setup();
+    let s = db.analyze("SELECT tags[1:3] AS slice FROM users").unwrap();
+    assert_cols(&s, vec![cn("slice", array_of(text()))]);
+}
+
+#[test]
+fn array_slice_bounds_can_be_params() {
+    let db = setup();
+    // Params inside the slice bounds get an int4 goal — no fallback to text.
+    let s = db
+        .analyze("SELECT nums[$p1:$p2] AS slice FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("slice", array_of(int4()))]);
+    assert_params(&s, vec![p(int4()), p(int4())]);
+}
+
+#[test]
+fn array_subscript_param_is_int4() {
+    let db = setup();
+    // `nums[$1]` also routes the param through the int4 goal.
+    let s = db.analyze("SELECT nums[$p1] AS first FROM users").unwrap();
+    assert_cols(&s, vec![cn("first", int4())]);
+    assert_params(&s, vec![p(int4())]);
 }
 
 // ── ANY / = ANY on an array ──────────────────────────────────────────────────

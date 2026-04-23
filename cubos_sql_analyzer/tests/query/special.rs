@@ -162,7 +162,7 @@ fn indirection_field_unknown_errors() {
     let sql = "SELECT (u).nao_existe FROM users u";
     assert_analyze_err!(
         db.analyze(sql),
-        AnalyzeError::UnknownColumn(_),
+        AnalyzeError::UndefinedColumn(_),
         "nao_existe"
     );
 }
@@ -244,7 +244,7 @@ fn indirection_on_srf_unknown_field_errors() {
     let sql = "SELECT (pg_options_to_table(ARRAY['a=b']::text[])).nao_existe";
     assert_analyze_err!(
         db.analyze(sql),
-        AnalyzeError::UnknownColumn(_),
+        AnalyzeError::UndefinedColumn(_),
         "nao_existe"
     );
 }
@@ -450,13 +450,25 @@ fn nested_lateral_inner_sees_outermost_scope() {
 // ── Plain (non-LATERAL) FROM does NOT inherit scope ──────────────────────────
 
 #[test]
+fn non_lateral_srf_cannot_see_outer_scope() {
+    let db = setup();
+    // `FROM users u, generate_series(1, u.id) g(n)` without LATERAL must
+    // fail — PG `invalid reference to FROM-clause entry for table "u"`.
+    assert_analyze_err!(
+        db.analyze("SELECT u.id, g.n FROM users u, generate_series(1, u.id) g(n)"),
+        AnalyzeError::UndefinedColumn(_),
+        "u.id",
+    );
+}
+
+#[test]
 fn non_lateral_subquery_cannot_see_outer_scope() {
     let db = setup();
     // Without LATERAL the inner subquery can't reference `u.id` — PG
     // rejects this, and so should the analyzer.
     let sql = "SELECT u.name, s.double_id \
                FROM users u, (SELECT u.id * 2 AS double_id) s";
-    assert_analyze_err!(db.analyze(sql), AnalyzeError::UnknownColumn(_), "u.id");
+    assert_analyze_err!(db.analyze(sql), AnalyzeError::UndefinedColumn(_), "u.id");
 }
 
 // ── Subquery column alias list overrides inner names ─────────────────────────

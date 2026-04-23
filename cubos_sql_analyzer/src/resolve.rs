@@ -268,9 +268,44 @@ pub(crate) fn analyze_raw(
 
 /// Infer an expression type, propagating only `TypeMismatch` errors.
 ///
-/// Other errors (e.g. `UnknownColumn` from correlated subqueries referencing
+/// Other errors (e.g. `UndefinedColumn` from correlated subqueries referencing
 /// outer scope) are swallowed — they represent pre-existing analyzer
 /// limitations, not user errors.
+/// Returns true when `node` is a bare SQL `NULL` (`AConst` with `isnull` set
+/// and no concrete `Val`). Typed NULLs like `NULL::int` become
+/// `TypeCast { arg: AConst NULL, typename: int }` — we don't treat those as
+/// unconditionally NULL because PG allows `SET col = NULL::t` to perform an
+/// assignment the caller has explicitly typed.
+fn is_sql_null_literal(node: &protobuf::Node) -> bool {
+    matches!(
+        node.node.as_ref(),
+        Some(node::Node::AConst(c)) if c.isnull
+    )
+}
+
+/// Reject aggregate / window function calls in a context where PG forbids
+/// them. Matches PG's `aggregate functions are not allowed in WHERE` /
+/// `window functions are not allowed in WHERE` errors. `context` goes into
+/// the error message (e.g. `"WHERE"`, `"GROUP BY"`, `"JOIN ON"`).
+fn check_no_aggregates_or_windows(
+    node: &protobuf::Node,
+    snapshot: &SchemaSnapshot,
+    context: &str,
+) -> Result<(), AnalyzeError> {
+    let kinds = expr::detect_func_kinds(node, snapshot);
+    if kinds.has_aggregate {
+        return Err(AnalyzeError::Invalid(format!(
+            "aggregate functions are not allowed in {context}"
+        )));
+    }
+    if kinds.has_window {
+        return Err(AnalyzeError::Invalid(format!(
+            "window functions are not allowed in {context}"
+        )));
+    }
+    Ok(())
+}
+
 fn infer_expr_propagate_mismatch(
     node: &protobuf::Node,
     scope: &Scope,
@@ -281,8 +316,13 @@ fn infer_expr_propagate_mismatch(
 ) -> Result<(), AnalyzeError> {
     match expr::infer_expr(node, scope, null_ctx, snapshot, params, goal) {
         Ok(_) => Ok(()),
-        Err(e @ AnalyzeError::TypeMismatch { .. }) => Err(e),
-        Err(_) => Ok(()), // Swallow non-type-mismatch errors.
+        Err(
+            e @ (AnalyzeError::TypeMismatch { .. }
+            | AnalyzeError::UndefinedOperator(_)
+            | AnalyzeError::IndeterminateType(_)
+            | AnalyzeError::Invalid(_)),
+        ) => Err(e),
+        Err(_) => Ok(()), // Swallow non-user-facing errors.
     }
 }
 
@@ -389,6 +429,10 @@ fn analyze_select_with_ctes_and_outer(
 
     // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal.
     if let Some(where_clause) = &sel.where_clause {
+        // PG rejects aggregate / window function calls inside WHERE
+        // (they reference the post-aggregation row, not the pre-aggregation
+        // one). Catch these statically before the type pass runs.
+        check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
         infer_expr_propagate_mismatch(
             where_clause,
             &scope,
@@ -402,6 +446,7 @@ fn analyze_select_with_ctes_and_outer(
     // Process GROUP BY expressions — no type expectation, but we still need
     // to walk them so any parameters referenced are collected and typed.
     for group_node in &sel.group_clause {
+        check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
         let _ = expr::infer_expr(
             group_node,
             &scope,
@@ -478,7 +523,12 @@ fn analyze_insert(
             },
             &relation.relname,
         )
-        .ok_or_else(|| AnalyzeError::UnknownRelation(relation.relname.clone()))?;
+        .ok_or_else(|| {
+            AnalyzeError::UndefinedTable(format!(
+                "relation \"{}\" does not exist",
+                relation.relname
+            ))
+        })?;
 
     // Infer param types from column positions in INSERT ... VALUES.
     let col_names: Vec<String> = ins
@@ -500,9 +550,9 @@ fn analyze_insert(
     // caller's SQL.
     for col in &col_names {
         if !table.columns.iter().any(|c| &c.name == col) {
-            return Err(AnalyzeError::UnknownColumn(format!(
-                "{}.{}",
-                table.name, col
+            return Err(AnalyzeError::UndefinedColumn(format!(
+                "column \"{col}\" of relation \"{}\" does not exist",
+                table.name,
             )));
         }
     }
@@ -520,18 +570,43 @@ fn analyze_insert(
             // VALUES (...) — infer each value with the column's type as goal.
             for val_list in &val_sel.values_lists {
                 if let Some(node::Node::List(list)) = val_list.node.as_ref() {
+                    // Arity check: the VALUES row must match the declared
+                    // column list (or, when no column list is given, the
+                    // full table width).
+                    let expected_len = if col_names.is_empty() {
+                        table.columns.len()
+                    } else {
+                        col_names.len()
+                    };
+                    if list.items.len() != expected_len {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "INSERT into `{}` expects {expected_len} values per row, \
+                             got {} in one row",
+                            table.name,
+                            list.items.len(),
+                        )));
+                    }
                     for (i, val) in list.items.iter().enumerate() {
-                        let goal = col_names
+                        let target_col = col_names
                             .get(i)
-                            .and_then(|cn| table.columns.iter().find(|c| &c.name == cn))
+                            .and_then(|cn| table.columns.iter().find(|c| &c.name == cn));
+                        if let Some(tc) = target_col
+                            && tc.not_null
+                            && is_sql_null_literal(val)
+                        {
+                            return Err(AnalyzeError::Invalid(format!(
+                                "cannot insert NULL into NOT NULL column `{}.{}`",
+                                table.name, tc.name,
+                            )));
+                        }
+                        let goal = target_col
                             .map(|tc| TypeGoal::assignment(tc.type_oid))
                             .unwrap_or(TypeGoal::NONE);
                         expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
                         // Infer nullable from column definition.
                         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-                            && let Some(col_name) = col_names.get(i)
-                            && let Some(tc) = table.columns.iter().find(|c| &c.name == col_name)
+                            && let Some(tc) = target_col
                             && !tc.not_null
                         {
                             params.infer_nullable(p.number, true);
@@ -540,7 +615,21 @@ fn analyze_insert(
                 }
             }
         } else {
-            // INSERT ... SELECT — analyze the SELECT for param inference.
+            // INSERT ... SELECT — analyze the SELECT for param inference and
+            // check column count matches.
+            let expected_len = if col_names.is_empty() {
+                table.columns.len()
+            } else {
+                col_names.len()
+            };
+            if val_sel.target_list.len() != expected_len {
+                return Err(AnalyzeError::Invalid(format!(
+                    "INSERT into `{}` expects {expected_len} columns, \
+                     SELECT produces {}",
+                    table.name,
+                    val_sel.target_list.len(),
+                )));
+            }
             let _ = analyze_select(val_sel, snapshot, params);
 
             // Back-fill ParamRef targets with column types from INSERT columns.
@@ -651,7 +740,12 @@ fn analyze_update(
             },
             &relation.relname,
         )
-        .ok_or_else(|| AnalyzeError::UnknownRelation(relation.relname.clone()))?;
+        .ok_or_else(|| {
+            AnalyzeError::UndefinedTable(format!(
+                "relation \"{}\" does not exist",
+                relation.relname
+            ))
+        })?;
 
     // Build scope with target table + FROM clause tables.
     let mut scope = Scope::default();
@@ -691,8 +785,21 @@ fn analyze_update(
                 .iter()
                 .find(|c| c.name == rt.name)
                 .ok_or_else(|| {
-                    AnalyzeError::UnknownColumn(format!("{}.{}", table.name, rt.name))
+                    AnalyzeError::UndefinedColumn(format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        rt.name, table.name,
+                    ))
                 })?;
+            // Catch `UPDATE … SET not_null_col = NULL` statically — PG
+            // raises a runtime `null value in column … violates not-null
+            // constraint` error, and we can do better by failing the macro
+            // at compile time.
+            if tc.not_null && is_sql_null_literal(val) {
+                return Err(AnalyzeError::Invalid(format!(
+                    "cannot assign NULL to NOT NULL column `{}.{}`",
+                    table.name, tc.name,
+                )));
+            }
             let goal = TypeGoal::assignment(tc.type_oid);
             expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
@@ -740,7 +847,12 @@ fn analyze_delete(
             },
             &relation.relname,
         )
-        .ok_or_else(|| AnalyzeError::UnknownRelation(relation.relname.clone()))?;
+        .ok_or_else(|| {
+            AnalyzeError::UndefinedTable(format!(
+                "relation \"{}\" does not exist",
+                relation.relname
+            ))
+        })?;
 
     let mut scope = Scope::default();
     let null_ctx = NullabilityContext::default();
@@ -794,22 +906,41 @@ fn analyze_set_operation(
         ));
     }
 
-    let columns = left_cols
-        .into_iter()
-        .zip(right_cols)
-        .map(|(l, r)| {
-            let type_oid = crate::coerce::find_common_type(&[l.type_oid, r.type_oid], snapshot)
-                .unwrap_or(l.type_oid);
-            RawColumn {
-                name: l.name,
-                type_oid,
-                nullable: l.nullable || r.nullable,
-                record_fields: None,
+    let mut columns = Vec::with_capacity(left_cols.len());
+    for (l, r) in left_cols.into_iter().zip(right_cols) {
+        // When both sides carry concrete types (not UNKNOWN), their common
+        // type must exist — PG rejects `SELECT 1 UNION SELECT 'x'` with
+        // `UNION types integer and text cannot be matched`.
+        let common = crate::coerce::find_common_type(&[l.type_oid, r.type_oid], snapshot);
+        let both_concrete = l.type_oid != oid::UNKNOWN && r.type_oid != oid::UNKNOWN;
+        let type_oid = match (common, both_concrete) {
+            (Some(t), _) => t,
+            (None, true) => {
+                return Err(AnalyzeError::TypeMismatch {
+                    actual: type_oid_name(r.type_oid, snapshot),
+                    expected: type_oid_name(l.type_oid, snapshot),
+                    context: format!("UNION column `{}`", l.name),
+                });
             }
-        })
-        .collect();
+            (None, false) => l.type_oid,
+        };
+        columns.push(RawColumn {
+            name: l.name,
+            type_oid,
+            nullable: l.nullable || r.nullable,
+            record_fields: None,
+        });
+    }
 
     Ok((columns, None))
+}
+
+/// Render a type OID as `schema.name` for user-facing errors.
+fn type_oid_name(oid: u32, snapshot: &SchemaSnapshot) -> String {
+    snapshot
+        .get_type(oid)
+        .map(|t| format!("{}.{}", t.schema, t.name))
+        .unwrap_or_else(|| format!("unknown({oid})"))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1238,16 +1369,22 @@ fn process_range_function(
     let empty_null_ctx = NullabilityContext::default();
     let mut arg_types = Vec::with_capacity(func_call.args.len());
     for arg in &func_call.args {
-        let t = expr::infer_expr(
+        let t = match expr::infer_expr(
             arg,
             &arg_scope,
             &empty_null_ctx,
             snapshot,
             params,
             crate::expr::TypeGoal::NONE,
-        )
-        .map(|e| e.type_oid)
-        .unwrap_or(oid::UNKNOWN);
+        ) {
+            Ok(e) => e.type_oid,
+            // `FROM a, f(a.col)` without LATERAL — PG rejects with `invalid
+            // reference to FROM-clause entry for table "a"`. The scope we
+            // built above is empty precisely so this fails; don't let the
+            // old `.unwrap_or(UNKNOWN)` swallow it.
+            Err(e @ AnalyzeError::UndefinedColumn(_)) if !rf.lateral => return Err(e),
+            Err(_) => oid::UNKNOWN,
+        };
         arg_types.push(t);
     }
 
@@ -1255,7 +1392,7 @@ fn process_range_function(
         [n] => (None, n.as_str()),
         [s, n] => (Some(s.as_str()), n.as_str()),
         _ => {
-            return Err(AnalyzeError::UnresolvedFunction(format!(
+            return Err(AnalyzeError::UndefinedFunction(format!(
                 "invalid function name in FROM: {func_name_parts:?}"
             )));
         }
@@ -1402,9 +1539,16 @@ fn resolve_target_list(
             None
         };
 
+        // Bare string literals are carried as `text` at the target-list
+        // boundary — this matches PG's `select_common_type` behavior at
+        // the SELECT output level, and (more importantly) gives UNION /
+        // subquery reconciliation a concrete type to compare against so
+        // `SELECT 1 UNION SELECT 'x'` fails instead of silently coercing.
+        let type_oid = expr::unknown_literal_as_text(Some(val), expr_type.type_oid);
+
         columns.push(RawColumn {
             name,
-            type_oid: expr_type.type_oid,
+            type_oid,
             nullable: expr_type.nullable,
             record_fields,
         });
@@ -1619,7 +1763,7 @@ fn resolve_type(type_oid: u32, snapshot: &SchemaSnapshot) -> Result<Type, Analyz
         });
     }
 
-    Err(AnalyzeError::UnknownType {
+    Err(AnalyzeError::UndefinedType {
         oid: type_oid,
         context: format!("OID {type_oid}"),
     })

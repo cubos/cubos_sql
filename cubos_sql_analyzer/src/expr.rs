@@ -78,6 +78,144 @@ pub(crate) struct ExprType {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Type OID → display name
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Render a type OID as `schema.name` for error messages. Falls back to
+/// `unknown(<oid>)` when the snapshot doesn't know the OID — should never
+/// happen in practice but avoids panicking during error formatting.
+fn type_oid_display(oid: u32, snapshot: &SchemaSnapshot) -> String {
+    snapshot
+        .get_type(oid)
+        .map(|t| format!("{}.{}", t.schema, t.name))
+        .unwrap_or_else(|| format!("unknown({oid})"))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Context-rule validation
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Kind of function call an expression tree contains. Used to enforce PG's
+/// placement rules (`no aggregate in WHERE`, `no window function in WHERE`,
+/// `no nested aggregates`).
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct FuncKindPresence {
+    pub has_aggregate: bool,
+    pub has_window: bool,
+}
+
+/// Walk an expression AST and report whether it contains aggregate calls
+/// (`COUNT(*)`, `SUM(x)`, …) or window function calls (`RANK() OVER …`),
+/// without resolving anything against the schema. Used up-front by clauses
+/// that forbid those constructs (WHERE, GROUP BY, JOIN ON, HAVING for the
+/// nested-agg case).
+pub(crate) fn detect_func_kinds(
+    node: &protobuf::Node,
+    snapshot: &SchemaSnapshot,
+) -> FuncKindPresence {
+    let mut out = FuncKindPresence::default();
+    walk(node, snapshot, &mut out);
+    out
+}
+
+fn walk(node: &protobuf::Node, snapshot: &SchemaSnapshot, out: &mut FuncKindPresence) {
+    let Some(inner) = node.node.as_ref() else {
+        return;
+    };
+    match inner {
+        node::Node::FuncCall(fc) => {
+            if fc.over.is_some() {
+                out.has_window = true;
+            } else {
+                // Aggregate check via pg_proc.is_aggregate — resolved by name
+                // against the snapshot.
+                let parts = extract_string_fields(&fc.funcname);
+                let (schema, name) = match parts.as_slice() {
+                    [n] => (None, n.as_str()),
+                    [s, n] => (Some(s.as_str()), n.as_str()),
+                    _ => (None, ""),
+                };
+                if !name.is_empty() {
+                    let candidates = snapshot.find_functions(schema, name);
+                    if candidates.iter().any(|f| f.is_aggregate) {
+                        out.has_aggregate = true;
+                    }
+                }
+            }
+            for arg in &fc.args {
+                walk(arg, snapshot, out);
+            }
+            if let Some(f) = &fc.agg_filter {
+                walk(f, snapshot, out);
+            }
+            for o in &fc.agg_order {
+                walk(o, snapshot, out);
+            }
+        }
+        node::Node::AExpr(e) => {
+            if let Some(l) = &e.lexpr {
+                walk(l, snapshot, out);
+            }
+            if let Some(r) = &e.rexpr {
+                walk(r, snapshot, out);
+            }
+        }
+        node::Node::BoolExpr(b) => {
+            for a in &b.args {
+                walk(a, snapshot, out);
+            }
+        }
+        node::Node::NullTest(t) => {
+            if let Some(a) = &t.arg {
+                walk(a, snapshot, out);
+            }
+        }
+        node::Node::BooleanTest(t) => {
+            if let Some(a) = &t.arg {
+                walk(a, snapshot, out);
+            }
+        }
+        node::Node::CoalesceExpr(c) => {
+            for a in &c.args {
+                walk(a, snapshot, out);
+            }
+        }
+        node::Node::CaseExpr(c) => {
+            for w in &c.args {
+                walk(w, snapshot, out);
+            }
+            if let Some(d) = &c.defresult {
+                walk(d, snapshot, out);
+            }
+        }
+        node::Node::CaseWhen(w) => {
+            if let Some(e) = &w.expr {
+                walk(e, snapshot, out);
+            }
+            if let Some(r) = &w.result {
+                walk(r, snapshot, out);
+            }
+        }
+        node::Node::TypeCast(c) => {
+            if let Some(a) = &c.arg {
+                walk(a, snapshot, out);
+            }
+        }
+        node::Node::List(l) => {
+            for i in &l.items {
+                walk(i, snapshot, out);
+            }
+        }
+        node::Node::SubLink(_) => {
+            // Do NOT descend into subqueries — a SubLink is its own scope
+            // and aggregates/windows inside it belong to that scope, not
+            // the one we're validating.
+        }
+        _ => {}
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Main entry point
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -132,12 +270,51 @@ pub(crate) fn infer_expr(
                 nullable: params.is_nullable(p.number),
             })
         }
-        node::Node::MinMaxExpr(mm) => Ok(ExprType {
-            type_oid: mm.minmaxtype,
-            nullable: true,
-        }),
+        node::Node::MinMaxExpr(mm) => {
+            // `GREATEST`/`LEAST` are non-strict: they skip NULL args and
+            // return NULL only when every arg is NULL. pg_query's AST
+            // doesn't fill in `minmaxtype` without full parse analysis —
+            // we resolve the common type from the args and track per-arg
+            // nullability.
+            let mut arg_oids = Vec::with_capacity(mm.args.len());
+            let mut all_nullable = true;
+            let mut any_arg = false;
+            for arg in &mm.args {
+                let t = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+                arg_oids.push(t.type_oid);
+                if !t.nullable {
+                    all_nullable = false;
+                }
+                any_arg = true;
+            }
+            let resolved_type = if mm.minmaxtype != 0 && mm.minmaxtype != oid::UNKNOWN {
+                mm.minmaxtype
+            } else {
+                crate::coerce::find_common_type(&arg_oids, snapshot).unwrap_or(oid::UNKNOWN)
+            };
+            Ok(ExprType {
+                type_oid: resolved_type,
+                // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
+                nullable: !any_arg || all_nullable,
+            })
+        }
         node::Node::AIndirection(ind) => infer_indirection(ind, scope, null_ctx, snapshot, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, scope, null_ctx, snapshot, params),
+        node::Node::RowExpr(row) => {
+            // `ROW(a, b, …)` constructs an anonymous composite. The ROW
+            // itself is never NULL (empty ROW() yields a record, not NULL);
+            // element NULLs are tracked inside the record, not here. Walk
+            // each element so params/refs get registered and errors surface,
+            // then return `record` so operators like `record = record` kick
+            // in.
+            for arg in &row.args {
+                let _ = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            }
+            Ok(ExprType {
+                type_oid: oid::RECORD,
+                nullable: false,
+            })
+        }
         node::Node::SetToDefault(_) => {
             // `DEFAULT` placeholder in INSERT VALUES / UPDATE SET. The actual
             // default expression lives on the column definition and is
@@ -211,6 +388,28 @@ fn type_display_name(oid: u32, snapshot: &SchemaSnapshot) -> String {
         .unwrap_or_else(|| format!("oid:{oid}"))
 }
 
+/// Return `text` when `node` is an untyped string literal (`'x'`) and its
+/// inferred type is still UNKNOWN. Used by constructs that need to treat a
+/// bare string constant as text for type-compatibility checks — NULLIF,
+/// CASE / COALESCE / ARRAY[...] branch merging, UNION column reconciliation.
+pub(crate) fn unknown_literal_as_text(node: Option<&protobuf::Node>, inferred_oid: u32) -> u32 {
+    if inferred_oid != oid::UNKNOWN {
+        return inferred_oid;
+    }
+    let is_string_literal = node.is_some_and(|n| {
+        matches!(
+            n.node.as_ref(),
+            Some(node::Node::AConst(ac))
+                if !ac.isnull && matches!(ac.val, Some(a_const::Val::Sval(_)))
+        )
+    });
+    if is_string_literal {
+        oid::TEXT
+    } else {
+        oid::UNKNOWN
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Column references
 // ──────────────────────────────────────────────────────────────────────────────
@@ -240,7 +439,7 @@ fn infer_column_ref(
         [tbl, col] => (Some(tbl.as_str()), col.as_str()),
         [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
         _ => {
-            return Err(AnalyzeError::UnknownColumn(format!(
+            return Err(AnalyzeError::UndefinedColumn(format!(
                 "invalid column ref: {:?}",
                 parts
             )));
@@ -260,7 +459,7 @@ fn infer_column_ref(
             // name a whole row from the FROM clause (`SELECT u FROM users u`
             // or `(u).name`). Only kick in when the column lookup failed AND
             // the identifier matches a table alias in scope — otherwise we'd
-            // shadow legitimate UnknownColumn errors.
+            // shadow legitimate UndefinedColumn errors.
             if table.is_none()
                 && let Some(src) = scope.find_source(column)
                 && let Some(qn) = src.source_qn.as_ref()
@@ -301,9 +500,9 @@ fn infer_star_ref(
             AnalyzeError::Unsupported("unqualified * has no relation — use alias.* instead".into())
         })?;
 
-    let source = scope
-        .find_source(alias)
-        .ok_or_else(|| AnalyzeError::UnknownRelation(format!("no table named {alias} in scope")))?;
+    let source = scope.find_source(alias).ok_or_else(|| {
+        AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
+    })?;
 
     let qn = source.source_qn.as_ref().ok_or_else(|| {
         AnalyzeError::Unsupported(format!(
@@ -316,7 +515,7 @@ fn infer_star_ref(
             .type_by_name
             .get(qn)
             .copied()
-            .ok_or_else(|| AnalyzeError::UnknownType {
+            .ok_or_else(|| AnalyzeError::UndefinedType {
                 oid: 0,
                 context: format!("composite type for {qn}"),
             })?;
@@ -387,10 +586,9 @@ fn infer_indirection(
             let Some(node::Node::String(s)) = ind.indirection[idx].node.as_ref() else {
                 break;
             };
-            let field = fields
-                .iter()
-                .find(|f| f.name == s.sval)
-                .ok_or_else(|| AnalyzeError::UnknownColumn(format!("record field {}", s.sval)))?;
+            let field = fields.iter().find(|f| f.name == s.sval).ok_or_else(|| {
+                AnalyzeError::UndefinedColumn(format!("record field \"{}\" does not exist", s.sval))
+            })?;
             current = Some(ExprType {
                 type_oid: field.type_oid,
                 nullable: !field.not_null,
@@ -413,15 +611,48 @@ fn infer_indirection(
                 current = resolve_composite_field(&current, &s.sval, snapshot)?;
             }
             Some(node::Node::AIndices(ai)) => {
-                // Plain subscript `arr[i]`: both bounds absent except `uidx`
-                // alone means PG's shorthand for a single element.
-                let is_slice = ai.is_slice;
-                if is_slice {
-                    return Err(AnalyzeError::Unsupported(
-                        "array slice indirection (arr[a:b]) not supported".into(),
-                    ));
+                // Walk both bounds with an int4 goal so params and column
+                // refs inside `arr[lo:hi]` / `arr[i]` get typed and
+                // validated. Track nullability so slice results propagate
+                // NULL from any NULL bound.
+                let mut any_bound_nullable = false;
+                for bound in [&ai.lidx, &ai.uidx].into_iter().flatten() {
+                    let t = infer_expr(
+                        bound,
+                        scope,
+                        null_ctx,
+                        snapshot,
+                        params,
+                        TypeGoal::assignment(oid::INT4),
+                    )?;
+                    any_bound_nullable = any_bound_nullable || t.nullable;
                 }
-                current = resolve_array_element(&current, snapshot)?;
+
+                if ai.is_slice {
+                    let type_entry = snapshot.get_type(current.type_oid).ok_or_else(|| {
+                        AnalyzeError::UndefinedType {
+                            oid: current.type_oid,
+                            context: "array slice".into(),
+                        }
+                    })?;
+                    if !matches!(type_entry.kind, crate::schema::TypeKind::Array { .. }) {
+                        return Err(AnalyzeError::Unsupported(format!(
+                            "slice on non-array type '{}'",
+                            type_entry.name
+                        )));
+                    }
+                    // `arr[lo:hi]` keeps the array type. Result is NULL iff
+                    // the array is NULL or any bound is NULL — out-of-range
+                    // bounds yield an empty (non-null) array.
+                    current = ExprType {
+                        type_oid: current.type_oid,
+                        nullable: current.nullable || any_bound_nullable,
+                    };
+                } else {
+                    // `arr[i]` is always nullable (out-of-bounds → NULL,
+                    // even with non-null array and non-null index).
+                    current = resolve_array_element(&current, snapshot)?;
+                }
             }
             _ => {
                 return Err(AnalyzeError::Unsupported(format!(
@@ -515,7 +746,7 @@ fn resolve_composite_field(
     let base_oid = snapshot.unwrap_domain(current.type_oid);
     let type_entry = snapshot
         .get_type(base_oid)
-        .ok_or_else(|| AnalyzeError::UnknownType {
+        .ok_or_else(|| AnalyzeError::UndefinedType {
             oid: base_oid,
             context: format!("composite field access .{field_name}"),
         })?;
@@ -533,7 +764,12 @@ fn resolve_composite_field(
     let field = fields
         .iter()
         .find(|f| f.name == field_name)
-        .ok_or_else(|| AnalyzeError::UnknownColumn(format!("{}.{field_name}", type_entry.name)))?;
+        .ok_or_else(|| {
+            AnalyzeError::UndefinedColumn(format!(
+                "column \"{field_name}\" of composite type \"{}\" does not exist",
+                type_entry.name
+            ))
+        })?;
 
     Ok(ExprType {
         type_oid: field.type_oid,
@@ -587,7 +823,7 @@ fn resolve_array_element(
     let type_entry =
         snapshot
             .get_type(current.type_oid)
-            .ok_or_else(|| AnalyzeError::UnknownType {
+            .ok_or_else(|| AnalyzeError::UndefinedType {
                 oid: current.type_oid,
                 context: "array subscript".into(),
             })?;
@@ -688,7 +924,7 @@ fn infer_func_call(
         [name] => (None, name.as_str()),
         [schema, name] => (Some(schema.as_str()), name.as_str()),
         _ => {
-            return Err(AnalyzeError::UnresolvedFunction(format!(
+            return Err(AnalyzeError::UndefinedFunction(format!(
                 "invalid function name: {:?}",
                 func_name_parts
             )));
@@ -697,15 +933,36 @@ fn infer_func_call(
 
     // Pass 1: infer args bottom-up with no goal.
     let mut arg_types = Vec::new();
+    let mut arg_nullable = Vec::with_capacity(func.args.len());
     let mut any_arg_nullable = false;
     for arg in &func.args {
         let t = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
         any_arg_nullable = any_arg_nullable || t.nullable;
+        arg_nullable.push(t.nullable);
         arg_types.push(t.type_oid);
     }
 
     // Resolve function with inferred arg types (UNKNOWN treated as wildcard).
     let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, func.agg_star)?;
+
+    // PG forbids aggregates / window functions nested inside aggregate
+    // arguments (`SUM(COUNT(*))`). We catch it here, after resolution,
+    // using the AST of each arg.
+    if resolved.is_aggregate {
+        for arg in &func.args {
+            let kinds = detect_func_kinds(arg, snapshot);
+            if kinds.has_aggregate {
+                return Err(AnalyzeError::Invalid(
+                    "aggregate function calls cannot be nested".into(),
+                ));
+            }
+            if kinds.has_window {
+                return Err(AnalyzeError::Invalid(
+                    "window functions are not allowed inside aggregate arguments".into(),
+                ));
+            }
+        }
+    }
 
     // Pass 2: back-fill UNKNOWN args with expected types from the resolved
     // function signature (equivalent to PG's coerce_func_args).
@@ -764,20 +1021,32 @@ fn infer_func_call(
         }
     }
 
+    // Per-arg nullability read by `concat_ws` (NULL separator propagates)
+    // and `lag(col, offset, default)` / `lead(col, offset, default)` (a
+    // non-null default replaces the boundary NULL).
+    let arg_is_nullable = |i: usize| arg_nullable.get(i).copied().unwrap_or(false);
+
     // Value window functions (`lag`/`lead`/`first_value`/`last_value`/
     // `nth_value`) can return NULL at partition/frame edges even when the
     // source column is NOT NULL — `lag(title) OVER (ORDER BY id)` produces
-    // NULL for the first row of each partition. Without this override the
-    // analyzer would inherit the strict pg_catalog nullability rule and
-    // mark the result as NOT NULL, matching PG with the wrong sign.
+    // NULL for the first row of each partition. A 3-arg `lag(col, offset,
+    // default)`/`lead(...)` replaces the boundary NULL with `default`, so
+    // the result is only nullable when the source column or the default
+    // themselves are nullable.
     let is_value_window = func.over.is_some()
         && matches!(
             name,
             "lag" | "lead" | "first_value" | "last_value" | "nth_value"
         );
+    let value_window_nullable = || -> bool {
+        match name {
+            "lag" | "lead" if func.args.len() >= 3 => arg_is_nullable(0) || arg_is_nullable(2),
+            _ => true,
+        }
+    };
 
     let nullable = if is_value_window {
-        true
+        value_window_nullable()
     } else if resolved.is_aggregate {
         // A FILTER clause can eliminate every row in the group, leaving the
         // aggregate with an empty set. Every aggregate except COUNT returns
@@ -802,6 +1071,10 @@ fn infer_func_call(
         } else {
             any_arg_nullable
         }
+    } else if resolved.schema == "pg_catalog" && name == "concat_ws" {
+        // `concat_ws(sep, …)` is non-strict for the variadic args (NULLs are
+        // skipped), but a NULL separator makes the whole result NULL.
+        arg_is_nullable(0)
     } else {
         !(!resolved.is_strict
             && resolved.schema == "pg_catalog"
@@ -828,16 +1101,96 @@ fn infer_a_expr(
     let op_name = extract_string_fields(&expr.name).join(".");
     let op_name = op_name.as_str();
 
-    let is_comparison = matches!(
-        op_name,
-        "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~~" | "~~*" | "!~~" | "!~~*"
-    );
+    // `NULLIF(v1, v2)` — represented as an AExpr with op_name "=" and a
+    // special kind. PG defines it as `CASE WHEN v1 = v2 THEN NULL ELSE v1 END`
+    // (src/backend/parser/parse_expr.c:transformAExprNullIf), so the result
+    // type is v1's type and the expression is always nullable. The generic
+    // path below would return `bool` (from the `=` operator's result type),
+    // silently corrupting the result column, so handle it up front.
+    if matches!(
+        protobuf::AExprKind::try_from(expr.kind),
+        Ok(protobuf::AExprKind::AexprNullif)
+    ) {
+        let left = expr
+            .lexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
+            .transpose()?;
+        let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
+        let rhs_goal = if left_oid != oid::UNKNOWN {
+            TypeGoal::implicit(left_oid)
+        } else {
+            TypeGoal::NONE
+        };
+        let right = expr
+            .rexpr
+            .as_ref()
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, rhs_goal))
+            .transpose()?;
+        let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
+
+        // Back-fill left if right carries the concrete type.
+        let left_oid_final = if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
+            expr.lexpr
+                .as_ref()
+                .and_then(|n| {
+                    infer_expr(
+                        n,
+                        scope,
+                        null_ctx,
+                        snapshot,
+                        params,
+                        TypeGoal::implicit(right_oid),
+                    )
+                    .ok()
+                    .map(|t| t.type_oid)
+                })
+                .unwrap_or(left_oid)
+        } else {
+            left_oid
+        };
+
+        // Validate: `=` must be defined between the two types. For untyped
+        // string literals (`'x'`), treat them as `text` during the check —
+        // this mirrors PG's "NULLIF types <T> and text cannot be matched"
+        // error when a bare string literal is paired with a non-string type.
+        let left_for_check = unknown_literal_as_text(expr.lexpr.as_deref(), left_oid_final);
+        let right_for_check = unknown_literal_as_text(expr.rexpr.as_deref(), right_oid);
+        if left_for_check != oid::UNKNOWN
+            && right_for_check != oid::UNKNOWN
+            && snapshot
+                .find_operator("=", Some(left_for_check), right_for_check)
+                .is_none()
+        {
+            return Err(AnalyzeError::TypeMismatch {
+                actual: type_display_name(right_for_check, snapshot),
+                expected: type_display_name(left_for_check, snapshot),
+                context: format!(
+                    "NULLIF types {} and {} cannot be matched",
+                    type_display_name(left_for_check, snapshot),
+                    type_display_name(right_for_check, snapshot),
+                ),
+            });
+        }
+
+        // Result type is the first arg's type (never bool). If the first arg
+        // is UNKNOWN and the second is concrete, use the second as a fallback
+        // so the result isn't a bare UNKNOWN dangling into the output.
+        let result_oid = if left_oid_final != oid::UNKNOWN {
+            left_oid_final
+        } else {
+            right_oid
+        };
+        return Ok(ExprType {
+            type_oid: result_oid,
+            nullable: true,
+        });
+    }
 
     // `expr IS [NOT] DISTINCT FROM other` — shares op_name "=" with ordinary
     // equality but PG guarantees the result is ALWAYS bool NOT NULL (the
-    // whole point of the construct is NULL-aware comparison). Handle before
-    // the generic `is_comparison` branch, which would otherwise let the
-    // operand nullability bleed into the result.
+    // whole point of the construct is NULL-aware comparison). Handled up
+    // front so operand nullability doesn't bleed into the result.
     if matches!(
         protobuf::AExprKind::try_from(expr.kind),
         Ok(protobuf::AExprKind::AexprDistinct) | Ok(protobuf::AExprKind::AexprNotDistinct)
@@ -1085,13 +1438,6 @@ fn infer_a_expr(
     let op_always_nullable = functions::is_nullable_operator(op_name);
     let nullable = any_nullable || op_always_nullable;
 
-    if is_comparison {
-        return Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable,
-        });
-    }
-
     // Try operator lookup with resolved types.
     if let Some(op) = snapshot.find_operator(op_name, left_oid_resolved, right_oid_resolved) {
         // Pass 2: back-fill still-UNKNOWN sides with operator's expected types.
@@ -1125,57 +1471,24 @@ fn infer_a_expr(
         });
     }
 
-    // Fallback: || as text concatenation.
-    if op_name == "||" {
-        // Back-fill UNKNOWN sides as TEXT.
-        if left_oid_resolved == Some(oid::UNKNOWN)
-            && let Some(lexpr) = &expr.lexpr
-        {
-            let _ = infer_expr(
-                lexpr,
-                scope,
-                null_ctx,
-                snapshot,
-                params,
-                TypeGoal::implicit(oid::TEXT),
-            );
-        }
-        if right_oid_resolved == oid::UNKNOWN
-            && let Some(rexpr) = &expr.rexpr
-        {
-            let _ = infer_expr(
-                rexpr,
-                scope,
-                null_ctx,
-                snapshot,
-                params,
-                TypeGoal::implicit(oid::TEXT),
-            );
-        }
-        return Ok(ExprType {
-            type_oid: oid::TEXT,
-            nullable,
-        });
+    // `find_operator` fails in two semantically different ways:
+    //   * both operand types are UNKNOWN → PG `indeterminate_datatype` (42P18),
+    //     e.g. `$1 + $2` with no context, or `NULL = NULL` where no candidate
+    //     can be picked. The user fix is to cast one side, not to blame the
+    //     operator itself.
+    //   * at least one side is concrete → PG `undefined_function` / operator
+    //     (42883): the operator really doesn't exist for these types.
+    let left_unknown = left_oid_resolved.map(|o| o == oid::UNKNOWN).unwrap_or(true);
+    let right_unknown = right_oid_resolved == oid::UNKNOWN;
+    if left_unknown && right_unknown {
+        return Err(AnalyzeError::IndeterminateType(format!(
+            "could not determine data type of operator {op_name}"
+        )));
     }
-
-    // LIKE, BETWEEN, etc. → bool. (IN is handled earlier, before Pass 1.)
-    if matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprLike)
-            | Ok(protobuf::AExprKind::AexprIlike)
-            | Ok(protobuf::AExprKind::AexprBetween)
-            | Ok(protobuf::AExprKind::AexprNotBetween)
-            | Ok(protobuf::AExprKind::AexprSimilar)
-    ) {
-        return Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable,
-        });
-    }
-
-    Err(AnalyzeError::UnresolvedOperator(format!(
-        "operator '{op_name}' with types {:?}, {:?}",
-        left_oid_resolved, right_oid_resolved
+    Err(AnalyzeError::UndefinedOperator(format!(
+        "operator {op_name} does not exist for types {} and {}",
+        type_oid_display(left_oid_resolved.unwrap_or(oid::UNKNOWN), snapshot),
+        type_oid_display(right_oid_resolved, snapshot),
     )))
 }
 
@@ -1219,19 +1532,43 @@ fn infer_coalesce(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    // Pass 1: infer all args bottom-up.
+    // Pass 1: infer all args bottom-up. Bare string literals in UNKNOWN slots
+    // are reinterpreted as `text` so `COALESCE(int_col, 'x')` rejects instead
+    // of silently coercing the literal under the concrete branch's type.
     let mut types = Vec::new();
     let mut all_nullable = true;
 
     for arg in &expr.args {
         let t = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
-        types.push(t.type_oid);
+        types.push(unknown_literal_as_text(Some(arg), t.type_oid));
         if !t.nullable {
             all_nullable = false;
         }
     }
 
-    let type_oid = coerce::find_common_type(&types, snapshot).unwrap_or(oid::TEXT);
+    // All non-UNKNOWN branches must share a common type, otherwise PG
+    // rejects with `could not convert type X to Y`.
+    let concrete_types: Vec<u32> = types
+        .iter()
+        .copied()
+        .filter(|&t| t != oid::UNKNOWN)
+        .collect();
+    let type_oid = if concrete_types.is_empty() {
+        // All branches are UNKNOWN → PG §10.5 defaults to the preferred type
+        // of the string category (usually `text`). Derived from the catalog so
+        // we stay honest: no hardcoded OID here.
+        snapshot
+            .preferred_type_in_category('S')
+            .unwrap_or(oid::UNKNOWN)
+    } else {
+        coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
+            AnalyzeError::TypeMismatch {
+                actual: type_oid_display(concrete_types[concrete_types.len() - 1], snapshot),
+                expected: type_oid_display(concrete_types[0], snapshot),
+                context: "COALESCE arguments have no common type".into(),
+            }
+        })?
+    };
 
     // Pass 2: back-fill UNKNOWN args with the resolved common type.
     if type_oid != oid::UNKNOWN {
@@ -1283,10 +1620,13 @@ fn infer_case(
                     TypeGoal::assignment(oid::BOOL),
                 );
             }
-            // THEN result.
+            // THEN result. Untyped string literals are reinterpreted as
+            // `text` for branch reconciliation — PG's common-type rules
+            // compare literal syntax against the concrete branch's type
+            // and reject mismatches like `CASE … THEN 1 ELSE 'x' END`.
             if let Some(result) = &when.result {
                 let t = infer_expr(result, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
-                types.push(t.type_oid);
+                types.push(unknown_literal_as_text(Some(result), t.type_oid));
                 any_branch_nullable = any_branch_nullable || t.nullable;
             }
         }
@@ -1295,13 +1635,35 @@ fn infer_case(
     // ELSE clause.
     if let Some(defresult) = &expr.defresult {
         let t = infer_expr(defresult, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
-        types.push(t.type_oid);
+        types.push(unknown_literal_as_text(Some(defresult), t.type_oid));
         any_branch_nullable = any_branch_nullable || t.nullable;
     } else {
         any_branch_nullable = true;
     }
 
-    let type_oid = coerce::find_common_type(&types, snapshot).unwrap_or(oid::TEXT);
+    // All non-UNKNOWN branches must share a common type, otherwise PG
+    // rejects with `could not convert type X to Y`.
+    let concrete_types: Vec<u32> = types
+        .iter()
+        .copied()
+        .filter(|&t| t != oid::UNKNOWN)
+        .collect();
+    let type_oid = if concrete_types.is_empty() {
+        // All branches are UNKNOWN → PG §10.5 defaults to the preferred type
+        // of the string category (usually `text`). Derived from the catalog so
+        // we stay honest: no hardcoded OID here.
+        snapshot
+            .preferred_type_in_category('S')
+            .unwrap_or(oid::UNKNOWN)
+    } else {
+        coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
+            AnalyzeError::TypeMismatch {
+                actual: type_oid_display(concrete_types[concrete_types.len() - 1], snapshot),
+                expected: type_oid_display(concrete_types[0], snapshot),
+                context: "CASE branches have no common type".into(),
+            }
+        })?
+    };
 
     // Pass 2: back-fill UNKNOWN result branches with the common type.
     if type_oid != oid::UNKNOWN {
@@ -1402,7 +1764,27 @@ fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let _ = crate::resolve::analyze_select(sel, snapshot, params)?;
+                let (cols, _) = crate::resolve::analyze_select(sel, snapshot, params)?;
+
+                // Arity check: `lhs IN (SELECT …)` / `lhs = ANY(SELECT …)`
+                // requires the LHS and the subquery to match column counts.
+                // PG rejects mismatches with `subquery has too many columns`
+                // or `subquery has too few columns`.
+                let lhs_arity = sub
+                    .testexpr
+                    .as_ref()
+                    .map(|n| match n.node.as_ref() {
+                        Some(node::Node::RowExpr(r)) => r.args.len(),
+                        _ => 1,
+                    })
+                    .unwrap_or(1);
+                if lhs_arity != cols.len() {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "subquery has {} column{}, lhs has {lhs_arity}",
+                        cols.len(),
+                        if cols.len() == 1 { "" } else { "s" },
+                    )));
+                }
             }
             Ok(ExprType {
                 type_oid: oid::BOOL,
@@ -1555,7 +1937,7 @@ fn resolve_type_name(
     let type_entry =
         snapshot
             .resolve_type_by_name(schema, name)
-            .ok_or_else(|| AnalyzeError::UnknownType {
+            .ok_or_else(|| AnalyzeError::UndefinedType {
                 oid: 0,
                 context: format!("type name: {}", parts.join(".")),
             })?;

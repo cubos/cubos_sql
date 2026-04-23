@@ -84,8 +84,8 @@ fn star_expr_on_unknown_alias_fails() {
     let sql = "SELECT row_to_json(nope.*) FROM users u";
     assert_analyze_err!(
         db.analyze(sql),
-        AnalyzeError::UnknownRelation(_),
-        "no table named nope",
+        AnalyzeError::UndefinedTable(_),
+        "missing FROM-clause entry for table \"nope\"",
     );
 }
 

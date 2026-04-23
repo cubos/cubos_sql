@@ -89,6 +89,20 @@ fn complex_arithmetic_on_not_null() {
 }
 
 #[test]
+fn numeric_plus_int_returns_numeric() {
+    let db = setup();
+    // `numeric + int4` must resolve to `numeric + numeric → numeric`
+    // (PG §10.2 step 3c — most exact matches wins). The alternative
+    // `float4 + float4` is reachable via implicit casts but scores lower
+    // because neither side matches exactly, so it would silently narrow
+    // money-style computations.
+    let s = db
+        .analyze("SELECT SUM(id)::numeric + 1 AS r FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("r", numeric())]);
+}
+
+#[test]
 fn complex_coalesce_in_arithmetic() {
     let db = setup();
     // COALESCE(age, 0) is NOT NULL → adding 10 stays NOT NULL.
@@ -137,6 +151,68 @@ fn coalesce_not_null() {
     let sql = "SELECT COALESCE(age, 0) as safe_age FROM users";
     let info = db.analyze(sql).unwrap();
     assert_cols(&info, vec![c("safe_age", int4())]);
+}
+
+// ── NULLIF ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn nullif_returns_first_arg_type() {
+    let db = setup();
+    // Result type is the first arg's type (NOT bool — NULLIF wraps the `=`
+    // operator but projects the first operand back on the non-match branch).
+    // Always nullable (NULL when args are equal).
+    let s = db
+        .analyze("SELECT NULLIF(age, 0) AS maybe_age FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("maybe_age", int4())]);
+}
+
+#[test]
+fn nullif_on_not_null_column_is_nullable() {
+    let db = setup();
+    // Even on a NOT NULL column, NULLIF can produce NULL (when args match).
+    let s = db
+        .analyze("SELECT NULLIF(name, 'admin') AS maybe_name FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("maybe_name", text())]);
+}
+
+#[test]
+fn nullif_with_param_inherits_type() {
+    let db = setup();
+    // `$p1` gets typed from the first arg via the implicit goal.
+    let s = db
+        .analyze("SELECT NULLIF(age, $p1) AS maybe_age FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("maybe_age", int4())]);
+    assert_params(&s, vec![p(int4())]);
+}
+
+#[test]
+fn nullif_incompatible_concrete_types_rejected() {
+    let db = setup();
+    // `int = text` has no operator — PG errors, analyzer should too. The
+    // explicit cast makes the right side concrete `text`, so the rejection
+    // comes from the generic "cannot coerce" check before NULLIF's own
+    // validation runs.
+    assert_analyze_err!(
+        db.analyze("SELECT NULLIF(age, 'x'::text) FROM users"),
+        AnalyzeError::TypeMismatch { .. },
+        "text",
+    );
+}
+
+#[test]
+fn nullif_int_with_string_literal_rejected() {
+    let db = setup();
+    // Bare string literal against an int column — treated as text for the
+    // compatibility check, so PG's "integer and text cannot be matched"
+    // surfaces here as well.
+    assert_analyze_err!(
+        db.analyze("SELECT NULLIF(age, 'x') FROM users"),
+        AnalyzeError::TypeMismatch { .. },
+        "NULLIF",
+    );
 }
 
 // ── CASE ─────────────────────────────────────────────────────────────────────
@@ -342,6 +418,43 @@ fn operator_concat_nullable_arg() {
     assert_cols(&info, vec![cn("combined", text())]);
 }
 
+// ── NULL literals ───────────────────────────────────────────────────────────
+
+#[test]
+fn null_at_top_level_coerces_to_text() {
+    let db = setup();
+    // PG coerces unresolved UNKNOWN output columns to text before sending
+    // them over the wire. A bare `NULL` surfaces as `text` nullable.
+    let s = db.analyze("SELECT NULL AS x").unwrap();
+    assert_cols(&s, vec![cn("x", text())]);
+}
+
+#[test]
+fn null_eq_null_is_nullable_bool() {
+    let db = setup();
+    // `NULL = NULL` is NULL (not TRUE) — result is `bool` nullable.
+    let s = db.analyze("SELECT NULL = NULL AS x").unwrap();
+    assert_cols(&s, vec![cn("x", bool_ty())]);
+}
+
+#[test]
+fn null_text_concat_propagates_null() {
+    let db = setup();
+    // Strict `||`: NULL on the left makes the whole concat nullable.
+    let s = db.analyze("SELECT NULL::text || 'x' AS y").unwrap();
+    assert_cols(&s, vec![cn("y", text())]);
+}
+
+// ── Schema-qualified function call ──────────────────────────────────────────
+
+#[test]
+fn schema_qualified_function_call() {
+    let db = setup();
+    // `pg_catalog.now()` should resolve the same as `now()`.
+    let s = db.analyze("SELECT pg_catalog.now() AS ts").unwrap();
+    assert_cols(&s, vec![c("ts", timestamptz())]);
+}
+
 // ── Nullability of strict comparisons ────────────────────────────────────────
 //
 // Comparison operators (`=`, `<`, `<>`, …) are strict — any NULL operand
@@ -373,6 +486,123 @@ fn comparison_with_nullable_both_sides() {
         .unwrap();
     // `body` is nullable, `name` is NOT NULL — result nullable (any-nullable).
     assert_cols(&s, vec![cn("match", bool_ty())]);
+}
+
+// ── CASE / COALESCE branch-type validation ──────────────────────────────────
+
+#[test]
+fn case_with_incompatible_concrete_arms_rejected() {
+    let db = setup();
+    // When both arms carry concrete (non-UNKNOWN) types and no common type
+    // exists, PG errors with `CASE/WHEN could not convert type X to Y`.
+    assert_analyze_err!(
+        db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x'::text END"),
+        AnalyzeError::TypeMismatch { .. },
+        "no common type",
+    );
+}
+
+#[test]
+fn case_with_incompatible_unknown_literal_rejected() {
+    let db = setup();
+    // Bare string literal vs int — the merge step treats `'x'` as `text`,
+    // so it errors the same way the explicit-cast case does above.
+    assert_analyze_err!(
+        db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x' END"),
+        AnalyzeError::TypeMismatch { .. },
+        "no common type",
+    );
+}
+
+#[test]
+fn coalesce_with_incompatible_concrete_arms_rejected() {
+    let db = setup();
+    // `COALESCE(int, text)` — neither side is the other's implicit target.
+    assert_analyze_err!(
+        db.analyze("SELECT COALESCE(1, 'x'::text)"),
+        AnalyzeError::TypeMismatch { .. },
+        "no common type",
+    );
+}
+
+#[test]
+fn coalesce_with_incompatible_unknown_literal_rejected() {
+    let db = setup();
+    // Same as above but with a bare string literal — treated as text for
+    // the merge check, then rejected against the concrete int4 arg.
+    assert_analyze_err!(
+        db.analyze("SELECT COALESCE(1, 'x')"),
+        AnalyzeError::TypeMismatch { .. },
+        "no common type",
+    );
+}
+
+// ── GREATEST / LEAST (non-strict minmax) ────────────────────────────────────
+
+#[test]
+fn greatest_of_all_null_typed_args() {
+    let db = setup();
+    // `GREATEST(NULL::int4, NULL::int4)` returns NULL typed int4 in PG —
+    // the analyzer resolves the common arg type and marks the result
+    // nullable because every arg is nullable.
+    let s = db
+        .analyze("SELECT GREATEST(NULL::int4, NULL::int4) AS g")
+        .unwrap();
+    assert_cols(&s, vec![cn("g", int4())]);
+}
+
+#[test]
+fn least_of_mixed_nullable_args_keeps_not_null() {
+    let db = setup();
+    // `LEAST(nullable, non-null)` — GREATEST/LEAST skip NULLs at runtime,
+    // so with at least one NOT NULL arg the result is NOT NULL (stricter
+    // than PG's statement-level nullability, which just tracks types).
+    let s = db.analyze("SELECT LEAST(age, id) AS m FROM users").unwrap();
+    assert_cols(&s, vec![c("m", int8())]);
+}
+
+#[test]
+fn greatest_over_int4_and_int8_promotes_to_int8() {
+    let db = setup();
+    // Common-type resolution promotes int4 + int8 → int8. `age` is nullable
+    // but `id` is NOT NULL, so GREATEST's "skip NULLs" semantics guarantee
+    // a non-null result.
+    let s = db
+        .analyze("SELECT GREATEST(age, id) AS g FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("g", int8())]);
+}
+
+#[test]
+fn greatest_all_not_null_args() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT GREATEST(id, 1::int8) AS g FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("g", int8())]);
+}
+
+// ── ROW constructor ─────────────────────────────────────────────────────────
+
+#[test]
+fn row_comparison_returns_bool() {
+    let db = setup();
+    // `ROW(...)` builds an anonymous composite; the `record = record`
+    // operator compares element-wise and returns bool.
+    let s = db.analyze("SELECT ROW(1, 2) = ROW(1, 2) AS e").unwrap();
+    assert_cols(&s, vec![c("e", bool_ty())]);
+}
+
+#[test]
+fn row_from_columns_comparison() {
+    let db = setup();
+    // ROW wrappers are never NULL themselves, and `record = record` is
+    // strict — since `id`/`name` are NOT NULL and the RHS uses literals,
+    // the result is NOT NULL.
+    let s = db
+        .analyze("SELECT ROW(id, name) = ROW(1::int8, 'x') AS e FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("e", bool_ty())]);
 }
 
 // ── Interval / date arithmetic ───────────────────────────────────────────────
@@ -428,6 +658,17 @@ fn nonstrict_concat_ws_never_null() {
     let sql = "SELECT concat_ws(', '::text, name, email) as combined FROM users";
     let info = db.analyze(sql).unwrap();
     assert_cols(&info, vec![c("combined", text())]);
+}
+
+#[test]
+fn concat_ws_with_null_separator_is_nullable() {
+    let db = setup();
+    // `concat_ws(sep, …)` skips NULL items, but a NULL separator makes the
+    // entire result NULL — the variadic part is non-strict, the separator
+    // arg is not.
+    let sql = "SELECT concat_ws(NULL::text, 'a', 'b') AS c";
+    let info = db.analyze(sql).unwrap();
+    assert_cols(&info, vec![cn("c", text())]);
 }
 
 #[test]

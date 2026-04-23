@@ -76,6 +76,18 @@ fn in_subquery() {
 }
 
 #[test]
+fn in_subquery_with_wrong_arity_rejected() {
+    let db = setup();
+    // PG: `subquery has too many columns`. A single-column LHS can't match
+    // a multi-column subquery.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE id IN (SELECT id, name FROM users)"),
+        AnalyzeError::Invalid(_),
+        "subquery has 2 columns, lhs has 1",
+    );
+}
+
+#[test]
 fn not_in_subquery() {
     let db = setup();
     // NOT IN is a semi-anti-join — doesn't affect the outer row shape.
@@ -110,6 +122,34 @@ fn all_subquery() {
             "SELECT id FROM users \
              WHERE age < ALL(SELECT rating FROM comments)",
         )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+// ── Correlated scalar subquery ───────────────────────────────────────────────
+
+#[test]
+fn correlated_scalar_subquery_in_select_list() {
+    let db = setup();
+    // Inner subquery references outer `t.id` — the analyzer must thread the
+    // outer scope into the subselect.
+    let s = db
+        .analyze(
+            "SELECT id, (SELECT title FROM posts p WHERE p.user_id = u.id LIMIT 1) AS first_title \
+             FROM users u",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), cn("first_title", text())]);
+}
+
+// ── EXISTS with SELECT * ─────────────────────────────────────────────────────
+
+#[test]
+fn exists_with_select_star_accepts() {
+    let db = setup();
+    // EXISTS ignores the projected columns, so `SELECT *` inside is fine.
+    let s = db
+        .analyze("SELECT id FROM users WHERE EXISTS(SELECT * FROM posts)")
         .unwrap();
     assert_cols(&s, vec![c("id", int8())]);
 }

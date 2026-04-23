@@ -78,19 +78,12 @@ pub(crate) fn resolve_function(
     schema: Option<&str>,
     name: &str,
     arg_types: &[u32],
-    is_agg_star: bool,
+    _is_agg_star: bool,
 ) -> Result<ResolvedFunction, AnalyzeError> {
-    // Special case: COUNT(*)
-    if name == "count" && is_agg_star {
-        return Ok(ResolvedFunction {
-            return_type_oid: oid::INT8,
-            arg_types: vec![],
-            schema: "pg_catalog".into(),
-            is_aggregate: true,
-            is_strict: true,
-            out_args: Vec::new(),
-        });
-    }
+    // `COUNT(*)` is not special: it parses with an empty arg list, and
+    // `pg_proc` already has a zero-arg `count()` → int8 entry. Phase 1 exact
+    // match below picks it up. `is_agg_star` is kept in the signature for
+    // callers that still pass it, but the resolution is fully catalog-driven.
 
     // Procedures are only callable via `CALL stmt`, never inside expressions,
     // so filter them out of the candidate set for expression-level lookups.
@@ -100,8 +93,8 @@ pub(crate) fn resolve_function(
         .filter(|f| !f.is_procedure)
         .collect();
     if candidates.is_empty() {
-        return Err(AnalyzeError::UnresolvedFunction(format!(
-            "function {name} not found"
+        return Err(AnalyzeError::UndefinedFunction(format!(
+            "function {name}() does not exist"
         )));
     }
 
@@ -145,8 +138,8 @@ pub(crate) fn resolve_function(
         return Ok(make_resolved(count_matches[0]));
     }
 
-    Err(AnalyzeError::UnresolvedFunction(format!(
-        "cannot resolve function {name} with {} args (found {} candidates)",
+    Err(AnalyzeError::UndefinedFunction(format!(
+        "function {name} with {} argument(s) does not exist (found {} candidate(s))",
         arg_types.len(),
         candidates.len()
     )))
@@ -538,9 +531,11 @@ pub(crate) fn is_nullable_operator(name: &str) -> bool {
 /// regardless of input nullability. These are safe to mark as NOT NULL
 /// unconditionally.
 const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
-    // String concatenation: treats NULLs as empty strings.
+    // String concatenation: treats NULLs as empty strings. `concat_ws` is
+    // handled separately at the call site — its first arg (the separator)
+    // being NULL propagates to NULL, so the "never-NULL" shortcut doesn't
+    // apply.
     "concat",
-    "concat_ws",
     // sprintf-like formatting: NULL args become empty.
     "format",
     // Current time: no inputs, always returns a value.

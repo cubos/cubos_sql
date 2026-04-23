@@ -48,8 +48,8 @@ fn insert_into_nonexistent_column_errors() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("INSERT INTO users (nonexistent) VALUES ($p1)"),
-        AnalyzeError::UnknownColumn(_),
-        "users.nonexistent",
+        AnalyzeError::UndefinedColumn(_),
+        "column \"nonexistent\"",
     );
 }
 
@@ -58,8 +58,8 @@ fn update_set_nonexistent_column_errors() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("UPDATE users SET nonexistent = $p1 WHERE id = $p2"),
-        AnalyzeError::UnknownColumn(_),
-        "users.nonexistent",
+        AnalyzeError::UndefinedColumn(_),
+        "column \"nonexistent\"",
     );
 }
 
@@ -276,6 +276,54 @@ fn complex_insert_select_with_join() {
             c("post_id", int8()),
             c("author_name", text()),
         ],
+    );
+}
+
+// ── Static rejection of NOT NULL violations and arity mismatches ────────────
+
+#[test]
+fn update_set_not_null_column_to_null_rejected() {
+    let db = setup();
+    // PG rejects this at runtime (`null value in column "name" violates
+    // not-null constraint`). We can catch it statically because the table
+    // schema says `name` is NOT NULL.
+    assert_analyze_err!(
+        db.analyze("UPDATE users SET name = NULL WHERE id = $p1 RETURNING id"),
+        AnalyzeError::Invalid(_),
+        "NOT NULL column `users.name`",
+    );
+}
+
+#[test]
+fn insert_null_into_not_null_column_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (name, email) VALUES (NULL, $p1)"),
+        AnalyzeError::Invalid(_),
+        "NOT NULL column `users.name`",
+    );
+}
+
+#[test]
+fn insert_values_row_wrong_arity_rejected() {
+    let db = setup();
+    // Explicit column list (name, email) expects 2 values per row; we
+    // pass 3. PG: `INSERT has more expressions than target columns`.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (name, email) VALUES ($p1, $p2, $p3)"),
+        AnalyzeError::Invalid(_),
+        "expects 2 values per row",
+    );
+}
+
+#[test]
+fn insert_select_column_count_mismatch_rejected() {
+    let db = setup();
+    // Target has 2 columns, SELECT has 1.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (name, email) SELECT name FROM users"),
+        AnalyzeError::Invalid(_),
+        "expects 2 columns, SELECT produces 1",
     );
 }
 

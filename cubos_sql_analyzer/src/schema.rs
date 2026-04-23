@@ -26,6 +26,7 @@ pub(crate) mod oid {
     pub const BPCHAR: u32 = 1042;
     pub const VARCHAR: u32 = 1043;
     pub const NUMERIC: u32 = 1700;
+    pub const RECORD: u32 = 2249;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -422,6 +423,18 @@ impl SchemaSnapshot {
         current
     }
 
+    /// The preferred type of a given `pg_type.typcategory`. Used when the
+    /// analyzer needs to pick a concrete type for an expression whose inputs
+    /// are all UNKNOWN (string-category literals default to `text`, numeric
+    /// literals to `numeric`, etc., because those are the preferred types in
+    /// their categories).
+    pub fn preferred_type_in_category(&self, category: char) -> Option<u32> {
+        self.types
+            .values()
+            .find(|t| t.category == category && t.is_preferred)
+            .map(|t| t.oid)
+    }
+
     /// Check if an implicit cast exists from `source` to `target`.
     pub fn has_implicit_cast(&self, source: u32, target: u32) -> bool {
         if source == target {
@@ -544,16 +557,44 @@ impl SchemaSnapshot {
             return Some(concretize_operator(op, left_oid, right_oid, self));
         }
 
-        // Step 2: match via implicit casts (non-UNKNOWN operands only).
-        if let Some(op) = candidates.iter().find(|o| {
-            let left_ok = match (o.left_type_oid, left_oid) {
-                (Some(expected), Some(actual)) => self.has_implicit_cast(actual, expected),
-                (None, None) => true,
-                _ => false,
+        // Step 2: match via implicit casts (non-UNKNOWN operands only). More
+        // than one candidate can match — PG §10.2 step 3c resolves the tie
+        // by keeping those with the most exact matches on input types (so
+        // `numeric + int4` picks `numeric + numeric` over `float4 + float4`,
+        // both reachable via implicit cast from numeric/int4).
+        let cast_matches: Vec<&OperatorEntry> = candidates
+            .iter()
+            .filter(|o| {
+                let left_ok = match (o.left_type_oid, left_oid) {
+                    (Some(expected), Some(actual)) => {
+                        actual == expected || self.has_implicit_cast(actual, expected)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                let right_ok = o.right_type_oid == right_oid
+                    || self.has_implicit_cast(right_oid, o.right_type_oid);
+                left_ok && right_ok
+            })
+            .copied()
+            .collect();
+        if !cast_matches.is_empty() {
+            let exact_score = |o: &&OperatorEntry| -> u8 {
+                let left_exact = match (o.left_type_oid, left_oid) {
+                    (Some(e), Some(a)) => (e == a) as u8,
+                    (None, None) => 1,
+                    _ => 0,
+                };
+                let right_exact = (o.right_type_oid == right_oid) as u8;
+                left_exact + right_exact
             };
-            left_ok && self.has_implicit_cast(right_oid, o.right_type_oid)
-        }) {
-            return Some(concretize_operator(op, left_oid, right_oid, self));
+            let max_score = cast_matches.iter().map(exact_score).max().unwrap();
+            let best = cast_matches
+                .iter()
+                .find(|o| exact_score(o) == max_score)
+                .copied()
+                .unwrap();
+            return Some(concretize_operator(best, left_oid, right_oid, self));
         }
 
         // Step 2b: polymorphic match. Operators declared over pseudo-types
@@ -701,8 +742,9 @@ impl SchemaSnapshot {
         }
 
         // 3d. Final fallback: resolve UNKNOWN positions to `text`, since
-        //     string constants default to text in PostgreSQL.  If exactly one
-        //     candidate matches after this substitution, use it.
+        //     string constants default to text in PostgreSQL.  Prefer an
+        //     exact match on the substituted types; fall back to candidates
+        //     reachable via implicit cast only if no exact match exists.
         let text_oid = oid::TEXT;
         let resolved_left = if left_unknown {
             Some(text_oid)
@@ -710,6 +752,21 @@ impl SchemaSnapshot {
             left_oid
         };
         let resolved_right = if right_unknown { text_oid } else { right_oid };
+
+        let exact_matches: Vec<&OperatorEntry> = remaining
+            .iter()
+            .filter(|o| o.left_type_oid == resolved_left && o.right_type_oid == resolved_right)
+            .copied()
+            .collect();
+        if exact_matches.len() == 1 {
+            return Some(concretize_operator(
+                exact_matches[0],
+                resolved_left,
+                resolved_right,
+                self,
+            ));
+        }
+
         let text_matches: Vec<&OperatorEntry> = remaining
             .iter()
             .filter(|o| {

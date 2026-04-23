@@ -111,6 +111,29 @@ fn lag_over_not_null_column_is_nullable() {
 }
 
 #[test]
+fn lag_with_non_null_default_is_not_null() {
+    let db = setup();
+    // `LAG(col, offset, default)` replaces the partition-edge NULL with
+    // `default`. With both `col` and `default` NOT NULL the result is
+    // never NULL.
+    let s = db
+        .analyze("SELECT LAG(views, 1, 0) OVER (ORDER BY id) AS prev FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("prev", int4())]);
+}
+
+#[test]
+fn lag_with_nullable_default_stays_nullable() {
+    let db = setup();
+    // `LAG(col, 1, nullable)` — the default could itself be NULL, so the
+    // result is nullable even when the source column is NOT NULL.
+    let s = db
+        .analyze("SELECT LAG(views, 1, NULL::int4) OVER (ORDER BY id) AS prev FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("prev", int4())]);
+}
+
+#[test]
 fn lead_over_not_null_column_is_nullable() {
     let db = setup();
     let s = db
@@ -137,6 +160,33 @@ fn nth_value_is_nullable() {
         .analyze("SELECT NTH_VALUE(title, 2) OVER (ORDER BY id) AS second FROM posts")
         .unwrap();
     assert_cols(&s, vec![cn("second", text())]);
+}
+
+// ── Placement rules ──────────────────────────────────────────────────────────
+
+#[test]
+fn window_function_in_where_rejected() {
+    let db = setup();
+    // PG: `window functions are not allowed in WHERE`.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM posts WHERE ROW_NUMBER() OVER () = 1"),
+        AnalyzeError::Invalid(_),
+        "window functions are not allowed in WHERE",
+    );
+}
+
+#[test]
+fn window_function_in_group_by_rejected() {
+    let db = setup();
+    // PG: `window functions are not allowed in GROUP BY`.
+    assert_analyze_err!(
+        db.analyze(
+            "SELECT title, COUNT(*) FROM posts \
+             GROUP BY title, ROW_NUMBER() OVER ()"
+        ),
+        AnalyzeError::Invalid(_),
+        "window functions are not allowed in GROUP BY",
+    );
 }
 
 // ── Named window (WINDOW … AS …) ─────────────────────────────────────────────

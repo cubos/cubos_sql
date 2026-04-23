@@ -267,6 +267,64 @@ fn where_similar_to() {
     assert_cols(&s, vec![c("id", int8())]);
 }
 
+// ── Cross-type operators rejected ───────────────────────────────────────────
+
+#[test]
+fn text_eq_int_rejected() {
+    let db = setup();
+    // PG: `operator does not exist: text = bigint`.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE name = id"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator = does not exist",
+    );
+}
+
+#[test]
+fn text_eq_int_literal_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE name = 42"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator = does not exist",
+    );
+}
+
+#[test]
+fn timestamptz_lt_int_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE created_at < 42"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator < does not exist",
+    );
+}
+
+#[test]
+fn int_like_text_rejected() {
+    let db = setup();
+    // PG: `operator does not exist: bigint ~~ text`. Catches typos where a
+    // developer writes `id LIKE 'foo'` instead of `id::text LIKE 'foo'`.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE id LIKE '%1%'"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator ~~ does not exist",
+    );
+}
+
+#[test]
+fn same_param_with_conflicting_types_rejected() {
+    let db = setup();
+    // First use (`age = $p1`) pins `$p1` to int4. Second use (`name = $p1`)
+    // would then be `text = int4`, which has no operator in PG — the
+    // cross-type check above catches this uniformly.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE age = $p1 AND name = $p1"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator = does not exist",
+    );
+}
+
 // ── Stress ───────────────────────────────────────────────────────────────────
 
 #[test]

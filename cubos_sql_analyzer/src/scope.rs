@@ -45,9 +45,9 @@ impl Scope {
         name: &str,
         alias: &str,
     ) -> Result<(), AnalyzeError> {
-        let table = snapshot
-            .resolve_table(schema, name)
-            .ok_or_else(|| AnalyzeError::UnknownRelation(name.to_owned()))?;
+        let table = snapshot.resolve_table(schema, name).ok_or_else(|| {
+            AnalyzeError::UndefinedTable(format!("relation \"{name}\" does not exist"))
+        })?;
 
         let columns = table
             .columns
@@ -119,21 +119,25 @@ impl Scope {
                     return Ok(col);
                 }
             }
-            return Err(AnalyzeError::UnknownColumn(format!("{t}.{column}")));
+            return Err(AnalyzeError::UndefinedColumn(format!(
+                "column \"{t}.{column}\" does not exist"
+            )));
         }
 
         let mut found: Option<&ScopeColumn> = None;
         for source in &self.sources {
             if let Some(col) = source.columns.iter().find(|c| c.name == column) {
                 if found.is_some() {
-                    return Err(AnalyzeError::UnknownColumn(format!(
-                        "ambiguous column: {column}"
+                    return Err(AnalyzeError::UndefinedColumn(format!(
+                        "column reference \"{column}\" is ambiguous"
                     )));
                 }
                 found = Some(col);
             }
         }
-        found.ok_or_else(|| AnalyzeError::UnknownColumn(column.to_owned()))
+        found.ok_or_else(|| {
+            AnalyzeError::UndefinedColumn(format!("column \"{column}\" does not exist"))
+        })
     }
 
     /// Get all columns (for SELECT *).

@@ -34,7 +34,7 @@ fn procedure_is_not_callable_in_expressions() {
 
     assert_analyze_err!(
         db.analyze("SELECT do_thing(1)"),
-        AnalyzeError::UnresolvedFunction(_),
+        AnalyzeError::UndefinedFunction(_),
         "do_thing",
     );
 }

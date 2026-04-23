@@ -246,3 +246,49 @@ fn torture_count_with_group_by() {
     let info = db.analyze(sql).unwrap();
     assert_cols(&info, vec![c("name", text()), c("post_count", int8())]);
 }
+
+// ── Placement rules ──────────────────────────────────────────────────────────
+
+#[test]
+fn aggregate_in_where_rejected() {
+    let db = setup();
+    // PG: `aggregate functions are not allowed in WHERE`.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE COUNT(*) > 0"),
+        AnalyzeError::Invalid(_),
+        "aggregate functions are not allowed in WHERE",
+    );
+}
+
+#[test]
+fn aggregate_in_group_by_rejected() {
+    let db = setup();
+    // PG: `aggregate functions are not allowed in GROUP BY`.
+    assert_analyze_err!(
+        db.analyze("SELECT age FROM users GROUP BY COUNT(*)"),
+        AnalyzeError::Invalid(_),
+        "aggregate functions are not allowed in GROUP BY",
+    );
+}
+
+#[test]
+fn nested_aggregate_rejected() {
+    let db = setup();
+    // PG: `aggregate function calls cannot be nested`.
+    assert_analyze_err!(
+        db.analyze("SELECT SUM(COUNT(*)) FROM posts GROUP BY user_id"),
+        AnalyzeError::Invalid(_),
+        "aggregate function calls cannot be nested",
+    );
+}
+
+#[test]
+fn window_function_in_aggregate_argument_rejected() {
+    let db = setup();
+    // PG: `window functions are not allowed in aggregate function arguments`.
+    assert_analyze_err!(
+        db.analyze("SELECT SUM(ROW_NUMBER() OVER ()) FROM posts"),
+        AnalyzeError::Invalid(_),
+        "window functions are not allowed inside aggregate arguments",
+    );
+}

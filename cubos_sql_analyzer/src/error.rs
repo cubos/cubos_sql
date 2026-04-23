@@ -1,4 +1,10 @@
 //! Error types for the SQL analyzer.
+//!
+//! Variant names mirror PostgreSQL error categories (SQLSTATE class 42):
+//! `UndefinedTable` = 42P01, `UndefinedColumn` = 42703, `UndefinedFunction` /
+//! `UndefinedOperator` = 42883, `IndeterminateType` = 42P18, and so on. This
+//! lets consumers map our errors to PG error codes without an extra translation
+//! table, and helps us stay honest about what each variant actually represents.
 
 use thiserror::Error;
 
@@ -15,27 +21,42 @@ pub enum AnalyzeError {
     #[error("SQL parse error: {0}")]
     Parse(String),
 
-    /// A table or view referenced in the query was not found in the schema snapshot.
-    #[error("unknown relation: {0}")]
-    UnknownRelation(String),
+    /// A table or view referenced in the query was not found in the schema
+    /// snapshot. Equivalent to PG `undefined_table` (SQLSTATE 42P01).
+    #[error("{0}")]
+    UndefinedTable(String),
 
-    /// A column referenced in the query was not found in scope.
-    #[error("unknown column: {0}")]
-    UnknownColumn(String),
+    /// A column referenced in the query was not found in scope. Equivalent to
+    /// PG `undefined_column` (SQLSTATE 42703).
+    #[error("{0}")]
+    UndefinedColumn(String),
 
     /// A type OID was not found in the schema snapshot or type map.
     #[error("unknown type OID {oid} for {context}")]
-    UnknownType { oid: u32, context: String },
+    UndefinedType { oid: u32, context: String },
 
-    /// A function could not be resolved (not found or ambiguous overload).
-    #[error("cannot resolve function: {0}")]
-    UnresolvedFunction(String),
+    /// A function does not exist for the given argument types. Equivalent to
+    /// PG `undefined_function` (SQLSTATE 42883). In PG the same SQLSTATE covers
+    /// missing operators; here we keep operators in their own variant for
+    /// clarity.
+    #[error("{0}")]
+    UndefinedFunction(String),
 
-    /// An operator could not be resolved for the given operand types.
-    #[error("cannot resolve operator: {0}")]
-    UnresolvedOperator(String),
+    /// An operator does not exist for the given operand types. Shares PG
+    /// SQLSTATE 42883 with `UndefinedFunction`.
+    #[error("{0}")]
+    UndefinedOperator(String),
 
-    /// A type mismatch: an expression's type cannot be coerced to the expected type.
+    /// The type of an expression could not be determined — typically a bare
+    /// parameter with no context, or an operator with UNKNOWN on both sides
+    /// that resolves ambiguously. Equivalent to PG `indeterminate_datatype`
+    /// (SQLSTATE 42P18).
+    #[error("{0}")]
+    IndeterminateType(String),
+
+    /// A type mismatch: an expression's type cannot be coerced to the expected
+    /// type. Equivalent to PG `datatype_mismatch` (SQLSTATE 42804) or
+    /// `cannot_coerce` (42846) depending on context.
     #[error("type mismatch: {actual} cannot be coerced to {expected} ({context})")]
     TypeMismatch {
         actual: String,
@@ -46,6 +67,14 @@ pub enum AnalyzeError {
     /// The analyzer encountered an AST node or SQL feature it does not yet support.
     #[error("unsupported SQL feature: {0}")]
     Unsupported(String),
+
+    /// The query violates PostgreSQL's placement rules for a construct
+    /// (aggregate in WHERE, window function in WHERE, nested aggregates,
+    /// INSERT/SELECT arity mismatch, etc.). Maps to a mix of PG SQLSTATEs —
+    /// primarily `grouping_error` (42803) and `syntax_error` (42601) — that we
+    /// don't yet split further.
+    #[error("invalid SQL: {0}")]
+    Invalid(String),
 
     /// The parser reported a JOIN kind the analyzer does not recognize.
     /// Returned instead of silently falling back to INNER JOIN semantics,

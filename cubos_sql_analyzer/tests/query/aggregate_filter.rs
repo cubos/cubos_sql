@@ -55,6 +55,16 @@ fn sum_filter_where_with_param() {
 }
 
 #[test]
+fn count_filter_always_false_is_still_non_null() {
+    let db = setup();
+    // Even when FILTER excludes every row, COUNT still returns 0 — never NULL.
+    let s = db
+        .analyze("SELECT COUNT(*) FILTER (WHERE false) AS c FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("c", int8())]);
+}
+
+#[test]
 fn multiple_filters_side_by_side() {
     let db = setup();
     let s = db

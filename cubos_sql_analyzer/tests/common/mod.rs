@@ -386,7 +386,7 @@ pub fn assert_type_mismatch(db: &PgCatalog, sql: &str, expect_actual: &str, expe
 ///
 /// Use via the [`assert_analyze_err!`] macro for natural pattern syntax:
 /// ```ignore
-/// assert_analyze_err!(db.analyze(sql), AnalyzeError::UnknownRelation(_), "users");
+/// assert_analyze_err!(db.analyze(sql), AnalyzeError::UndefinedTable(_), "users");
 /// ```
 #[macro_export]
 macro_rules! assert_analyze_err {
