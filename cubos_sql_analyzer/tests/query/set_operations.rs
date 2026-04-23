@@ -1,0 +1,156 @@
+//! UNION, UNION ALL, INTERSECT, EXCEPT: column unification, nullability
+//! propagation across branches, type coercion of mixed branches.
+
+use crate::common::*;
+
+fn setup() -> Database {
+    let mut db = Database::new();
+    db.apply_sql(
+        "CREATE TABLE users (
+            id   BIGINT PRIMARY KEY,
+            name TEXT NOT NULL,
+            age  INT
+         );
+         CREATE TABLE posts (
+            id      BIGINT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            title   TEXT NOT NULL,
+            body    TEXT
+         );
+         CREATE TABLE comments (
+            id          BIGINT PRIMARY KEY,
+            post_id     BIGINT NOT NULL,
+            author_name TEXT NOT NULL,
+            content     TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    db
+}
+
+// ── UNION / UNION ALL / INTERSECT / EXCEPT type match ────────────────────────
+
+#[test]
+fn types_match_union_all() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id, name FROM users WHERE age > 20 \
+             UNION ALL \
+             SELECT id, name FROM users WHERE age <= 20",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+}
+
+#[test]
+fn types_match_union_distinct() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT name FROM users \
+             UNION \
+             SELECT title FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("name", text())]);
+}
+
+#[test]
+fn types_match_intersect() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT name FROM users \
+             INTERSECT \
+             SELECT title FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("name", text())]);
+}
+
+#[test]
+fn types_match_except() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT name FROM users \
+             EXCEPT \
+             SELECT title FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("name", text())]);
+}
+
+#[test]
+fn types_match_cte_union() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH all_names AS (\
+               SELECT name FROM users \
+               UNION ALL \
+               SELECT author_name AS name FROM comments\
+             ) \
+             SELECT name FROM all_names",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("name", text())]);
+}
+
+// ── Nullability propagation across branches ──────────────────────────────────
+
+#[test]
+fn union_nullable_branch() {
+    let db = setup();
+    // Nullable because body is nullable.
+    let sql = "SELECT name as val FROM users UNION ALL SELECT body as val FROM posts";
+    let info = db.analyze(sql).unwrap();
+    assert!(col(&info, "val").nullable);
+}
+
+#[test]
+fn union_all_not_null() {
+    let db = setup();
+    let sql = "SELECT name as val FROM users UNION ALL SELECT title as val FROM posts";
+    let info = db.analyze(sql).unwrap();
+    assert!(!col(&info, "val").nullable);
+}
+
+// ── Stress / complex ─────────────────────────────────────────────────────────
+
+#[test]
+fn stress_union_with_null_literal_branch() {
+    let db = setup();
+    // One branch is a literal NULL → union should be nullable.
+    let sql = "SELECT name as val FROM users \
+               UNION ALL \
+               SELECT NULL as val";
+    let info = db.analyze(sql).unwrap();
+    assert!(col(&info, "val").nullable);
+}
+
+#[test]
+fn stress_union_mixed_types() {
+    let db = setup();
+    // int + bigint → bigint (coercion).
+    let sql = "SELECT age as num FROM users \
+               UNION ALL \
+               SELECT id as num FROM users";
+    let info = db.analyze(sql).unwrap();
+    // age is nullable → union is nullable (even though id is NOT NULL).
+    assert!(col(&info, "num").nullable);
+}
+
+#[test]
+fn complex_union_three_branches() {
+    let db = setup();
+    let sql = "SELECT name as label FROM users \
+               UNION ALL \
+               SELECT title as label FROM posts \
+               UNION ALL \
+               SELECT author_name as label FROM comments";
+    let info = db.analyze(sql).unwrap();
+    // All three NOT NULL → union NOT NULL.
+    assert!(!col(&info, "label").nullable);
+}

@@ -1,8 +1,73 @@
-//! Tests for parameter type inference and nullability: annotations, auto-inferred
-//! nullability from INSERT/UPDATE target columns, and goal-type-driven inference.
+//! Parameter inference: `$name`, `$name!`, `$name?`, goal-type-driven
+//! inference (LIMIT/OFFSET/WHERE/INSERT/UPDATE), preferred-type tiebreaks,
+//! `$..spread`.
 
-mod common;
-use common::*;
+use crate::common::*;
+
+fn empty_db() -> Database {
+    Database::new()
+}
+
+fn setup() -> Database {
+    let mut db = Database::new();
+    db.apply_sql(
+        "CREATE TABLE users (
+            id         BIGINT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            email      TEXT NOT NULL,
+            age        INT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+         CREATE TABLE posts (
+            id      BIGINT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            title   TEXT NOT NULL,
+            body    TEXT
+         );",
+    )
+    .unwrap();
+    db
+}
+
+/// Assert that the analyzer produces the expected param types.
+fn assert_param_types(db: &Database, sql: &str, expected: &[Type]) {
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(
+        info.params.len(),
+        expected.len(),
+        "param count mismatch for: {sql}"
+    );
+    for (i, (p, exp)) in info.params.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(&p.pg_type, exp, "param ${} type mismatch for: {sql}", i + 1);
+    }
+}
+
+/// Assert the single param of `sql` resolves to the expected PG type.
+fn assert_single_param_ty(db: &Database, sql: &str, expected: Type) {
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(info.params.len(), 1, "expected exactly one param in: {sql}");
+    assert_eq!(
+        info.params[0].pg_type, expected,
+        "param PG type mismatch for: {sql}"
+    );
+}
+
+// ── Untyped params fall back to PG's preferred type: `text` ──────────────────
+
+#[test]
+fn untyped_param_in_select_defaults_to_text() {
+    let db = empty_db();
+    let info = db.analyze("SELECT $p1").unwrap();
+    assert_eq!(info.params[0].pg_type, text());
+}
+
+#[test]
+fn untyped_params_in_comparison_default_to_text() {
+    let db = empty_db();
+    let info = db.analyze("SELECT $p1 > $p2").unwrap();
+    assert_eq!(info.params[0].pg_type, text());
+    assert_eq!(info.params[1].pg_type, text());
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests: parameter nullability annotations
@@ -252,19 +317,6 @@ fn param_bang_on_insert_select() {
 // ──────────────────────────────────────────────────────────────────────────────
 // These tests validate that parameter types are inferred exactly as PostgreSQL
 // infers them (via PREPARE), plus nullability inference from column definitions.
-
-/// Helper: assert that the analyzer produces the expected param types.
-fn assert_param_types(db: &Database, sql: &str, expected: &[Type]) {
-    let info = db.analyze(sql).unwrap();
-    assert_eq!(
-        info.params.len(),
-        expected.len(),
-        "param count mismatch for: {sql}"
-    );
-    for (i, (p, exp)) in info.params.iter().zip(expected.iter()).enumerate() {
-        assert_eq!(&p.pg_type, exp, "param ${} type mismatch for: {sql}", i + 1);
-    }
-}
 
 // ── LIMIT with bare param ─────────────────────────────────────────────
 
@@ -581,16 +633,6 @@ fn goal_limit_offset_literals_no_error() {
 // register overloads in an order that favors the wrong candidate, or assert
 // on `pg_type` to distinguish types that share the same Rust mapping.
 
-/// Assert the single param of `sql` resolves to the expected PG type.
-fn assert_single_param_ty(db: &Database, sql: &str, expected: Type) {
-    let info = db.analyze(sql).unwrap();
-    assert_eq!(info.params.len(), 1, "expected exactly one param in: {sql}");
-    assert_eq!(
-        info.params[0].pg_type, expected,
-        "param PG type mismatch for: {sql}"
-    );
-}
-
 #[test]
 fn preferred_type_text_wins_over_bytea_in_reverse_registration_order() {
     // bytea is category 'U' and text is the preferred type of category 'S'.
@@ -694,4 +736,71 @@ fn param_as_element_in_any_lhs() {
         .analyze("SELECT * FROM items WHERE $tag = ANY(tags)")
         .unwrap();
     assert_params(&info, vec![p(text())]);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests: mixed param types across the query (migrated from identical/nullability)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn params_all_types() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id FROM users \
+             WHERE name = $p1 AND age = $p2 AND id > $p3 AND created_at > $p4",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(text()), p(int4()), p(int8()), p(timestamptz())]);
+}
+
+#[test]
+fn params_with_cast() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE name = $p1::text AND age > $p2::int4")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(text()), p(int4())]);
+}
+
+#[test]
+fn complex_multiple_params_from_different_contexts() {
+    let db = setup();
+    // $p1 from WHERE, $p2 via comparison, $p3 from another comparison.
+    let sql = "SELECT id, name FROM users WHERE id = $p1 AND age > $p2 AND email = $p3";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(info.params.len(), 3);
+    assert_eq!(info.params[0].pg_type, int8());
+    assert_eq!(info.params[1].pg_type, int4());
+    assert_eq!(info.params[2].pg_type, text());
+}
+
+#[test]
+fn stress_param_from_insert_values() {
+    let db = setup();
+    let sql = "INSERT INTO posts (user_id, title, body) VALUES ($p1, $p2, $p3) RETURNING id";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(info.params.len(), 3);
+    assert_eq!(info.params[0].pg_type, int8());
+    assert_eq!(info.params[1].pg_type, text());
+    assert_eq!(info.params[2].pg_type, text());
+}
+
+#[test]
+fn stress_param_with_cast() {
+    let db = setup();
+    let sql = "SELECT id FROM users WHERE id = $p1::bigint";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(info.params[0].pg_type, int8());
+}
+
+#[test]
+fn torture_param_in_coalesce() {
+    let db = setup();
+    let sql = "SELECT COALESCE(age, $p1) as val FROM users";
+    let info = db.analyze(sql).unwrap();
+    // $p1 is NOT NULL by default → COALESCE has a NOT NULL arg → NOT NULL.
+    assert!(!col(&info, "val").nullable);
 }

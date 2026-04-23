@@ -1,8 +1,11 @@
 //! Shared setup, helpers, and assertion utilities for analyzer tests.
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
-pub use cubos_sql_analyzer::{AnalyzedColumn, AnalyzedQuery, Database, QualifiedName, Type};
+pub use cubos_sql_analyzer::schema::{RelationKind, SchemaSnapshot, TypeKind};
+pub use cubos_sql_analyzer::{
+    AnalyzeError, AnalyzedColumn, AnalyzedQuery, Database, DdlError, QualifiedName, Type,
+};
 
 /// Terse helper for building a [`QualifiedName`] in tests.
 pub fn qn(schema: &str, name: &str) -> QualifiedName {
@@ -10,61 +13,34 @@ pub fn qn(schema: &str, name: &str) -> QualifiedName {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Setup
+// Multi-migration setup (DDL tests)
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub const MIGRATION: &str = "\
-    CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
-    CREATE DOMAIN user_prefs AS JSONB;
-    CREATE SCHEMA whatsapp;
-    CREATE DOMAIN whatsapp.health_data AS JSONB;
-    CREATE TABLE users (\
-        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-        name TEXT NOT NULL, \
-        email TEXT NOT NULL UNIQUE, \
-        age INT, \
-        role user_role NOT NULL DEFAULT 'viewer', \
-        preferences user_prefs, \
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-    );\
-    CREATE TABLE posts (\
-        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-        user_id BIGINT NOT NULL REFERENCES users(id), \
-        title TEXT NOT NULL, \
-        body TEXT, \
-        published_at TIMESTAMPTZ\
-    );\
-    CREATE TABLE comments (\
-        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-        post_id BIGINT NOT NULL REFERENCES posts(id), \
-        author_name TEXT NOT NULL, \
-        content TEXT NOT NULL, \
-        rating INT\
-    );\
-    CREATE TABLE whatsapp.channels (\
-        channel_id BIGINT PRIMARY KEY, \
-        health whatsapp.health_data, \
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-    );\
-    CREATE TABLE whatsapp.contacts (\
-        channel_id BIGINT NOT NULL, \
-        id TEXT NOT NULL, \
-        name TEXT, \
-        pushname TEXT, \
-        is_business BOOLEAN, \
-        profile_pic TEXT, \
-        profile_pic_full TEXT, \
-        status TEXT, \
-        saved BOOLEAN, \
-        PRIMARY KEY (channel_id, id)\
-    );\
-";
+/// Apply a sequence of `(filename, sql)` migrations and return the resulting
+/// schema snapshot. Panics on any migration error — use [`try_apply`] when the
+/// test expects a specific failure.
+pub fn build(migrations: &[(&str, &str)]) -> SchemaSnapshot {
+    build_db(migrations).into_snapshot()
+}
 
-/// Build a [`Database`] from the shared test migration.
-pub fn setup() -> Database {
+/// Apply a sequence of migrations and return the live [`Database`] — useful
+/// when the test also needs to analyze queries against the resulting schema.
+pub fn build_db(migrations: &[(&str, &str)]) -> Database {
     let mut db = Database::new();
-    db.apply_sql(MIGRATION).unwrap();
+    for (_, sql) in migrations {
+        db.apply_sql(sql).unwrap();
+    }
     db
+}
+
+/// Apply a sequence of migrations and return the `Result` so tests can match
+/// on the specific [`DdlError`] variant.
+pub fn try_apply(migrations: &[(&str, &str)]) -> Result<(), DdlError> {
+    let mut db = Database::new();
+    for (_, sql) in migrations {
+        db.apply_sql(sql)?;
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -342,3 +318,131 @@ pub fn assert_identical(a: &AnalyzedQuery, b: &AnalyzedQuery, context: &str) {
         );
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Error assertions
+//
+// Every test that expects an error must validate BOTH the variant (via a
+// `matches!` pattern) AND a stable substring of the message. This catches
+// regressions where an error changes from e.g. `DuplicateObject` to `Parse`,
+// which the old `assert!(result.is_err())` pattern would miss.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Assert a query fails with a `TypeMismatch` whose `actual`/`expected` fields
+/// match exactly. Used for the analyzer's structured type-coercion errors.
+#[track_caller]
+pub fn assert_type_mismatch(db: &Database, sql: &str, expect_actual: &str, expect_expected: &str) {
+    match db.analyze(sql) {
+        Err(AnalyzeError::TypeMismatch {
+            actual,
+            expected,
+            context,
+        }) => {
+            assert_eq!(
+                actual, expect_actual,
+                "TypeMismatch.actual wrong for: {sql}\n  context: {context}"
+            );
+            assert_eq!(
+                expected, expect_expected,
+                "TypeMismatch.expected wrong for: {sql}\n  context: {context}"
+            );
+            assert!(
+                !context.is_empty(),
+                "TypeMismatch.context is empty for: {sql}"
+            );
+        }
+        Err(other) => panic!(
+            "expected TypeMismatch({expect_actual} -> {expect_expected}) for: {sql}\n  got: {other}"
+        ),
+        Ok(info) => panic!(
+            "expected TypeMismatch({expect_actual} -> {expect_expected}) for: {sql}\n  \
+             got params: {:?}\n  got columns: {:?}",
+            info.params
+                .iter()
+                .map(|p| p.pg_type.clone())
+                .collect::<Vec<_>>(),
+            info.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.pg_type.clone()))
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// Assert a query fails with a specific `AnalyzeError` variant and message substring.
+///
+/// Use via the [`assert_analyze_err!`] macro for natural pattern syntax:
+/// ```ignore
+/// assert_analyze_err!(db.analyze(sql), AnalyzeError::UnknownRelation(_), "users");
+/// ```
+#[macro_export]
+macro_rules! assert_analyze_err {
+    ($result:expr, $variant:pat, $msg_substring:expr $(,)?) => {{
+        // Borrow the expression so the macro doesn't consume the caller's
+        // binding — callers often inspect the error again afterwards.
+        match &$result {
+            Err(err) => {
+                if !matches!(err, $variant) {
+                    panic!(
+                        "expected {} but got different variant: {:?}",
+                        stringify!($variant),
+                        err
+                    );
+                }
+                let msg = err.to_string();
+                assert!(
+                    msg.contains($msg_substring),
+                    "error message must contain {:?}\n  got: {msg}",
+                    $msg_substring,
+                );
+            }
+            Ok(info) => panic!(
+                "expected {} containing {:?}, got Ok: {:?}",
+                stringify!($variant),
+                $msg_substring,
+                info,
+            ),
+        }
+    }};
+}
+
+/// Assert a migration `Result<(), DdlError>` failed with a specific variant
+/// and message substring.
+///
+/// ```ignore
+/// assert_ddl_err!(try_apply(&[...]), DdlError::DuplicateObject(_), "already exists");
+/// ```
+#[macro_export]
+macro_rules! assert_ddl_err {
+    ($result:expr, $variant:pat, $msg_substring:expr $(,)?) => {{
+        // Borrow the expression so the macro doesn't consume the caller's
+        // binding — callers often inspect the error again afterwards.
+        match &$result {
+            Err(err) => {
+                if !matches!(err, $variant) {
+                    panic!(
+                        "expected {} but got different variant: {:?}",
+                        stringify!($variant),
+                        err
+                    );
+                }
+                let msg = err.to_string();
+                assert!(
+                    msg.contains($msg_substring),
+                    "DDL error message must contain {:?}\n  got: {msg}",
+                    $msg_substring,
+                );
+            }
+            Ok(()) => panic!(
+                "expected {} containing {:?}, got Ok(())",
+                stringify!($variant),
+                $msg_substring,
+            ),
+        }
+    }};
+}
+
+// `#[macro_export]` macros land at the crate root of the test binary, so any
+// test file in this binary can invoke them as `assert_ddl_err!(...)` — no
+// `use` needed, and `mod common;` in the binary's entry file is enough to
+// make them visible.

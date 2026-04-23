@@ -1,0 +1,58 @@
+//! Query analysis test binary.
+//!
+//! Each submodule tests a specific SQL/Postgres feature by:
+//! 1. Building a minimal `Database` with only the schema it needs
+//! 2. Analyzing a query
+//! 3. Asserting output columns, parameters, or a specific error variant
+//!
+//! Compare with the `ddl` binary, which tests schema-state changes (DDL
+//! application and its resulting snapshot), not query analysis.
+
+#[macro_use]
+mod common;
+
+// ── Feature files ────────────────────────────────────────────────────────────
+#[path = "query/aggregates.rs"]
+mod aggregates;
+#[path = "query/casts_and_coercion.rs"]
+mod casts_and_coercion;
+#[path = "query/ctes.rs"]
+mod ctes;
+#[path = "query/dml.rs"]
+mod dml;
+#[path = "query/expressions.rs"]
+mod expressions;
+#[path = "query/joins.rs"]
+mod joins;
+#[path = "query/params.rs"]
+mod params;
+#[path = "query/select.rs"]
+mod select;
+#[path = "query/set_operations.rs"]
+mod set_operations;
+#[path = "query/special.rs"]
+mod special;
+#[path = "query/subqueries.rs"]
+mod subqueries;
+#[path = "query/user_types.rs"]
+mod user_types;
+#[path = "query/where_clause.rs"]
+mod where_clause;
+
+// ── Coverage gaps (empty; populate as features get covered) ──────────────────
+#[path = "query/aggregate_filter.rs"]
+mod aggregate_filter;
+#[path = "query/arrays.rs"]
+mod arrays;
+#[path = "query/collation.rs"]
+mod collation;
+#[path = "query/full_text_search.rs"]
+mod full_text_search;
+#[path = "query/grouping_sets.rs"]
+mod grouping_sets;
+#[path = "query/json_operators.rs"]
+mod json_operators;
+#[path = "query/recursive_ctes.rs"]
+mod recursive_ctes;
+#[path = "query/window_functions.rs"]
+mod window_functions;
