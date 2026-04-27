@@ -4,7 +4,8 @@
 
 pub use cubos_sql_analyzer::schema::{RelationKind, SchemaSnapshot, TypeKind};
 pub use cubos_sql_analyzer::{
-    AnalyzeError, AnalyzedColumn, AnalyzedQuery, DdlError, PgCatalog, QualifiedName, Type,
+    AnalyzeError, AnalyzedColumn, AnalyzedQuery, DdlError, PgCatalog, QualifiedName, RecordField,
+    Type,
 };
 
 /// Terse helper for building a [`QualifiedName`] in tests.
@@ -96,9 +97,27 @@ pub fn range_of(schema: &str, name: &str, subtype: Type) -> Type {
     }
 }
 
-pub fn anon_record(attrs: Vec<(&str, Type)>) -> Type {
-    Type::AnonymousRecord {
-        attributes: attrs.into_iter().map(|(n, t)| (n.into(), t)).collect(),
+/// Build a [`Type::AnonymousRecord`] from a list of [`RecordField`]s.
+/// Pair with [`rf`] / [`rfn`] for terse construction.
+pub fn anon_record(fields: Vec<RecordField>) -> Type {
+    Type::AnonymousRecord { fields }
+}
+
+/// Non-null record field (mirrors [`c`] for record fields).
+pub fn rf(name: &str, ty: Type) -> RecordField {
+    RecordField {
+        name: name.into(),
+        ty,
+        nullable: false,
+    }
+}
+
+/// Nullable record field (mirrors [`cn`] for record fields).
+pub fn rfn(name: &str, ty: Type) -> RecordField {
+    RecordField {
+        name: name.into(),
+        ty,
+        nullable: true,
     }
 }
 

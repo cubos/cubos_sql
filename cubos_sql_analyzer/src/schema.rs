@@ -109,7 +109,15 @@ pub enum TypeKind {
     Pseudo,
 }
 
-/// A field in a composite type.
+/// A field of a registered composite type or an OUT/TABLE arg of a function.
+/// Pure schema-level data: just a name, OID and NOT NULL bit, identical to
+/// what `pg_attribute` stores for the composite's row type.
+///
+/// Anonymous records flowing through expressions use [`crate::expr::RecordField`]
+/// instead — that one carries an [`crate::expr::ExprType`] per element so it
+/// can describe nested rows recursively. Use [`CompositeField::lift`] to bridge
+/// from this schema form to the expression form when consuming a composite
+/// type inside an expression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeField {
     pub name: String,

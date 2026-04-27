@@ -335,11 +335,11 @@ pub(crate) struct RawColumn {
     pub name: String,
     pub type_oid: u32,
     pub nullable: bool,
-    /// When the column is produced by a call to an SRF / OUT-arg function
-    /// that returns `record`, this carries the named output columns. Lets
-    /// downstream `(x).field` on a subquery-produced column resolve without
-    /// re-running the analyzer — we just look the field up here.
-    pub record_fields: Option<Vec<crate::schema::CompositeField>>,
+    /// Named-field structure when this column holds a record. Sourced from
+    /// SRF out_args, ROW constructors, or propagated through subqueries.
+    /// Used both to surface `Type::AnonymousRecord` in the final output and
+    /// to feed downstream `(x).field` resolution via the scope.
+    pub record_fields: Option<Vec<crate::expr::RecordField>>,
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.
@@ -354,7 +354,28 @@ pub(crate) fn analyze_select(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &[])
+}
+
+/// Like [`analyze_select`] but seeds the initial scope with `outer_sources`
+/// as **correlated** references — a subquery's column lookup tries its local
+/// FROM first and only falls back to these outer sources when nothing
+/// matched. Used for `EXISTS (...)`, scalar sublinks, and `IN (SELECT ...)`,
+/// where PG's lexical rule says inner aliases shadow outer ones.
+pub(crate) fn analyze_correlated_select(
+    sel: &protobuf::SelectStmt,
+    snapshot: &SchemaSnapshot,
+    params: &mut ParamCollector,
+    outer_scope: &crate::scope::Scope,
+) -> AnalyzeResult {
+    analyze_select_with_ctes_and_outer(
+        sel,
+        snapshot,
+        params,
+        &HashMap::new(),
+        &[],
+        &outer_scope.sources,
+    )
 }
 
 fn analyze_select_with_ctes(
@@ -363,21 +384,26 @@ fn analyze_select_with_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[], &[])
 }
 
 /// Core SELECT analyzer.
 ///
-/// `outer_sources` seeds the initial scope with pre-visible table sources
-/// (non-empty only for `LATERAL` subqueries, which inherit the outer FROM
-/// clause's scope per PG's LATERAL semantics). Empty for regular SELECTs
-/// and CTEs, which start with an empty scope.
+/// Two flavours of outer scope, mirroring PG's distinction:
+/// - `lateral_sources`: pre-visible aliases for `LATERAL` subqueries —
+///   merged into the local FROM scope so the inner query sees them as if
+///   they were declared locally.
+/// - `correlated_sources`: pre-visible aliases for plain sublinks
+///   (`EXISTS`, scalar, `IN`, `ANY`/`ALL`) — only consulted as a fallback
+///   when local resolution fails, so an inner alias of the same name
+///   shadows the outer one.
 fn analyze_select_with_ctes_and_outer(
     sel: &protobuf::SelectStmt,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-    outer_sources: &[crate::scope::TableSource],
+    lateral_sources: &[crate::scope::TableSource],
+    correlated_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
@@ -410,10 +436,14 @@ fn analyze_select_with_ctes_and_outer(
     }
 
     let mut scope = Scope::default();
-    // LATERAL subqueries see their enclosing FROM clause's sources as if
-    // they were already in scope. We seed those up-front so column/row refs
-    // resolve normally through the rest of the SELECT analysis.
-    scope.sources.extend(outer_sources.iter().cloned());
+    // LATERAL: outer aliases live as if locally declared (visible to `*`,
+    // can be referenced unqualified, etc.). Correlated sublinks: outer
+    // aliases are only a fallback so an inner alias of the same name
+    // shadows correctly.
+    scope.sources.extend(lateral_sources.iter().cloned());
+    scope
+        .outer_sources
+        .extend(correlated_sources.iter().cloned());
     let mut null_ctx = NullabilityContext::default();
     null_ctx.has_group_by = !sel.group_clause.is_empty();
 
@@ -1247,6 +1277,7 @@ fn process_from_item(
                     params,
                     cte_scopes,
                     &lateral_sources,
+                    &[],
                 )?;
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
@@ -1530,14 +1561,18 @@ fn resolve_target_list(
             infer_column_name(val).unwrap_or_else(|| format!("_column{i}_"))
         };
 
-        // If the expression is a FuncCall returning a `record` and we know
-        // its named output columns (TABLE/OUT args), propagate those through
-        // the scope so downstream `(alias.col).field` can look them up.
-        let record_fields = if let Some(node::Node::FuncCall(fc)) = val.node.as_ref() {
-            resolve_funccall_record_fields(fc, snapshot, params)
-        } else {
-            None
-        };
+        // Inferred shape from the expression (ROW(...), nested indirection,
+        // column propagation) takes priority. As a fallback, if the target
+        // expression is a direct FuncCall with TABLE/OUT args, lift those so
+        // downstream `(alias.col).field` can look them up — this covers the
+        // SRF-as-target-list case where the expression itself is the call.
+        let record_fields = expr_type.record_fields.or_else(|| {
+            if let Some(node::Node::FuncCall(fc)) = val.node.as_ref() {
+                resolve_funccall_record_fields(fc, snapshot, params)
+            } else {
+                None
+            }
+        });
 
         // Bare string literals are carried as `text` at the target-list
         // boundary — this matches PG's `select_common_type` behavior at
@@ -1624,7 +1659,7 @@ fn resolve_funccall_record_fields(
     fc: &protobuf::FuncCall,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Option<Vec<crate::schema::CompositeField>> {
+) -> Option<Vec<crate::expr::RecordField>> {
     let parts = expr::extract_string_fields(&fc.funcname);
     let (schema, name) = match parts.as_slice() {
         [n] => (None, n.as_str()),
@@ -1653,7 +1688,7 @@ fn resolve_funccall_record_fields(
     if resolved.out_args.is_empty() {
         None
     } else {
-        Some(resolved.out_args)
+        Some(crate::expr::RecordField::lift_all(&resolved.out_args))
     }
 }
 
@@ -1677,7 +1712,7 @@ fn infer_column_name(node: &protobuf::Node) -> Option<String> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn build_column(rc: RawColumn, snapshot: &SchemaSnapshot) -> Result<AnalyzedColumn, AnalyzeError> {
-    let pg_type = resolve_type(rc.type_oid, snapshot)?;
+    let pg_type = resolve_type_with_shape(rc.type_oid, rc.record_fields.as_deref(), snapshot)?;
 
     // Handle nullability annotations (! and ?).
     let (name, nullable) = parse_nullability_annotation(&rc.name, rc.nullable);
@@ -1687,6 +1722,35 @@ fn build_column(rc: RawColumn, snapshot: &SchemaSnapshot) -> Result<AnalyzedColu
         pg_type,
         nullable,
     })
+}
+
+/// Like [`resolve_type`] but lets the caller override the structural shape
+/// when the OID is the pseudo `record` type (typmod -1 in PG terms). When
+/// `shape` is `Some` and the OID is `record`, we build a `Type::AnonymousRecord`
+/// from the shape recursively. Otherwise falls through to the OID-only path.
+fn resolve_type_with_shape(
+    type_oid: u32,
+    shape: Option<&[crate::expr::RecordField]>,
+    snapshot: &SchemaSnapshot,
+) -> Result<Type, AnalyzeError> {
+    if type_oid == oid::RECORD
+        && let Some(fields) = shape
+    {
+        let mut out = Vec::with_capacity(fields.len());
+        for f in fields {
+            out.push(crate::types::RecordField {
+                name: f.name.clone(),
+                ty: resolve_type_with_shape(
+                    f.ty.type_oid,
+                    f.ty.record_fields.as_deref(),
+                    snapshot,
+                )?,
+                nullable: f.ty.nullable,
+            });
+        }
+        return Ok(Type::AnonymousRecord { fields: out });
+    }
+    resolve_type(type_oid, snapshot)
 }
 
 fn build_param_info(
@@ -1738,11 +1802,15 @@ fn resolve_type(type_oid: u32, snapshot: &SchemaSnapshot) -> Result<Type, Analyz
                 });
             }
             TypeKind::Composite { fields } => {
-                let mut attributes = Vec::with_capacity(fields.len());
+                let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
-                    attributes.push((f.name.clone(), resolve_type(f.type_oid, snapshot)?));
+                    out.push(crate::types::RecordField {
+                        name: f.name.clone(),
+                        ty: resolve_type(f.type_oid, snapshot)?,
+                        nullable: !f.not_null,
+                    });
                 }
-                return Ok(Type::AnonymousRecord { attributes });
+                return Ok(Type::AnonymousRecord { fields: out });
             }
             TypeKind::Base | TypeKind::Pseudo => {
                 return Ok(Type::Basic {

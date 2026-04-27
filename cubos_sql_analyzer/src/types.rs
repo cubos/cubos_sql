@@ -4,12 +4,24 @@
 //! maps to Rust. Consumers (like the `cubos_sql_macros` crate) pattern-match
 //! on this enum to decide the Rust target type.
 //!
-//! Nullability is *not* part of the type — it is a property of the column /
-//! parameter site and is carried alongside on [`crate::AnalyzedColumn`] /
-//! [`crate::AnalyzedParam`].
+//! Nullability is *not* part of the outer type — it is a property of the
+//! column / parameter site and is carried alongside on
+//! [`crate::AnalyzedColumn`] / [`crate::AnalyzedParam`]. Inside an
+//! `AnonymousRecord` the fields *do* carry per-element nullability because
+//! every field is its own column-like site (`ROW(NOT_NULL_col, NULL_col)`
+//! has one nullable element and one not).
 
 use cubos_sql_core::QualifiedName;
 use serde::{Deserialize, Serialize};
+
+/// One field of an [`Type::AnonymousRecord`]. Carries the field's name, its
+/// resolved [`Type`], and whether the value at that position can be NULL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordField {
+    pub name: String,
+    pub ty: Type,
+    pub nullable: bool,
+}
 
 /// A resolved PostgreSQL type.
 ///
@@ -26,7 +38,8 @@ use serde::{Deserialize, Serialize};
 ///   order.
 /// - `Range` — `CREATE TYPE ... AS RANGE (...)` / built-in range types.
 /// - `AnonymousRecord` — the unnamed row type produced by a subquery or a
-///   composite-returning function, carrying its attribute list.
+///   composite-returning function, carrying its named field list with
+///   per-field nullability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Type {
     Basic {
@@ -56,7 +69,7 @@ pub enum Type {
         extension: Option<String>,
     },
     AnonymousRecord {
-        attributes: Vec<(String, Type)>,
+        fields: Vec<RecordField>,
     },
 }
 

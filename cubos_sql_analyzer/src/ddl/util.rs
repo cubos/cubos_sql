@@ -3,7 +3,7 @@
 use pg_query::protobuf::{Node, RangeVar, TypeName, node};
 
 use crate::qualified_name::QualifiedName;
-use crate::schema::SchemaSnapshot;
+use crate::schema::{CastContext, CastInfo, CastMethod, SchemaSnapshot, oid};
 
 /// Extract the (schema, name) pair from a `RangeVar`.
 /// If no schema is specified, defaults to the first entry in `search_path`.
@@ -148,4 +148,17 @@ pub fn node_string(n: &Node) -> Option<&str> {
         node::Node::String(s) => Some(s.sval.as_str()),
         _ => None,
     }
+}
+
+/// Register the implicit `composite_oid → record` cast that PG creates for
+/// every composite type (CREATE TYPE foo AS (...) and the row type implicitly
+/// generated for each table). Used by the operator resolver so that
+/// `composite = composite` reaches the polymorphic `record = record`
+/// (record_eq) operator via cast lookup.
+pub fn register_composite_to_record_cast(snapshot: &mut SchemaSnapshot, composite_oid: u32) {
+    let key = format!("{composite_oid}:{}", oid::RECORD);
+    snapshot.casts.insert(
+        key,
+        CastInfo::new(CastContext::Implicit, CastMethod::Binary),
+    );
 }

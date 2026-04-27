@@ -9,7 +9,9 @@ use crate::qualified_name::QualifiedName;
 use crate::schema::{CompositeField, TypeEntry, TypeKind};
 
 use super::DdlError;
-use super::util::{extract_names, names_key, node_string, resolve_type_name};
+use super::util::{
+    extract_names, names_key, node_string, register_composite_to_record_cast, resolve_type_name,
+};
 use crate::pg_catalog::PgCatalog;
 
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
@@ -161,6 +163,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     interp.snapshot.type_by_name.insert(key, oid);
 
     register_array_type(interp, array_oid, &schema, &name, oid);
+    register_composite_to_record_cast(&mut interp.snapshot, oid);
 
     Ok(())
 }

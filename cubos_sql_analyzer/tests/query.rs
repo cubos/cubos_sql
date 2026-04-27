@@ -26,6 +26,8 @@ mod expressions;
 mod joins;
 #[path = "query/params.rs"]
 mod params;
+#[path = "query/records.rs"]
+mod records;
 #[path = "query/select.rs"]
 mod select;
 #[path = "query/set_operations.rs"]

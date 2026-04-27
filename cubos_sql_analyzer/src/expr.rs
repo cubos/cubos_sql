@@ -71,10 +71,63 @@ impl TypeGoal {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Result of inferring an expression's type.
+///
+/// `record_fields` is populated for anonymous records whose attribute list is
+/// statically determinable (e.g. `ROW(1, 'x')` produces `Some([(f1, int4),
+/// (f2, text)])`). Mirrors PostgreSQL's typmod + RecordCacheArray: when the
+/// shape can't be determined (opaque `RETURNS RECORD`, UNION of mismatched
+/// shapes, casts to `record`/`text`), the field is `None` and the value
+/// behaves like a typmod=-1 dynamic record.
 #[derive(Debug, Clone)]
 pub(crate) struct ExprType {
     pub type_oid: u32,
     pub nullable: bool,
+    pub record_fields: Option<Vec<RecordField>>,
+}
+
+/// One element of an anonymous record's static shape, as it flows through
+/// inference. Recursive via `ty: ExprType` — nested rows like
+/// `ROW(1, ROW(2, 3))` survive without a special `nested_fields` channel.
+///
+/// This is the expression-side counterpart to [`crate::schema::CompositeField`]:
+/// the schema struct is the serialization format used for registered
+/// composite types and SRF out_args; this one is the in-memory form used
+/// during inference. [`RecordField::lift`] bridges from schema to expression.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordField {
+    pub name: String,
+    pub ty: ExprType,
+}
+
+impl RecordField {
+    /// Convert a registered composite/out-arg field (schema form) into the
+    /// expression form by populating an `ExprType` whose `record_fields` is
+    /// `None` — registered composites only carry OIDs, so any nested record
+    /// content is reachable later through snapshot lookup.
+    pub fn lift(f: &crate::schema::CompositeField) -> Self {
+        Self {
+            name: f.name.clone(),
+            ty: ExprType::scalar(f.type_oid, !f.not_null),
+        }
+    }
+
+    /// Lift a slice of schema-side composite fields in one shot.
+    pub fn lift_all(fields: &[crate::schema::CompositeField]) -> Vec<Self> {
+        fields.iter().map(Self::lift).collect()
+    }
+}
+
+impl ExprType {
+    /// Construct a scalar (non-record) ExprType. The vast majority of call
+    /// sites use this; only ROW constructors and shape-propagating helpers
+    /// build with `record_fields: Some(...)`.
+    pub fn scalar(type_oid: u32, nullable: bool) -> Self {
+        Self {
+            type_oid,
+            nullable,
+            record_fields: None,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -245,14 +298,8 @@ pub(crate) fn infer_expr(
         node::Node::FuncCall(func) => infer_func_call(func, scope, null_ctx, snapshot, params),
         node::Node::AExpr(expr) => infer_a_expr(expr, scope, null_ctx, snapshot, params),
         node::Node::BoolExpr(expr) => infer_bool_expr(expr, scope, null_ctx, snapshot, params),
-        node::Node::NullTest(_) => Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: false,
-        }),
-        node::Node::BooleanTest(_) => Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: false,
-        }),
+        node::Node::NullTest(_) => Ok(ExprType::scalar(oid::BOOL, false)),
+        node::Node::BooleanTest(_) => Ok(ExprType::scalar(oid::BOOL, false)),
         node::Node::CoalesceExpr(expr) => infer_coalesce(expr, scope, null_ctx, snapshot, params),
         node::Node::CaseExpr(expr) => infer_case(expr, scope, null_ctx, snapshot, params),
         node::Node::SubLink(sub) => infer_sublink(sub, scope, null_ctx, snapshot, params),
@@ -265,10 +312,7 @@ pub(crate) fn infer_expr(
                 params.record(p.number, goal.type_oid);
             }
             let type_oid = params.get(p.number);
-            Ok(ExprType {
-                type_oid,
-                nullable: params.is_nullable(p.number),
-            })
+            Ok(ExprType::scalar(type_oid, params.is_nullable(p.number)))
         }
         node::Node::MinMaxExpr(mm) => {
             // `GREATEST`/`LEAST` are non-strict: they skip NULL args and
@@ -292,27 +336,73 @@ pub(crate) fn infer_expr(
             } else {
                 crate::coerce::find_common_type(&arg_oids, snapshot).unwrap_or(oid::UNKNOWN)
             };
-            Ok(ExprType {
-                type_oid: resolved_type,
-                // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
-                nullable: !any_arg || all_nullable,
-            })
+            // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
+            Ok(ExprType::scalar(resolved_type, !any_arg || all_nullable))
         }
         node::Node::AIndirection(ind) => infer_indirection(ind, scope, null_ctx, snapshot, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, scope, null_ctx, snapshot, params),
         node::Node::RowExpr(row) => {
             // `ROW(a, b, …)` constructs an anonymous composite. The ROW
-            // itself is never NULL (empty ROW() yields a record, not NULL);
-            // element NULLs are tracked inside the record, not here. Walk
-            // each element so params/refs get registered and errors surface,
-            // then return `record` so operators like `record = record` kick
-            // in.
-            for arg in &row.args {
-                let _ = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            // value itself is never NULL — empty `ROW()` still yields a
+            // record.
+            //
+            // When the enclosing context expects a registered composite
+            // type of matching arity (UPDATE composite_col = ROW(...) or
+            // INSERT INTO t (composite_col) VALUES (ROW(...))), we type
+            // each element against the composite's declared field type so
+            // params get pinned correctly and the result adopts the goal's
+            // OID — exactly what PG does in `coerce_record_to_complex`.
+            // Otherwise the ROW types as the pseudo `record` with shape
+            // captured statically so downstream operators/indirection can
+            // see through.
+            let composite_goal = if goal.has_expectation() {
+                let target = snapshot.unwrap_domain(goal.type_oid);
+                snapshot.get_type(target).and_then(|te| match &te.kind {
+                    crate::schema::TypeKind::Composite { fields }
+                        if fields.len() == row.args.len() =>
+                    {
+                        Some((target, fields.clone()))
+                    }
+                    _ => None,
+                })
+            } else {
+                None
+            };
+
+            if let Some((composite_oid, composite_fields)) = composite_goal {
+                let mut any_nullable = false;
+                for (arg, field) in row.args.iter().zip(composite_fields.iter()) {
+                    let t = infer_expr(
+                        arg,
+                        scope,
+                        null_ctx,
+                        snapshot,
+                        params,
+                        TypeGoal::assignment(field.type_oid),
+                    )?;
+                    any_nullable = any_nullable || t.nullable;
+                }
+                // ROW value is never NULL; element NULLs are tracked
+                // inside the composite, not at the outer site.
+                let _ = any_nullable;
+                return Ok(ExprType::scalar(composite_oid, false));
+            }
+
+            // PG names anonymous ROW elements `f1`, `f2`, ... by position.
+            // The element's full ExprType (with any nested record shape)
+            // goes straight onto the field — recursion handled by ExprType.
+            let mut fields = Vec::with_capacity(row.args.len());
+            for (i, arg) in row.args.iter().enumerate() {
+                let ty = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+                fields.push(RecordField {
+                    name: format!("f{}", i + 1),
+                    ty,
+                });
             }
             Ok(ExprType {
                 type_oid: oid::RECORD,
                 nullable: false,
+                record_fields: Some(fields),
             })
         }
         node::Node::SetToDefault(_) => {
@@ -321,14 +411,14 @@ pub(crate) fn infer_expr(
             // trusted to produce a valid value of the column's type, so we
             // adopt the assignment goal here. Nullability defers to the
             // goal's NOT NULL reasoning in the caller.
-            Ok(ExprType {
-                type_oid: if goal.has_expectation() {
+            Ok(ExprType::scalar(
+                if goal.has_expectation() {
                     goal.type_oid
                 } else {
                     oid::UNKNOWN
                 },
-                nullable: false,
-            })
+                false,
+            ))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
@@ -452,6 +542,10 @@ fn infer_column_ref(
             Ok(ExprType {
                 type_oid: col.type_oid,
                 nullable,
+                // Carry the column's record shape forward so downstream
+                // `(col).field` indirection and ROW-vs-shape coercion can
+                // see through to the field types.
+                record_fields: col.record_fields.clone(),
             })
         }
         Err(e) => {
@@ -465,10 +559,7 @@ fn infer_column_ref(
                 && let Some(qn) = src.source_qn.as_ref()
                 && let Some(&composite_oid) = snapshot.type_by_name.get(qn)
             {
-                return Ok(ExprType {
-                    type_oid: composite_oid,
-                    nullable: false,
-                });
+                return Ok(ExprType::scalar(composite_oid, false));
             }
             Err(e)
         }
@@ -523,10 +614,7 @@ fn infer_star_ref(
     // A row value from a real relation is never NULL (it exists as soon as
     // the row is produced); individual fields may be null, but the composite
     // value itself isn't.
-    Ok(ExprType {
-        type_oid: composite_oid,
-        nullable: false,
-    })
+    Ok(ExprType::scalar(composite_oid, false))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -589,10 +677,7 @@ fn infer_indirection(
             let field = fields.iter().find(|f| f.name == s.sval).ok_or_else(|| {
                 AnalyzeError::UndefinedColumn(format!("record field \"{}\" does not exist", s.sval))
             })?;
-            current = Some(ExprType {
-                type_oid: field.type_oid,
-                nullable: !field.not_null,
-            });
+            current = Some(field.ty.clone());
             idx += 1;
         }
         (idx, current)
@@ -644,10 +729,8 @@ fn infer_indirection(
                     // `arr[lo:hi]` keeps the array type. Result is NULL iff
                     // the array is NULL or any bound is NULL — out-of-range
                     // bounds yield an empty (non-null) array.
-                    current = ExprType {
-                        type_oid: current.type_oid,
-                        nullable: current.nullable || any_bound_nullable,
-                    };
+                    current =
+                        ExprType::scalar(current.type_oid, current.nullable || any_bound_nullable);
                 } else {
                     // `arr[i]` is always nullable (out-of-bounds → NULL,
                     // even with non-null array and non-null index).
@@ -670,10 +753,7 @@ fn infer_indirection(
 /// carrying named output columns (set when its producing expression was a
 /// FuncCall with `out_args`). Returns `None` if the ref doesn't resolve or
 /// the column isn't a record.
-fn column_ref_record_fields(
-    cr: &protobuf::ColumnRef,
-    scope: &Scope,
-) -> Option<Vec<crate::schema::CompositeField>> {
+fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<Vec<RecordField>> {
     let parts = extract_string_fields(&cr.fields);
     let (table, column) = match parts.as_slice() {
         [col] => (None, col.as_str()),
@@ -693,7 +773,7 @@ fn resolve_funccall_out_args(
     fc: &protobuf::FuncCall,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
-) -> Result<Option<Vec<crate::schema::CompositeField>>, AnalyzeError> {
+) -> Result<Option<Vec<RecordField>>, AnalyzeError> {
     let parts = extract_string_fields(&fc.funcname);
     let (schema, name) = match parts.as_slice() {
         [n] => (None, n.as_str()),
@@ -729,7 +809,7 @@ fn resolve_funccall_out_args(
     if resolved.out_args.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(resolved.out_args))
+        Ok(Some(RecordField::lift_all(&resolved.out_args)))
     }
 }
 
@@ -737,11 +817,28 @@ fn resolve_funccall_out_args(
 /// nullability is the combination of the enclosing value being nullable AND
 /// the field's own `not_null` declaration — either one being nullable makes
 /// the access nullable.
+///
+/// When the enclosing value carries an inline `record_fields` shape (e.g.
+/// `(ROW(1, 'x'::text)).f2`), we use that directly — no snapshot lookup,
+/// since pseudo `record` has no `TypeKind::Composite` to consult.
 fn resolve_composite_field(
     current: &ExprType,
     field_name: &str,
     snapshot: &SchemaSnapshot,
 ) -> Result<ExprType, AnalyzeError> {
+    if let Some(shape) = current.record_fields.as_deref() {
+        let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
+            AnalyzeError::UndefinedColumn(format!("record field \"{field_name}\" does not exist"))
+        })?;
+        // Field's full ExprType (including any nested record shape) is
+        // already on `field.ty`; just OR the enclosing nullability in.
+        return Ok(ExprType {
+            type_oid: field.ty.type_oid,
+            nullable: current.nullable || field.ty.nullable,
+            record_fields: field.ty.record_fields.clone(),
+        });
+    }
+
     // Domain-over-composite needs unwrapping to see the composite fields.
     let base_oid = snapshot.unwrap_domain(current.type_oid);
     let type_entry = snapshot
@@ -771,10 +868,10 @@ fn resolve_composite_field(
             ))
         })?;
 
-    Ok(ExprType {
-        type_oid: field.type_oid,
-        nullable: current.nullable || !field.not_null,
-    })
+    Ok(ExprType::scalar(
+        field.type_oid,
+        current.nullable || !field.not_null,
+    ))
 }
 
 /// `ARRAY[expr1, expr2, …]` literal — result type is the common element type
@@ -788,10 +885,7 @@ fn infer_array_expr(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     if arr.elements.is_empty() {
-        return Ok(ExprType {
-            type_oid: oid::UNKNOWN,
-            nullable: false,
-        });
+        return Ok(ExprType::scalar(oid::UNKNOWN, false));
     }
     let mut element_types = Vec::with_capacity(arr.elements.len());
     let mut any_nullable = false;
@@ -802,16 +896,11 @@ fn infer_array_expr(
     }
     let common = coerce::find_common_type(&element_types, snapshot).unwrap_or(oid::UNKNOWN);
     let array_oid = snapshot.array_type_of(common).unwrap_or(oid::UNKNOWN);
-    Ok(ExprType {
-        type_oid: array_oid,
-        // An ARRAY[...] constructor is never NULL itself — it's always at
-        // least an empty array. Element nullability is tracked separately by
-        // Rust's `Option<T>` inside `Vec<T>`.
-        nullable: {
-            let _ = any_nullable;
-            false
-        },
-    })
+    // An ARRAY[...] constructor is never NULL itself — it's always at least
+    // an empty array. Element nullability is tracked separately by Rust's
+    // `Option<T>` inside `Vec<T>`.
+    let _ = any_nullable;
+    Ok(ExprType::scalar(array_oid, false))
 }
 
 /// `arr[i]` — the result is an element of the array. Nullable because SQL
@@ -836,10 +925,7 @@ fn resolve_array_element(
             )));
         }
     };
-    Ok(ExprType {
-        type_oid: elem_oid,
-        nullable: true,
-    })
+    Ok(ExprType::scalar(elem_oid, true))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -848,10 +934,7 @@ fn resolve_array_element(
 
 fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, AnalyzeError> {
     if a_const.isnull {
-        return Ok(ExprType {
-            type_oid: oid::UNKNOWN,
-            nullable: true,
-        });
+        return Ok(ExprType::scalar(oid::UNKNOWN, true));
     }
 
     let type_oid = match &a_const.val {
@@ -863,10 +946,7 @@ fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, AnalyzeError> {
         None => oid::UNKNOWN,
     };
 
-    Ok(ExprType {
-        type_oid,
-        nullable: false,
-    })
+    Ok(ExprType::scalar(type_oid, false))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -902,10 +982,7 @@ fn infer_type_cast(
         params.record(p.number, target_oid);
     }
 
-    Ok(ExprType {
-        type_oid: target_oid,
-        nullable: inner_type.nullable,
-    })
+    Ok(ExprType::scalar(target_oid, inner_type.nullable))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1081,10 +1158,7 @@ fn infer_func_call(
             && functions::is_not_null_nonstrict(name))
     };
 
-    Ok(ExprType {
-        type_oid: resolved.return_type_oid,
-        nullable,
-    })
+    Ok(ExprType::scalar(resolved.return_type_oid, nullable))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1181,10 +1255,7 @@ fn infer_a_expr(
         } else {
             right_oid
         };
-        return Ok(ExprType {
-            type_oid: result_oid,
-            nullable: true,
-        });
+        return Ok(ExprType::scalar(result_oid, true));
     }
 
     // `expr IS [NOT] DISTINCT FROM other` — shares op_name "=" with ordinary
@@ -1211,10 +1282,7 @@ fn infer_a_expr(
             .as_ref()
             .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, rhs_goal))
             .transpose()?;
-        return Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: false,
-        });
+        return Ok(ExprType::scalar(oid::BOOL, false));
     }
 
     // `expr [NOT] BETWEEN lo AND hi` (and the SYM variants) — rexpr is a
@@ -1253,10 +1321,7 @@ fn infer_a_expr(
         }
 
         let any_nullable = left.as_ref().is_some_and(|l| l.nullable) || any_bound_nullable;
-        return Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: any_nullable,
-        });
+        return Ok(ExprType::scalar(oid::BOOL, any_nullable));
     }
 
     // col IN ($1, $2, ...) / col NOT IN (...): rexpr is a Node::List whose
@@ -1291,10 +1356,7 @@ fn infer_a_expr(
         }
 
         let any_nullable = left.as_ref().is_some_and(|l| l.nullable) || any_right_nullable;
-        return Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: any_nullable,
-        });
+        return Ok(ExprType::scalar(oid::BOOL, any_nullable));
     }
 
     // col = ANY($arr) / col = ALL($arr): lexpr is scalar, rexpr is array.
@@ -1358,10 +1420,66 @@ fn infer_a_expr(
 
         let any_nullable =
             left.as_ref().is_some_and(|l| l.nullable) || right.as_ref().is_some_and(|r| r.nullable);
-        return Ok(ExprType {
-            type_oid: oid::BOOL,
-            nullable: any_nullable,
-        });
+        return Ok(ExprType::scalar(oid::BOOL, any_nullable));
+    }
+
+    // Record-record comparison pre-pass.
+    //
+    // `ROW(a, b) = ROW(c, d)` and the implicit `(a, b) = (c, d)` both parse
+    // as AExpr with two RowExpr children. The generic AExpr resolver below
+    // can't handle them: `find_operator` looks for a `record OP record`
+    // overload but neither side carries enough type info for params to be
+    // pinned, so `$p1`/`$p2` fall through as text. Instead, walk both rows
+    // once to collect shapes, then back-fill each ROW element with the
+    // peer's concrete OID as a goal — exactly mirroring how PG types
+    // each component before reaching the row-compare operator.
+    if matches!(op_name, "=" | "<>" | "<" | ">" | "<=" | ">=")
+        && let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref())
+        && let (Some(node::Node::RowExpr(lrow)), Some(node::Node::RowExpr(rrow))) =
+            (lexpr.node.as_ref(), rexpr.node.as_ref())
+        && lrow.args.len() == rrow.args.len()
+    {
+        // Pass 1: collect element types for each side with no goal.
+        let mut left_types = Vec::with_capacity(lrow.args.len());
+        let mut right_types = Vec::with_capacity(rrow.args.len());
+        let mut any_nullable = false;
+        for la in &lrow.args {
+            let t = infer_expr(la, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            any_nullable = any_nullable || t.nullable;
+            left_types.push(t);
+        }
+        for ra in &rrow.args {
+            let t = infer_expr(ra, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            any_nullable = any_nullable || t.nullable;
+            right_types.push(t);
+        }
+
+        // Pass 2: back-fill — when one side is concrete and the other is
+        // UNKNOWN at the same position, re-walk the unknown side with the
+        // concrete OID as goal so embedded params get pinned.
+        for (i, (l, r)) in left_types.iter().zip(right_types.iter()).enumerate() {
+            if l.type_oid != oid::UNKNOWN && r.type_oid == oid::UNKNOWN {
+                let _ = infer_expr(
+                    &rrow.args[i],
+                    scope,
+                    null_ctx,
+                    snapshot,
+                    params,
+                    TypeGoal::implicit(l.type_oid),
+                );
+            } else if r.type_oid != oid::UNKNOWN && l.type_oid == oid::UNKNOWN {
+                let _ = infer_expr(
+                    &lrow.args[i],
+                    scope,
+                    null_ctx,
+                    snapshot,
+                    params,
+                    TypeGoal::implicit(r.type_oid),
+                );
+            }
+        }
+
+        return Ok(ExprType::scalar(oid::BOOL, any_nullable));
     }
 
     // Pass 1: infer both sides bottom-up.
@@ -1465,10 +1583,7 @@ fn infer_a_expr(
                 TypeGoal::implicit(op.right_type_oid),
             );
         }
-        return Ok(ExprType {
-            type_oid: op.result_type_oid,
-            nullable,
-        });
+        return Ok(ExprType::scalar(op.result_type_oid, nullable));
     }
 
     // `find_operator` fails in two semantically different ways:
@@ -1515,10 +1630,7 @@ fn infer_bool_expr(
         )?;
         any_nullable = any_nullable || t.nullable;
     }
-    Ok(ExprType {
-        type_oid: oid::BOOL,
-        nullable: any_nullable,
-    })
+    Ok(ExprType::scalar(oid::BOOL, any_nullable))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1586,10 +1698,7 @@ fn infer_coalesce(
         }
     }
 
-    Ok(ExprType {
-        type_oid,
-        nullable: all_nullable,
-    })
+    Ok(ExprType::scalar(type_oid, all_nullable))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1699,10 +1808,7 @@ fn infer_case(
         }
     }
 
-    Ok(ExprType {
-        type_oid,
-        nullable: any_branch_nullable,
-    })
+    Ok(ExprType::scalar(type_oid, any_branch_nullable))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1711,7 +1817,7 @@ fn infer_case(
 
 fn infer_sublink(
     sub: &protobuf::SubLink,
-    _scope: &Scope,
+    scope: &Scope,
     _null_ctx: &NullabilityContext,
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
@@ -1723,22 +1829,22 @@ fn infer_sublink(
         protobuf::SubLinkType::ExistsSublink => {
             // Walk the subselect to collect any params referenced inside —
             // without this, `EXISTS(SELECT 1 FROM t WHERE x = $p1)` would
-            // drop `$p1` from the param list entirely.
+            // drop `$p1` from the param list entirely. Outer scope is
+            // seeded so correlated refs (`outer.col`) resolve correctly
+            // and feed types into the param resolver.
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let _ = crate::resolve::analyze_select(sel, snapshot, params)?;
+                let _ = crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
             }
-            Ok(ExprType {
-                type_oid: oid::BOOL,
-                nullable: false,
-            })
+            Ok(ExprType::scalar(oid::BOOL, false))
         }
         protobuf::SubLinkType::ExprSublink => {
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) = crate::resolve::analyze_select(sel, snapshot, params)?;
+                let (cols, _) =
+                    crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
                 if let Some(first) = cols.first() {
                     let guaranteed_one_row =
                         sel.group_clause.is_empty() && has_aggregate_target(&sel.target_list);
@@ -1747,16 +1853,10 @@ fn infer_sublink(
                     } else {
                         true
                     };
-                    return Ok(ExprType {
-                        type_oid: first.type_oid,
-                        nullable,
-                    });
+                    return Ok(ExprType::scalar(first.type_oid, nullable));
                 }
             }
-            Ok(ExprType {
-                type_oid: oid::UNKNOWN,
-                nullable: true,
-            })
+            Ok(ExprType::scalar(oid::UNKNOWN, true))
         }
         protobuf::SubLinkType::AnySublink | protobuf::SubLinkType::AllSublink => {
             // Walk the subselect so params inside `col = ANY(SELECT …)` /
@@ -1764,7 +1864,8 @@ fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) = crate::resolve::analyze_select(sel, snapshot, params)?;
+                let (cols, _) =
+                    crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
 
                 // Arity check: `lhs IN (SELECT …)` / `lhs = ANY(SELECT …)`
                 // requires the LHS and the subquery to match column counts.
@@ -1786,10 +1887,7 @@ fn infer_sublink(
                     )));
                 }
             }
-            Ok(ExprType {
-                type_oid: oid::BOOL,
-                nullable: true,
-            })
+            Ok(ExprType::scalar(oid::BOOL, true))
         }
         protobuf::SubLinkType::ArraySublink => {
             // `ARRAY(SELECT expr FROM …)` — returns an array of the subquery's
@@ -1800,16 +1898,14 @@ fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) = crate::resolve::analyze_select(sel, snapshot, params)?;
+                let (cols, _) =
+                    crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
                 if let Some(first) = cols.first() {
                     elem_oid = first.type_oid;
                 }
             }
             let array_oid = snapshot.array_type_of(elem_oid).unwrap_or(oid::UNKNOWN);
-            Ok(ExprType {
-                type_oid: array_oid,
-                nullable: false,
-            })
+            Ok(ExprType::scalar(array_oid, false))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "sublink type: {:?}",

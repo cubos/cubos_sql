@@ -13,10 +13,12 @@ pub(crate) struct ScopeColumn {
     pub base_not_null: bool,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
-    /// When this column holds a `record` produced by an SRF / OUT-arg
-    /// function, the named output columns live here so that downstream
-    /// `(alias.col).field` can resolve through to the field's real type.
-    pub record_fields: Option<Vec<crate::schema::CompositeField>>,
+    /// Named-field structure when the column holds a record value: SRF /
+    /// OUT-arg functions populate this from `out_args`, ROW constructors fill
+    /// it from the inferred shape, subqueries propagate it through. Lets
+    /// `(alias.col).field` resolve through to the field's real type without
+    /// needing a registered composite OID.
+    pub record_fields: Option<Vec<crate::expr::RecordField>>,
 }
 
 /// A table-like source in the FROM clause.
@@ -31,9 +33,16 @@ pub(crate) struct TableSource {
 }
 
 /// Tracks all table sources visible in the current query scope.
+///
+/// `sources` holds the local FROM-clause aliases. `outer_sources` mirrors
+/// PG's correlated-reference fallback: a subquery's column lookup tries the
+/// local sources first, and only falls back to outer sources when the local
+/// search fails (so an inner `FROM users` shadowing an outer `users` works
+/// the same way it does in PG).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
+    pub outer_sources: Vec<TableSource>,
 }
 
 impl Scope {
@@ -100,19 +109,26 @@ impl Scope {
     }
 
     /// Look up a `TableSource` by its alias (user alias or generated relname).
+    /// Tries local sources first, then outer (correlated) sources.
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
-        self.sources.iter().find(|s| s.alias == alias)
+        self.sources
+            .iter()
+            .chain(self.outer_sources.iter())
+            .find(|s| s.alias == alias)
     }
 
     /// Resolve a column reference. If `table` is Some, look only in that alias.
-    /// Otherwise search all sources (error if ambiguous).
+    /// Otherwise search all sources (error if ambiguous). Outer (correlated)
+    /// sources are only consulted when the local lookup turns up nothing —
+    /// this matches PG's lexical rule that inner `FROM` aliases shadow outer
+    /// ones with the same name.
     pub fn resolve_column(
         &self,
         table: Option<&str>,
         column: &str,
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
-            for source in &self.sources {
+            for source in self.sources.iter().chain(self.outer_sources.iter()) {
                 if source.alias == t
                     && let Some(col) = source.columns.iter().find(|c| c.name == column)
                 {
@@ -124,23 +140,31 @@ impl Scope {
             )));
         }
 
-        let mut found: Option<&ScopeColumn> = None;
-        for source in &self.sources {
-            if let Some(col) = source.columns.iter().find(|c| c.name == column) {
-                if found.is_some() {
-                    return Err(AnalyzeError::UndefinedColumn(format!(
-                        "column reference \"{column}\" is ambiguous"
-                    )));
+        // Try local sources first, then outer (correlated) sources. Within
+        // each tier we still detect ambiguous matches.
+        for tier in [&self.sources, &self.outer_sources] {
+            let mut found: Option<&ScopeColumn> = None;
+            for source in tier {
+                if let Some(col) = source.columns.iter().find(|c| c.name == column) {
+                    if found.is_some() {
+                        return Err(AnalyzeError::UndefinedColumn(format!(
+                            "column reference \"{column}\" is ambiguous"
+                        )));
+                    }
+                    found = Some(col);
                 }
-                found = Some(col);
+            }
+            if let Some(col) = found {
+                return Ok(col);
             }
         }
-        found.ok_or_else(|| {
-            AnalyzeError::UndefinedColumn(format!("column \"{column}\" does not exist"))
-        })
+        Err(AnalyzeError::UndefinedColumn(format!(
+            "column \"{column}\" does not exist"
+        )))
     }
 
-    /// Get all columns (for SELECT *).
+    /// Get all columns (for SELECT *) from the local FROM clause only —
+    /// outer correlated sources don't expand under `*`.
     pub fn all_columns(&self) -> Vec<&ScopeColumn> {
         self.sources.iter().flat_map(|s| s.columns.iter()).collect()
     }

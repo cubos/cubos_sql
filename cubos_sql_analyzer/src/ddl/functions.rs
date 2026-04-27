@@ -3,7 +3,7 @@
 use pg_query::protobuf::{CreateFunctionStmt, FunctionParameterMode, node};
 
 use crate::qualified_name::QualifiedName;
-use crate::schema::FunctionEntry;
+use crate::schema::{CompositeField, FunctionEntry, oid as builtin_oid};
 
 use super::DdlError;
 use super::util::{extract_names, resolve_type_name};
@@ -12,8 +12,12 @@ use crate::pg_catalog::PgCatalog;
 pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
     let (schema, name) = extract_names(&stmt.funcname, &interp.snapshot);
 
-    // Resolve parameter types (IN params only for the signature).
+    // Walk parameters once, splitting IN/INOUT/VARIADIC into the call
+    // signature and OUT/TABLE/INOUT into the named output columns.
+    // pg_query uses FuncParamDefault for implicit IN parameters; Undefined
+    // (0) is the parser's catch-all that we also treat as IN.
     let mut arg_types = Vec::new();
+    let mut out_args: Vec<CompositeField> = Vec::new();
     let mut is_variadic = false;
     for param_node in &stmt.parameters {
         let Some(node::Node::FunctionParameter(fp)) = param_node.node.as_ref() else {
@@ -21,34 +25,57 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         };
         let mode =
             FunctionParameterMode::try_from(fp.mode).unwrap_or(FunctionParameterMode::FuncParamIn);
+        let resolved_oid = fp
+            .arg_type
+            .as_ref()
+            .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
+            .unwrap_or(0);
 
-        // Skip OUT and TABLE params. Undefined (0) and Default (6) are treated as IN.
-        // pg_query uses FuncParamDefault for implicit IN parameters.
         match mode {
             FunctionParameterMode::FuncParamIn
-            | FunctionParameterMode::FuncParamInout
-            | FunctionParameterMode::FuncParamVariadic
             | FunctionParameterMode::FuncParamDefault
-            | FunctionParameterMode::Undefined => {}
-            _ => continue,
-        }
-
-        if mode == FunctionParameterMode::FuncParamVariadic {
-            is_variadic = true;
-        }
-
-        if let Some(tn) = &fp.arg_type {
-            let oid = resolve_type_name(tn, &interp.snapshot).unwrap_or(0);
-            arg_types.push(oid);
+            | FunctionParameterMode::Undefined => {
+                arg_types.push(resolved_oid);
+            }
+            FunctionParameterMode::FuncParamVariadic => {
+                arg_types.push(resolved_oid);
+                is_variadic = true;
+            }
+            FunctionParameterMode::FuncParamInout => {
+                arg_types.push(resolved_oid);
+                out_args.push(CompositeField {
+                    name: fp.name.clone(),
+                    type_oid: resolved_oid,
+                    not_null: false,
+                });
+            }
+            FunctionParameterMode::FuncParamOut | FunctionParameterMode::FuncParamTable => {
+                out_args.push(CompositeField {
+                    name: fp.name.clone(),
+                    type_oid: resolved_oid,
+                    not_null: false,
+                });
+            }
         }
     }
 
-    // Resolve return type.
-    let return_type_oid = stmt
+    // Resolve return type. PG synthesizes one when there's no explicit
+    // RETURNS but OUT/INOUT params are present:
+    //   - exactly one OUT/INOUT slot → that slot's type bubbles up.
+    //   - multiple slots             → pseudo `record` (out_args carries
+    //                                  the named columns for SRF callers).
+    let explicit_return_oid = stmt
         .return_type
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
-        .unwrap_or(0);
+        .and_then(|tn| resolve_type_name(tn, &interp.snapshot));
+    let return_type_oid = match explicit_return_oid {
+        Some(oid) => oid,
+        None => match out_args.len() {
+            0 => 0,
+            1 => out_args[0].type_oid,
+            _ => builtin_oid::RECORD,
+        },
+    };
 
     let is_set_returning = stmt.return_type.as_ref().is_some_and(|tn| tn.setof);
 
@@ -80,7 +107,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         is_strict,
         is_procedure: stmt.is_procedure,
         agg_final_type_oid: None,
-        out_args: Vec::new(),
+        out_args,
     };
 
     // Check for existing entry with same (signature, kind). Functions and

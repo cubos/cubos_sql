@@ -7,7 +7,9 @@ use pg_query::protobuf::{
 use crate::schema::{CompositeField, RelationKind, TableColumn, TableEntry, TypeEntry, TypeKind};
 
 use super::DdlError;
-use super::util::{range_var_key, range_var_names, resolve_type_name};
+use super::util::{
+    range_var_key, range_var_names, register_composite_to_record_cast, resolve_type_name,
+};
 use super::views;
 use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
@@ -115,6 +117,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .snapshot
         .type_by_name
         .insert(composite_key, composite_oid);
+    register_composite_to_record_cast(&mut interp.snapshot, composite_oid);
 
     // Register array type for the composite.
     let array_name = format!("_{name}");

@@ -69,4 +69,4 @@ pub use pg_catalog::PgCatalog;
 pub use resolve::{
     AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread, AnalyzedSpreadField,
 };
-pub use types::Type;
+pub use types::{RecordField, Type};
