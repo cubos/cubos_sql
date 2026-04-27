@@ -1,8 +1,9 @@
 //! Scope tracking for table aliases, columns, and CTEs.
 
 use crate::error::AnalyzeError;
+use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
-use crate::schema::{SchemaSnapshot, TableColumn};
+use crate::schema::TableColumn;
 
 /// A resolved column with its type and base nullability (from table definition).
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ impl Scope {
     /// Add a table from the schema snapshot.
     pub fn add_table(
         &mut self,
-        snapshot: &SchemaSnapshot,
+        snapshot: &PgCatalog,
         schema: Option<&str>,
         name: &str,
         alias: &str,

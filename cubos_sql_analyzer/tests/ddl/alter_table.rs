@@ -321,8 +321,7 @@ fn alter_column_type_reanalyze_is_noop_for_legacy_view() {
     )]);
 
     let key = QualifiedName::new("public", "v");
-    db.snapshot_mut()
-        .tables
+    db.tables_mut()
         .get_mut(&key)
         .unwrap()
         .view_def

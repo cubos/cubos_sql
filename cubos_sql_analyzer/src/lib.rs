@@ -62,6 +62,9 @@ pub mod schema;
 #[cfg(not(any(test, feature = "internal")))]
 mod schema;
 
+#[cfg(any(test, feature = "internal"))]
+pub use seed::SchemaSeed;
+
 pub use cubos_sql_core::{ParseQualifiedNameError, QualifiedName};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;

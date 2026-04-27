@@ -1038,19 +1038,16 @@ pub fn create_extension(
     let path = find_install_path(ext, &target_version)?;
 
     // Snapshot state before install to track what the extension creates.
-    let types_before: std::collections::HashSet<u32> =
-        interp.snapshot.types.keys().copied().collect();
+    let types_before: std::collections::HashSet<u32> = interp.types.keys().copied().collect();
     let funcs_before: std::collections::HashSet<crate::qualified_name::QualifiedName> =
-        interp.snapshot.functions_by_name.keys().cloned().collect();
-    let casts_before: std::collections::HashSet<String> =
-        interp.snapshot.casts.keys().cloned().collect();
+        interp.functions_by_name.keys().cloned().collect();
+    let casts_before: std::collections::HashSet<String> = interp.casts.keys().cloned().collect();
 
     // Apply scripts with schema override.
     apply_with_schema(interp, &target_schema, &path)?;
 
     // Compute diff: what was created by the extension.
     let type_oids: Vec<u32> = interp
-        .snapshot
         .types
         .keys()
         .filter(|k| !types_before.contains(k))
@@ -1061,19 +1058,17 @@ pub fn create_extension(
     // Rust type resolver route extension types (e.g. pgvector's `vector`)
     // to crate-specific Rust types without needing a config entry.
     for oid in &type_oids {
-        if let Some(te) = interp.snapshot.types.get_mut(oid) {
+        if let Some(te) = interp.types.get_mut(oid) {
             te.extension = Some(name.clone());
         }
     }
     let function_names: Vec<crate::qualified_name::QualifiedName> = interp
-        .snapshot
         .functions_by_name
         .keys()
         .filter(|k| !funcs_before.contains(*k))
         .cloned()
         .collect();
     let cast_keys: Vec<String> = interp
-        .snapshot
         .casts
         .keys()
         .filter(|k| !casts_before.contains(k.as_str()))
@@ -1123,12 +1118,11 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
 
     // Track new objects created by upgrade scripts.
     let funcs_before: std::collections::HashSet<crate::qualified_name::QualifiedName> =
-        interp.snapshot.functions_by_name.keys().cloned().collect();
+        interp.functions_by_name.keys().cloned().collect();
 
     apply_with_schema(interp, &installed.schema, &path)?;
 
     let new_funcs: Vec<crate::qualified_name::QualifiedName> = interp
-        .snapshot
         .functions_by_name
         .keys()
         .filter(|k| !funcs_before.contains(*k))
@@ -1221,14 +1215,9 @@ fn apply_with_schema(
     schema: &str,
     scripts: &[&str],
 ) -> Result<(), DdlError> {
-    let original = interp.snapshot.search_path.clone();
-    if interp
-        .snapshot
-        .search_path
-        .first()
-        .is_none_or(|s| s != schema)
-    {
-        interp.snapshot.search_path.insert(0, schema.to_owned());
+    let original = interp.search_path.clone();
+    if interp.search_path.first().is_none_or(|s| s != schema) {
+        interp.search_path.insert(0, schema.to_owned());
     }
 
     let mut result = Ok(());
@@ -1241,7 +1230,7 @@ fn apply_with_schema(
         }
     }
 
-    interp.snapshot.search_path = original;
+    interp.search_path = original;
     result
 }
 

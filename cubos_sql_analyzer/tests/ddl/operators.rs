@@ -24,7 +24,7 @@ fn drop_operator_removes_only_matching_signature() {
     let halfvec_oid = snap.resolve_type_by_name(None, "halfvec").unwrap().oid;
 
     let ops = snap
-        .operators_by_name
+        .operators_by_name()
         .get(&QualifiedName::new("public", "<=>"))
         .expect("other overloads should still be registered");
 

@@ -22,7 +22,7 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW without name".into()))?;
 
-    let (schema, name) = range_var_names(rv, &interp.snapshot);
+    let (schema, name) = range_var_names(rv, interp);
     let key = QualifiedName::new(&schema, &name);
 
     let query_sql = stmt.query.as_deref().and_then(deparse_query);
@@ -40,23 +40,22 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         .collect();
 
     let (columns, view_def) = match (query_sql, stmt.query.as_deref()) {
-        (Some(sql), Some(query_node)) => {
-            resolve_view_now(&interp.snapshot, &sql, query_node, &aliases).map_err(|e| match e {
+        (Some(sql), Some(query_node)) => resolve_view_now(interp, &sql, query_node, &aliases)
+            .map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
                     view: key.to_string(),
                     source,
                 },
                 other => other,
-            })?
-        }
+            })?,
         _ => (Vec::new(), None),
     };
 
     if stmt.replace {
-        interp.snapshot.tables.remove(&key);
+        interp.tables.remove(&key);
     }
 
-    interp.snapshot.tables.insert(
+    interp.tables.insert(
         key,
         TableEntry {
             name,
@@ -82,24 +81,25 @@ pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Resu
         _ => RelationKind::Table,
     };
 
-    let (schema, name) = range_var_names(rv, &interp.snapshot);
+    let (schema, name) = range_var_names(rv, interp);
     let key = QualifiedName::new(&schema, &name);
 
     let query_sql = stmt.query.as_deref().and_then(deparse_query);
 
     let (columns, view_def) = match (query_sql, stmt.query.as_deref()) {
-        (Some(sql), Some(query_node)) => resolve_view_now(&interp.snapshot, &sql, query_node, &[])
-            .map_err(|e| match e {
+        (Some(sql), Some(query_node)) => {
+            resolve_view_now(interp, &sql, query_node, &[]).map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
                     view: key.to_string(),
                     source,
                 },
                 other => other,
-            })?,
+            })?
+        }
         _ => (Vec::new(), None),
     };
 
-    interp.snapshot.tables.insert(
+    interp.tables.insert(
         key,
         TableEntry {
             name,
@@ -138,7 +138,7 @@ fn deparse_query(query: &pg_query::protobuf::Node) -> Option<String> {
 /// Resolve view columns at creation time and collect real AST-level dependencies
 /// by walking the parsed query tree (no JSON string matching).
 fn resolve_view_now(
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
     sql: &str,
     query_node: &protobuf::Node,
     aliases: &[String],
@@ -217,7 +217,7 @@ pub(crate) fn decode_ast(bytes: &[u8]) -> Option<protobuf::Node> {
 /// re-analysis succeeded. Surfaces `DdlError::ViewAnalysis` if re-analysis
 /// fails — callers can treat that as a sign the ALTER would've been unsafe.
 pub(crate) fn reanalyze_view(
-    snapshot: &mut crate::schema::SchemaSnapshot,
+    snapshot: &mut crate::pg_catalog::PgCatalog,
     view_key: &QualifiedName,
 ) -> Result<(), DdlError> {
     let Some(ast) = snapshot
@@ -283,7 +283,7 @@ struct DepsCollector {
 /// same-named columns across different tables and respects schema qualification.
 fn collect_view_deps(
     query_node: &protobuf::Node,
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
 ) -> (Vec<QualifiedName>, Vec<(QualifiedName, String)>) {
     let mut collector = DepsCollector::default();
     let scope_stack: Vec<Vec<FromSource>> = Vec::new();
@@ -301,7 +301,7 @@ impl DepsCollector {
     fn walk_node(
         &mut self,
         node: &protobuf::Node,
-        snapshot: &crate::schema::SchemaSnapshot,
+        snapshot: &crate::pg_catalog::PgCatalog,
         stack: &[Vec<FromSource>],
     ) {
         let Some(inner) = node.node.as_ref() else {
@@ -435,7 +435,7 @@ impl DepsCollector {
     fn walk_select(
         &mut self,
         sel: &protobuf::SelectStmt,
-        snapshot: &crate::schema::SchemaSnapshot,
+        snapshot: &crate::pg_catalog::PgCatalog,
         parent_stack: &[Vec<FromSource>],
     ) {
         // UNION / INTERSECT / EXCEPT: walk both sides in the parent scope.
@@ -506,7 +506,7 @@ impl DepsCollector {
     fn process_from_item(
         &mut self,
         node: &protobuf::Node,
-        snapshot: &crate::schema::SchemaSnapshot,
+        snapshot: &crate::pg_catalog::PgCatalog,
         parent_stack: &[Vec<FromSource>],
         frame: &mut Vec<FromSource>,
     ) {
@@ -687,7 +687,7 @@ impl DepsCollector {
 
 /// Find all views that depend on the given table or view.
 pub fn find_dependent_views(
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
     table_key: &QualifiedName,
 ) -> Vec<QualifiedName> {
     snapshot
@@ -705,7 +705,7 @@ pub fn find_dependent_views(
 
 /// Find all views that depend on a specific column of a table.
 pub fn find_views_depending_on_column(
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
     table_key: &QualifiedName,
     column_name: &str,
 ) -> Vec<QualifiedName> {
@@ -726,7 +726,7 @@ pub fn find_views_depending_on_column(
 
 /// Drop views by qualified name, transitively dropping any views that depend
 /// on them.
-pub fn drop_views(snapshot: &mut crate::schema::SchemaSnapshot, view_keys: &[QualifiedName]) {
+pub fn drop_views(snapshot: &mut crate::pg_catalog::PgCatalog, view_keys: &[QualifiedName]) {
     let mut to_drop: Vec<QualifiedName> = view_keys.to_vec();
     let mut dropped: Vec<QualifiedName> = Vec::new();
 
@@ -779,7 +779,7 @@ enum AstEdit<'a> {
 fn rewrite_ast_node(
     node: &mut protobuf::Node,
     edit: &AstEdit,
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
 ) {
     let Some(inner) = node.node.as_mut() else {
         return;
@@ -801,7 +801,7 @@ fn rewrite_ast_node(
 fn rewrite_select(
     sel: &mut protobuf::SelectStmt,
     edit: &AstEdit,
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
 ) {
     if let Some(larg) = sel.larg.as_deref_mut() {
         rewrite_select(larg, edit, snapshot);
@@ -863,7 +863,7 @@ fn rewrite_select(
 fn rewrite_from_item(
     n: &mut protobuf::Node,
     edit: &AstEdit,
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
     labels: &mut Vec<(String, QualifiedName)>,
 ) {
     let Some(inner) = n.node.as_mut() else {
@@ -1196,7 +1196,7 @@ fn rewrite_qualified_name_list(names: &mut [protobuf::Node], old_schema: &str, n
 
 fn resolve_rangevar_schema(
     rv: &protobuf::RangeVar,
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
 ) -> String {
     if !rv.schemaname.is_empty() {
         return rv.schemaname.clone();
@@ -1213,27 +1213,18 @@ fn resolve_rangevar_schema(
         .unwrap_or_else(|| "public".to_owned())
 }
 
-/// Placeholder snapshot for recursive subselects during rewrite. The walker
-/// only consults the snapshot to resolve a RangeVar's default schema when
-/// rewriting table renames inside a fresh scope — and the stored AST was
-/// fully qualified at creation time, so subselects always carry explicit
-/// `schemaname`. Passing a static empty snapshot keeps the signature simple.
-fn empty_snapshot_handle() -> &'static crate::schema::SchemaSnapshot {
+/// Placeholder catalog handle for recursive subselects during rewrite. The
+/// walker only consults the catalog to resolve a RangeVar's default schema
+/// when rewriting table renames inside a fresh scope — and the stored AST
+/// was fully qualified at creation time, so subselects always carry explicit
+/// `schemaname`. Passing a static empty catalog keeps the signature simple.
+fn empty_snapshot_handle() -> &'static crate::pg_catalog::PgCatalog {
     use std::sync::OnceLock;
-    static EMPTY: OnceLock<crate::schema::SchemaSnapshot> = OnceLock::new();
-    EMPTY.get_or_init(|| crate::schema::SchemaSnapshot {
-        types: Default::default(),
-        type_by_name: Default::default(),
-        tables: Default::default(),
-        functions_by_name: Default::default(),
-        operators_by_name: Default::default(),
-        casts: Default::default(),
-        search_path: Vec::new(),
-        schemas: Default::default(),
-    })
+    static EMPTY: OnceLock<crate::pg_catalog::PgCatalog> = OnceLock::new();
+    EMPTY.get_or_init(crate::pg_catalog::PgCatalog::empty)
 }
 
-fn apply_edit_to_all_views(snapshot: &mut crate::schema::SchemaSnapshot, edit: AstEdit<'_>) {
+fn apply_edit_to_all_views(snapshot: &mut crate::pg_catalog::PgCatalog, edit: AstEdit<'_>) {
     // Snapshot the keys first; borrow issues otherwise since `rewrite_ast_node`
     // needs an immutable snapshot handle for RangeVar schema resolution while
     // we iterate mutably over the tables map.
@@ -1274,7 +1265,7 @@ fn apply_edit_to_all_views(snapshot: &mut crate::schema::SchemaSnapshot, edit: A
 /// Rewrite every view's dependencies so references to `old` now point at `new`.
 /// Call this after renaming a table/view or moving it to a new schema.
 pub fn rewrite_deps_on_table_rename(
-    snapshot: &mut crate::schema::SchemaSnapshot,
+    snapshot: &mut crate::pg_catalog::PgCatalog,
     old: &QualifiedName,
     new: &QualifiedName,
 ) {
@@ -1298,7 +1289,7 @@ pub fn rewrite_deps_on_table_rename(
 
 /// Rewrite every view's column-level dependencies after a column rename.
 pub fn rewrite_deps_on_column_rename(
-    snapshot: &mut crate::schema::SchemaSnapshot,
+    snapshot: &mut crate::pg_catalog::PgCatalog,
     table_key: &QualifiedName,
     old_col: &str,
     new_col: &str,
@@ -1327,7 +1318,7 @@ pub fn rewrite_deps_on_column_rename(
 /// dependency whose schema matches `old_schema` has its schema field
 /// replaced with `new_schema`.
 pub fn rewrite_deps_on_schema_rename(
-    snapshot: &mut crate::schema::SchemaSnapshot,
+    snapshot: &mut crate::pg_catalog::PgCatalog,
     old_schema: &str,
     new_schema: &str,
 ) {

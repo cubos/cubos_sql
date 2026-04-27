@@ -2,12 +2,13 @@
 
 use pg_query::protobuf::{Node, RangeVar, TypeName, node};
 
+use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
-use crate::schema::{CastContext, CastInfo, CastMethod, SchemaSnapshot, oid};
+use crate::schema::{CastContext, CastInfo, CastMethod, oid};
 
 /// Extract the (schema, name) pair from a `RangeVar`.
 /// If no schema is specified, defaults to the first entry in `search_path`.
-pub fn range_var_names(rv: &RangeVar, snapshot: &SchemaSnapshot) -> (String, String) {
+pub fn range_var_names(rv: &RangeVar, snapshot: &PgCatalog) -> (String, String) {
     let schema = if rv.schemaname.is_empty() {
         snapshot
             .search_path
@@ -21,14 +22,14 @@ pub fn range_var_names(rv: &RangeVar, snapshot: &SchemaSnapshot) -> (String, Str
 }
 
 /// Extract schema-qualified key from a `RangeVar`.
-pub fn range_var_key(rv: &RangeVar, snapshot: &SchemaSnapshot) -> QualifiedName {
+pub fn range_var_key(rv: &RangeVar, snapshot: &PgCatalog) -> QualifiedName {
     let (schema, name) = range_var_names(rv, snapshot);
     QualifiedName::new(schema, name)
 }
 
 /// Extract (schema, name) from a list of name nodes (e.g., `domainname`, `type_name` in DDL).
 /// Handles both `["name"]` and `["schema", "name"]` forms.
-pub fn extract_names(names: &[Node], snapshot: &SchemaSnapshot) -> (String, String) {
+pub fn extract_names(names: &[Node], snapshot: &PgCatalog) -> (String, String) {
     let parts: Vec<&str> = names
         .iter()
         .filter_map(|n| match n.node.as_ref()? {
@@ -52,7 +53,7 @@ pub fn extract_names(names: &[Node], snapshot: &SchemaSnapshot) -> (String, Stri
 }
 
 /// Extract a schema-qualified key from name nodes.
-pub fn names_key(names: &[Node], snapshot: &SchemaSnapshot) -> QualifiedName {
+pub fn names_key(names: &[Node], snapshot: &PgCatalog) -> QualifiedName {
     let (schema, name) = extract_names(names, snapshot);
     QualifiedName::new(schema, name)
 }
@@ -64,7 +65,7 @@ pub fn names_key(names: &[Node], snapshot: &SchemaSnapshot) -> QualifiedName {
 /// - Unqualified names: `int4`, `text`, `uuid`
 /// - Array bounds: `int4[]` → array element type OID
 /// - Shorthand aliases: `integer` → `int4`, `bigint` → `int8`, etc.
-pub fn resolve_type_name(tn: &TypeName, snapshot: &SchemaSnapshot) -> Option<u32> {
+pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<u32> {
     let parts: Vec<&str> = tn
         .names
         .iter()
@@ -155,7 +156,7 @@ pub fn node_string(n: &Node) -> Option<&str> {
 /// generated for each table). Used by the operator resolver so that
 /// `composite = composite` reaches the polymorphic `record = record`
 /// (record_eq) operator via cast lookup.
-pub fn register_composite_to_record_cast(snapshot: &mut SchemaSnapshot, composite_oid: u32) {
+pub fn register_composite_to_record_cast(snapshot: &mut PgCatalog, composite_oid: u32) {
     let key = format!("{composite_oid}:{}", oid::RECORD);
     snapshot.casts.insert(
         key,

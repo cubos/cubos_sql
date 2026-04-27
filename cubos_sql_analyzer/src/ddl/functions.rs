@@ -10,7 +10,7 @@ use super::util::{extract_names, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.funcname, &interp.snapshot);
+    let (schema, name) = extract_names(&stmt.funcname, interp);
 
     // Walk parameters once, splitting IN/INOUT/VARIADIC into the call
     // signature and OUT/TABLE/INOUT into the named output columns.
@@ -28,7 +28,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         let resolved_oid = fp
             .arg_type
             .as_ref()
-            .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
+            .and_then(|tn| resolve_type_name(tn, interp))
             .unwrap_or(0);
 
         match mode {
@@ -67,7 +67,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     let explicit_return_oid = stmt
         .return_type
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot));
+        .and_then(|tn| resolve_type_name(tn, interp));
     let return_type_oid = match explicit_return_oid {
         Some(oid) => oid,
         None => match out_args.len() {
@@ -116,7 +116,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // separate object kinds, so a CREATE FUNCTION may coexist with a
     // CREATE PROCEDURE of the same name and signature.
     let key = QualifiedName::new(&entry.schema, &entry.name);
-    if let Some(fns) = interp.snapshot.functions_by_name.get_mut(&key) {
+    if let Some(fns) = interp.functions_by_name.get_mut(&key) {
         let exists = fns
             .iter()
             .any(|f| f.arg_types == entry.arg_types && f.is_procedure == entry.is_procedure);
@@ -138,12 +138,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         }
     }
 
-    interp
-        .snapshot
-        .functions_by_name
-        .entry(key)
-        .or_default()
-        .push(entry);
+    interp.functions_by_name.entry(key).or_default().push(entry);
 
     Ok(())
 }

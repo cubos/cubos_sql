@@ -1,6 +1,7 @@
 //! Type coercion and common-type resolution.
 
-use crate::schema::{CastContext, CastInfo, SchemaSnapshot, oid};
+use crate::pg_catalog::PgCatalog;
+use crate::schema::{CastContext, CastInfo, oid};
 
 /// Describes the level of implicit coercion allowed in a given context.
 ///
@@ -22,7 +23,7 @@ pub(crate) fn can_coerce(
     source: u32,
     target: u32,
     context: CoercionContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> bool {
     if source == target {
         return true;
@@ -77,7 +78,7 @@ fn is_string_type(type_oid: u32) -> bool {
 /// Find the common supertype for a list of types.
 ///
 /// Used for CASE, COALESCE, UNION column reconciliation.
-pub(crate) fn find_common_type(types: &[u32], snapshot: &SchemaSnapshot) -> Option<u32> {
+pub(crate) fn find_common_type(types: &[u32], snapshot: &PgCatalog) -> Option<u32> {
     if types.is_empty() {
         return None;
     }

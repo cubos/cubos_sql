@@ -12,7 +12,7 @@ fn drop_schema_empty_succeeds() {
         "CREATE SCHEMA temp_stuff;
          DROP SCHEMA temp_stuff;",
     )]);
-    assert!(!snap.search_path.contains(&"temp_stuff".to_string()));
+    assert!(!snap.search_path().contains(&"temp_stuff".to_string()));
 }
 
 #[test]

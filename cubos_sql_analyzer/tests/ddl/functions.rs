@@ -140,12 +140,12 @@ fn alter_function_rename_moves_overload() {
 
     assert!(
         !snap
-            .functions_by_name
+            .functions_by_name()
             .contains_key(&QualifiedName::new("public", "add_one")),
         "old name should be gone"
     );
     let fns = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "plus_one"))
         .expect("renamed function should exist");
     assert_eq!(fns.len(), 1);
@@ -166,7 +166,7 @@ fn alter_function_set_schema_moves_it() {
     )]);
 
     let fns = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("utils", "add_one"))
         .unwrap();
     assert_eq!(fns[0].schema, "utils");
@@ -193,14 +193,14 @@ fn alter_function_rename_with_overloads_only_moves_matching_signature() {
         .oid;
 
     let renamed = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "do_it_int"))
         .unwrap();
     assert_eq!(renamed.len(), 1);
     assert_eq!(renamed[0].arg_types, vec![int4_oid]);
 
     let remaining = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "do_it"))
         .unwrap();
     assert_eq!(
@@ -225,7 +225,7 @@ fn alter_aggregate_rename_only_touches_aggregate() {
 
     // Scalar survives under original name.
     let scalar = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "ag"))
         .unwrap();
     assert_eq!(scalar.len(), 1);
@@ -233,7 +233,7 @@ fn alter_aggregate_rename_only_touches_aggregate() {
 
     // Aggregate moved.
     let moved = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "ag_total"))
         .unwrap();
     assert_eq!(moved.len(), 1);
@@ -254,7 +254,7 @@ fn drop_function_does_not_touch_procedure_of_same_name() {
     )]);
 
     let fns = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "f"))
         .unwrap();
     assert_eq!(fns.len(), 1, "procedure must survive DROP FUNCTION");

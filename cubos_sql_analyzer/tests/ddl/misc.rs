@@ -21,25 +21,25 @@ fn setup() -> PgCatalog {
 #[test]
 fn snapshot_roundtrip() {
     let db = setup();
-    let snapshot = db.snapshot();
+    let seed = db.to_seed();
 
-    let json = serde_json::to_string(snapshot).unwrap();
-    let restored: SchemaSnapshot = serde_json::from_str(&json).unwrap();
+    let json = serde_json::to_string(&seed).unwrap();
+    let restored: SchemaSeed = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(snapshot.types.len(), restored.types.len());
-    assert_eq!(snapshot.tables.len(), restored.tables.len());
+    assert_eq!(db.types().len(), restored.types.len());
+    assert_eq!(db.tables().len(), restored.tables.len());
     assert_eq!(
-        snapshot.functions_by_name.len(),
+        db.functions_by_name().len(),
         restored.functions_by_name.len()
     );
     assert_eq!(
-        snapshot.operators_by_name.len(),
+        db.operators_by_name().len(),
         restored.operators_by_name.len()
     );
-    assert_eq!(snapshot.casts.len(), restored.casts.len());
+    assert_eq!(db.casts().len(), restored.casts.len());
 
     // Analyze against both databases — results must match exactly.
-    let restored_db = PgCatalog::from_snapshot(restored);
+    let restored_db = PgCatalog::from_seed(restored);
     let sql = "SELECT id, name FROM users";
     let info1 = db.analyze(sql).unwrap();
     let info2 = restored_db.analyze(sql).unwrap();

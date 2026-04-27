@@ -546,7 +546,7 @@ fn view_deps_rename_column_unrelated_is_noop() {
         .depends_on_columns
         .iter()
         .filter(|(k, _)| k == &t)
-        .map(|(_, c)| c.as_str())
+        .map(|(_, c): &(QualifiedName, String)| c.as_str())
         .collect();
     assert!(names.contains(&"id"));
     assert!(names.contains(&"name"));
@@ -601,7 +601,7 @@ fn view_def_stores_resolved_ast() {
 
 #[test]
 fn view_def_serde_roundtrip_preserves_ast() {
-    // Serializing the snapshot to JSON and back must reproduce the AST
+    // Serializing the catalog to JSON and back must reproduce the AST
     // byte-for-byte. Base64 is load-bearing: without it the JSON blows
     // up to one int per byte.
     let snap = build(&[(
@@ -610,8 +610,8 @@ fn view_def_serde_roundtrip_preserves_ast() {
          CREATE VIEW v AS SELECT id, name FROM t;",
     )]);
 
-    let json = serde_json::to_string(&snap).unwrap();
-    let back: SchemaSnapshot = serde_json::from_str(&json).unwrap();
+    let json = serde_json::to_string(&snap.to_seed()).unwrap();
+    let back: PgCatalog = PgCatalog::from_seed(serde_json::from_str(&json).unwrap());
 
     let original = snap
         .resolve_table(None, "v")
@@ -666,7 +666,7 @@ fn view_def_accepts_legacy_json_without_resolved_ast() {
         "search_path": ["public"]
     }"#;
 
-    let snap: SchemaSnapshot = serde_json::from_str(legacy).unwrap();
+    let snap: PgCatalog = PgCatalog::from_seed(serde_json::from_str(legacy).unwrap());
     let vd = snap
         .resolve_table(None, "v")
         .unwrap()

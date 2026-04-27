@@ -15,7 +15,7 @@ fn create_procedure_registers_with_is_procedure_flag() {
     )]);
 
     let fns = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "do_thing"))
         .expect("do_thing should be registered");
     assert_eq!(fns.len(), 1);
@@ -51,7 +51,7 @@ fn drop_procedure_does_not_touch_function_of_same_name() {
     )]);
 
     let fns = snap
-        .functions_by_name
+        .functions_by_name()
         .get(&QualifiedName::new("public", "f"))
         .unwrap();
     assert_eq!(fns.len(), 1);

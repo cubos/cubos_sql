@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use cubos_sql_analyzer::schema::*;
-use cubos_sql_analyzer::{PgCatalog, QualifiedName};
+use cubos_sql_analyzer::{PgCatalog, QualifiedName, SchemaSeed};
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -97,7 +97,7 @@ fn main() {
 
 // ─── Deterministic serialization ───────────────────────────────────────────────
 
-/// Mirror of `SchemaSnapshot` with `BTreeMap` for deterministic key ordering.
+/// Mirror of [`SchemaSeed`] with `BTreeMap` for deterministic key ordering.
 #[derive(serde::Serialize)]
 struct OrderedSnapshot {
     types: BTreeMap<u32, TypeEntry>,
@@ -109,8 +109,8 @@ struct OrderedSnapshot {
     search_path: Vec<String>,
 }
 
-impl From<SchemaSnapshot> for OrderedSnapshot {
-    fn from(s: SchemaSnapshot) -> Self {
+impl From<SchemaSeed> for OrderedSnapshot {
+    fn from(s: SchemaSeed) -> Self {
         Self {
             types: s.types.into_iter().collect(),
             type_by_name: s
@@ -141,7 +141,7 @@ impl From<SchemaSnapshot> for OrderedSnapshot {
 
 // ─── Schema export ─────────────────────────────────────────────────────────────
 
-fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgres::Error> {
+fn export_schema(client: &mut postgres::Client) -> Result<SchemaSeed, postgres::Error> {
     let search_path = export_search_path(client)?;
     let (types, type_by_name) = export_types(client)?;
     let tables = export_tables(client)?;
@@ -186,7 +186,7 @@ fn export_schema(client: &mut postgres::Client) -> Result<SchemaSnapshot, postgr
         schemas.insert(s.clone());
     }
 
-    Ok(SchemaSnapshot {
+    Ok(SchemaSeed {
         types,
         type_by_name,
         tables,
@@ -622,11 +622,8 @@ fn export_view_definitions(
 /// offending view's name, error, and full SQL definition. The expectation is
 /// that every system view round-trips cleanly — otherwise the analyzer has
 /// regressed or a new PG release introduced a construct we don't cover.
-fn populate_view_defs(
-    snapshot: SchemaSnapshot,
-    defs: Vec<(String, String, String)>,
-) -> SchemaSnapshot {
-    let mut db = PgCatalog::from_snapshot(snapshot);
+fn populate_view_defs(seed: SchemaSeed, defs: Vec<(String, String, String)>) -> SchemaSeed {
+    let mut db = PgCatalog::from_seed(seed);
 
     for (schema, name, definition) in &defs {
         let qn = QualifiedName::new(schema.clone(), name.clone());
@@ -634,8 +631,7 @@ fn populate_view_defs(
         // Keep the pass-1 column list so we can diff against the reanalyzed
         // version below.
         let before: Vec<TableColumn> = db
-            .snapshot()
-            .tables
+            .tables()
             .get(&qn)
             .map(|t| t.columns.clone())
             .unwrap_or_default();
@@ -655,8 +651,7 @@ fn populate_view_defs(
         }
 
         let after: Vec<TableColumn> = db
-            .snapshot()
-            .tables
+            .tables()
             .get(&qn)
             .map(|t| t.columns.clone())
             .unwrap_or_default();
@@ -666,7 +661,7 @@ fn populate_view_defs(
         }
     }
 
-    db.into_snapshot()
+    db.to_seed()
 }
 
 /// Print the offending view's error and SQL, then panic. Formatted the same

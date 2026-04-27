@@ -14,7 +14,7 @@ use super::util::{extract_names, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.defnames, &interp.snapshot);
+    let (schema, name) = extract_names(&stmt.defnames, interp);
 
     // Argument types come from `args`. The shape varies between
     //   CREATE AGGREGATE name (type1, type2)        — bare type list
@@ -42,12 +42,12 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
                     is_variadic = true;
                 }
                 if let Some(tn) = &fp.arg_type {
-                    let oid = resolve_type_name(tn, &interp.snapshot).unwrap_or(0);
+                    let oid = resolve_type_name(tn, interp).unwrap_or(0);
                     arg_types.push(oid);
                 }
             }
             Some(node::Node::TypeName(tn)) => {
-                let oid = resolve_type_name(tn, &interp.snapshot).unwrap_or(0);
+                let oid = resolve_type_name(tn, interp).unwrap_or(0);
                 arg_types.push(oid);
             }
             _ => {}
@@ -68,7 +68,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         match de.defname.to_ascii_lowercase().as_str() {
             "stype" => {
                 if let Some(node::Node::TypeName(tn)) = arg.node.as_ref() {
-                    state_type = resolve_type_name(tn, &interp.snapshot);
+                    state_type = resolve_type_name(tn, interp);
                 }
             }
             "finalfunc" => {
@@ -82,7 +82,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     //   1. FINALFUNC return type, if a final function is declared.
     //   2. Otherwise the state type.
     let final_return = finalfunc.as_ref().and_then(|(schema, name)| {
-        let candidates = interp.snapshot.find_functions(schema.as_deref(), name);
+        let candidates = interp.find_functions(schema.as_deref(), name);
         candidates.into_iter().next().map(|f| f.return_type_oid)
     });
 
@@ -105,12 +105,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     };
 
     let key = crate::qualified_name::QualifiedName::new(&entry.schema, &entry.name);
-    interp
-        .snapshot
-        .functions_by_name
-        .entry(key)
-        .or_default()
-        .push(entry);
+    interp.functions_by_name.entry(key).or_default().push(entry);
 
     Ok(())
 }

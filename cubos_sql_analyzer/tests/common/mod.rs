@@ -2,10 +2,10 @@
 
 #![allow(dead_code, unused_imports)]
 
-pub use cubos_sql_analyzer::schema::{RelationKind, SchemaSnapshot, TypeKind};
+pub use cubos_sql_analyzer::schema::{RelationKind, TypeKind};
 pub use cubos_sql_analyzer::{
     AnalyzeError, AnalyzedColumn, AnalyzedQuery, DdlError, PgCatalog, QualifiedName, RecordField,
-    Type,
+    SchemaSeed, Type,
 };
 
 /// Terse helper for building a [`QualifiedName`] in tests.
@@ -18,10 +18,10 @@ pub fn qn(schema: &str, name: &str) -> QualifiedName {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Apply a sequence of `(filename, sql)` migrations and return the resulting
-/// schema snapshot. Panics on any migration error — use [`try_apply`] when the
-/// test expects a specific failure.
-pub fn build(migrations: &[(&str, &str)]) -> SchemaSnapshot {
-    build_db(migrations).into_snapshot()
+/// catalog. Panics on any migration error — use [`try_apply`] when the test
+/// expects a specific failure.
+pub fn build(migrations: &[(&str, &str)]) -> PgCatalog {
+    build_db(migrations)
 }
 
 /// Apply a sequence of migrations and return the live [`PgCatalog`] — useful

@@ -17,10 +17,10 @@ use crate::pg_catalog::PgCatalog;
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
 
 pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.domainname, &interp.snapshot);
+    let (schema, name) = extract_names(&stmt.domainname, interp);
     let key = QualifiedName::new(&schema, &name);
 
-    if interp.snapshot.type_by_name.contains_key(&key) {
+    if interp.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
@@ -29,7 +29,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     let base_type_oid = stmt
         .type_name
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
+        .and_then(|tn| resolve_type_name(tn, interp))
         .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
 
     let oid = interp.alloc_oid();
@@ -37,12 +37,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 
     // Domains inherit category/preferred from their base type.
     let (category, is_preferred) = interp
-        .snapshot
         .types
         .get(&base_type_oid)
         .map(|t| (t.category, t.is_preferred))
         .unwrap_or(('U', false));
-    interp.snapshot.types.insert(
+    interp.types.insert(
         oid,
         TypeEntry {
             oid,
@@ -54,7 +53,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(key, oid);
+    interp.type_by_name.insert(key, oid);
 
     // Array type for the domain.
     register_array_type(interp, array_oid, &schema, &name, oid);
@@ -65,10 +64,10 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 // ─── CREATE TYPE AS ENUM ────────────────────────────────────────────────────
 
 pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.type_name, &interp.snapshot);
+    let (schema, name) = extract_names(&stmt.type_name, interp);
     let key = QualifiedName::new(&schema, &name);
 
-    if interp.snapshot.type_by_name.contains_key(&key) {
+    if interp.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
@@ -83,7 +82,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
     let oid = interp.alloc_oid();
     let array_oid = interp.alloc_oid();
 
-    interp.snapshot.types.insert(
+    interp.types.insert(
         oid,
         TypeEntry {
             oid,
@@ -95,7 +94,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(key, oid);
+    interp.type_by_name.insert(key, oid);
 
     register_array_type(interp, array_oid, &schema, &name, oid);
 
@@ -112,7 +111,6 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 
     let schema = if rv.schemaname.is_empty() {
         interp
-            .snapshot
             .search_path
             .first()
             .cloned()
@@ -123,7 +121,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     let name = rv.relname.clone();
     let key = QualifiedName::new(&schema, &name);
 
-    if interp.snapshot.type_by_name.contains_key(&key) {
+    if interp.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
@@ -135,7 +133,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             let type_oid = cd
                 .type_name
                 .as_ref()
-                .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
+                .and_then(|tn| resolve_type_name(tn, interp))
                 .unwrap_or(0);
             fields.push(CompositeField {
                 name: cd.colname.clone(),
@@ -148,7 +146,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     let oid = interp.alloc_oid();
     let array_oid = interp.alloc_oid();
 
-    interp.snapshot.types.insert(
+    interp.types.insert(
         oid,
         TypeEntry {
             oid,
@@ -160,10 +158,10 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(key, oid);
+    interp.type_by_name.insert(key, oid);
 
     register_array_type(interp, array_oid, &schema, &name, oid);
-    register_composite_to_record_cast(&mut interp.snapshot, oid);
+    register_composite_to_record_cast(interp, oid);
 
     Ok(())
 }
@@ -171,10 +169,10 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 // ─── CREATE TYPE AS RANGE ───────────────────────────────────────────────────
 
 pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.type_name, &interp.snapshot);
+    let (schema, name) = extract_names(&stmt.type_name, interp);
     let key = QualifiedName::new(&schema, &name);
 
-    if interp.snapshot.type_by_name.contains_key(&key) {
+    if interp.type_by_name.contains_key(&key) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
@@ -188,14 +186,14 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             && let Some(arg) = de.arg.as_deref()
             && let Some(node::Node::TypeName(tn)) = arg.node.as_ref()
         {
-            subtype_oid = resolve_type_name(tn, &interp.snapshot).unwrap_or(0);
+            subtype_oid = resolve_type_name(tn, interp).unwrap_or(0);
         }
     }
 
     let oid = interp.alloc_oid();
     let array_oid = interp.alloc_oid();
 
-    interp.snapshot.types.insert(
+    interp.types.insert(
         oid,
         TypeEntry {
             oid,
@@ -207,7 +205,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(key, oid);
+    interp.type_by_name.insert(key, oid);
 
     register_array_type(interp, array_oid, &schema, &name, oid);
 
@@ -217,15 +215,15 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
 // ─── ALTER TYPE ... ADD VALUE (enum) ────────────────────────────────────────
 
 pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
-    let key = names_key(&stmt.type_name, &interp.snapshot);
+    let key = names_key(&stmt.type_name, interp);
 
-    let Some(&oid) = interp.snapshot.type_by_name.get(&key) else {
+    let Some(&oid) = interp.type_by_name.get(&key) else {
         // IF NOT EXISTS applies to the VALUE, not the TYPE.
         // Type must always exist.
         return Err(DdlError::TypeNotFound(key.to_string()));
     };
 
-    let Some(te) = interp.snapshot.types.get_mut(&oid) else {
+    let Some(te) = interp.types.get_mut(&oid) else {
         return Err(DdlError::TypeNotFound(key.to_string()));
     };
 
@@ -268,11 +266,11 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         return Ok(());
     }
 
-    let (schema, name) = extract_names(&stmt.defnames, &interp.snapshot);
+    let (schema, name) = extract_names(&stmt.defnames, interp);
     let key = QualifiedName::new(&schema, &name);
 
     // If the type already exists (e.g., shell type followed by full definition), reuse OID.
-    if interp.snapshot.type_by_name.contains_key(&key) {
+    if interp.type_by_name.contains_key(&key) {
         // Full definition after shell type — just confirm it exists.
         return Ok(());
     }
@@ -282,7 +280,7 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
     let oid = interp.alloc_oid();
     let array_oid = interp.alloc_oid();
 
-    interp.snapshot.types.insert(
+    interp.types.insert(
         oid,
         TypeEntry {
             oid,
@@ -294,7 +292,7 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(key, oid);
+    interp.type_by_name.insert(key, oid);
 
     register_array_type(interp, array_oid, &schema, &name, oid);
 
@@ -307,11 +305,11 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
     let source_oid = stmt
         .sourcetype
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot));
+        .and_then(|tn| resolve_type_name(tn, interp));
     let target_oid = stmt
         .targettype
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot));
+        .and_then(|tn| resolve_type_name(tn, interp));
 
     let (Some(src), Some(tgt)) = (source_oid, target_oid) else {
         // Can't resolve types — skip silently.
@@ -338,7 +336,6 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
 
     let key = format!("{src}:{tgt}");
     interp
-        .snapshot
         .casts
         .insert(key, crate::schema::CastInfo::new(context, method));
 
@@ -357,7 +354,7 @@ fn register_array_type(
 ) {
     let array_name = format!("_{base_name}");
     let array_key = QualifiedName::new(schema, &array_name);
-    interp.snapshot.types.insert(
+    interp.types.insert(
         array_oid,
         TypeEntry {
             oid: array_oid,
@@ -371,5 +368,5 @@ fn register_array_type(
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(array_key, array_oid);
+    interp.type_by_name.insert(array_key, array_oid);
 }

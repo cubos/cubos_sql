@@ -22,11 +22,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE TABLE without relation".into()))?;
 
-    let key = range_var_key(rv, &interp.snapshot);
-    let (schema, name) = range_var_names(rv, &interp.snapshot);
+    let key = range_var_key(rv, interp);
+    let (schema, name) = range_var_names(rv, interp);
 
     // Check for existing table.
-    if interp.snapshot.tables.contains_key(&key) {
+    if interp.tables.contains_key(&key) {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -99,7 +99,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .collect();
 
     let composite_key = QualifiedName::new(&schema, &name);
-    interp.snapshot.types.insert(
+    interp.types.insert(
         composite_oid,
         TypeEntry {
             oid: composite_oid,
@@ -113,16 +113,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             extension: None,
         },
     );
-    interp
-        .snapshot
-        .type_by_name
-        .insert(composite_key, composite_oid);
-    register_composite_to_record_cast(&mut interp.snapshot, composite_oid);
+    interp.type_by_name.insert(composite_key, composite_oid);
+    register_composite_to_record_cast(interp, composite_oid);
 
     // Register array type for the composite.
     let array_name = format!("_{name}");
     let array_key = QualifiedName::new(&schema, &array_name);
-    interp.snapshot.types.insert(
+    interp.types.insert(
         array_oid,
         TypeEntry {
             oid: array_oid,
@@ -136,10 +133,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             extension: None,
         },
     );
-    interp.snapshot.type_by_name.insert(array_key, array_oid);
+    interp.type_by_name.insert(array_key, array_oid);
 
     // Register the table.
-    interp.snapshot.tables.insert(
+    interp.tables.insert(
         key,
         TableEntry {
             name: name.clone(),
@@ -171,7 +168,7 @@ fn parse_column_def(
     let type_oid = cd
         .type_name
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
+        .and_then(|tn| resolve_type_name(tn, interp))
         .unwrap_or(0); // 0 if unresolved — will produce a warning downstream.
 
     let mut not_null = cd.is_not_null;
@@ -243,10 +240,10 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         .as_ref()
         .ok_or_else(|| DdlError::Parse("ALTER TABLE without relation".into()))?;
 
-    let key = range_var_key(rv, &interp.snapshot);
+    let key = range_var_key(rv, interp);
 
     // Verify the table exists. Handle missing_ok (IF EXISTS).
-    if !interp.snapshot.tables.contains_key(&key) {
+    if !interp.tables.contains_key(&key) {
         if stmt.missing_ok {
             return Ok(());
         }
@@ -298,7 +295,6 @@ fn add_column(
     };
 
     let table = interp
-        .snapshot
         .tables
         .get(table_key)
         .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
@@ -317,7 +313,7 @@ fn add_column(
     let col = parse_column_def(interp, cd, &[])?;
 
     // Mutate table and composite type.
-    let table = interp.snapshot.tables.get_mut(table_key).unwrap();
+    let table = interp.tables.get_mut(table_key).unwrap();
     table.columns.push(col.clone());
 
     // Update composite type.
@@ -332,7 +328,6 @@ fn drop_column(
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let table = interp
-        .snapshot
         .tables
         .get(table_key)
         .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
@@ -354,8 +349,7 @@ fn drop_column(
     );
 
     // Check for dependent views.
-    let dependent_views =
-        views::find_views_depending_on_column(&interp.snapshot, table_key, &cmd.name);
+    let dependent_views = views::find_views_depending_on_column(interp, table_key, &cmd.name);
     if !dependent_views.is_empty() && !cascade {
         let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
         return Err(DdlError::DependencyError(format!(
@@ -368,10 +362,10 @@ fn drop_column(
 
     // CASCADE: drop dependent views.
     if !dependent_views.is_empty() {
-        views::drop_views(&mut interp.snapshot, &dependent_views);
+        views::drop_views(interp, &dependent_views);
     }
 
-    let table = interp.snapshot.tables.get_mut(table_key).unwrap();
+    let table = interp.tables.get_mut(table_key).unwrap();
     table.columns.retain(|c| c.name != cmd.name);
     update_composite_for_table(interp, table_key);
     Ok(())
@@ -384,7 +378,6 @@ fn set_not_null(
     not_null: bool,
 ) -> Result<(), DdlError> {
     let table = interp
-        .snapshot
         .tables
         .get_mut(table_key)
         .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
@@ -407,7 +400,6 @@ fn set_default(
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let table = interp
-        .snapshot
         .tables
         .get_mut(table_key)
         .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
@@ -441,17 +433,16 @@ fn alter_column_type(
     let new_type_oid = cd
         .type_name
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, &interp.snapshot))
+        .and_then(|tn| resolve_type_name(tn, interp))
         .unwrap_or(0);
 
-    if !interp.snapshot.tables.contains_key(table_key) {
+    if !interp.tables.contains_key(table_key) {
         return Err(DdlError::TableNotFound(table_key.to_string()));
     }
 
     // Pull the current OID before mutating, so we can decide whether PG would
     // allow the ALTER in the presence of dependent views.
     let old_type_oid = interp
-        .snapshot
         .tables
         .get(table_key)
         .and_then(|t| t.columns.iter().find(|c| c.name == cmd.name))
@@ -467,13 +458,8 @@ fn alter_column_type(
     // allowed when the new type is binary coercible with the old one — no
     // table rewrite, so dependent views keep working. Any other change
     // fails unless the user drops the view first.
-    let dependent_views =
-        views::find_views_depending_on_column(&interp.snapshot, table_key, &cmd.name);
-    if !dependent_views.is_empty()
-        && !interp
-            .snapshot
-            .is_binary_coercible(old_type_oid, new_type_oid)
-    {
+    let dependent_views = views::find_views_depending_on_column(interp, table_key, &cmd.name);
+    if !dependent_views.is_empty() && !interp.is_binary_coercible(old_type_oid, new_type_oid) {
         let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
         return Err(DdlError::DependencyError(format!(
             "cannot alter type of column {}.{} because view(s) {} depend on it \
@@ -486,7 +472,7 @@ fn alter_column_type(
     }
 
     // Apply the type change.
-    let table = interp.snapshot.tables.get_mut(table_key).unwrap();
+    let table = interp.tables.get_mut(table_key).unwrap();
     let col = table
         .columns
         .iter_mut()
@@ -503,7 +489,7 @@ fn alter_column_type(
     // affects snapshots that haven't been regenerated since the upgrade.
     let _ = old_type_oid; // no longer needed for the view fix-up path
     for view_key in &dependent_views {
-        views::reanalyze_view(&mut interp.snapshot, view_key)?;
+        views::reanalyze_view(interp, view_key)?;
     }
 
     Ok(())
@@ -536,7 +522,6 @@ fn add_constraint(
             .collect();
 
         let table = interp
-            .snapshot
             .tables
             .get_mut(table_key)
             .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
@@ -552,7 +537,6 @@ fn add_constraint(
     // NOT NULL constraint.
     if c.contype == ConstrType::ConstrNotnull as i32 {
         let table = interp
-            .snapshot
             .tables
             .get_mut(table_key)
             .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
@@ -581,10 +565,10 @@ fn add_constraint(
 
 /// Sync the composite type fields with the table's columns.
 fn update_composite_for_table(interp: &mut PgCatalog, table_key: &QualifiedName) {
-    let Some(table) = interp.snapshot.tables.get(table_key) else {
+    let Some(table) = interp.tables.get(table_key) else {
         return;
     };
-    let Some(&composite_oid) = interp.snapshot.type_by_name.get(table_key) else {
+    let Some(&composite_oid) = interp.type_by_name.get(table_key) else {
         return;
     };
     let fields: Vec<CompositeField> = table
@@ -597,7 +581,7 @@ fn update_composite_for_table(interp: &mut PgCatalog, table_key: &QualifiedName)
         })
         .collect();
 
-    if let Some(te) = interp.snapshot.types.get_mut(&composite_oid) {
+    if let Some(te) = interp.types.get_mut(&composite_oid) {
         te.kind = TypeKind::Composite { fields };
     }
 }

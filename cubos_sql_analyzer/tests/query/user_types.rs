@@ -232,13 +232,12 @@ fn text_array_column_type_resolves_to_array_kind() {
     let mut db = PgCatalog::new();
     db.apply_sql("CREATE TABLE t (id INT NOT NULL, tags TEXT[] NOT NULL);")
         .unwrap();
-    let snap = db.into_snapshot();
 
-    let table = snap.resolve_table(None, "t").unwrap();
+    let table = db.resolve_table(None, "t").unwrap();
     let tags_col = table.columns.iter().find(|c| c.name == "tags").unwrap();
     assert_ne!(tags_col.type_oid, 0);
 
-    let type_entry = snap.get_type(tags_col.type_oid).unwrap();
+    let type_entry = db.get_type(tags_col.type_oid).unwrap();
     assert!(
         matches!(type_entry.kind, TypeKind::Array { .. }),
         "TEXT[] should be an Array type, got {:?}",
@@ -266,30 +265,29 @@ fn builtin_type_aliases_resolve_to_canonical_oid() {
         );",
     )
     .unwrap();
-    let snap = db.into_snapshot();
 
-    let table = snap.resolve_table(None, "t").unwrap();
-    let int4_oid = snap
+    let table = db.resolve_table(None, "t").unwrap();
+    let int4_oid = db
         .resolve_type_by_name(Some("pg_catalog"), "int4")
         .unwrap()
         .oid;
-    let int8_oid = snap
+    let int8_oid = db
         .resolve_type_by_name(Some("pg_catalog"), "int8")
         .unwrap()
         .oid;
-    let int2_oid = snap
+    let int2_oid = db
         .resolve_type_by_name(Some("pg_catalog"), "int2")
         .unwrap()
         .oid;
-    let bool_oid = snap
+    let bool_oid = db
         .resolve_type_by_name(Some("pg_catalog"), "bool")
         .unwrap()
         .oid;
-    let float4_oid = snap
+    let float4_oid = db
         .resolve_type_by_name(Some("pg_catalog"), "float4")
         .unwrap()
         .oid;
-    let text_oid = snap
+    let text_oid = db
         .resolve_type_by_name(Some("pg_catalog"), "text")
         .unwrap()
         .oid;

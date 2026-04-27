@@ -67,10 +67,10 @@ fn drop_relation(
         _ => return Ok(()),
     };
 
-    let (schema, name) = extract_names(names, &interp.snapshot);
+    let (schema, name) = extract_names(names, interp);
     let key = QualifiedName::new(&schema, &name);
 
-    if !interp.snapshot.tables.contains_key(&key) {
+    if !interp.tables.contains_key(&key) {
         if missing_ok {
             return Ok(());
         }
@@ -78,7 +78,7 @@ fn drop_relation(
     }
 
     // Check for dependent views.
-    let dependent_views = views::find_dependent_views(&interp.snapshot, &key);
+    let dependent_views = views::find_dependent_views(interp, &key);
     if !dependent_views.is_empty() && !cascade {
         let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
         return Err(DdlError::DependencyError(format!(
@@ -89,20 +89,20 @@ fn drop_relation(
 
     // CASCADE: drop dependent views first.
     if !dependent_views.is_empty() {
-        views::drop_views(&mut interp.snapshot, &dependent_views);
+        views::drop_views(interp, &dependent_views);
     }
 
-    interp.snapshot.tables.remove(&key);
+    interp.tables.remove(&key);
 
     // Also remove the composite type and its array type.
-    if let Some(&composite_oid) = interp.snapshot.type_by_name.get(&key) {
-        interp.snapshot.types.remove(&composite_oid);
-        interp.snapshot.type_by_name.remove(&key);
+    if let Some(&composite_oid) = interp.type_by_name.get(&key) {
+        interp.types.remove(&composite_oid);
+        interp.type_by_name.remove(&key);
 
         let array_key = QualifiedName::new(&schema, format!("_{name}"));
-        if let Some(&array_oid) = interp.snapshot.type_by_name.get(&array_key) {
-            interp.snapshot.types.remove(&array_oid);
-            interp.snapshot.type_by_name.remove(&array_key);
+        if let Some(&array_oid) = interp.type_by_name.get(&array_key) {
+            interp.types.remove(&array_oid);
+            interp.type_by_name.remove(&array_key);
         }
     }
 
@@ -121,10 +121,10 @@ fn drop_type(
         _ => return Ok(()),
     };
 
-    let (schema, name) = extract_names(names, &interp.snapshot);
+    let (schema, name) = extract_names(names, interp);
     let key = QualifiedName::new(&schema, &name);
 
-    let Some(&type_oid) = interp.snapshot.type_by_name.get(&key) else {
+    let Some(&type_oid) = interp.type_by_name.get(&key) else {
         if missing_ok {
             return Ok(());
         }
@@ -133,7 +133,6 @@ fn drop_type(
 
     // Check for tables with columns of this type.
     let dependents: Vec<QualifiedName> = interp
-        .snapshot
         .tables
         .iter()
         .filter(|(_, t)| t.columns.iter().any(|c| c.type_oid == type_oid))
@@ -142,11 +141,10 @@ fn drop_type(
 
     // Also check array type usage.
     let array_key = QualifiedName::new(&schema, format!("_{name}"));
-    let array_oid = interp.snapshot.type_by_name.get(&array_key).copied();
+    let array_oid = interp.type_by_name.get(&array_key).copied();
 
     let array_dependents: Vec<QualifiedName> = if let Some(arr_oid) = array_oid {
         interp
-            .snapshot
             .tables
             .iter()
             .filter(|(_, t)| t.columns.iter().any(|c| c.type_oid == arr_oid))
@@ -172,25 +170,25 @@ fn drop_type(
     // CASCADE: drop columns of this type from dependent tables.
     if cascade {
         for table_key in &dependents {
-            if let Some(table) = interp.snapshot.tables.get_mut(table_key) {
+            if let Some(table) = interp.tables.get_mut(table_key) {
                 table.columns.retain(|c| c.type_oid != type_oid);
             }
         }
         if let Some(arr_oid) = array_oid {
             for table_key in &array_dependents {
-                if let Some(table) = interp.snapshot.tables.get_mut(table_key) {
+                if let Some(table) = interp.tables.get_mut(table_key) {
                     table.columns.retain(|c| c.type_oid != arr_oid);
                 }
             }
         }
     }
 
-    interp.snapshot.types.remove(&type_oid);
-    interp.snapshot.type_by_name.remove(&key);
+    interp.types.remove(&type_oid);
+    interp.type_by_name.remove(&key);
 
     if let Some(arr_oid) = array_oid {
-        interp.snapshot.types.remove(&arr_oid);
-        interp.snapshot.type_by_name.remove(&array_key);
+        interp.types.remove(&arr_oid);
+        interp.type_by_name.remove(&array_key);
     }
 
     Ok(())
@@ -219,20 +217,20 @@ fn drop_extension(
 
     // Remove types created by the extension.
     for oid in &installed.type_oids {
-        if let Some(te) = interp.snapshot.types.remove(oid) {
+        if let Some(te) = interp.types.remove(oid) {
             let key = QualifiedName::new(&te.schema, &te.name);
-            interp.snapshot.type_by_name.remove(&key);
+            interp.type_by_name.remove(&key);
         }
     }
 
     // Remove functions created by the extension.
     for fname in &installed.function_names {
-        interp.snapshot.functions_by_name.remove(fname);
+        interp.functions_by_name.remove(fname);
     }
 
     // Remove casts created by the extension.
     for cast_key in &installed.cast_keys {
-        interp.snapshot.casts.remove(cast_key);
+        interp.casts.remove(cast_key);
     }
 
     Ok(())
@@ -275,7 +273,7 @@ fn drop_function(
         .iter()
         .filter_map(|n| {
             if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-                super::util::resolve_type_name(tn, &interp.snapshot)
+                super::util::resolve_type_name(tn, interp)
             } else {
                 None
             }
@@ -301,12 +299,7 @@ fn drop_function(
 
     // Find the schema-qualified key: either the one given explicitly, or the
     // first one on `search_path` that actually has a matching overload.
-    let target_key = resolve_function_key(
-        &interp.snapshot,
-        schema_opt.as_deref(),
-        &name,
-        &matches_overload,
-    );
+    let target_key = resolve_function_key(interp, schema_opt.as_deref(), &name, &matches_overload);
 
     let existed = target_key.as_ref().is_some();
 
@@ -322,11 +315,11 @@ fn drop_function(
     }
 
     if let Some(key) = target_key
-        && let Some(fns) = interp.snapshot.functions_by_name.get_mut(&key)
+        && let Some(fns) = interp.functions_by_name.get_mut(&key)
     {
         fns.retain(|f| !matches_overload(f));
         if fns.is_empty() {
-            interp.snapshot.functions_by_name.remove(&key);
+            interp.functions_by_name.remove(&key);
         }
     }
 
@@ -340,7 +333,7 @@ fn drop_function(
 /// (`pg_catalog` first unless explicitly listed) for the first schema whose
 /// bucket holds a matching overload.
 fn resolve_function_key(
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
     schema: Option<&str>,
     name: &str,
     matches: &dyn Fn(&crate::schema::FunctionEntry) -> bool,
@@ -411,7 +404,7 @@ fn drop_aggregate(
         .iter()
         .filter_map(|n| {
             if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-                resolve_type_name(tn, &interp.snapshot)
+                resolve_type_name(tn, interp)
             } else {
                 None
             }
@@ -419,21 +412,21 @@ fn drop_aggregate(
         .collect();
 
     let matches = |f: &crate::schema::FunctionEntry| f.is_aggregate && f.arg_types == arg_oids;
-    let target_key = resolve_function_key(&interp.snapshot, schema_opt.as_deref(), &name, &matches);
+    let target_key = resolve_function_key(interp, schema_opt.as_deref(), &name, &matches);
 
     if target_key.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
             "aggregate {name}({}) does not exist",
-            format_arg_oids(&arg_oids, &interp.snapshot),
+            format_arg_oids(&arg_oids, interp),
         )));
     }
 
     if let Some(key) = target_key
-        && let Some(fns) = interp.snapshot.functions_by_name.get_mut(&key)
+        && let Some(fns) = interp.functions_by_name.get_mut(&key)
     {
         fns.retain(|f| !matches(f));
         if fns.is_empty() {
-            interp.snapshot.functions_by_name.remove(&key);
+            interp.functions_by_name.remove(&key);
         }
     }
 
@@ -465,7 +458,7 @@ fn drop_operator(
         _ => return Ok(()),
     };
 
-    let (left_oid, right_oid) = parse_operator_arg_types(&owa.objargs, &interp.snapshot);
+    let (left_oid, right_oid) = parse_operator_arg_types(&owa.objargs, interp);
     let Some(right_oid) = right_oid else {
         // Right operand is required for both binary and prefix operators.
         return Ok(());
@@ -475,8 +468,7 @@ fn drop_operator(
         o.left_type_oid == left_oid && o.right_type_oid == right_oid
     };
 
-    let target_key =
-        resolve_operator_key(&interp.snapshot, schema_opt.as_deref(), &op_name, &matches);
+    let target_key = resolve_operator_key(interp, schema_opt.as_deref(), &op_name, &matches);
 
     if target_key.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
@@ -485,11 +477,11 @@ fn drop_operator(
     }
 
     if let Some(key) = target_key
-        && let Some(ops) = interp.snapshot.operators_by_name.get_mut(&key)
+        && let Some(ops) = interp.operators_by_name.get_mut(&key)
     {
         ops.retain(|o| !matches(o));
         if ops.is_empty() {
-            interp.snapshot.operators_by_name.remove(&key);
+            interp.operators_by_name.remove(&key);
         }
     }
 
@@ -497,7 +489,7 @@ fn drop_operator(
 }
 
 fn resolve_operator_key(
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
     schema: Option<&str>,
     name: &str,
     matches: &dyn Fn(&crate::schema::OperatorEntry) -> bool,
@@ -538,7 +530,7 @@ fn resolve_operator_key(
 /// `NONE`, indicating a prefix operator (no left operand).
 fn parse_operator_arg_types(
     objargs: &[pg_query::protobuf::Node],
-    snapshot: &crate::schema::SchemaSnapshot,
+    snapshot: &crate::pg_catalog::PgCatalog,
 ) -> (Option<u32>, Option<u32>) {
     let resolve = |n: &pg_query::protobuf::Node| -> Option<u32> {
         if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
@@ -575,11 +567,11 @@ fn drop_cast(
     };
 
     let src_oid = match src_node.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, &interp.snapshot),
+        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, interp),
         _ => None,
     };
     let tgt_oid = match tgt_node.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, &interp.snapshot),
+        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, interp),
         _ => None,
     };
 
@@ -591,7 +583,7 @@ fn drop_cast(
     };
 
     let key = format!("{src}:{tgt}");
-    if interp.snapshot.casts.remove(&key).is_none() && !missing_ok {
+    if interp.casts.remove(&key).is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
             "cast from OID {src} to OID {tgt} does not exist"
         )));
@@ -602,7 +594,7 @@ fn drop_cast(
 
 /// Format a list of argument OIDs as PG type names for error messages.
 /// Falls back to `"oid:N"` when a type isn't in the snapshot.
-fn format_arg_oids(oids: &[u32], snapshot: &crate::schema::SchemaSnapshot) -> String {
+fn format_arg_oids(oids: &[u32], snapshot: &crate::pg_catalog::PgCatalog) -> String {
     oids.iter()
         .map(|oid| {
             snapshot
@@ -634,21 +626,15 @@ fn drop_schema(
     // PG's system schemas are never in our snapshot's search_path writable
     // surface, but users sometimes DROP SCHEMA IF EXISTS them. Treat absence
     // as missing.
-    let has_objects = interp.snapshot.tables.keys().any(|k| k.schema == name)
+    let has_objects = interp.tables.keys().any(|k| k.schema == name)
+        || interp.type_by_name.keys().any(|k| k.schema == name)
         || interp
-            .snapshot
-            .type_by_name
-            .keys()
-            .any(|k| k.schema == name)
-        || interp
-            .snapshot
             .functions_by_name
             .values()
             .any(|fns| fns.iter().any(|f| f.schema == name));
 
-    let exists = interp.snapshot.schemas.contains(&name)
-        || interp.snapshot.search_path.contains(&name)
-        || has_objects;
+    let exists =
+        interp.schemas.contains(&name) || interp.search_path.contains(&name) || has_objects;
 
     if !exists {
         if missing_ok {
@@ -667,7 +653,6 @@ fn drop_schema(
 
     // CASCADE: gather everything in this schema.
     let tables_to_drop: Vec<QualifiedName> = interp
-        .snapshot
         .tables
         .keys()
         .filter(|k| k.schema == name)
@@ -677,16 +662,16 @@ fn drop_schema(
     // Drop views/tables. `drop_views` transitively removes dependents; for
     // plain tables we also need to strip the composite type + array type,
     // mirroring the `drop_relation` cleanup logic.
-    views::drop_views(&mut interp.snapshot, &tables_to_drop);
+    views::drop_views(interp, &tables_to_drop);
     for key in &tables_to_drop {
-        if let Some(te) = interp.snapshot.tables.remove(key)
-            && let Some(&ctype_oid) = interp.snapshot.type_by_name.get(key)
+        if let Some(te) = interp.tables.remove(key)
+            && let Some(&ctype_oid) = interp.type_by_name.get(key)
         {
-            interp.snapshot.types.remove(&ctype_oid);
-            interp.snapshot.type_by_name.remove(key);
+            interp.types.remove(&ctype_oid);
+            interp.type_by_name.remove(key);
             let arr_key = QualifiedName::new(&te.schema, format!("_{}", te.name));
-            if let Some(arr_oid) = interp.snapshot.type_by_name.remove(&arr_key) {
-                interp.snapshot.types.remove(&arr_oid);
+            if let Some(arr_oid) = interp.type_by_name.remove(&arr_key) {
+                interp.types.remove(&arr_oid);
             }
         }
     }
@@ -694,31 +679,24 @@ fn drop_schema(
     // Remove all remaining types in this schema (enums, domains, ranges,
     // standalone composites, …).
     let type_keys: Vec<QualifiedName> = interp
-        .snapshot
         .type_by_name
         .keys()
         .filter(|k| k.schema == name)
         .cloned()
         .collect();
     for key in type_keys {
-        if let Some(oid) = interp.snapshot.type_by_name.remove(&key) {
-            interp.snapshot.types.remove(&oid);
+        if let Some(oid) = interp.type_by_name.remove(&key) {
+            interp.types.remove(&oid);
         }
     }
 
     // Remove all functions and operators in this schema.
-    interp
-        .snapshot
-        .functions_by_name
-        .retain(|k, _| k.schema != name);
-    interp
-        .snapshot
-        .operators_by_name
-        .retain(|k, _| k.schema != name);
+    interp.functions_by_name.retain(|k, _| k.schema != name);
+    interp.operators_by_name.retain(|k, _| k.schema != name);
 
     // Finally, drop the schema itself from the search_path and the known set.
-    interp.snapshot.search_path.retain(|s| s != &name);
-    interp.snapshot.schemas.remove(&name);
+    interp.search_path.retain(|s| s != &name);
+    interp.schemas.remove(&name);
 
     Ok(())
 }

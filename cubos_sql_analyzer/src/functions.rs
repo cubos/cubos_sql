@@ -1,7 +1,8 @@
 //! Function and aggregate resolution.
 
 use crate::error::AnalyzeError;
-use crate::schema::{CompositeField, FunctionEntry, SchemaSnapshot, oid};
+use crate::pg_catalog::PgCatalog;
+use crate::schema::{CompositeField, FunctionEntry, oid};
 
 /// Resolved function call result.
 pub(crate) struct ResolvedFunction {
@@ -74,7 +75,7 @@ const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &[
 
 /// Resolve a function call by name and argument types.
 pub(crate) fn resolve_function(
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,
     arg_types: &[u32],
@@ -198,7 +199,7 @@ fn find_exact_match<'a>(
 fn find_default_args_match<'a>(
     candidates: &[&'a FunctionEntry],
     arg_types: &[u32],
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Option<&'a FunctionEntry> {
     let provided = arg_types.len();
     let matching: Vec<&FunctionEntry> = candidates
@@ -236,7 +237,7 @@ fn find_default_args_match<'a>(
 fn find_polymorphic_match<'a>(
     candidates: &[&'a FunctionEntry],
     arg_types: &[u32],
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Option<&'a FunctionEntry> {
     let matching: Vec<&FunctionEntry> = candidates
         .iter()
@@ -281,7 +282,7 @@ pub(crate) const ANYCOMPATIBLERANGE: u32 = 5080;
 pub(crate) const ANYCOMPATIBLEMULTIRANGE: u32 = 4538;
 
 /// Is `expected` a polymorphic pseudo-type that PG would accept `actual` for?
-pub(crate) fn matches_polymorphic(expected: u32, actual: u32, snapshot: &SchemaSnapshot) -> bool {
+pub(crate) fn matches_polymorphic(expected: u32, actual: u32, snapshot: &PgCatalog) -> bool {
     // Historical array-shaped types that pg_cast doesn't mark as arrays in
     // the normal sense but still satisfy `anyarray` / `anynonarray` for
     // legacy catalog functions.
@@ -361,7 +362,7 @@ pub(crate) fn polymorphic_specificity(oid: u32) -> u8 {
 pub(crate) fn bind_polymorphic_from(
     expected: u32,
     actual: u32,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     bound_element: &mut Option<u32>,
     bound_array: &mut Option<u32>,
 ) {
@@ -391,7 +392,7 @@ pub(crate) fn substitute_polymorphic(
     oid: u32,
     bound_element: Option<u32>,
     bound_array: Option<u32>,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> u32 {
     match oid {
         ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
@@ -410,7 +411,7 @@ pub(crate) fn substitute_polymorphic(
 fn find_cast_match<'a>(
     candidates: &[&'a FunctionEntry],
     arg_types: &[u32],
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Option<&'a FunctionEntry> {
     let matching: Vec<&FunctionEntry> = candidates
         .iter()
@@ -520,7 +521,7 @@ fn make_resolved(f: &FunctionEntry) -> ResolvedFunction {
 fn make_resolved_polymorphic(
     f: &FunctionEntry,
     actual_args: &[u32],
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> ResolvedFunction {
     let mut bound_element: Option<u32> = None;
     let mut bound_array: Option<u32> = None;

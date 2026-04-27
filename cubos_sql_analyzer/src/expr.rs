@@ -18,7 +18,8 @@ use crate::error::AnalyzeError;
 use crate::functions;
 use crate::nullability::NullabilityContext;
 use crate::param_collector::ParamCollector;
-use crate::schema::{SchemaSnapshot, oid};
+use crate::pg_catalog::PgCatalog;
+use crate::schema::oid;
 use crate::scope::Scope;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -137,7 +138,7 @@ impl ExprType {
 /// Render a type OID as `schema.name` for error messages. Falls back to
 /// `unknown(<oid>)` when the snapshot doesn't know the OID — should never
 /// happen in practice but avoids panicking during error formatting.
-fn type_oid_display(oid: u32, snapshot: &SchemaSnapshot) -> String {
+fn type_oid_display(oid: u32, snapshot: &PgCatalog) -> String {
     snapshot
         .get_type(oid)
         .map(|t| format!("{}.{}", t.schema, t.name))
@@ -162,16 +163,13 @@ pub(crate) struct FuncKindPresence {
 /// without resolving anything against the schema. Used up-front by clauses
 /// that forbid those constructs (WHERE, GROUP BY, JOIN ON, HAVING for the
 /// nested-agg case).
-pub(crate) fn detect_func_kinds(
-    node: &protobuf::Node,
-    snapshot: &SchemaSnapshot,
-) -> FuncKindPresence {
+pub(crate) fn detect_func_kinds(node: &protobuf::Node, snapshot: &PgCatalog) -> FuncKindPresence {
     let mut out = FuncKindPresence::default();
     walk(node, snapshot, &mut out);
     out
 }
 
-fn walk(node: &protobuf::Node, snapshot: &SchemaSnapshot, out: &mut FuncKindPresence) {
+fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence) {
     let Some(inner) = node.node.as_ref() else {
         return;
     };
@@ -282,7 +280,7 @@ pub(crate) fn infer_expr(
     node: &protobuf::Node,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
@@ -475,7 +473,7 @@ pub(crate) fn infer_expr(
 fn check_goal_compatibility(
     result: &ExprType,
     goal: &TypeGoal,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     if !goal.has_expectation() {
         return Ok(());
@@ -500,7 +498,7 @@ fn check_goal_compatibility(
     })
 }
 
-fn type_display_name(oid: u32, snapshot: &SchemaSnapshot) -> String {
+fn type_display_name(oid: u32, snapshot: &PgCatalog) -> String {
     snapshot
         .get_type(oid)
         .map(|t| t.name.clone())
@@ -537,7 +535,7 @@ fn infer_column_ref(
     col_ref: &protobuf::ColumnRef,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {
     // Star expansion in expression context. `alias.*` in PG becomes the
     // composite type of the relation referenced by `alias`. `*` alone
@@ -602,7 +600,7 @@ fn infer_column_ref(
 fn infer_star_ref(
     col_ref: &protobuf::ColumnRef,
     scope: &Scope,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {
     // The alias/relname qualifying the star is the last String field before
     // AStar. For `t.*` it's index 0; for `schema.t.*` it's index 1.
@@ -659,7 +657,7 @@ fn infer_indirection(
     ind: &protobuf::AIndirection,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let arg = ind
@@ -800,7 +798,7 @@ fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<V
 /// fall back to generic composite/record handling.
 fn resolve_funccall_out_args(
     fc: &protobuf::FuncCall,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<Option<Vec<RecordField>>, AnalyzeError> {
     let parts = extract_string_fields(&fc.funcname);
@@ -853,7 +851,7 @@ fn resolve_funccall_out_args(
 fn resolve_composite_field(
     current: &ExprType,
     field_name: &str,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {
     if let Some(shape) = current.record_fields.as_deref() {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
@@ -910,7 +908,7 @@ fn infer_array_expr(
     arr: &protobuf::AArrayExpr,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     if arr.elements.is_empty() {
@@ -968,7 +966,7 @@ fn infer_array_expr(
 /// subscripts out of bounds return NULL rather than erroring.
 fn resolve_array_element(
     current: &ExprType,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {
     let type_entry =
         snapshot
@@ -1018,7 +1016,7 @@ fn infer_type_cast(
     cast: &protobuf::TypeCast,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let inner = cast
@@ -1054,7 +1052,7 @@ fn infer_func_call(
     func: &protobuf::FuncCall,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let func_name_parts = extract_string_fields(&func.funcname);
@@ -1230,7 +1228,7 @@ fn infer_a_expr(
     expr: &protobuf::AExpr,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let op_name = extract_string_fields(&expr.name).join(".");
@@ -1676,7 +1674,7 @@ fn infer_bool_expr(
     expr: &protobuf::BoolExpr,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let mut any_nullable = false;
@@ -1702,7 +1700,7 @@ fn infer_coalesce(
     expr: &protobuf::CoalesceExpr,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     // Pass 1: infer all args bottom-up. Bare string literals in UNKNOWN slots
@@ -1770,7 +1768,7 @@ fn infer_case(
     expr: &protobuf::CaseExpr,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     // Pass 1: infer WHEN conditions with BOOL goal, results with NONE.
@@ -1880,7 +1878,7 @@ fn infer_sublink(
     sub: &protobuf::SubLink,
     scope: &Scope,
     _null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let sub_type = protobuf::SubLinkType::try_from(sub.sub_link_type)
@@ -2069,7 +2067,7 @@ pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
 /// Resolve a TypeName to a type OID.
 fn resolve_type_name(
     type_name: Option<&protobuf::TypeName>,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<u32, AnalyzeError> {
     let tn = type_name.ok_or_else(|| AnalyzeError::Unsupported("missing TypeName".into()))?;
 

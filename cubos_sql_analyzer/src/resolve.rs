@@ -12,7 +12,8 @@ use crate::functions;
 use crate::nullability::{self, NullabilityContext};
 use crate::param::LexOutput;
 use crate::param_collector::ParamCollector;
-use crate::schema::{SchemaSnapshot, TypeKind, oid};
+use crate::pg_catalog::PgCatalog;
+use crate::schema::{TypeKind, oid};
 use crate::scope::{Scope, ScopeColumn};
 use crate::types::Type;
 
@@ -180,7 +181,7 @@ pub(crate) fn fuse(
 /// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
 /// 1-based positional parameter index minus one.
 pub(crate) fn analyze_static(
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     sql: &str,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>), AnalyzeError> {
@@ -218,7 +219,7 @@ pub(crate) type RawParam = (i32, u32, bool);
 /// and sorted param list without converting to [`Type`]. Used by the DDL
 /// view handling, which only needs OIDs to rebuild catalog entries.
 pub(crate) fn analyze_raw(
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     sql: &str,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
@@ -295,7 +296,7 @@ fn is_set_to_default(node: &protobuf::Node) -> bool {
 /// the error message (e.g. `"WHERE"`, `"GROUP BY"`, `"JOIN ON"`).
 fn check_no_aggregates_or_windows(
     node: &protobuf::Node,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     context: &str,
 ) -> Result<(), AnalyzeError> {
     let kinds = expr::detect_func_kinds(node, snapshot);
@@ -316,7 +317,7 @@ fn infer_expr_propagate_mismatch(
     node: &protobuf::Node,
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<(), AnalyzeError> {
@@ -357,7 +358,7 @@ type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), Ana
 
 pub(crate) fn analyze_select(
     sel: &protobuf::SelectStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
     analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &[])
@@ -370,7 +371,7 @@ pub(crate) fn analyze_select(
 /// where PG's lexical rule says inner aliases shadow outer ones.
 pub(crate) fn analyze_correlated_select(
     sel: &protobuf::SelectStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_scope: &crate::scope::Scope,
 ) -> AnalyzeResult {
@@ -386,7 +387,7 @@ pub(crate) fn analyze_correlated_select(
 
 fn analyze_select_with_ctes(
     sel: &protobuf::SelectStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
@@ -405,7 +406,7 @@ fn analyze_select_with_ctes(
 ///   shadows the outer one.
 fn analyze_select_with_ctes_and_outer(
     sel: &protobuf::SelectStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
     lateral_sources: &[crate::scope::TableSource],
@@ -542,7 +543,7 @@ fn analyze_select_with_ctes_and_outer(
 
 fn analyze_insert(
     ins: &protobuf::InsertStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
     let relation = ins
@@ -771,7 +772,7 @@ fn analyze_insert(
 
 fn analyze_update(
     upd: &protobuf::UpdateStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
     let relation = upd
@@ -886,7 +887,7 @@ fn analyze_update(
 
 fn analyze_delete(
     del: &protobuf::DeleteStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
     let relation = del
@@ -940,7 +941,7 @@ fn analyze_delete(
 
 fn analyze_set_operation(
     sel: &protobuf::SelectStmt,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
@@ -992,7 +993,7 @@ fn analyze_set_operation(
 }
 
 /// Render a type OID as `schema.name` for user-facing errors.
-fn type_oid_name(oid: u32, snapshot: &SchemaSnapshot) -> String {
+fn type_oid_name(oid: u32, snapshot: &PgCatalog) -> String {
     snapshot
         .get_type(oid)
         .map(|t| format!("{}.{}", t.schema, t.name))
@@ -1006,7 +1007,7 @@ fn type_oid_name(oid: u32, snapshot: &SchemaSnapshot) -> String {
 fn analyze_cte(
     cte: &protobuf::CommonTableExpr,
     with_recursive: bool,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
     existing_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
@@ -1152,7 +1153,7 @@ fn analyze_cte(
 fn append_search_cycle_columns(
     cte: &protobuf::CommonTableExpr,
     cols: &mut Vec<ScopeColumn>,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) {
     if let Some(search) = cte.search_clause.as_ref()
         && !search.search_seq_column.is_empty()
@@ -1232,7 +1233,7 @@ fn process_from_clause(
     from_clause: &[protobuf::Node],
     scope: &mut Scope,
     null_ctx: &mut NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -1246,7 +1247,7 @@ fn process_from_item(
     node: &protobuf::Node,
     scope: &mut Scope,
     null_ctx: &mut NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -1423,7 +1424,7 @@ fn process_from_item(
 fn process_range_function(
     rf: &protobuf::RangeFunction,
     scope: &mut Scope,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     // PG always treats a function-call FROM item as LATERAL: the
@@ -1606,7 +1607,7 @@ fn resolve_target_list(
     target_list: &[protobuf::Node],
     scope: &Scope,
     null_ctx: &NullabilityContext,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<Vec<RawColumn>, AnalyzeError> {
     let mut columns = Vec::new();
@@ -1704,7 +1705,7 @@ fn resolve_target_list(
 /// Nullability is `true` if any row's element at that position is nullable.
 fn analyze_values_lists(
     values_lists: &[protobuf::Node],
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<Vec<RawColumn>, AnalyzeError> {
     // Each entry in `values_lists` is a `List` of per-column expressions for
@@ -1764,7 +1765,7 @@ fn analyze_values_lists(
 /// records the field list on the produced column.
 fn resolve_funccall_record_fields(
     fc: &protobuf::FuncCall,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Option<Vec<crate::expr::RecordField>> {
     let parts = expr::extract_string_fields(&fc.funcname);
@@ -1818,7 +1819,7 @@ fn infer_column_name(node: &protobuf::Node) -> Option<String> {
 // Type resolution
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn build_column(rc: RawColumn, snapshot: &SchemaSnapshot) -> Result<AnalyzedColumn, AnalyzeError> {
+fn build_column(rc: RawColumn, snapshot: &PgCatalog) -> Result<AnalyzedColumn, AnalyzeError> {
     let pg_type = resolve_type_with_shape(rc.type_oid, rc.record_fields.as_deref(), snapshot)?;
 
     // Handle nullability annotations (! and ?).
@@ -1838,7 +1839,7 @@ fn build_column(rc: RawColumn, snapshot: &SchemaSnapshot) -> Result<AnalyzedColu
 fn resolve_type_with_shape(
     type_oid: u32,
     shape: Option<&[crate::expr::RecordField]>,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<Type, AnalyzeError> {
     if type_oid == oid::RECORD
         && let Some(fields) = shape
@@ -1863,7 +1864,7 @@ fn resolve_type_with_shape(
 fn build_param_info(
     type_oid: u32,
     nullable: bool,
-    snapshot: &SchemaSnapshot,
+    snapshot: &PgCatalog,
 ) -> Result<ParamInfo, AnalyzeError> {
     let pg_type = resolve_type(type_oid, snapshot)?;
     Ok(ParamInfo { pg_type, nullable })
@@ -1873,7 +1874,7 @@ fn build_param_info(
 /// wrappers. Unknown OIDs (pseudo `UNKNOWN` included) are surfaced as
 /// [`Type::Basic`] named `pg_catalog.unknown` so consumers can fall back to
 /// `String` without the analyzer having to know about Rust.
-fn resolve_type(type_oid: u32, snapshot: &SchemaSnapshot) -> Result<Type, AnalyzeError> {
+fn resolve_type(type_oid: u32, snapshot: &PgCatalog) -> Result<Type, AnalyzeError> {
     if let Some(te) = snapshot.get_type(type_oid) {
         match &te.kind {
             TypeKind::Domain { base_type_oid } => {

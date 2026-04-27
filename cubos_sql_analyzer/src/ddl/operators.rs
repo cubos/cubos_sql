@@ -26,7 +26,6 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
     let (schema, op_name) = match parts.as_slice() {
         [name] => (
             interp
-                .snapshot
                 .search_path
                 .first()
                 .cloned()
@@ -51,12 +50,12 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         match de.defname.to_ascii_lowercase().as_str() {
             "leftarg" => {
                 if let Some(node::Node::TypeName(tn)) = arg.node.as_ref() {
-                    left_type = resolve_type_name(tn, &interp.snapshot);
+                    left_type = resolve_type_name(tn, interp);
                 }
             }
             "rightarg" => {
                 if let Some(node::Node::TypeName(tn)) = arg.node.as_ref() {
-                    right_type = resolve_type_name(tn, &interp.snapshot);
+                    right_type = resolve_type_name(tn, interp);
                 }
             }
             "procedure" | "function" => {
@@ -79,7 +78,6 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         .unwrap_or(0);
 
     interp
-        .snapshot
         .operators_by_name
         .entry(QualifiedName::new(schema, &op_name))
         .or_default()
@@ -135,7 +133,7 @@ fn resolve_procedure_return(
     left: Option<u32>,
     right: u32,
 ) -> Option<u32> {
-    let candidates = interp.snapshot.find_functions(schema, name);
+    let candidates = interp.find_functions(schema, name);
     candidates
         .into_iter()
         .find(|f| match (left, f.arg_types.as_slice()) {

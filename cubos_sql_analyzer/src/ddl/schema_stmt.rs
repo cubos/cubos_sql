@@ -9,7 +9,7 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     // Register the schema name so `DROP SCHEMA` can distinguish between
     // "schema is empty" and "schema doesn't exist".
     if !stmt.schemaname.is_empty() {
-        interp.snapshot.schemas.insert(stmt.schemaname.clone());
+        interp.schemas.insert(stmt.schemaname.clone());
     }
     // Process any inline schema elements (CREATE SCHEMA ... CREATE TABLE ...).
     for elt in &stmt.schema_elts {
