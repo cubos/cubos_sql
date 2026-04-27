@@ -3,13 +3,14 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::AnalyzeError;
-use crate::schema::oid;
+use crate::oid::PgTypeOid;
+use crate::pg_catalog::oid;
 
 /// Collects type constraints for positional parameters ($1, $2, ...).
 #[derive(Debug, Default)]
 pub(crate) struct ParamCollector {
     /// Maps param number (1-based) → inferred type OID.
-    constraints: HashMap<i32, u32>,
+    constraints: HashMap<i32, PgTypeOid>,
     /// All param numbers seen in the query (even if type not yet inferred).
     seen: HashSet<i32>,
     /// Maps param number (1-based) → nullable annotation.
@@ -25,7 +26,7 @@ impl ParamCollector {
     }
 
     /// Record a type constraint for a parameter.
-    pub fn record(&mut self, param_num: i32, type_oid: u32) {
+    pub fn record(&mut self, param_num: i32, type_oid: PgTypeOid) {
         self.seen.insert(param_num);
         if type_oid == oid::UNKNOWN {
             return;
@@ -54,7 +55,7 @@ impl ParamCollector {
     }
 
     /// Get the inferred type for a parameter. Returns UNKNOWN if not yet constrained.
-    pub fn get(&self, param_num: i32) -> u32 {
+    pub fn get(&self, param_num: i32) -> PgTypeOid {
         self.constraints
             .get(&param_num)
             .copied()
@@ -65,10 +66,10 @@ impl ParamCollector {
     ///
     /// Returns `(param_number, type_oid, nullable)` tuples.
     /// Fails if any `$N` was referenced but its type could not be inferred.
-    pub fn into_sorted(self) -> Result<Vec<(i32, u32, bool)>, AnalyzeError> {
+    pub fn into_sorted(self) -> Result<Vec<(i32, PgTypeOid, bool)>, AnalyzeError> {
         // Params that were seen but not typed default to TEXT, matching PG's
         // behavior (preferred type of the string category for unknown params).
-        let mut params: Vec<(i32, u32, bool)> = self
+        let mut params: Vec<(i32, PgTypeOid, bool)> = self
             .seen
             .iter()
             .map(|&num| {

@@ -2,15 +2,61 @@
 
 #![allow(dead_code, unused_imports)]
 
-pub use cubos_sql_analyzer::schema::{RelationKind, TypeKind};
 pub use cubos_sql_analyzer::{
-    AnalyzeError, AnalyzedColumn, AnalyzedQuery, DdlError, PgCatalog, QualifiedName, RecordField,
-    SchemaSeed, Type,
+    AnalyzeError, AnalyzedColumn, AnalyzedQuery, AttGenerated, CastContext, CastMethod, DdlError,
+    PgAggregate, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid,
+    PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgNamespace,
+    PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid,
+    ProKind, QualifiedName, RecordField, RelKind, TypCategory, TypType, Type,
 };
 
 /// Terse helper for building a [`QualifiedName`] in tests.
 pub fn qn(schema: &str, name: &str) -> QualifiedName {
     QualifiedName::new(schema, name)
+}
+
+/// Look up a relation by name and return its OID. Panics if not found.
+#[track_caller]
+pub fn class_oid(db: &PgCatalog, schema: Option<&str>, name: &str) -> PgClassOid {
+    db.resolve_table(schema, name)
+        .unwrap_or_else(|| panic!("relation {schema:?}.{name} not found"))
+        .oid
+}
+
+/// Tables that a view depends on, as `(schema, name)` pairs.
+pub fn view_table_deps(db: &PgCatalog, view_oid: PgClassOid) -> Vec<QualifiedName> {
+    let out: std::collections::BTreeSet<QualifiedName> = db
+        .view_dependencies(view_oid)
+        .filter_map(|(refobj, _)| {
+            let class = db.pg_class().get(&refobj)?;
+            let schema = db.namespace_name(class.relnamespace)?;
+            Some(QualifiedName::new(schema, class.relname.clone()))
+        })
+        .collect();
+    out.into_iter().collect()
+}
+
+/// Column-level deps a view has, as `(QualifiedName, column_name)` pairs.
+pub fn view_column_deps(db: &PgCatalog, view_oid: PgClassOid) -> Vec<(QualifiedName, String)> {
+    let out: std::collections::BTreeSet<(QualifiedName, String)> = db
+        .view_dependencies(view_oid)
+        .filter_map(|(refobj, refobjsubid)| {
+            if refobjsubid == 0 {
+                return None;
+            }
+            let class = db.pg_class().get(&refobj)?;
+            let schema = db.namespace_name(class.relnamespace)?;
+            let attr = db
+                .attributes_of(refobj)
+                .iter()
+                .find(|a| a.attnum == refobjsubid)?;
+            Some((
+                QualifiedName::new(schema, class.relname.clone()),
+                attr.attname.clone(),
+            ))
+        })
+        .collect();
+    out.into_iter().collect()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

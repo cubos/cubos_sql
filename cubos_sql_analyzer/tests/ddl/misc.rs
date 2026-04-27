@@ -24,19 +24,13 @@ fn snapshot_roundtrip() {
     let seed = db.to_seed();
 
     let json = serde_json::to_string(&seed).unwrap();
-    let restored: SchemaSeed = serde_json::from_str(&json).unwrap();
+    let restored: PgCatalogSeed = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(db.types().len(), restored.types.len());
-    assert_eq!(db.tables().len(), restored.tables.len());
-    assert_eq!(
-        db.functions_by_name().len(),
-        restored.functions_by_name.len()
-    );
-    assert_eq!(
-        db.operators_by_name().len(),
-        restored.operators_by_name.len()
-    );
-    assert_eq!(db.casts().len(), restored.casts.len());
+    assert_eq!(db.pg_type().len(), restored.pg_type.len());
+    assert_eq!(db.pg_class().len(), restored.pg_class.len());
+    assert_eq!(db.pg_proc().len(), restored.pg_proc.len());
+    assert_eq!(db.pg_operator().len(), restored.pg_operator.len());
+    assert_eq!(db.pg_cast().len(), restored.pg_cast.len());
 
     // Analyze against both databases — results must match exactly.
     let restored_db = PgCatalog::from_seed(restored);
@@ -50,9 +44,6 @@ fn snapshot_roundtrip() {
 
 #[test]
 fn dml_statements_in_migration_are_ignored() {
-    // Real-world migrations often intersperse INSERT/UPDATE/DELETE between
-    // DDL statements. The analyzer is DDL-only and must skip DML without
-    // aborting the migration.
     let snap = build(&[(
         "0001.sql",
         "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
@@ -62,7 +53,7 @@ fn dml_statements_in_migration_are_ignored() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    assert_eq!(table.columns.len(), 2);
+    assert_eq!(snap.attributes_of(table.oid).len(), 2);
 }
 
 // ── Multi-file real-world migration chain ─────────────────────────────────
@@ -137,39 +128,42 @@ fn complex_real_world_migration_chain() {
 
     // Verify organizations.
     let orgs = snap.resolve_table(None, "organizations").unwrap();
-    assert_eq!(orgs.columns.len(), 4);
-    let org_id = orgs.columns.iter().find(|c| c.name == "id").unwrap();
-    assert!(org_id.not_null);
-    assert!(org_id.has_default);
+    let org_attrs = snap.attributes_of(orgs.oid);
+    assert_eq!(org_attrs.len(), 4);
+    let org_id = org_attrs.iter().find(|c| c.attname == "id").unwrap();
+    assert!(org_id.attnotnull);
+    assert!(org_id.atthasdef);
 
     // Verify users (8 columns after ALTER ADD COLUMN).
     let users = snap.resolve_table(None, "users").unwrap();
-    assert_eq!(users.columns.len(), 8);
-    let role_col = users.columns.iter().find(|c| c.name == "role").unwrap();
-    let role_type = snap.get_type(role_col.type_oid).unwrap();
-    assert!(matches!(role_type.kind, TypeKind::Enum { .. }));
+    let user_attrs = snap.attributes_of(users.oid);
+    assert_eq!(user_attrs.len(), 8);
+    let role_col = user_attrs.iter().find(|c| c.attname == "role").unwrap();
+    let role_type = snap.get_type(role_col.atttypid).unwrap();
+    assert_eq!(role_type.typtype, TypType::Enum);
 
     // user_role gained a new label at the top.
-    if let TypeKind::Enum { labels } = &role_type.kind {
-        assert_eq!(labels, &["owner", "admin", "editor", "viewer"]);
-    }
+    let labels = snap.enum_labels_of(role_type.oid);
+    assert_eq!(labels, vec!["owner", "admin", "editor", "viewer"]);
 
     // Verify the active_tasks view has the right shape.
     let view = snap.resolve_table(None, "active_tasks").unwrap();
-    assert_eq!(view.columns.len(), 5);
-    assert_eq!(view.columns[0].name, "id");
-    assert_eq!(view.columns[1].name, "title");
-    assert_eq!(view.columns[3].name, "project_name");
-    assert_eq!(view.columns[4].name, "assignee_name");
+    let view_attrs = snap.attributes_of(view.oid);
+    assert_eq!(view_attrs.len(), 5);
+    assert_eq!(view_attrs[0].attname, "id");
+    assert_eq!(view_attrs[1].attname, "title");
+    assert_eq!(view_attrs[3].attname, "project_name");
+    assert_eq!(view_attrs[4].attname, "assignee_name");
 
     // Tasks table.
     let tasks = snap.resolve_table(None, "tasks").unwrap();
-    assert_eq!(tasks.columns.len(), 8);
-    let priority = tasks.columns.iter().find(|c| c.name == "priority").unwrap();
-    assert!(priority.not_null);
-    assert!(priority.has_default);
+    let task_attrs = snap.attributes_of(tasks.oid);
+    assert_eq!(task_attrs.len(), 8);
+    let priority = task_attrs.iter().find(|c| c.attname == "priority").unwrap();
+    assert!(priority.attnotnull);
+    assert!(priority.atthasdef);
 
     // Projects with added column.
     let projects = snap.resolve_table(None, "projects").unwrap();
-    assert_eq!(projects.columns.len(), 7);
+    assert_eq!(snap.attributes_of(projects.oid).len(), 7);
 }

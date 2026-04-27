@@ -6,15 +6,23 @@
 //! - ALTER TABLE DROP COLUMN fails if a view depends on the column (without CASCADE)
 //! - ALTER TABLE ALTER COLUMN TYPE fails if a view depends on the column (without CASCADE)
 //! - With CASCADE, dependent views are dropped (transitively)
+//!
+//! View → relation/column dependencies are stored in `pg_depend` rows with
+//! `deptype = Normal`, `classid = refclassid = PG_CLASS_RELID`, `objid =
+//! view_oid`, `refobjid = table_oid`, and `refobjsubid = attnum` (or 0 when
+//! the view depends on the whole relation).
 
 use pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
 
-use crate::schema::{RelationKind, TableColumn, TableEntry, ViewDef};
+use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgTypeOid};
+use crate::pg_catalog::{
+    DepType, PG_CLASS_RELID, PgAttribute, PgClass, PgDepend, PgType, RelKind, TypCategory, TypType,
+    ViewBinding,
+};
 
 use super::DdlError;
-use super::util::range_var_names;
+use super::util::ensure_range_var;
 use crate::pg_catalog::PgCatalog;
-use crate::qualified_name::QualifiedName;
 
 pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlError> {
     let rv = stmt
@@ -22,10 +30,12 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW without name".into()))?;
 
-    let (schema, name) = range_var_names(rv, interp);
-    let key = QualifiedName::new(&schema, &name);
-
-    let query_sql = stmt.query.as_deref().and_then(deparse_query);
+    let (nsoid, name) = ensure_range_var(interp, rv);
+    let qn_label = crate::qualified_name::QualifiedName::new(
+        interp.namespace_name(nsoid).unwrap_or("?"),
+        name.clone(),
+    )
+    .to_string();
 
     let aliases: Vec<String> = stmt
         .aliases
@@ -39,33 +49,26 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         })
         .collect();
 
-    let (columns, view_def) = match (query_sql, stmt.query.as_deref()) {
-        (Some(sql), Some(query_node)) => resolve_view_now(interp, &sql, query_node, &aliases)
-            .map_err(|e| match e {
+    let resolved = match stmt.query.as_deref() {
+        Some(query_node) => {
+            resolve_view_now(interp, query_node, &aliases).map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                    view: key.to_string(),
+                    view: qn_label.clone(),
                     source,
                 },
                 other => other,
-            })?,
-        _ => (Vec::new(), None),
+            })?
+        }
+        None => ResolvedView::default(),
     };
 
-    if stmt.replace {
-        interp.tables.remove(&key);
+    if stmt.replace
+        && let Some(existing_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied()
+    {
+        super::drop::drop_relation_by_oid(interp, existing_oid);
     }
 
-    interp.tables.insert(
-        key,
-        TableEntry {
-            name,
-            schema,
-            kind: RelationKind::View,
-            columns,
-            view_def,
-        },
-    );
-
+    install_relation(interp, nsoid, name, RelKind::View, resolved);
     Ok(())
 }
 
@@ -77,80 +80,165 @@ pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Resu
         .ok_or_else(|| DdlError::Parse("CREATE TABLE AS without target".into()))?;
 
     let kind = match ObjectType::try_from(stmt.objtype) {
-        Ok(ObjectType::ObjectMatview) => RelationKind::MaterializedView,
-        _ => RelationKind::Table,
+        Ok(ObjectType::ObjectMatview) => RelKind::MaterializedView,
+        _ => RelKind::Table,
     };
 
-    let (schema, name) = range_var_names(rv, interp);
-    let key = QualifiedName::new(&schema, &name);
+    let (nsoid, name) = ensure_range_var(interp, rv);
+    let qn_label = crate::qualified_name::QualifiedName::new(
+        interp.namespace_name(nsoid).unwrap_or("?"),
+        name.clone(),
+    )
+    .to_string();
 
-    let query_sql = stmt.query.as_deref().and_then(deparse_query);
-
-    let (columns, view_def) = match (query_sql, stmt.query.as_deref()) {
-        (Some(sql), Some(query_node)) => {
-            resolve_view_now(interp, &sql, query_node, &[]).map_err(|e| match e {
-                DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                    view: key.to_string(),
-                    source,
-                },
-                other => other,
-            })?
-        }
-        _ => (Vec::new(), None),
+    let resolved = match stmt.query.as_deref() {
+        Some(query_node) => resolve_view_now(interp, query_node, &[]).map_err(|e| match e {
+            DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                view: qn_label.clone(),
+                source,
+            },
+            other => other,
+        })?,
+        None => ResolvedView::default(),
     };
 
-    interp.tables.insert(
-        key,
-        TableEntry {
-            name,
-            schema,
-            kind,
-            columns,
-            view_def,
-        },
-    );
-
+    install_relation(interp, nsoid, name, kind, resolved);
     Ok(())
 }
 
-fn deparse_query(query: &pg_query::protobuf::Node) -> Option<String> {
-    if !matches!(query.node.as_ref(), Some(node::Node::SelectStmt(_))) {
-        return None;
-    }
-
-    let version = pg_query::parse("SELECT 1")
-        .ok()
-        .map(|p| p.protobuf.version)
-        .unwrap_or(170001);
-
-    let wrapper = pg_query::protobuf::ParseResult {
-        version,
-        stmts: vec![pg_query::protobuf::RawStmt {
-            stmt: Some(Box::new(query.clone())),
-            stmt_location: 0,
-            stmt_len: 0,
-        }],
-    };
-
-    pg_query::deparse(&wrapper).ok()
+/// Bundle of analyzer outputs that [`install_relation`] needs to wire up a
+/// view: column shape, the deparse-time binding side-table, the encoded
+/// AST, and the deps to record in `pg_depend`.
+#[derive(Default)]
+struct ResolvedView {
+    columns: Vec<ResolvedColumn>,
+    bindings: Vec<ViewBinding>,
+    ast: Vec<u8>,
+    deps: ViewDeps,
 }
 
-/// Resolve view columns at creation time and collect real AST-level dependencies
-/// by walking the parsed query tree (no JSON string matching).
+/// Build a `pg_class` row + the matching `pg_attribute` rows + composite type
+/// + array type, and write the `pg_depend` rows for the view's dependencies.
+fn install_relation(
+    interp: &mut PgCatalog,
+    nsoid: PgNamespaceOid,
+    name: String,
+    relkind: RelKind,
+    resolved: ResolvedView,
+) {
+    let ResolvedView {
+        columns,
+        bindings: viewbindings,
+        ast: relviewdef,
+        deps,
+    } = resolved;
+    let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let composite_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let array_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+
+    interp.insert_pg_class(PgClass {
+        oid: class_oid,
+        relname: name.clone(),
+        relnamespace: nsoid,
+        relkind,
+        reltype: Some(composite_oid),
+        relviewdef,
+        viewbindings,
+    });
+    for (i, col) in columns.iter().enumerate() {
+        interp.insert_pg_attribute(PgAttribute {
+            attrelid: class_oid,
+            attname: col.name.clone(),
+            atttypid: col.type_oid,
+            attnum: (i + 1) as i16,
+            attnotnull: col.not_null,
+            atthasdef: false,
+            attgenerated: None,
+        });
+    }
+    interp.insert_pg_type(PgType {
+        oid: composite_oid,
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Composite,
+        typcategory: TypCategory::Composite,
+        typispreferred: false,
+        typrelid: Some(class_oid),
+        typelem: None,
+        typarray: Some(array_oid),
+        typbasetype: None,
+    });
+    interp.insert_pg_type(PgType {
+        oid: array_oid,
+        typname: format!("_{name}"),
+        typnamespace: nsoid,
+        typtype: TypType::Base,
+        typcategory: TypCategory::Array,
+        typispreferred: false,
+        typrelid: None,
+        typelem: Some(composite_oid),
+        typarray: None,
+        typbasetype: None,
+    });
+
+    // Record dependencies in pg_depend.
+    let class_obj = PgGenericOid::new(class_oid.get()).unwrap();
+    let view_dep = |refobjid: PgClassOid, refobjsubid: i16| PgDepend {
+        classid: PG_CLASS_RELID,
+        objid: class_obj,
+        objsubid: 0,
+        refclassid: PG_CLASS_RELID,
+        refobjid: PgGenericOid::new(refobjid.get()).unwrap(),
+        refobjsubid,
+        deptype: DepType::Normal,
+    };
+    let mut whole_recorded = std::collections::HashSet::new();
+    for (refrelid, refattnum) in &deps.column_refs {
+        interp.add_dependency(view_dep(*refrelid, *refattnum));
+    }
+    for refrelid in &deps.relation_refs {
+        if whole_recorded.insert(*refrelid) {
+            interp.add_dependency(view_dep(*refrelid, 0));
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedColumn {
+    name: String,
+    type_oid: PgTypeOid,
+    not_null: bool,
+}
+
+#[derive(Default, Clone)]
+struct ViewDeps {
+    /// `(refrelid, attnum)` pairs — one per distinct column dependency.
+    column_refs: Vec<(PgClassOid, i16)>,
+    /// `refrelid` values — relations the view reads from (whole-row deps).
+    relation_refs: Vec<PgClassOid>,
+}
+
+/// Resolve view columns at creation time, walk the AST to emit a binding
+/// stream (one OID-resolved entry per name slot), and derive the
+/// `pg_depend` deps from those bindings.
 fn resolve_view_now(
-    snapshot: &crate::pg_catalog::PgCatalog,
-    sql: &str,
+    snapshot: &PgCatalog,
     query_node: &protobuf::Node,
     aliases: &[String],
-) -> Result<(Vec<TableColumn>, Option<ViewDef>), DdlError> {
-    let (raw_columns, _) = crate::resolve::analyze_raw(snapshot, sql, &[]).map_err(|source| {
-        DdlError::ViewAnalysis {
-            view: String::new(), // filled in by caller
-            source: Box::new(source),
-        }
-    })?;
+) -> Result<ResolvedView, DdlError> {
+    let inner = query_node
+        .node
+        .as_ref()
+        .ok_or_else(|| DdlError::Parse("CREATE VIEW with empty query node".into()))?;
+    let (raw_columns, _) =
+        crate::resolve::analyze_raw_node(snapshot, inner, &[]).map_err(|source| {
+            DdlError::ViewAnalysis {
+                view: String::new(),
+                source: Box::new(source),
+            }
+        })?;
 
-    let columns: Vec<TableColumn> = raw_columns
+    let columns: Vec<ResolvedColumn> = raw_columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -159,35 +247,26 @@ fn resolve_view_now(
             } else {
                 col.name.clone()
             };
-            TableColumn {
+            ResolvedColumn {
                 name,
                 type_oid: col.type_oid,
                 not_null: !col.nullable,
-                has_default: false,
-                is_generated: false,
             }
         })
         .collect();
 
-    let (depends_on_tables, depends_on_columns) = collect_view_deps(query_node, snapshot);
+    let (bindings, deps) = collect_view_bindings_and_deps(query_node, snapshot);
+    let ast = encode_ast(query_node);
 
-    // Freeze the AST so RENAMEs can rewrite it in place and
-    // `ALTER COLUMN TYPE` can re-analyze without the original SQL.
-    let resolved_ast = encode_ast(query_node);
-
-    Ok((
+    Ok(ResolvedView {
         columns,
-        Some(ViewDef {
-            depends_on_tables,
-            depends_on_columns,
-            resolved_ast,
-        }),
-    ))
+        bindings,
+        ast,
+        deps,
+    })
 }
 
-/// Encode a single AST node as protobuf bytes. Returns an empty `Vec` if
-/// encoding fails — callers treat that as "AST not available", same as a
-/// legacy snapshot loaded from an older JSON.
+/// Encode a single AST node as protobuf bytes.
 pub(crate) fn encode_ast(node: &protobuf::Node) -> Vec<u8> {
     use prost::Message;
     let mut buf = Vec::with_capacity(256);
@@ -205,50 +284,56 @@ pub(crate) fn decode_ast(bytes: &[u8]) -> Option<protobuf::Node> {
     protobuf::Node::decode(bytes).ok()
 }
 
-/// Re-run the static analyzer against a view's stored AST and replace the
-/// stored column list with the refreshed types.
-///
-/// Used by `ALTER COLUMN TYPE` when the change is binary-coercible: PG keeps
-/// the view alive, but expression types inside the view may have shifted
-/// (domain → base collapses one layer, for instance), so the view's own
-/// column OIDs need re-deriving.
-///
-/// Returns `Ok(())` if either the AST was missing (legacy snapshot) or the
-/// re-analysis succeeded. Surfaces `DdlError::ViewAnalysis` if re-analysis
-/// fails — callers can treat that as a sign the ALTER would've been unsafe.
+/// Re-run the static analyzer against a view's stored AST and refresh the
+/// stored column types. The AST is rewritten in-memory via the bindings
+/// side-table before analysis, so any RENAME / SET SCHEMA on a dependency
+/// is visible to the analyzer without ever round-tripping through SQL text
+/// (no deparse + reparse).
 pub(crate) fn reanalyze_view(
-    snapshot: &mut crate::pg_catalog::PgCatalog,
-    view_key: &QualifiedName,
+    snapshot: &mut PgCatalog,
+    view_oid: PgClassOid,
 ) -> Result<(), DdlError> {
-    let Some(ast) = snapshot
-        .tables
-        .get(view_key)
-        .and_then(|t| t.view_def.as_ref())
-        .and_then(|vd| decode_ast(&vd.resolved_ast))
+    let Some((ast_bytes, bindings)) = snapshot
+        .pg_class
+        .get(&view_oid)
+        .map(|c| (c.relviewdef.clone(), c.viewbindings.clone()))
+        .filter(|(b, _)| !b.is_empty())
     else {
         return Ok(());
     };
+    let Some(mut ast) = decode_ast(&ast_bytes) else {
+        return Ok(());
+    };
+    apply_view_bindings(&mut ast, &bindings, snapshot);
 
-    let Some(sql) = deparse_query(&ast) else {
+    let Some(stmt) = ast.node.as_ref() else {
         return Ok(());
     };
 
-    let (cols, _) = crate::resolve::analyze_raw(snapshot, &sql, &[]).map_err(|source| {
+    let label = snapshot
+        .pg_class
+        .get(&view_oid)
+        .map(|c| {
+            crate::qualified_name::QualifiedName::new(
+                snapshot.namespace_name(c.relnamespace).unwrap_or("?"),
+                c.relname.clone(),
+            )
+            .to_string()
+        })
+        .unwrap_or_default();
+
+    let (cols, _) = crate::resolve::analyze_raw_node(snapshot, stmt, &[]).map_err(|source| {
         DdlError::ViewAnalysis {
-            view: view_key.to_string(),
+            view: label,
             source: Box::new(source),
         }
     })?;
 
-    if let Some(view) = snapshot.tables.get_mut(view_key) {
-        // Preserve existing user-supplied aliases (set at view creation time
-        // via `CREATE VIEW v (a, b) AS ...`) — just refresh types and
-        // nullability. A mismatched column count would only happen if the
-        // AST itself changed arity, which no RENAME/ALTER TYPE can do.
+    if let Some(attrs) = snapshot.pg_attribute.get_mut(&view_oid) {
         for (i, new_col) in cols.iter().enumerate() {
-            if let Some(existing) = view.columns.get_mut(i) {
-                existing.type_oid = new_col.type_oid;
-                existing.not_null = !new_col.nullable;
+            if let Some(existing) = attrs.get_mut(i) {
+                existing.atttypid = new_col.type_oid;
+                existing.attnotnull = !new_col.nullable;
             }
         }
     }
@@ -256,52 +341,70 @@ pub(crate) fn reanalyze_view(
     Ok(())
 }
 
-// ─── Structured dependency walker ───────────────────────────────────────────
+// ─── Structured walker: emits bindings + collects deps ──────────────────────
 
-/// A table source visible in the current FROM scope. Mirrors `scope::TableSource`
-/// but kept local because this walker collects dependencies — not types — so it
-/// needs neither nullability nor full `ScopeColumn` data.
+/// A table source visible in the current FROM scope.
 #[derive(Debug, Clone)]
 struct FromSource {
     alias: String,
-    /// `Some` for real tables/views (tracked as deps); `None` for CTEs and
+    /// `Some` for real relations (tracked as deps); `None` for CTEs and
     /// subquery sources that are local to the query.
-    qn: Option<QualifiedName>,
-    /// Column names visible through this source. Used to resolve unqualified
-    /// `ColumnRef`s to the right `FromSource` (and therefore the right `qn`).
+    relid: Option<PgClassOid>,
+    /// Column names visible through this source.
     columns: Vec<String>,
 }
 
+/// Walks a view's parsed AST and emits a deterministic stream of
+/// [`ViewBinding`]s — one per name slot, in pre-order. Deps for `pg_depend`
+/// are derived from the bindings as a side-effect.
+///
+/// The applier ([`apply_view_bindings`]) walks the same AST in the same order
+/// and consumes the bindings in lockstep — this is how RENAME / SET SCHEMA
+/// propagate without ever editing the stored AST: at deparse time the
+/// applier rewrites name slots from the OID's *current* catalog name.
 #[derive(Default)]
-struct DepsCollector {
-    depends_on_tables: Vec<QualifiedName>,
-    depends_on_columns: Vec<(QualifiedName, String)>,
+struct ViewWalker {
+    bindings: Vec<ViewBinding>,
 }
 
-/// Walk the view's query tree and return the structurally resolved
-/// dependencies. Unlike the old JSON-based extractor, this distinguishes
-/// same-named columns across different tables and respects schema qualification.
-fn collect_view_deps(
+fn collect_view_bindings_and_deps(
     query_node: &protobuf::Node,
-    snapshot: &crate::pg_catalog::PgCatalog,
-) -> (Vec<QualifiedName>, Vec<(QualifiedName, String)>) {
-    let mut collector = DepsCollector::default();
+    snapshot: &PgCatalog,
+) -> (Vec<ViewBinding>, ViewDeps) {
+    let mut walker = ViewWalker::default();
     let scope_stack: Vec<Vec<FromSource>> = Vec::new();
-    collector.walk_node(query_node, snapshot, &scope_stack);
-
-    collector.depends_on_tables.sort();
-    collector.depends_on_tables.dedup();
-    collector.depends_on_columns.sort();
-    collector.depends_on_columns.dedup();
-
-    (collector.depends_on_tables, collector.depends_on_columns)
+    walker.walk_node(query_node, snapshot, &scope_stack);
+    let deps = derive_deps_from_bindings(&walker.bindings);
+    (walker.bindings, deps)
 }
 
-impl DepsCollector {
+/// Derive `(relation_refs, column_refs)` from emitted bindings — the pieces
+/// `install_relation` writes into `pg_depend`.
+fn derive_deps_from_bindings(bindings: &[ViewBinding]) -> ViewDeps {
+    let mut relation_refs: Vec<PgClassOid> = Vec::new();
+    let mut column_refs: Vec<(PgClassOid, i16)> = Vec::new();
+    for b in bindings {
+        match b {
+            ViewBinding::Relation(oid) => relation_refs.push(*oid),
+            ViewBinding::Column(rel, attnum) => column_refs.push((*rel, *attnum)),
+            _ => {}
+        }
+    }
+    relation_refs.sort();
+    relation_refs.dedup();
+    column_refs.sort();
+    column_refs.dedup();
+    ViewDeps {
+        column_refs,
+        relation_refs,
+    }
+}
+
+impl ViewWalker {
     fn walk_node(
         &mut self,
         node: &protobuf::Node,
-        snapshot: &crate::pg_catalog::PgCatalog,
+        snapshot: &PgCatalog,
         stack: &[Vec<FromSource>],
     ) {
         let Some(inner) = node.node.as_ref() else {
@@ -309,7 +412,7 @@ impl DepsCollector {
         };
         match inner {
             node::Node::SelectStmt(sel) => self.walk_select(sel, snapshot, stack),
-            node::Node::ColumnRef(cr) => self.record_column_ref(cr, stack),
+            node::Node::ColumnRef(cr) => self.record_column_ref(cr, snapshot, stack),
             node::Node::AExpr(expr) => {
                 if let Some(lexpr) = expr.lexpr.as_deref() {
                     self.walk_node(lexpr, snapshot, stack);
@@ -324,6 +427,7 @@ impl DepsCollector {
                 }
             }
             node::Node::FuncCall(fc) => {
+                self.bind_func_name(&fc.funcname, snapshot);
                 for arg in &fc.args {
                     self.walk_node(arg, snapshot, stack);
                 }
@@ -342,6 +446,9 @@ impl DepsCollector {
             node::Node::TypeCast(tc) => {
                 if let Some(arg) = tc.arg.as_deref() {
                     self.walk_node(arg, snapshot, stack);
+                }
+                if let Some(tn) = tc.type_name.as_ref() {
+                    self.bind_type_name(tn, snapshot);
                 }
             }
             node::Node::CollateClause(cc) => {
@@ -426,8 +533,6 @@ impl DepsCollector {
                     self.walk_node(n, snapshot, stack);
                 }
             }
-            // Leaves and nodes that carry no column/table references we care
-            // about (AConst, ParamRef, AStar, etc.) are ignored.
             _ => {}
         }
     }
@@ -435,10 +540,9 @@ impl DepsCollector {
     fn walk_select(
         &mut self,
         sel: &protobuf::SelectStmt,
-        snapshot: &crate::pg_catalog::PgCatalog,
+        snapshot: &PgCatalog,
         parent_stack: &[Vec<FromSource>],
     ) {
-        // UNION / INTERSECT / EXCEPT: walk both sides in the parent scope.
         if let Some(larg) = sel.larg.as_deref() {
             self.walk_select(larg, snapshot, parent_stack);
         }
@@ -446,22 +550,19 @@ impl DepsCollector {
             self.walk_select(rarg, snapshot, parent_stack);
         }
 
-        // Build a new scope frame from CTEs + FROM items.
         let mut frame: Vec<FromSource> = Vec::new();
 
         if let Some(with) = sel.with_clause.as_ref() {
             for cte_node in &with.ctes {
                 if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
                     if let Some(query) = cte.ctequery.as_deref() {
-                        // Push the partially-built frame so the CTE body can
-                        // reference earlier CTEs — mirrors PG WITH semantics.
                         let mut stack_with_partial = parent_stack.to_vec();
                         stack_with_partial.push(frame.clone());
                         self.walk_node(query, snapshot, &stack_with_partial);
                     }
                     frame.push(FromSource {
                         alias: cte.ctename.clone(),
-                        qn: None,
+                        relid: None,
                         columns: cte
                             .aliascolnames
                             .iter()
@@ -479,7 +580,6 @@ impl DepsCollector {
             self.process_from_item(from_item, snapshot, parent_stack, &mut frame);
         }
 
-        // New scope is parent + current frame.
         let mut stack = parent_stack.to_vec();
         stack.push(frame);
 
@@ -506,7 +606,7 @@ impl DepsCollector {
     fn process_from_item(
         &mut self,
         node: &protobuf::Node,
-        snapshot: &crate::pg_catalog::PgCatalog,
+        snapshot: &PgCatalog,
         parent_stack: &[Vec<FromSource>],
         frame: &mut Vec<FromSource>,
     ) {
@@ -521,18 +621,17 @@ impl DepsCollector {
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| rv.relname.clone());
 
-                // Skip CTE-shadowed references: if an ancestor scope has a CTE
-                // with this name and the RangeVar isn't schema-qualified, treat
-                // it as a reference to the CTE (no table dep).
                 if rv.schemaname.is_empty()
                     && parent_stack
                         .iter()
                         .chain(std::iter::once(&*frame))
-                        .any(|f| f.iter().any(|s| s.qn.is_none() && s.alias == rv.relname))
+                        .any(|f| f.iter().any(|s| s.relid.is_none() && s.alias == rv.relname))
                 {
+                    // CTE / subquery alias shadowing: keep literal AST text.
+                    self.bindings.push(ViewBinding::Unresolved);
                     frame.push(FromSource {
                         alias,
-                        qn: None,
+                        relid: None,
                         columns: Vec::new(),
                     });
                     return;
@@ -545,20 +644,23 @@ impl DepsCollector {
                 };
 
                 if let Some(table) = snapshot.resolve_table(schema, &rv.relname) {
-                    let qn = QualifiedName::new(&table.schema, &table.name);
-                    self.depends_on_tables.push(qn.clone());
-                    let columns = table.columns.iter().map(|c| c.name.clone()).collect();
+                    let relid = table.oid;
+                    self.bindings.push(ViewBinding::Relation(relid));
+                    let columns = snapshot
+                        .attributes_of(relid)
+                        .iter()
+                        .map(|a| a.attname.clone())
+                        .collect();
                     frame.push(FromSource {
                         alias,
-                        qn: Some(qn),
+                        relid: Some(relid),
                         columns,
                     });
                 } else {
-                    // Unknown relation — analyzer will have already flagged it;
-                    // record nothing and move on so we don't poison deps.
+                    self.bindings.push(ViewBinding::Unresolved);
                     frame.push(FromSource {
                         alias,
-                        qn: None,
+                        relid: None,
                         columns: Vec::new(),
                     });
                 }
@@ -570,7 +672,6 @@ impl DepsCollector {
                 if let Some(rarg) = join.rarg.as_deref() {
                     self.process_from_item(rarg, snapshot, parent_stack, frame);
                 }
-                // JOIN quals see both sides in scope.
                 let mut stack = parent_stack.to_vec();
                 stack.push(frame.clone());
                 if let Some(q) = join.quals.as_deref() {
@@ -588,12 +689,11 @@ impl DepsCollector {
                 }
                 frame.push(FromSource {
                     alias,
-                    qn: None,
+                    relid: None,
                     columns: Vec::new(),
                 });
             }
             node::Node::RangeFunction(rf) => {
-                // SRF in FROM (e.g. unnest(...)). Walk args for column refs.
                 for arg in &rf.functions {
                     self.walk_node(arg, snapshot, parent_stack);
                 }
@@ -604,7 +704,7 @@ impl DepsCollector {
                     .unwrap_or_else(|| "_srf".into());
                 frame.push(FromSource {
                     alias,
-                    qn: None,
+                    relid: None,
                     columns: Vec::new(),
                 });
             }
@@ -612,7 +712,12 @@ impl DepsCollector {
         }
     }
 
-    fn record_column_ref(&mut self, cr: &protobuf::ColumnRef, stack: &[Vec<FromSource>]) {
+    fn record_column_ref(
+        &mut self,
+        cr: &protobuf::ColumnRef,
+        snapshot: &PgCatalog,
+        stack: &[Vec<FromSource>],
+    ) {
         let parts: Vec<String> = cr
             .fields
             .iter()
@@ -622,726 +727,618 @@ impl DepsCollector {
             })
             .collect();
 
-        match parts.as_slice() {
-            [col] => {
-                // Unqualified — search all in-scope sources for a unique match.
-                let mut found: Option<&FromSource> = None;
-                for frame in stack.iter().rev() {
-                    for src in frame {
-                        if src.columns.iter().any(|c| c == col) {
-                            if found.is_some() {
-                                // Ambiguous — analyzer will flag; skip.
-                                return;
-                            }
-                            found = Some(src);
-                        }
-                    }
-                    if found.is_some() {
-                        break;
-                    }
-                }
-                if let Some(src) = found
-                    && let Some(qn) = src.qn.as_ref()
-                {
-                    self.depends_on_columns.push((qn.clone(), col.clone()));
-                }
-            }
-            [alias, col] => {
-                // Qualified by alias or table name.
-                for frame in stack.iter().rev() {
-                    for src in frame {
-                        if &src.alias == alias
-                            || src
-                                .qn
-                                .as_ref()
-                                .is_some_and(|q| q.name.as_str() == alias.as_str())
-                        {
-                            if let Some(qn) = src.qn.as_ref() {
-                                self.depends_on_columns.push((qn.clone(), col.clone()));
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
+        let resolved: Option<(PgClassOid, i16)> = match parts.as_slice() {
+            [col] => resolve_column_unqualified(col, snapshot, stack),
+            [alias, col] => resolve_column_aliased(alias, col, snapshot, stack),
             [schema, relation, col] => {
-                // Fully qualified (schema.table.col).
-                for frame in stack.iter().rev() {
-                    for src in frame {
-                        if let Some(qn) = src.qn.as_ref()
-                            && qn.schema.as_str() == schema
-                            && qn.name.as_str() == relation
-                        {
-                            self.depends_on_columns.push((qn.clone(), col.clone()));
-                            return;
-                        }
+                resolve_column_qualified(schema, relation, col, snapshot, stack)
+            }
+            _ => None,
+        };
+        match resolved {
+            Some((relid, attnum)) => self.bindings.push(ViewBinding::Column(relid, attnum)),
+            None => self.bindings.push(ViewBinding::Unresolved),
+        }
+    }
+
+    /// FuncCall.funcname is `[name]` or `[schema, name]`. We look up the
+    /// function (any overload) and emit a Function binding with its OID;
+    /// the applier uses the proc's namespace + proname to rewrite the
+    /// AST literals on deparse.
+    fn bind_func_name(&mut self, funcname: &[protobuf::Node], snapshot: &PgCatalog) {
+        let parts: Vec<&str> = funcname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                node::Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (schema, name) = match parts.as_slice() {
+            [n] => (None, *n),
+            [s, n] => (Some(*s), *n),
+            _ => {
+                self.bindings.push(ViewBinding::Unresolved);
+                return;
+            }
+        };
+        let resolved = snapshot
+            .find_functions(schema, name)
+            .into_iter()
+            .next()
+            .map(|p| p.oid);
+        match resolved {
+            Some(oid) => self.bindings.push(ViewBinding::Function(oid)),
+            None => self.bindings.push(ViewBinding::Unresolved),
+        }
+    }
+
+    /// TypeName.names is `[name]` or `[schema, name]`. Emit a Type binding
+    /// when the type resolves; applier rewrites the schema portion.
+    fn bind_type_name(&mut self, tn: &protobuf::TypeName, snapshot: &PgCatalog) {
+        let parts: Vec<&str> = tn
+            .names
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                node::Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (schema, name) = match parts.as_slice() {
+            [n] => (None, *n),
+            [s, n] => (Some(*s), *n),
+            _ => {
+                self.bindings.push(ViewBinding::Unresolved);
+                return;
+            }
+        };
+        let resolved = snapshot.resolve_type_by_name(schema, name).map(|t| t.oid);
+        match resolved {
+            Some(oid) => self.bindings.push(ViewBinding::Type(oid)),
+            None => self.bindings.push(ViewBinding::Unresolved),
+        }
+    }
+}
+
+fn resolve_column_unqualified(
+    col: &str,
+    snapshot: &PgCatalog,
+    stack: &[Vec<FromSource>],
+) -> Option<(PgClassOid, i16)> {
+    let mut found: Option<&FromSource> = None;
+    for frame in stack.iter().rev() {
+        for src in frame {
+            if src.columns.iter().any(|c| c == col) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(src);
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let src = found?;
+    let relid = src.relid?;
+    let attr = snapshot.attribute_by_name(relid, col)?;
+    Some((relid, attr.attnum))
+}
+
+fn resolve_column_aliased(
+    alias: &str,
+    col: &str,
+    snapshot: &PgCatalog,
+    stack: &[Vec<FromSource>],
+) -> Option<(PgClassOid, i16)> {
+    for frame in stack.iter().rev() {
+        for src in frame {
+            let qn_name_match = src
+                .relid
+                .and_then(|r| snapshot.pg_class.get(&r))
+                .is_some_and(|c| c.relname.as_str() == alias);
+            if src.alias == alias || qn_name_match {
+                let relid = src.relid?;
+                let attr = snapshot.attribute_by_name(relid, col)?;
+                return Some((relid, attr.attnum));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_column_qualified(
+    schema: &str,
+    relation: &str,
+    col: &str,
+    snapshot: &PgCatalog,
+    stack: &[Vec<FromSource>],
+) -> Option<(PgClassOid, i16)> {
+    for frame in stack.iter().rev() {
+        for src in frame {
+            if let Some(relid) = src.relid
+                && let Some(class) = snapshot.pg_class.get(&relid)
+                && snapshot
+                    .namespace_name(class.relnamespace)
+                    .is_some_and(|ns| ns == schema)
+                && class.relname.as_str() == relation
+                && let Some(attr) = snapshot.attribute_by_name(relid, col)
+            {
+                return Some((relid, attr.attnum));
+            }
+        }
+    }
+    None
+}
+
+// ─── Binding applier (rewrites AST in-place using bindings) ─────────────────
+//
+// Walks the AST in the same pre-order as `ViewWalker`, popping one binding
+// per name slot and substituting the literal AST text with the OID's
+// *current* catalog name. Called right before deparse / reanalysis so RENAME
+// and SET SCHEMA never need to touch the stored AST.
+//
+// On binding/AST mismatch (e.g. binding count drifts from slot count due to
+// a walker bug) the applier silently bails by treating extra slots as
+// `Unresolved`. That can't happen with the matched walker pair below, but
+// keeps things robust against future divergence.
+struct ViewApplier<'a> {
+    bindings: &'a [ViewBinding],
+    cursor: usize,
+    snapshot: &'a PgCatalog,
+}
+
+/// Walk `ast` mutably, applying `bindings` in the same pre-order
+/// [`ViewWalker`] used to emit them. Each name slot is rewritten from the
+/// OID stored in its binding to the catalog's current name.
+fn apply_view_bindings(ast: &mut protobuf::Node, bindings: &[ViewBinding], snapshot: &PgCatalog) {
+    let mut applier = ViewApplier {
+        bindings,
+        cursor: 0,
+        snapshot,
+    };
+    applier.walk_node(ast);
+}
+
+impl<'a> ViewApplier<'a> {
+    fn pop(&mut self) -> ViewBinding {
+        let b = self
+            .bindings
+            .get(self.cursor)
+            .copied()
+            .unwrap_or(ViewBinding::Unresolved);
+        self.cursor += 1;
+        b
+    }
+
+    fn walk_node(&mut self, node: &mut protobuf::Node) {
+        let Some(inner) = node.node.as_mut() else {
+            return;
+        };
+        match inner {
+            node::Node::SelectStmt(sel) => self.walk_select(sel),
+            node::Node::ColumnRef(cr) => {
+                let b = self.pop();
+                if let ViewBinding::Column(rel, attnum) = b {
+                    self.apply_column_ref(cr, rel, attnum);
+                }
+            }
+            node::Node::AExpr(expr) => {
+                if let Some(lexpr) = expr.lexpr.as_deref_mut() {
+                    self.walk_node(lexpr);
+                }
+                if let Some(rexpr) = expr.rexpr.as_deref_mut() {
+                    self.walk_node(rexpr);
+                }
+            }
+            node::Node::BoolExpr(b) => {
+                for arg in b.args.iter_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::FuncCall(fc) => {
+                let b = self.pop();
+                if let ViewBinding::Function(proc_oid) = b {
+                    self.apply_func_name(&mut fc.funcname, proc_oid);
+                }
+                for arg in fc.args.iter_mut() {
+                    self.walk_node(arg);
+                }
+                if let Some(over) = fc.over.as_deref_mut() {
+                    for arg in over.partition_clause.iter_mut() {
+                        self.walk_node(arg);
                     }
+                    for arg in over.order_clause.iter_mut() {
+                        self.walk_node(arg);
+                    }
+                }
+                if let Some(filter) = fc.agg_filter.as_deref_mut() {
+                    self.walk_node(filter);
+                }
+            }
+            node::Node::TypeCast(tc) => {
+                if let Some(arg) = tc.arg.as_deref_mut() {
+                    self.walk_node(arg);
+                }
+                if let Some(tn) = tc.type_name.as_mut() {
+                    let b = self.pop();
+                    if let ViewBinding::Type(type_oid) = b {
+                        self.apply_type_name(tn, type_oid);
+                    }
+                }
+            }
+            node::Node::CollateClause(cc) => {
+                if let Some(arg) = cc.arg.as_deref_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::CoalesceExpr(c) => {
+                for arg in c.args.iter_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::MinMaxExpr(m) => {
+                for arg in m.args.iter_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::NullIfExpr(n) => {
+                for arg in n.args.iter_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::CaseExpr(c) => {
+                if let Some(arg) = c.arg.as_deref_mut() {
+                    self.walk_node(arg);
+                }
+                for branch in c.args.iter_mut() {
+                    self.walk_node(branch);
+                }
+                if let Some(def) = c.defresult.as_deref_mut() {
+                    self.walk_node(def);
+                }
+            }
+            node::Node::CaseWhen(w) => {
+                if let Some(expr) = w.expr.as_deref_mut() {
+                    self.walk_node(expr);
+                }
+                if let Some(result) = w.result.as_deref_mut() {
+                    self.walk_node(result);
+                }
+            }
+            node::Node::SubLink(sl) => {
+                if let Some(testexpr) = sl.testexpr.as_deref_mut() {
+                    self.walk_node(testexpr);
+                }
+                if let Some(subselect) = sl.subselect.as_deref_mut() {
+                    self.walk_node(subselect);
+                }
+            }
+            node::Node::NullTest(t) => {
+                if let Some(arg) = t.arg.as_deref_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::BooleanTest(t) => {
+                if let Some(arg) = t.arg.as_deref_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::List(l) => {
+                for item in l.items.iter_mut() {
+                    self.walk_node(item);
+                }
+            }
+            node::Node::ArrayExpr(a) => {
+                for elem in a.elements.iter_mut() {
+                    self.walk_node(elem);
+                }
+            }
+            node::Node::RowExpr(r) => {
+                for arg in r.args.iter_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            node::Node::ResTarget(rt) => {
+                if let Some(val) = rt.val.as_deref_mut() {
+                    self.walk_node(val);
+                }
+            }
+            node::Node::SortBy(sb) => {
+                if let Some(n) = sb.node.as_deref_mut() {
+                    self.walk_node(n);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn walk_select(&mut self, sel: &mut protobuf::SelectStmt) {
+        if let Some(larg) = sel.larg.as_deref_mut() {
+            self.walk_select(larg);
+        }
+        if let Some(rarg) = sel.rarg.as_deref_mut() {
+            self.walk_select(rarg);
+        }
+        if let Some(with) = sel.with_clause.as_mut() {
+            for cte_node in with.ctes.iter_mut() {
+                if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_mut()
+                    && let Some(query) = cte.ctequery.as_deref_mut()
+                {
+                    self.walk_node(query);
+                }
+            }
+        }
+        for from_item in sel.from_clause.iter_mut() {
+            self.process_from_item(from_item);
+        }
+        for t in sel.target_list.iter_mut() {
+            self.walk_node(t);
+        }
+        if let Some(w) = sel.where_clause.as_deref_mut() {
+            self.walk_node(w);
+        }
+        for g in sel.group_clause.iter_mut() {
+            self.walk_node(g);
+        }
+        if let Some(h) = sel.having_clause.as_deref_mut() {
+            self.walk_node(h);
+        }
+        for s in sel.sort_clause.iter_mut() {
+            self.walk_node(s);
+        }
+        for d in sel.distinct_clause.iter_mut() {
+            self.walk_node(d);
+        }
+    }
+
+    fn process_from_item(&mut self, n: &mut protobuf::Node) {
+        let Some(inner) = n.node.as_mut() else {
+            return;
+        };
+        match inner {
+            node::Node::RangeVar(rv) => {
+                let b = self.pop();
+                if let ViewBinding::Relation(relid) = b {
+                    self.apply_range_var(rv, relid);
+                }
+            }
+            node::Node::JoinExpr(join) => {
+                if let Some(larg) = join.larg.as_deref_mut() {
+                    self.process_from_item(larg);
+                }
+                if let Some(rarg) = join.rarg.as_deref_mut() {
+                    self.process_from_item(rarg);
+                }
+                if let Some(q) = join.quals.as_deref_mut() {
+                    self.walk_node(q);
+                }
+            }
+            node::Node::RangeSubselect(sub) => {
+                if let Some(query) = sub.subquery.as_deref_mut() {
+                    self.walk_node(query);
+                }
+            }
+            node::Node::RangeFunction(rf) => {
+                for arg in rf.functions.iter_mut() {
+                    self.walk_node(arg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_range_var(&self, rv: &mut protobuf::RangeVar, relid: PgClassOid) {
+        let Some(class) = self.snapshot.pg_class.get(&relid) else {
+            return;
+        };
+        let Some(nsname) = self.snapshot.namespace_name(class.relnamespace) else {
+            return;
+        };
+        // Preserve schema-less form when the original AST had it: only emit
+        // the schema portion if the AST already had one.
+        if !rv.schemaname.is_empty() {
+            rv.schemaname = nsname.to_owned();
+        }
+        rv.relname = class.relname.clone();
+    }
+
+    fn apply_column_ref(&self, cr: &mut protobuf::ColumnRef, relid: PgClassOid, attnum: i16) {
+        let Some(class) = self.snapshot.pg_class.get(&relid) else {
+            return;
+        };
+        let Some(attr) = self
+            .snapshot
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+        else {
+            return;
+        };
+        let nsname = self.snapshot.namespace_name(class.relnamespace);
+
+        let segments: Vec<Option<&mut String>> = cr
+            .fields
+            .iter_mut()
+            .map(|f| match f.node.as_mut() {
+                Some(node::Node::String(s)) => Some(&mut s.sval),
+                _ => None,
+            })
+            .collect();
+        match segments.len() {
+            // [col] — bare column. Update terminal.
+            1 => {
+                if let Some(Some(s)) = segments.into_iter().next() {
+                    *s = attr.attname.clone();
+                }
+            }
+            // [alias_or_relname, col] — qualifier could be an alias OR the
+            // bare table name. We can't tell without scope; leave the
+            // qualifier alone (RENAME ALIAS isn't a thing; RENAME TABLE
+            // updates the qualifier only when it spelled the relation
+            // name, which we'd need more context for). Update only the
+            // terminal.
+            2 => {
+                let mut iter = segments.into_iter();
+                let _ = iter.next();
+                if let Some(Some(s)) = iter.next() {
+                    *s = attr.attname.clone();
+                }
+            }
+            // [schema, relname, col] — fully qualified. Update all three.
+            3 => {
+                let mut iter = segments.into_iter();
+                if let (Some(Some(s_schema)), Some(Some(s_rel)), Some(Some(s_col))) =
+                    (iter.next(), iter.next(), iter.next())
+                {
+                    if let Some(ns) = nsname {
+                        *s_schema = ns.to_owned();
+                    }
+                    *s_rel = class.relname.clone();
+                    *s_col = attr.attname.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_func_name(&self, funcname: &mut [protobuf::Node], proc_oid: PgProcOid) {
+        let Some(proc) = self.snapshot.pg_proc.get(&proc_oid) else {
+            return;
+        };
+        // Only update the schema portion (proname stays — RENAME FUNCTION
+        // renames an exact overload, not all overloads, so we'd need full
+        // type-aware resolution to bind the right one). Schema move via
+        // SET SCHEMA does affect every overload, so it's safe to update.
+        if funcname.len() == 2
+            && let Some(node::Node::String(s)) = funcname[0].node.as_mut()
+            && let Some(ns) = self.snapshot.namespace_name(proc.pronamespace)
+        {
+            s.sval = ns.to_owned();
+        }
+    }
+
+    fn apply_type_name(&self, tn: &mut protobuf::TypeName, type_oid: PgTypeOid) {
+        let Some(t) = self.snapshot.pg_type.get(&type_oid) else {
+            return;
+        };
+        // Same restraint as apply_func_name: only fix the schema portion.
+        if tn.names.len() == 2
+            && let Some(node::Node::String(s)) = tn.names[0].node.as_mut()
+            && let Some(ns) = self.snapshot.namespace_name(t.typnamespace)
+        {
+            s.sval = ns.to_owned();
         }
     }
 }
 
 // ─── Dependency checking ────────────────────────────────────────────────────
 
-/// Find all views that depend on the given table or view.
-pub fn find_dependent_views(
-    snapshot: &crate::pg_catalog::PgCatalog,
-    table_key: &QualifiedName,
-) -> Vec<QualifiedName> {
-    snapshot
-        .tables
-        .iter()
-        .filter(|(_, t)| {
-            matches!(t.kind, RelationKind::View | RelationKind::MaterializedView)
-                && t.view_def
-                    .as_ref()
-                    .is_some_and(|vd| vd.depends_on_tables.iter().any(|k| k == table_key))
+/// Find all view OIDs that depend on the given table or view OID.
+pub fn find_dependent_views(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
+    let mut out: Vec<PgClassOid> = snapshot
+        .iter_pg_depend()
+        .filter(|d| {
+            matches!(d.deptype, DepType::Normal)
+                && d.classid == PG_CLASS_RELID
+                && d.refclassid == PG_CLASS_RELID
+                && d.refobjid.get() == relid.get()
         })
-        .map(|(k, _)| k.clone())
-        .collect()
+        .filter_map(|d| {
+            let obj = PgClassOid::new(d.objid.get())?;
+            let class = snapshot.pg_class.get(&obj)?;
+            matches!(class.relkind, RelKind::View | RelKind::MaterializedView).then_some(obj)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
-/// Find all views that depend on a specific column of a table.
+/// Find all view OIDs that depend on a specific column of a relation.
 pub fn find_views_depending_on_column(
-    snapshot: &crate::pg_catalog::PgCatalog,
-    table_key: &QualifiedName,
+    snapshot: &PgCatalog,
+    relid: PgClassOid,
     column_name: &str,
-) -> Vec<QualifiedName> {
-    snapshot
-        .tables
-        .iter()
-        .filter(|(_, t)| {
-            matches!(t.kind, RelationKind::View | RelationKind::MaterializedView)
-                && t.view_def.as_ref().is_some_and(|vd| {
-                    vd.depends_on_columns
-                        .iter()
-                        .any(|(tk, cname)| tk == table_key && cname == column_name)
-                })
+) -> Vec<PgClassOid> {
+    let Some(attr) = snapshot.attribute_by_name(relid, column_name) else {
+        return Vec::new();
+    };
+    let attnum = attr.attnum;
+    let mut out: Vec<PgClassOid> = snapshot
+        .iter_pg_depend()
+        .filter(|d| {
+            matches!(d.deptype, DepType::Normal)
+                && d.classid == PG_CLASS_RELID
+                && d.refclassid == PG_CLASS_RELID
+                && d.refobjid.get() == relid.get()
+                && d.refobjsubid == attnum
         })
-        .map(|(k, _)| k.clone())
-        .collect()
+        .filter_map(|d| {
+            let obj = PgClassOid::new(d.objid.get())?;
+            let class = snapshot.pg_class.get(&obj)?;
+            matches!(class.relkind, RelKind::View | RelKind::MaterializedView).then_some(obj)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
-/// Drop views by qualified name, transitively dropping any views that depend
-/// on them.
-pub fn drop_views(snapshot: &mut crate::pg_catalog::PgCatalog, view_keys: &[QualifiedName]) {
-    let mut to_drop: Vec<QualifiedName> = view_keys.to_vec();
-    let mut dropped: Vec<QualifiedName> = Vec::new();
+/// Drop views by OID, transitively dropping any views that depend on them.
+pub fn drop_views(snapshot: &mut PgCatalog, view_oids: &[PgClassOid]) {
+    let mut to_drop: Vec<PgClassOid> = view_oids.to_vec();
+    let mut dropped: Vec<PgClassOid> = Vec::new();
 
-    // Transitively find all dependents.
-    while let Some(key) = to_drop.pop() {
-        if dropped.contains(&key) {
+    while let Some(oid) = to_drop.pop() {
+        if dropped.contains(&oid) {
             continue;
         }
-        // Find views that depend on this one.
-        let dependents = find_dependent_views(snapshot, &key);
+        let dependents = find_dependent_views(snapshot, oid);
         for dep in dependents {
             if !dropped.contains(&dep) {
                 to_drop.push(dep);
             }
         }
-        // Drop this view.
-        snapshot.tables.remove(&key);
-        dropped.push(key);
+        super::drop::drop_relation_by_oid(snapshot, oid);
+        dropped.push(oid);
     }
 }
 
-// ─── AST rewriting (RENAME / SET SCHEMA propagation) ────────────────────────
+// (The legacy `AstEdit` machinery — `rewrite_ast_node` / `rewrite_select` /
+// `rewrite_from_item` / `rewrite_any` / `rewrite_column_ref` / helpers /
+// `apply_edit_to_all_views` — was deleted when the binding side-table
+// replaced it. RENAME / SET SCHEMA no longer touch the stored AST;
+// deparse-time `apply_view_bindings` rewrites name slots from the OIDs in
+// `pg_class.viewbindings`.)
 
-/// Mutations the rewrite walker can apply to a view's stored AST. Kept as a
-/// single enum so every entry point goes through the same traversal — adding
-/// a new kind of rename only requires a new variant.
-enum AstEdit<'a> {
-    /// A table/view was renamed (possibly cross-schema). Touches `RangeVar`s
-    /// and the `relname` part of two-element `ColumnRef` qualifiers.
-    Relation {
-        old: &'a QualifiedName,
-        new: &'a QualifiedName,
-    },
-    /// A column of `table` changed names. Finds every `RangeVar` that points
-    /// at `table`, collects its label (user alias or generated from relname),
-    /// then rewrites `label.old_col`/bare `old_col` targets to `new_col`.
-    Column {
-        table: &'a QualifiedName,
-        old_col: &'a str,
-        new_col: &'a str,
-    },
-    /// An entire schema was renamed. Touches `schemaname` on `RangeVar`s and
-    /// schema-qualified `TypeName`/`FuncCall` heads.
-    Schema {
-        old_schema: &'a str,
-        new_schema: &'a str,
-    },
-}
+// ─── AST rewriting entry points (called from ALTER handlers) ────────────────
+//
+// With the OID-resolved binding side-table, these are now no-ops: a rename
+// or schema move doesn't change any view's stored AST, because the bindings
+// keep pointing at the same OIDs. The applier substitutes current names at
+// deparse time. The functions are preserved as named callsites in case we
+// reintroduce a side-effect later (e.g. invalidating a cached deparse).
 
-fn rewrite_ast_node(
-    node: &mut protobuf::Node,
-    edit: &AstEdit,
-    snapshot: &crate::pg_catalog::PgCatalog,
+pub fn rewrite_views_on_table_rename(
+    _snapshot: &mut PgCatalog,
+    _old_schema: &str,
+    _old_name: &str,
+    _new_schema: &str,
+    _new_name: &str,
 ) {
-    let Some(inner) = node.node.as_mut() else {
-        return;
-    };
-    match inner {
-        node::Node::SelectStmt(sel) => rewrite_select(sel, edit, snapshot),
-        node::Node::ColumnRef(_) => {
-            // Bare ColumnRef handled inside rewrite_select where scope is
-            // known; if we hit one at top level there's no table context
-            // anyway, so nothing to do.
-        }
-        _ => {
-            // Nothing else at top level should carry table/column references
-            // for a VIEW query (which is always a SELECT).
-        }
-    }
 }
 
-fn rewrite_select(
-    sel: &mut protobuf::SelectStmt,
-    edit: &AstEdit,
-    snapshot: &crate::pg_catalog::PgCatalog,
+pub fn rewrite_views_on_column_rename(
+    _snapshot: &mut PgCatalog,
+    _relid: PgClassOid,
+    _old_col: &str,
+    _new_col: &str,
 ) {
-    if let Some(larg) = sel.larg.as_deref_mut() {
-        rewrite_select(larg, edit, snapshot);
-    }
-    if let Some(rarg) = sel.rarg.as_deref_mut() {
-        rewrite_select(rarg, edit, snapshot);
-    }
-
-    // CTEs first so later FROM items can reference them.
-    if let Some(with) = sel.with_clause.as_mut() {
-        for cte_node in with.ctes.iter_mut() {
-            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_mut()
-                && let Some(query) = cte.ctequery.as_deref_mut()
-            {
-                rewrite_ast_node(query, edit, snapshot);
-            }
-        }
-    }
-
-    // Rewrite RangeVars / apply the edit to every FROM item. This is the
-    // only place where schema/table renames fire on the scope side.
-    let mut rangevar_labels: Vec<(String, QualifiedName)> = Vec::new();
-    for from in sel.from_clause.iter_mut() {
-        rewrite_from_item(from, edit, snapshot, &mut rangevar_labels);
-    }
-
-    // For ColumnRename we need to know which labels point at the target
-    // table, so the walk of target_list/where/etc. can scope-limit the
-    // rename. For other edits the label set is unused.
-    let target_labels: Vec<String> = match edit {
-        AstEdit::Column { table, .. } => rangevar_labels
-            .iter()
-            .filter(|(_, qn)| qn == *table)
-            .map(|(label, _)| label.clone())
-            .collect(),
-        _ => Vec::new(),
-    };
-
-    for t in sel.target_list.iter_mut() {
-        rewrite_any(t, edit, &target_labels);
-    }
-    if let Some(w) = sel.where_clause.as_deref_mut() {
-        rewrite_any(w, edit, &target_labels);
-    }
-    for g in sel.group_clause.iter_mut() {
-        rewrite_any(g, edit, &target_labels);
-    }
-    if let Some(h) = sel.having_clause.as_deref_mut() {
-        rewrite_any(h, edit, &target_labels);
-    }
-    for s in sel.sort_clause.iter_mut() {
-        rewrite_any(s, edit, &target_labels);
-    }
-    for d in sel.distinct_clause.iter_mut() {
-        rewrite_any(d, edit, &target_labels);
-    }
 }
 
-fn rewrite_from_item(
-    n: &mut protobuf::Node,
-    edit: &AstEdit,
-    snapshot: &crate::pg_catalog::PgCatalog,
-    labels: &mut Vec<(String, QualifiedName)>,
+pub fn rewrite_views_on_schema_rename(
+    _snapshot: &mut PgCatalog,
+    _old_schema: &str,
+    _new_schema: &str,
 ) {
-    let Some(inner) = n.node.as_mut() else {
-        return;
-    };
-    match inner {
-        node::Node::RangeVar(rv) => {
-            // Apply the edit to the RangeVar itself before computing its
-            // label so later ColumnRename passes see the post-rename table.
-            match edit {
-                AstEdit::Relation { old, new } => {
-                    let cur_schema = resolve_rangevar_schema(rv, snapshot);
-                    if cur_schema == old.schema && rv.relname == old.name {
-                        rv.schemaname = new.schema.clone();
-                        rv.relname = new.name.clone();
-                    }
-                }
-                AstEdit::Schema {
-                    old_schema,
-                    new_schema,
-                } => {
-                    if rv.schemaname == *old_schema {
-                        rv.schemaname = (*new_schema).to_owned();
-                    }
-                }
-                AstEdit::Column { .. } => {}
-            }
-
-            // Compute the label this RangeVar exposes in the SELECT scope.
-            let label = rv
-                .alias
-                .as_ref()
-                .map(|a| a.aliasname.clone())
-                .unwrap_or_else(|| rv.relname.clone());
-            let qn = QualifiedName::new(resolve_rangevar_schema(rv, snapshot), rv.relname.clone());
-            labels.push((label, qn));
-        }
-        node::Node::JoinExpr(join) => {
-            if let Some(larg) = join.larg.as_deref_mut() {
-                rewrite_from_item(larg, edit, snapshot, labels);
-            }
-            if let Some(rarg) = join.rarg.as_deref_mut() {
-                rewrite_from_item(rarg, edit, snapshot, labels);
-            }
-            if let Some(q) = join.quals.as_deref_mut() {
-                // For JOIN quals, only ColumnRename cares about the scope;
-                // other edits already applied to RangeVars. Compute scoped
-                // labels locally so we don't leak them to the outer SELECT.
-                let scoped: Vec<String> = match edit {
-                    AstEdit::Column { table, .. } => labels
-                        .iter()
-                        .filter(|(_, qn)| qn == *table)
-                        .map(|(l, _)| l.clone())
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                rewrite_any(q, edit, &scoped);
-            }
-        }
-        node::Node::RangeSubselect(sub) => {
-            if let Some(query) = sub.subquery.as_deref_mut() {
-                rewrite_ast_node(query, edit, snapshot);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Walk an arbitrary expression node and apply the edit. `target_labels` is
-/// only consulted for `ColumnRename` — the set of RangeVar labels in the
-/// current scope that point at the target table.
-fn rewrite_any(n: &mut protobuf::Node, edit: &AstEdit, target_labels: &[String]) {
-    let Some(inner) = n.node.as_mut() else {
-        return;
-    };
-    match inner {
-        node::Node::ColumnRef(cr) => rewrite_column_ref(cr, edit, target_labels),
-        node::Node::AExpr(expr) => {
-            if let Some(l) = expr.lexpr.as_deref_mut() {
-                rewrite_any(l, edit, target_labels);
-            }
-            if let Some(r) = expr.rexpr.as_deref_mut() {
-                rewrite_any(r, edit, target_labels);
-            }
-        }
-        node::Node::BoolExpr(b) => {
-            for a in b.args.iter_mut() {
-                rewrite_any(a, edit, target_labels);
-            }
-        }
-        node::Node::FuncCall(fc) => {
-            if let AstEdit::Schema {
-                old_schema,
-                new_schema,
-            } = edit
-            {
-                rewrite_qualified_name_list(&mut fc.funcname, old_schema, new_schema);
-            }
-            for a in fc.args.iter_mut() {
-                rewrite_any(a, edit, target_labels);
-            }
-            if let Some(filter) = fc.agg_filter.as_deref_mut() {
-                rewrite_any(filter, edit, target_labels);
-            }
-            if let Some(over) = fc.over.as_deref_mut() {
-                for p in over.partition_clause.iter_mut() {
-                    rewrite_any(p, edit, target_labels);
-                }
-                for o in over.order_clause.iter_mut() {
-                    rewrite_any(o, edit, target_labels);
-                }
-            }
-        }
-        node::Node::TypeCast(tc) => {
-            if let Some(arg) = tc.arg.as_deref_mut() {
-                rewrite_any(arg, edit, target_labels);
-            }
-            if let (
-                AstEdit::Schema {
-                    old_schema,
-                    new_schema,
-                },
-                Some(tn),
-            ) = (edit, tc.type_name.as_mut())
-            {
-                rewrite_qualified_name_list(&mut tn.names, old_schema, new_schema);
-            }
-        }
-        node::Node::CoalesceExpr(c) => {
-            for a in c.args.iter_mut() {
-                rewrite_any(a, edit, target_labels);
-            }
-        }
-        node::Node::MinMaxExpr(m) => {
-            for a in m.args.iter_mut() {
-                rewrite_any(a, edit, target_labels);
-            }
-        }
-        node::Node::NullIfExpr(ne) => {
-            for a in ne.args.iter_mut() {
-                rewrite_any(a, edit, target_labels);
-            }
-        }
-        node::Node::CaseExpr(c) => {
-            if let Some(arg) = c.arg.as_deref_mut() {
-                rewrite_any(arg, edit, target_labels);
-            }
-            for b in c.args.iter_mut() {
-                rewrite_any(b, edit, target_labels);
-            }
-            if let Some(def) = c.defresult.as_deref_mut() {
-                rewrite_any(def, edit, target_labels);
-            }
-        }
-        node::Node::CaseWhen(w) => {
-            if let Some(expr) = w.expr.as_deref_mut() {
-                rewrite_any(expr, edit, target_labels);
-            }
-            if let Some(result) = w.result.as_deref_mut() {
-                rewrite_any(result, edit, target_labels);
-            }
-        }
-        node::Node::SubLink(sl) => {
-            if let Some(testexpr) = sl.testexpr.as_deref_mut() {
-                rewrite_any(testexpr, edit, target_labels);
-            }
-            if let Some(sub) = sl.subselect.as_deref_mut() {
-                // Subselect has its own scope; recurse at top level so the
-                // edit is re-evaluated against the inner FROM clause.
-                rewrite_ast_node(sub, edit, empty_snapshot_handle());
-            }
-        }
-        node::Node::NullTest(t) => {
-            if let Some(arg) = t.arg.as_deref_mut() {
-                rewrite_any(arg, edit, target_labels);
-            }
-        }
-        node::Node::BooleanTest(t) => {
-            if let Some(arg) = t.arg.as_deref_mut() {
-                rewrite_any(arg, edit, target_labels);
-            }
-        }
-        node::Node::List(l) => {
-            for i in l.items.iter_mut() {
-                rewrite_any(i, edit, target_labels);
-            }
-        }
-        node::Node::ArrayExpr(a) => {
-            for e in a.elements.iter_mut() {
-                rewrite_any(e, edit, target_labels);
-            }
-        }
-        node::Node::RowExpr(r) => {
-            for a in r.args.iter_mut() {
-                rewrite_any(a, edit, target_labels);
-            }
-        }
-        node::Node::ResTarget(rt) => {
-            if let Some(val) = rt.val.as_deref_mut() {
-                rewrite_any(val, edit, target_labels);
-            }
-        }
-        node::Node::SortBy(sb) => {
-            if let Some(v) = sb.node.as_deref_mut() {
-                rewrite_any(v, edit, target_labels);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_column_ref(cr: &mut protobuf::ColumnRef, edit: &AstEdit, target_labels: &[String]) {
-    // Collect field strings (skip AStar) into a working vector of owned
-    // strings keyed by position, so we can rewrite specific entries.
-    let parts: Vec<Option<String>> = cr
-        .fields
-        .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let string_count = parts.iter().filter(|p| p.is_some()).count();
-    match edit {
-        AstEdit::Relation { old, new } => {
-            // Two-part ColumnRef: `<relname>.<col>`. Rewrite `relname` when
-            // it matches `old.name` and either the qualifier has no schema
-            // explicitly (it comes from 2-part form) or the prefixed schema
-            // matches `old.schema`. Three-part ColumnRef `schema.rel.col`:
-            // rewrite both schema and rel.
-            if string_count == 2
-                && let [Some(p0), Some(_col)] = &parts[..2]
-                && p0.as_str() == old.name.as_str()
-            {
-                set_string_field(&mut cr.fields[0], &new.name);
-                // Note: 2-part ColumnRef has no explicit schema; schema of
-                // `old` and `new` might differ but the written form stays
-                // unqualified — which is still valid because the RangeVar
-                // above was also rewritten to the new QN.
-            }
-            if string_count == 3
-                && let [Some(p0), Some(p1), Some(_col)] = &parts[..3]
-                && p0.as_str() == old.schema.as_str()
-                && p1.as_str() == old.name.as_str()
-            {
-                set_string_field(&mut cr.fields[0], &new.schema);
-                set_string_field(&mut cr.fields[1], &new.name);
-            }
-        }
-        AstEdit::Schema {
-            old_schema,
-            new_schema,
-        } => {
-            if string_count == 3
-                && let Some(p0) = &parts[0]
-                && p0.as_str() == *old_schema
-            {
-                set_string_field(&mut cr.fields[0], new_schema);
-            }
-        }
-        AstEdit::Column {
-            table: _,
-            old_col,
-            new_col,
-        } => {
-            match string_count {
-                1 => {
-                    if let Some(col) = &parts[0]
-                        && col.as_str() == *old_col
-                        && !target_labels.is_empty()
-                    {
-                        // Unqualified ref in a scope where at least one label
-                        // points at the target table — assume it resolves
-                        // there. Any ambiguity would have already been flagged
-                        // by the analyzer at view-creation time.
-                        set_string_field(&mut cr.fields[0], new_col);
-                    }
-                }
-                2 => {
-                    if let [Some(qualifier), Some(col)] = &parts[..2]
-                        && col.as_str() == *old_col
-                        && target_labels.iter().any(|l| l == qualifier)
-                    {
-                        set_string_field(&mut cr.fields[1], new_col);
-                    }
-                }
-                3 => {
-                    if let [Some(_schema), Some(_rel), Some(col)] = &parts[..3]
-                        && col.as_str() == *old_col
-                    {
-                        // target_labels for 3-part refs would need schema
-                        // matching; we rely on RelationRename to have already
-                        // normalized the rel portion to point at the right
-                        // table. If the label of this schema-qualified ref
-                        // is in target_labels (rare), rewrite the column.
-                        if target_labels
-                            .iter()
-                            .any(|l| l == parts[1].as_ref().unwrap())
-                        {
-                            set_string_field(&mut cr.fields[2], new_col);
-                        } else {
-                            // Fallback: rewrite whenever column name matches
-                            // and the table portion matches the target.
-                            let _ = col;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn set_string_field(node: &mut protobuf::Node, new_value: &str) {
-    if let Some(node::Node::String(s)) = node.node.as_mut() {
-        s.sval = new_value.to_owned();
-    }
-}
-
-fn rewrite_qualified_name_list(names: &mut [protobuf::Node], old_schema: &str, new_schema: &str) {
-    // Two-element list: [schema, name]. Rewrite the schema entry.
-    if names.len() == 2
-        && let Some(node::Node::String(s)) = names[0].node.as_mut()
-        && s.sval == old_schema
-    {
-        s.sval = new_schema.to_owned();
-    }
-}
-
-fn resolve_rangevar_schema(
-    rv: &protobuf::RangeVar,
-    snapshot: &crate::pg_catalog::PgCatalog,
-) -> String {
-    if !rv.schemaname.is_empty() {
-        return rv.schemaname.clone();
-    }
-    // Mirror `resolve_table`'s search-path walk so the stored schema name
-    // matches what the analyzer would have used at view-creation time.
-    if let Some(table) = snapshot.resolve_table(None, &rv.relname) {
-        return table.schema.clone();
-    }
-    snapshot
-        .search_path
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "public".to_owned())
-}
-
-/// Placeholder catalog handle for recursive subselects during rewrite. The
-/// walker only consults the catalog to resolve a RangeVar's default schema
-/// when rewriting table renames inside a fresh scope — and the stored AST
-/// was fully qualified at creation time, so subselects always carry explicit
-/// `schemaname`. Passing a static empty catalog keeps the signature simple.
-fn empty_snapshot_handle() -> &'static crate::pg_catalog::PgCatalog {
-    use std::sync::OnceLock;
-    static EMPTY: OnceLock<crate::pg_catalog::PgCatalog> = OnceLock::new();
-    EMPTY.get_or_init(crate::pg_catalog::PgCatalog::empty)
-}
-
-fn apply_edit_to_all_views(snapshot: &mut crate::pg_catalog::PgCatalog, edit: AstEdit<'_>) {
-    // Snapshot the keys first; borrow issues otherwise since `rewrite_ast_node`
-    // needs an immutable snapshot handle for RangeVar schema resolution while
-    // we iterate mutably over the tables map.
-    let keys: Vec<QualifiedName> = snapshot
-        .tables
-        .iter()
-        .filter(|(_, t)| {
-            t.view_def
-                .as_ref()
-                .is_some_and(|v| !v.resolved_ast.is_empty())
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-
-    for key in keys {
-        // Pull the AST out, rewrite, and put it back.
-        let Some(entry) = snapshot.tables.get_mut(&key) else {
-            continue;
-        };
-        let Some(vd) = entry.view_def.as_mut() else {
-            continue;
-        };
-        let Some(mut ast) = decode_ast(&vd.resolved_ast) else {
-            continue;
-        };
-        // `rewrite_ast_node` reads from the snapshot only for computing
-        // RangeVar labels (SchemaRename/RelationRename already applied
-        // before we inspect labels), but we also use a static empty
-        // handle for subselect recursion — both paths are fine here.
-        let empty = empty_snapshot_handle();
-        rewrite_ast_node(&mut ast, &edit, empty);
-        vd.resolved_ast = encode_ast(&ast);
-    }
-}
-
-// ─── Dependency rewriting (RENAME / SET SCHEMA propagation) ─────────────────
-
-/// Rewrite every view's dependencies so references to `old` now point at `new`.
-/// Call this after renaming a table/view or moving it to a new schema.
-pub fn rewrite_deps_on_table_rename(
-    snapshot: &mut crate::pg_catalog::PgCatalog,
-    old: &QualifiedName,
-    new: &QualifiedName,
-) {
-    for table in snapshot.tables.values_mut() {
-        let Some(vd) = table.view_def.as_mut() else {
-            continue;
-        };
-        for k in vd.depends_on_tables.iter_mut() {
-            if k == old {
-                *k = new.clone();
-            }
-        }
-        for (k, _) in vd.depends_on_columns.iter_mut() {
-            if k == old {
-                *k = new.clone();
-            }
-        }
-    }
-    apply_edit_to_all_views(snapshot, AstEdit::Relation { old, new });
-}
-
-/// Rewrite every view's column-level dependencies after a column rename.
-pub fn rewrite_deps_on_column_rename(
-    snapshot: &mut crate::pg_catalog::PgCatalog,
-    table_key: &QualifiedName,
-    old_col: &str,
-    new_col: &str,
-) {
-    for table in snapshot.tables.values_mut() {
-        let Some(vd) = table.view_def.as_mut() else {
-            continue;
-        };
-        for (k, c) in vd.depends_on_columns.iter_mut() {
-            if k == table_key && c == old_col {
-                *c = new_col.to_owned();
-            }
-        }
-    }
-    apply_edit_to_all_views(
-        snapshot,
-        AstEdit::Column {
-            table: table_key,
-            old_col,
-            new_col,
-        },
-    );
-}
-
-/// Rewrite every view's dependencies after renaming a whole schema — any
-/// dependency whose schema matches `old_schema` has its schema field
-/// replaced with `new_schema`.
-pub fn rewrite_deps_on_schema_rename(
-    snapshot: &mut crate::pg_catalog::PgCatalog,
-    old_schema: &str,
-    new_schema: &str,
-) {
-    for table in snapshot.tables.values_mut() {
-        let Some(vd) = table.view_def.as_mut() else {
-            continue;
-        };
-        for k in vd.depends_on_tables.iter_mut() {
-            if k.schema == old_schema {
-                k.schema = new_schema.to_owned();
-            }
-        }
-        for (k, _) in vd.depends_on_columns.iter_mut() {
-            if k.schema == old_schema {
-                k.schema = new_schema.to_owned();
-            }
-        }
-    }
-    apply_edit_to_all_views(
-        snapshot,
-        AstEdit::Schema {
-            old_schema,
-            new_schema,
-        },
-    );
 }

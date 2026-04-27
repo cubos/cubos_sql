@@ -9,11 +9,6 @@ use crate::common::*;
 fn drop_operator_removes_only_matching_signature() {
     // pgvector registers multiple `<=>` overloads (vector/halfvec/sparsevec).
     // Dropping the (vector, vector) overload must leave the others alone.
-    //
-    // We inspect the raw registry directly because pgvector also defines
-    // implicit casts between vector, halfvec and sparsevec — so
-    // `find_operator` would still succeed via cast-based resolution after
-    // the exact (vector, vector) entry is removed.
     let snap = build(&[(
         "0001.sql",
         "CREATE EXTENSION vector;
@@ -23,19 +18,25 @@ fn drop_operator_removes_only_matching_signature() {
     let vector_oid = snap.resolve_type_by_name(None, "vector").unwrap().oid;
     let halfvec_oid = snap.resolve_type_by_name(None, "halfvec").unwrap().oid;
 
-    let ops = snap
-        .operators_by_name()
-        .get(&QualifiedName::new("public", "<=>"))
-        .expect("other overloads should still be registered");
+    let public_oid = snap.namespace_oid("public").unwrap();
+    let ops: Vec<&PgOperator> = snap
+        .pg_operator()
+        .values()
+        .filter(|o| o.oprnamespace == public_oid && o.oprname == "<=>")
+        .collect();
+    assert!(
+        !ops.is_empty(),
+        "other overloads should still be registered"
+    );
 
     assert!(
         !ops.iter()
-            .any(|o| o.left_type_oid == Some(vector_oid) && o.right_type_oid == vector_oid),
+            .any(|o| o.oprleft == Some(vector_oid) && o.oprright == vector_oid),
         "(vector, vector) overload should have been dropped"
     );
     assert!(
         ops.iter()
-            .any(|o| o.left_type_oid == Some(halfvec_oid) && o.right_type_oid == halfvec_oid),
+            .any(|o| o.oprleft == Some(halfvec_oid) && o.oprright == halfvec_oid),
         "(halfvec, halfvec) overload should still be registered"
     );
 }
@@ -55,9 +56,6 @@ fn drop_operator_missing_errors_without_if_exists() {
 
 #[test]
 fn alter_operator_is_noop_but_does_not_crash() {
-    // ALTER OPERATOR currently only changes attributes (join selectivity,
-    // restriction selectivity). None of those affect type analysis, so this
-    // must be a successful no-op.
     let _snap = build(&[(
         "0001.sql",
         "CREATE EXTENSION vector;

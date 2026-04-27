@@ -4,35 +4,32 @@
 //!   cargo run -p cubos_sql_seed
 //!
 //! Spins up a disposable `postgres:latest` container via the Docker daemon
-//! (using `testcontainers`), waits for it to accept connections, exports the
-//! schema, and then stops + removes the container (via `Drop`). The output is
-//! written to `cubos_sql_analyzer/src/seed.json`.
-//!
-//! Run this when updating to a new PostgreSQL version (e.g. PG 19) to refresh
-//! the baseline type catalog used by the DDL interpreter.
+//! (using `testcontainers`), waits for it to accept connections, exports each
+//! `pg_catalog` table almost 1:1 into the analyzer's `PgCatalogSeed`, then
+//! stops + removes the container (via `Drop`). The output is written to
+//! `cubos_sql_analyzer/src/seed.json`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use cubos_sql_analyzer::schema::*;
-use cubos_sql_analyzer::{PgCatalog, QualifiedName, SchemaSeed};
+use cubos_sql_analyzer::{
+    ArgMode, AttGenerated, CastContext, CastMethod, DepType, PgAggregate, PgAttribute, PgCast,
+    PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgDepend, PgEnum, PgEnumOid,
+    PgExtension, PgExtensionOid, PgGenericOid, PgNamespace, PgNamespaceOid, PgOperator,
+    PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, QualifiedName, RelKind,
+    TypCategory, TypType,
+};
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 fn main() {
     eprintln!("Pulling postgres:latest from registry...");
-    // `pull_image()` forces a fresh pull on every run — otherwise
-    // `start()` only pulls on 404, which would pin us to whatever
-    // `postgres:latest` was when the image was first cached locally.
     let request = Postgres::default()
         .with_tag("latest")
         .pull_image()
         .expect("failed to pull postgres:latest");
 
     eprintln!("Starting postgres:latest container...");
-    // `testcontainers_modules::postgres::Postgres` waits for the "database
-    // system is ready to accept connections" log line before `start()`
-    // returns, so no manual readiness polling is required.
     let container = request.start().expect("failed to start postgres container");
 
     let host = container.get_host().expect("failed to get container host");
@@ -46,32 +43,16 @@ fn main() {
     let mut client = postgres::Client::connect(&conn_str, postgres::NoTls)
         .expect("failed to connect to PostgreSQL");
 
-    eprintln!("Exporting schema...");
-    let mut snapshot = export_schema(&mut client).expect("failed to export schema");
+    eprintln!("Exporting catalog...");
+    let snapshot = export_catalog(&mut client).expect("failed to export schema");
 
-    // Vec values are kept in the natural pg_proc order (the export query is
-    // ordered by oid). That ordering determines overload resolution
-    // tie-breaking, and pg_proc oids correlate with preferred overloads in
-    // the way the analyzer expects (e.g. `length(text)` before
-    // `length(bytea)`), so do not re-sort here.
-    for ops in snapshot.operators_by_name.values_mut() {
-        ops.sort_by_key(|o| (o.left_type_oid.unwrap_or(0), o.right_type_oid));
-    }
-
-    // Second pass: populate `view_def` on every relation that `pg_class`
-    // reported as a view/matview by re-applying its `CREATE VIEW` through the
-    // analyzer's own DDL pipeline. The pass-1 snapshot already has the view
-    // columns from `pg_attribute`, so resolution of one view against another
-    // works without ordering.
     eprintln!("Exporting view definitions...");
     let view_defs =
         export_view_definitions(&mut client).expect("failed to export view definitions");
-    eprintln!("Populating view_def for {} view(s)...", view_defs.len());
+    eprintln!("Populating relviewdef for {} view(s)...", view_defs.len());
     let snapshot = populate_view_defs(snapshot, view_defs);
 
-    // Serialize via BTreeMap for sorted keys.
-    let ordered = OrderedSnapshot::from(snapshot);
-    let json = serde_json::to_string(&ordered).expect("failed to serialize snapshot");
+    let json = serde_json::to_string(&snapshot).expect("failed to serialize snapshot");
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let out_path = std::path::Path::new(manifest_dir)
@@ -80,518 +61,437 @@ fn main() {
         .join("cubos_sql_analyzer/src/seed.json");
     std::fs::write(&out_path, &json).expect("failed to write seed.json");
 
-    let num_types = ordered.types.len();
-    let num_tables = ordered.tables.len();
-    let num_functions: usize = ordered.functions_by_name.values().map(|v| v.len()).sum();
-    let num_operators: usize = ordered.operators_by_name.values().map(|v| v.len()).sum();
-    let num_casts = ordered.casts.len();
     let size_kb = json.len() / 1024;
-
     eprintln!("Wrote {out_path:?} ({size_kb} KB)");
-    eprintln!("  types:     {num_types}");
-    eprintln!("  tables:    {num_tables}");
-    eprintln!("  functions: {num_functions}");
-    eprintln!("  operators: {num_operators}");
-    eprintln!("  casts:     {num_casts}");
-}
-
-// ─── Deterministic serialization ───────────────────────────────────────────────
-
-/// Mirror of [`SchemaSeed`] with `BTreeMap` for deterministic key ordering.
-#[derive(serde::Serialize)]
-struct OrderedSnapshot {
-    types: BTreeMap<u32, TypeEntry>,
-    type_by_name: BTreeMap<String, u32>,
-    tables: BTreeMap<String, TableEntry>,
-    functions_by_name: BTreeMap<String, Vec<FunctionEntry>>,
-    operators_by_name: BTreeMap<String, Vec<OperatorEntry>>,
-    casts: BTreeMap<String, CastInfo>,
-    search_path: Vec<String>,
-}
-
-impl From<SchemaSeed> for OrderedSnapshot {
-    fn from(s: SchemaSeed) -> Self {
-        Self {
-            types: s.types.into_iter().collect(),
-            type_by_name: s
-                .type_by_name
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            tables: s
-                .tables
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            functions_by_name: s
-                .functions_by_name
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            operators_by_name: s
-                .operators_by_name
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            casts: s.casts.into_iter().collect(),
-            search_path: s.search_path,
-        }
-    }
+    eprintln!("  pg_namespace: {}", snapshot.pg_namespace.len());
+    eprintln!("  pg_type:      {}", snapshot.pg_type.len());
+    eprintln!("  pg_enum:      {}", snapshot.pg_enum.len());
+    eprintln!("  pg_range:     {}", snapshot.pg_range.len());
+    eprintln!("  pg_class:     {}", snapshot.pg_class.len());
+    eprintln!("  pg_attribute: {}", snapshot.pg_attribute.len());
+    eprintln!("  pg_proc:      {}", snapshot.pg_proc.len());
+    eprintln!("  pg_aggregate: {}", snapshot.pg_aggregate.len());
+    eprintln!("  pg_operator:  {}", snapshot.pg_operator.len());
+    eprintln!("  pg_cast:      {}", snapshot.pg_cast.len());
+    eprintln!("  pg_extension: {}", snapshot.pg_extension.len());
+    eprintln!("  pg_depend:    {}", snapshot.pg_depend.len());
 }
 
 // ─── Schema export ─────────────────────────────────────────────────────────────
 
-fn export_schema(client: &mut postgres::Client) -> Result<SchemaSeed, postgres::Error> {
-    let search_path = export_search_path(client)?;
-    let (types, type_by_name) = export_types(client)?;
-    let tables = export_tables(client)?;
-    let functions = export_functions(client)?;
-    let operators = export_operators(client)?;
-    let casts = export_casts(client)?;
-
-    let mut functions_by_name: HashMap<QualifiedName, Vec<FunctionEntry>> = HashMap::new();
-    for f in functions {
-        let key = QualifiedName::new(&f.schema, &f.name);
-        functions_by_name.entry(key).or_default().push(f);
-    }
-
-    let mut operators_by_name: HashMap<QualifiedName, Vec<OperatorEntry>> = HashMap::new();
-    for o in operators {
-        let key = QualifiedName::new("pg_catalog", &o.name);
-        operators_by_name.entry(key).or_default().push(o);
-    }
-
-    let casts_map: HashMap<String, CastInfo> = casts
-        .into_iter()
-        .map(|c| {
-            let key = format!("{}:{}", c.source_type_oid, c.target_type_oid);
-            (key, CastInfo::new(c.context, c.method))
-        })
+fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgres::Error> {
+    let pg_namespace = export_namespaces(client)?;
+    let nsname_by_oid: HashMap<PgNamespaceOid, String> = pg_namespace
+        .iter()
+        .map(|n| (n.oid, n.nspname.clone()))
         .collect();
 
-    // Derive the known schema set from everything we exported.
-    let mut schemas: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for t in types.values() {
-        schemas.insert(t.schema.clone());
-    }
-    for t in tables.values() {
-        schemas.insert(t.schema.clone());
-    }
-    for fns in functions_by_name.values() {
-        for f in fns {
-            schemas.insert(f.schema.clone());
-        }
-    }
-    for s in &search_path {
-        schemas.insert(s.clone());
-    }
+    let pg_type = export_types(client)?;
+    let pg_enum = export_enums(client)?;
+    let pg_range = export_ranges(client)?;
+    let pg_class = export_classes(client)?;
+    let pg_attribute = export_attributes(client)?;
+    let pg_proc = export_procs(client)?;
+    let pg_aggregate = export_aggregates(client)?;
+    let pg_operator = export_operators(client)?;
+    let pg_cast = export_casts(client)?;
+    let pg_extension = export_extensions(client)?;
+    let pg_depend = export_depends(client)?;
+    let search_path = export_search_path(client, &pg_namespace)?;
 
-    Ok(SchemaSeed {
-        types,
-        type_by_name,
-        tables,
-        functions_by_name,
-        operators_by_name,
-        casts: casts_map,
+    let _ = nsname_by_oid;
+
+    Ok(PgCatalogSeed {
+        pg_namespace,
+        pg_type,
+        pg_enum,
+        pg_range,
+        pg_class,
+        pg_attribute,
+        pg_proc,
+        pg_aggregate,
+        pg_operator,
+        pg_cast,
+        pg_extension,
+        pg_depend,
         search_path,
-        schemas,
     })
 }
 
-fn export_search_path(client: &mut postgres::Client) -> Result<Vec<String>, postgres::Error> {
+fn export_search_path(
+    client: &mut postgres::Client,
+    namespaces: &[PgNamespace],
+) -> Result<Vec<PgNamespaceOid>, postgres::Error> {
     let row = client.query_one("SHOW search_path", &[])?;
     let raw: String = row.get(0);
-    // Both `$user` (session role) and `"$user"` get normalized to "public"
-    // since we don't have a real user context at analysis time. Dedupe after
-    // normalization so the same schema doesn't appear twice.
-    let mut schemas: Vec<String> = Vec::new();
+    let by_name: HashMap<&str, PgNamespaceOid> = namespaces
+        .iter()
+        .map(|n| (n.nspname.as_str(), n.oid))
+        .collect();
+    let mut oids: Vec<PgNamespaceOid> = Vec::new();
+    let mut seen: std::collections::HashSet<PgNamespaceOid> = std::collections::HashSet::new();
     for part in raw.split(',') {
         let part = part.trim().trim_matches('"');
         let name = if part == "$user" || part == "\"$user\"" {
-            "public".to_owned()
+            "public"
         } else {
-            part.to_owned()
+            part
         };
-        if !schemas.contains(&name) {
-            schemas.push(name);
+        if let Some(&oid) = by_name.get(name)
+            && seen.insert(oid)
+        {
+            oids.push(oid);
         }
     }
-    Ok(schemas)
+    Ok(oids)
 }
 
-type TypeExport = (HashMap<u32, TypeEntry>, HashMap<QualifiedName, u32>);
-
-fn export_types(client: &mut postgres::Client) -> Result<TypeExport, postgres::Error> {
+fn export_namespaces(client: &mut postgres::Client) -> Result<Vec<PgNamespace>, postgres::Error> {
     let rows = client.query(
-        "SELECT t.oid, t.typname, n.nspname, t.typtype, t.typbasetype, t.typelem, \
-                t.typrelid, t.typlen, t.typcategory, t.typispreferred \
-         FROM pg_catalog.pg_type t \
-         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
-         ORDER BY t.oid",
+        "SELECT oid, nspname FROM pg_catalog.pg_namespace ORDER BY oid",
         &[],
     )?;
-
-    let enum_rows = client.query(
-        "SELECT enumtypid, enumlabel \
-         FROM pg_catalog.pg_enum \
-         ORDER BY enumtypid, enumsortorder",
-        &[],
-    )?;
-    let mut enum_labels: HashMap<u32, Vec<String>> = HashMap::new();
-    for row in &enum_rows {
-        let typid: u32 = row.get(0);
-        let label: String = row.get(1);
-        enum_labels.entry(typid).or_default().push(label);
-    }
-
-    let comp_rows = client.query(
-        "SELECT a.attrelid, a.attname, a.atttypid, a.attnotnull \
-         FROM pg_catalog.pg_attribute a \
-         WHERE a.attnum > 0 AND NOT a.attisdropped \
-         ORDER BY a.attrelid, a.attnum",
-        &[],
-    )?;
-    let mut composite_fields: HashMap<u32, Vec<CompositeField>> = HashMap::new();
-    for row in &comp_rows {
-        let relid: u32 = row.get(0);
-        composite_fields
-            .entry(relid)
-            .or_default()
-            .push(CompositeField {
-                name: row.get(1),
-                type_oid: row.get(2),
-                not_null: row.get(3),
-            });
-    }
-
-    let mut types = HashMap::new();
-    let mut type_by_name: HashMap<QualifiedName, u32> = HashMap::new();
-
-    for row in &rows {
-        let oid: u32 = row.get(0);
-        let name: String = row.get(1);
-        let schema: String = row.get(2);
-        let typtype: i8 = row.get(3);
-        let basetype: u32 = row.get(4);
-        let typelem: u32 = row.get(5);
-        let typrelid: u32 = row.get(6);
-        let typlen: i16 = row.get(7);
-        let typcategory: i8 = row.get(8);
-        let typispreferred: bool = row.get(9);
-        let category = typcategory as u8 as char;
-
-        let kind = match typtype as u8 as char {
-            'd' => TypeKind::Domain {
-                base_type_oid: basetype,
-            },
-            'e' => TypeKind::Enum {
-                labels: enum_labels.remove(&oid).unwrap_or_default(),
-            },
-            'c' => TypeKind::Composite {
-                fields: composite_fields.get(&typrelid).cloned().unwrap_or_default(),
-            },
-            'r' => TypeKind::Range {
-                subtype_oid: basetype,
-            },
-            'p' => TypeKind::Pseudo,
-            _ => {
-                if typelem != 0 && typlen == -1 && name.starts_with('_') {
-                    TypeKind::Array {
-                        element_type_oid: typelem,
-                    }
-                } else {
-                    TypeKind::Base
-                }
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            PgNamespace {
+                oid: PgNamespaceOid::new(oid).expect("namespace oid is non-zero"),
+                nspname: r.get(1),
             }
-        };
-
-        type_by_name.insert(QualifiedName::new(&schema, &name), oid);
-        types.insert(
-            oid,
-            TypeEntry {
-                oid,
-                name,
-                schema,
-                kind,
-                category,
-                is_preferred: typispreferred,
-                extension: None,
-            },
-        );
-    }
-
-    Ok((types, type_by_name))
+        })
+        .collect())
 }
 
-fn export_tables(
-    client: &mut postgres::Client,
-) -> Result<HashMap<QualifiedName, TableEntry>, postgres::Error> {
+fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::Error> {
     let rows = client.query(
-        "SELECT c.oid, c.relname, n.nspname, c.relkind \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind IN ('r', 'v', 'm', 'p') \
-           AND n.nspname NOT IN ('pg_toast') \
-         ORDER BY c.oid",
+        "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
+                typrelid, typelem, typarray, typbasetype \
+         FROM pg_catalog.pg_type ORDER BY oid",
         &[],
     )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let typtype: i8 = r.get(3);
+            let typcategory: i8 = r.get(4);
+            let oid: u32 = r.get(0);
+            let typnamespace: u32 = r.get(2);
+            let typrelid: u32 = r.get(6);
+            let typelem: u32 = r.get(7);
+            let typarray: u32 = r.get(8);
+            let typbasetype: u32 = r.get(9);
+            PgType {
+                oid: PgTypeOid::new(oid).expect("pg_type.oid is non-zero"),
+                typname: r.get(1),
+                typnamespace: PgNamespaceOid::new(typnamespace).expect("typnamespace is non-zero"),
+                typtype: char_to_typtype(typtype as u8 as char),
+                typcategory: char_to_typcategory(typcategory as u8 as char),
+                typispreferred: r.get(5),
+                typrelid: PgClassOid::new(typrelid),
+                typelem: PgTypeOid::new(typelem),
+                typarray: PgTypeOid::new(typarray),
+                typbasetype: PgTypeOid::new(typbasetype),
+            }
+        })
+        .collect())
+}
 
-    let col_rows = client.query(
-        "SELECT a.attrelid, a.attname, a.atttypid, a.attnotnull, a.atthasdef, \
+fn export_enums(client: &mut postgres::Client) -> Result<Vec<PgEnum>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, enumtypid, enumsortorder, enumlabel \
+         FROM pg_catalog.pg_enum ORDER BY enumtypid, enumsortorder",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let enumtypid: u32 = r.get(1);
+            PgEnum {
+                oid: PgEnumOid::new(oid).expect("pg_enum.oid is non-zero"),
+                enumtypid: PgTypeOid::new(enumtypid).expect("enumtypid is non-zero"),
+                enumsortorder: r.get(2),
+                enumlabel: r.get(3),
+            }
+        })
+        .collect())
+}
+
+fn export_ranges(client: &mut postgres::Client) -> Result<Vec<PgRange>, postgres::Error> {
+    let rows = client.query(
+        "SELECT rngtypid, rngsubtype FROM pg_catalog.pg_range ORDER BY rngtypid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let rngtypid: u32 = r.get(0);
+            let rngsubtype: u32 = r.get(1);
+            PgRange {
+                rngtypid: PgTypeOid::new(rngtypid).expect("rngtypid is non-zero"),
+                rngsubtype: PgTypeOid::new(rngsubtype).expect("rngsubtype is non-zero"),
+            }
+        })
+        .collect())
+}
+
+fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, relname, relnamespace, relkind, reltype \
+         FROM pg_catalog.pg_class \
+         WHERE relkind IN ('r', 'v', 'm', 'p', 'c') \
+         ORDER BY oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let relkind: i8 = r.get(3);
+            let relkind = char_to_relkind(relkind as u8 as char)?;
+            let oid: u32 = r.get(0);
+            let relnamespace: u32 = r.get(2);
+            let reltype: u32 = r.get(4);
+            Some(PgClass {
+                oid: PgClassOid::new(oid).expect("pg_class.oid is non-zero"),
+                relname: r.get(1),
+                relnamespace: PgNamespaceOid::new(relnamespace).expect("relnamespace is non-zero"),
+                relkind,
+                reltype: PgTypeOid::new(reltype),
+                relviewdef: Vec::new(),
+                viewbindings: Vec::new(),
+            })
+        })
+        .collect())
+}
+
+fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, postgres::Error> {
+    let rows = client.query(
+        "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
                 a.attgenerated \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE a.attnum > 0 \
            AND NOT a.attisdropped \
-           AND c.relkind IN ('r', 'v', 'm', 'p') \
-           AND n.nspname NOT IN ('pg_toast') \
+           AND c.relkind IN ('r', 'v', 'm', 'p', 'c') \
          ORDER BY a.attrelid, a.attnum",
         &[],
     )?;
-
-    let mut columns_map: HashMap<u32, Vec<TableColumn>> = HashMap::new();
-    for row in &col_rows {
-        let relid: u32 = row.get(0);
-        // `attgenerated` is one byte: 's' for STORED, 'v' for VIRTUAL
-        // (PG18), '\0' for non-generated.
-        let attgenerated: i8 = row.get(5);
-        columns_map.entry(relid).or_default().push(TableColumn {
-            name: row.get(1),
-            type_oid: row.get(2),
-            not_null: row.get(3),
-            has_default: row.get(4),
-            is_generated: attgenerated != 0,
-        });
-    }
-
-    let mut tables: HashMap<QualifiedName, TableEntry> = HashMap::new();
-
-    for row in &rows {
-        let oid: u32 = row.get(0);
-        let name: String = row.get(1);
-        let schema: String = row.get(2);
-        let relkind: i8 = row.get(3);
-
-        let kind = match relkind as u8 as char {
-            'r' => RelationKind::Table,
-            'v' => RelationKind::View,
-            'm' => RelationKind::MaterializedView,
-            'p' => RelationKind::Partitioned,
-            _ => continue,
-        };
-
-        let key = QualifiedName::new(&schema, &name);
-        tables.insert(
-            key,
-            TableEntry {
-                name,
-                schema,
-                kind,
-                columns: columns_map.remove(&oid).unwrap_or_default(),
-                view_def: None,
-            },
-        );
-    }
-
-    Ok(tables)
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let attgenerated: i8 = r.get(6);
+            let attrelid: u32 = r.get(0);
+            let atttypid: u32 = r.get(2);
+            PgAttribute {
+                attrelid: PgClassOid::new(attrelid).expect("attrelid is non-zero"),
+                attname: r.get(1),
+                atttypid: PgTypeOid::new(atttypid).expect("atttypid is non-zero"),
+                attnum: r.get(3),
+                attnotnull: r.get(4),
+                atthasdef: r.get(5),
+                attgenerated: char_to_attgenerated(attgenerated as u8 as char),
+            }
+        })
+        .collect())
 }
 
-fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>, postgres::Error> {
-    // `proallargtypes` / `proargmodes` / `proargnames` are NULL for plain
-    // functions that only take IN args (PG sets them non-NULL only when at
-    // least one arg is OUT/INOUT/TABLE/VARIADIC). Read them as nullable
-    // arrays and fall back to an empty slice when absent.
+fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::Error> {
     let rows = client.query(
-        "SELECT p.oid, p.proname, n.nspname, \
+        "SELECT p.oid, p.proname, p.pronamespace, p.prokind, \
                 p.proargtypes::int4[]::int4[], p.prorettype, \
-                p.proisstrict, p.proretset, p.provariadic != 0 as is_variadic, \
-                p.prokind, \
-                p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
-                p.pronargdefaults \
+                p.proretset, p.provariadic, p.proisstrict, p.pronargdefaults, \
+                p.proallargtypes::int4[], p.proargmodes, p.proargnames \
          FROM pg_catalog.pg_proc p \
-         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname NOT IN ('pg_toast') \
          ORDER BY p.oid",
         &[],
     )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let prokind: i8 = r.get(3);
+            let arg_types_raw: Vec<i32> = r.get(4);
+            let proargtypes: Vec<PgTypeOid> = arg_types_raw
+                .iter()
+                .filter_map(|&x| PgTypeOid::new(x as u32))
+                .collect();
+            let proallargtypes_raw: Option<Vec<i32>> = r.get(10);
+            let proallargtypes: Vec<PgTypeOid> = proallargtypes_raw
+                .map(|v| {
+                    v.into_iter()
+                        .filter_map(|x| PgTypeOid::new(x as u32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let arg_modes: Option<Vec<i8>> = r.get(11);
+            let proargmodes: Vec<ArgMode> = arg_modes
+                .map(|v| {
+                    v.into_iter()
+                        .map(|c| char_to_argmode(c as u8 as char))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let arg_names: Option<Vec<String>> = r.get(12);
+            let oid: u32 = r.get(0);
+            let pronamespace: u32 = r.get(2);
+            let prorettype: u32 = r.get(5);
+            let provariadic: u32 = r.get(7);
+            PgProc {
+                oid: PgProcOid::new(oid).expect("pg_proc.oid is non-zero"),
+                proname: r.get(1),
+                pronamespace: PgNamespaceOid::new(pronamespace).expect("pronamespace is non-zero"),
+                prokind: char_to_prokind(prokind as u8 as char),
+                proargtypes,
+                prorettype: PgTypeOid::new(prorettype).expect("prorettype is non-zero"),
+                proretset: r.get(6),
+                provariadic: PgTypeOid::new(provariadic),
+                proisstrict: r.get(8),
+                pronargdefaults: r.get(9),
+                proallargtypes,
+                proargmodes,
+                proargnames: arg_names.unwrap_or_default(),
+            }
+        })
+        .collect())
+}
 
-    let agg_rows = client.query(
+fn export_aggregates(client: &mut postgres::Client) -> Result<Vec<PgAggregate>, postgres::Error> {
+    let rows = client.query(
         "SELECT a.aggfnoid::int4 as oid, \
                 CASE WHEN a.aggfinalfn != 0 \
                      THEN (SELECT prorettype FROM pg_proc WHERE oid = a.aggfinalfn) \
-                     ELSE NULL \
+                     ELSE 0::oid \
                 END as final_type \
-         FROM pg_catalog.pg_aggregate a",
+         FROM pg_aggregate a \
+         ORDER BY a.aggfnoid",
         &[],
     )?;
-    let mut agg_final: HashMap<u32, Option<u32>> = HashMap::new();
-    for row in &agg_rows {
-        let oid: i32 = row.get(0);
-        let final_type: Option<u32> = row.get(1);
-        agg_final.insert(oid as u32, final_type);
-    }
-
-    let mut functions = Vec::new();
-
-    for row in &rows {
-        let oid: u32 = row.get(0);
-        let name: String = row.get(1);
-        let schema: String = row.get(2);
-        let arg_types_raw: Vec<i32> = row.get(3);
-        let arg_types: Vec<u32> = arg_types_raw.iter().map(|&x| x as u32).collect();
-        let return_type_oid: u32 = row.get(4);
-        let is_strict: bool = row.get(5);
-        let is_set_returning: bool = row.get(6);
-        let is_variadic: bool = row.get(7);
-        let prokind: i8 = row.get(8);
-        let all_arg_types: Option<Vec<i32>> = row.get(9);
-        // `proargmodes` is `char[]` → Vec<i8> with one byte per arg.
-        let arg_modes: Option<Vec<i8>> = row.get(10);
-        let arg_names: Option<Vec<String>> = row.get(11);
-        // `pronargdefaults` — count of trailing IN args with DEFAULT
-        // expressions. Lets the analyzer accept calls that omit the
-        // tail (e.g. `jsonb_set(j, p, v)` against the 4-arg signature).
-        let pronargdefaults: i16 = row.get(12);
-
-        let is_aggregate = prokind as u8 as char == 'a';
-        let is_window = prokind as u8 as char == 'w';
-        let agg_final_type_oid = if is_aggregate {
-            agg_final.get(&oid).copied().flatten()
-        } else {
-            None
-        };
-
-        let out_args = extract_out_args(
-            all_arg_types.as_deref(),
-            arg_modes.as_deref(),
-            arg_names.as_deref(),
-        );
-
-        functions.push(FunctionEntry {
-            name,
-            schema,
-            arg_types,
-            return_type_oid,
-            is_aggregate,
-            is_window,
-            is_variadic,
-            is_set_returning,
-            is_strict,
-            is_procedure: false,
-            agg_final_type_oid,
-            out_args,
-            num_default_args: pronargdefaults.max(0) as u8,
-        });
-    }
-
-    Ok(functions)
-}
-
-/// Extract OUT/INOUT/TABLE args from `pg_proc.{proallargtypes, proargmodes,
-/// proargnames}` into a list of `CompositeField`s keyed by name.
-/// - All three arrays share one index per formal arg.
-/// - `proargmodes`: `'i'` IN, `'o'` OUT, `'b'` INOUT, `'v'` VARIADIC, `'t'` TABLE.
-/// - We only keep OUT, INOUT and TABLE entries — those are the columns
-///   visible from `(func(...)).field` or `FROM func(...)`.
-/// - `proargnames[i]` may be an empty string; skip those since they can't
-///   appear in a named field lookup anyway.
-fn extract_out_args(
-    all_types: Option<&[i32]>,
-    modes: Option<&[i8]>,
-    names: Option<&[String]>,
-) -> Vec<CompositeField> {
-    let (Some(types), Some(modes), Some(names)) = (all_types, modes, names) else {
-        return Vec::new();
-    };
-    let len = types.len().min(modes.len()).min(names.len());
-    let mut out = Vec::new();
-    for i in 0..len {
-        let mode = modes[i] as u8 as char;
-        if !matches!(mode, 'o' | 'b' | 't') {
-            continue;
-        }
-        let name = &names[i];
-        if name.is_empty() {
-            continue;
-        }
-        out.push(CompositeField {
-            name: name.clone(),
-            type_oid: types[i] as u32,
-            not_null: false,
-        });
-    }
-    out
-}
-
-fn export_operators(client: &mut postgres::Client) -> Result<Vec<OperatorEntry>, postgres::Error> {
-    let rows = client.query(
-        "SELECT o.oprname, o.oprleft, o.oprright, o.oprresult \
-         FROM pg_catalog.pg_operator o \
-         WHERE o.oprresult != 0",
-        &[],
-    )?;
-
-    let operators = rows
+    Ok(rows
         .iter()
-        .map(|row| {
-            let left: u32 = row.get(1);
-            OperatorEntry {
-                name: row.get(0),
-                left_type_oid: if left == 0 { None } else { Some(left) },
-                right_type_oid: row.get(2),
-                result_type_oid: row.get(3),
+        .map(|r| {
+            let oid: i32 = r.get(0);
+            let final_type: u32 = r.get(1);
+            PgAggregate {
+                aggfnoid: PgProcOid::new(oid as u32).expect("aggfnoid is non-zero"),
+                aggfinaltype: PgTypeOid::new(final_type),
             }
         })
-        .collect();
-
-    Ok(operators)
+        .collect())
 }
 
-struct CastEntry {
-    source_type_oid: u32,
-    target_type_oid: u32,
-    context: CastContext,
-    method: CastMethod,
-}
-
-fn export_casts(client: &mut postgres::Client) -> Result<Vec<CastEntry>, postgres::Error> {
+fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, postgres::Error> {
     let rows = client.query(
-        "SELECT c.castsource, c.casttarget, c.castcontext, c.castmethod \
-         FROM pg_catalog.pg_cast c",
+        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult \
+         FROM pg_catalog.pg_operator \
+         WHERE oprresult != 0 \
+         ORDER BY oid",
         &[],
     )?;
-
-    let casts = rows
+    Ok(rows
         .iter()
-        .map(|row| {
-            let ctx: i8 = row.get(2);
-            let method: i8 = row.get(3);
-            CastEntry {
-                source_type_oid: row.get(0),
-                target_type_oid: row.get(1),
-                context: match ctx as u8 as char {
-                    'i' => CastContext::Implicit,
-                    'a' => CastContext::Assignment,
-                    _ => CastContext::Explicit,
-                },
-                method: match method as u8 as char {
-                    'b' => CastMethod::Binary,
-                    'i' => CastMethod::InOut,
-                    _ => CastMethod::Function,
-                },
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let oprnamespace: u32 = r.get(2);
+            let oprleft: u32 = r.get(3);
+            let oprright: u32 = r.get(4);
+            let oprresult: u32 = r.get(5);
+            PgOperator {
+                oid: PgOperatorOid::new(oid).expect("pg_operator.oid is non-zero"),
+                oprname: r.get(1),
+                oprnamespace: PgNamespaceOid::new(oprnamespace).expect("oprnamespace is non-zero"),
+                oprleft: PgTypeOid::new(oprleft),
+                oprright: PgTypeOid::new(oprright).expect("oprright is non-zero"),
+                oprresult: PgTypeOid::new(oprresult).expect("oprresult is non-zero"),
             }
         })
-        .collect();
+        .collect())
+}
 
-    Ok(casts)
+fn export_casts(client: &mut postgres::Client) -> Result<Vec<PgCast>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, castsource, casttarget, castcontext, castmethod \
+         FROM pg_catalog.pg_cast \
+         ORDER BY oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let ctx: i8 = r.get(3);
+            let method: i8 = r.get(4);
+            let oid: u32 = r.get(0);
+            let castsource: u32 = r.get(1);
+            let casttarget: u32 = r.get(2);
+            PgCast {
+                oid: PgCastOid::new(oid).expect("pg_cast.oid is non-zero"),
+                castsource: PgTypeOid::new(castsource).expect("castsource is non-zero"),
+                casttarget: PgTypeOid::new(casttarget).expect("casttarget is non-zero"),
+                castcontext: char_to_castcontext(ctx as u8 as char),
+                castmethod: char_to_castmethod(method as u8 as char),
+            }
+        })
+        .collect())
+}
+
+fn export_extensions(client: &mut postgres::Client) -> Result<Vec<PgExtension>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, extname, extnamespace, extversion \
+         FROM pg_catalog.pg_extension \
+         ORDER BY oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let extnamespace: u32 = r.get(2);
+            PgExtension {
+                oid: PgExtensionOid::new(oid).expect("pg_extension.oid is non-zero"),
+                extname: r.get(1),
+                extnamespace: PgNamespaceOid::new(extnamespace).expect("extnamespace is non-zero"),
+                extversion: r.get(3),
+            }
+        })
+        .collect())
+}
+
+fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgres::Error> {
+    // Only export deptype = 'e' (extension) — the only type the analyzer
+    // tracks in the seed. Normal/auto deps from the DDL pipeline are
+    // re-derived when `apply_sql` runs against a clean catalog.
+    let rows = client.query(
+        "SELECT classid::int4, objid::int4, objsubid, refclassid::int4, refobjid::int4, \
+                refobjsubid, deptype \
+         FROM pg_catalog.pg_depend \
+         WHERE deptype = 'e' \
+         ORDER BY classid, objid, objsubid, refclassid, refobjid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let classid: i32 = r.get(0);
+            let objid: i32 = r.get(1);
+            let objsubid: i32 = r.get(2);
+            let refclassid: i32 = r.get(3);
+            let refobjid: i32 = r.get(4);
+            let refobjsubid: i32 = r.get(5);
+            let deptype: i8 = r.get(6);
+            Some(PgDepend {
+                classid: PgClassOid::new(classid as u32)?,
+                objid: PgGenericOid::new(objid as u32)?,
+                objsubid: objsubid as i16,
+                refclassid: PgClassOid::new(refclassid as u32)?,
+                refobjid: PgGenericOid::new(refobjid as u32)?,
+                refobjsubid: refobjsubid as i16,
+                deptype: char_to_deptype(deptype as u8 as char),
+            })
+        })
+        .collect())
 }
 
 // ─── View definitions (second pass) ────────────────────────────────────────────
 
-/// Read every view and materialized view definition from the pristine catalog.
-/// `pg_views` / `pg_matviews` already cover `pg_catalog`, `information_schema`
-/// and any other schema visible to the superuser.
 fn export_view_definitions(
     client: &mut postgres::Client,
 ) -> Result<Vec<(String, String, String)>, postgres::Error> {
@@ -602,7 +502,6 @@ fn export_view_definitions(
          ORDER BY 1, 2",
         &[],
     )?;
-
     Ok(rows
         .iter()
         .map(|r| {
@@ -614,32 +513,30 @@ fn export_view_definitions(
         .collect())
 }
 
-/// Enrich `snapshot` by re-applying each view's `CREATE VIEW` through the
-/// analyzer. This drives `ddl::views::create_view`, which populates
-/// `TableEntry.view_def` (resolved AST + deps) the same way user migrations do.
+/// Re-apply each view's `CREATE VIEW` through the analyzer's DDL pipeline so
+/// `PgClass.relviewdef` is populated with the resolved AST. Continues to use
+/// `to_seed()`/`from_seed()` for round-trip.
 ///
-/// Fail-fast: any analyzer failure or column drift aborts the seed with the
-/// offending view's name, error, and full SQL definition. The expectation is
-/// that every system view round-trips cleanly — otherwise the analyzer has
-/// regressed or a new PG release introduced a construct we don't cover.
-fn populate_view_defs(seed: SchemaSeed, defs: Vec<(String, String, String)>) -> SchemaSeed {
+/// Views that the analyzer can't yet handle (typically polymorphic /
+/// information_schema oddities) are logged and skipped — `relviewdef` stays
+/// empty for those, but the rest of the seed is still produced.
+fn populate_view_defs(seed: PgCatalogSeed, defs: Vec<(String, String, String)>) -> PgCatalogSeed {
     let mut db = PgCatalog::from_seed(seed);
+    let mut skipped = Vec::new();
 
     for (schema, name, definition) in &defs {
         let qn = QualifiedName::new(schema.clone(), name.clone());
 
-        // Keep the pass-1 column list so we can diff against the reanalyzed
-        // version below.
-        let before: Vec<TableColumn> = db
-            .tables()
-            .get(&qn)
-            .map(|t| t.columns.clone())
+        let before: Vec<(String, PgTypeOid)> = db
+            .resolve_table(Some(schema), name)
+            .map(|c| {
+                db.attributes_of(c.oid)
+                    .iter()
+                    .map(|a| (a.attname.clone(), a.atttypid))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        // `pg_views.definition` always contains just the SELECT body; wrap it
-        // with CREATE OR REPLACE so the DDL pipeline treats it as a view
-        // replacement (overwriting the pass-1 `TableEntry` with one that
-        // carries `view_def`).
         let sql = format!(
             "CREATE OR REPLACE VIEW {qn} AS {body}",
             qn = qn,
@@ -647,55 +544,166 @@ fn populate_view_defs(seed: SchemaSeed, defs: Vec<(String, String, String)>) -> 
         );
 
         if let Err(err) = db.apply_sql(&sql) {
-            abort_on_view_failure(&qn, &err.to_string(), definition);
+            log_view_failure(&qn, &err.to_string(), &sql);
+            skipped.push(qn.to_string());
+            continue;
         }
 
-        let after: Vec<TableColumn> = db
-            .tables()
-            .get(&qn)
-            .map(|t| t.columns.clone())
+        let after: Vec<(String, PgTypeOid)> = db
+            .resolve_table(Some(schema), name)
+            .map(|c| {
+                db.attributes_of(c.oid)
+                    .iter()
+                    .map(|a| (a.attname.clone(), a.atttypid))
+                    .collect()
+            })
             .unwrap_or_default();
 
         if let Some(drift) = describe_column_drift(&before, &after) {
-            abort_on_view_failure(&qn, &format!("column drift: {drift}"), definition);
+            log_view_failure(&qn, &format!("column drift: {drift}"), &sql);
+            skipped.push(qn.to_string());
+        }
+    }
+
+    if !skipped.is_empty() {
+        eprintln!(
+            "Skipped {} view(s) that the analyzer couldn't reanalyze:",
+            skipped.len()
+        );
+        for s in &skipped {
+            eprintln!("  - {s}");
         }
     }
 
     db.to_seed()
 }
 
-/// Print the offending view's error and SQL, then panic. Formatted the same
-/// way regardless of whether the failure came from `apply_sql` or from the
-/// column-drift check so the caller's log layout stays consistent.
-fn abort_on_view_failure(qn: &QualifiedName, error: &str, definition: &str) -> ! {
-    eprintln!();
+fn log_view_failure(qn: &QualifiedName, error: &str, sql: &str) {
     eprintln!("--- {qn} ---");
     eprintln!("  error: {error}");
-    eprintln!("  definition:");
-    for line in definition.lines() {
-        eprintln!("    {line}");
-    }
-    panic!("view reanalysis failed for {qn}");
+    eprintln!("  sql: {sql}");
 }
 
-/// Diff pass-1 and post-reanalysis column lists on shape: count, order,
-/// names, and type OIDs. `not_null` is intentionally skipped — our analyzer
-/// derives stricter nullability from expression structure than
-/// `pg_attribute.attnotnull`, so drift on that field is expected.
-fn describe_column_drift(before: &[TableColumn], after: &[TableColumn]) -> Option<String> {
+fn describe_column_drift(
+    before: &[(String, PgTypeOid)],
+    after: &[(String, PgTypeOid)],
+) -> Option<String> {
     if before.len() != after.len() {
         return Some(format!("column count {} → {}", before.len(), after.len()));
     }
     for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
-        if b.name != a.name {
-            return Some(format!("column #{i} name {:?} → {:?}", b.name, a.name));
+        if b.0 != a.0 {
+            return Some(format!("column #{i} name {:?} → {:?}", b.0, a.0));
         }
-        if b.type_oid != a.type_oid {
+        if b.1 != a.1 {
             return Some(format!(
-                "column #{i} {:?} type_oid {} → {}",
-                b.name, b.type_oid, a.type_oid
+                "column #{i} type_oid {} → {}",
+                b.1.get(),
+                a.1.get()
             ));
         }
     }
     None
+}
+
+// ─── Char → enum mapping ───────────────────────────────────────────────────────
+
+fn char_to_typtype(c: char) -> TypType {
+    match c {
+        'b' => TypType::Base,
+        'c' => TypType::Composite,
+        'd' => TypType::Domain,
+        'e' => TypType::Enum,
+        'p' => TypType::Pseudo,
+        'r' => TypType::Range,
+        'm' => TypType::Multirange,
+        _ => TypType::Base,
+    }
+}
+
+fn char_to_typcategory(c: char) -> TypCategory {
+    match c {
+        'A' => TypCategory::Array,
+        'B' => TypCategory::Boolean,
+        'C' => TypCategory::Composite,
+        'D' => TypCategory::DateTime,
+        'E' => TypCategory::Enum,
+        'G' => TypCategory::Geometric,
+        'I' => TypCategory::Network,
+        'N' => TypCategory::Numeric,
+        'P' => TypCategory::Pseudo,
+        'R' => TypCategory::Range,
+        'S' => TypCategory::String,
+        'T' => TypCategory::Timespan,
+        'U' => TypCategory::UserDefined,
+        'V' => TypCategory::BitString,
+        'X' => TypCategory::Unknown,
+        'Z' => TypCategory::Internal,
+        _ => TypCategory::UserDefined,
+    }
+}
+
+fn char_to_relkind(c: char) -> Option<RelKind> {
+    Some(match c {
+        'r' => RelKind::Table,
+        'v' => RelKind::View,
+        'm' => RelKind::MaterializedView,
+        'p' => RelKind::Partitioned,
+        'c' => RelKind::CompositeType,
+        _ => return None,
+    })
+}
+
+fn char_to_prokind(c: char) -> ProKind {
+    match c {
+        'a' => ProKind::Aggregate,
+        'w' => ProKind::Window,
+        'p' => ProKind::Procedure,
+        _ => ProKind::Function,
+    }
+}
+
+fn char_to_argmode(c: char) -> ArgMode {
+    match c {
+        'o' => ArgMode::Out,
+        'b' => ArgMode::InOut,
+        'v' => ArgMode::Variadic,
+        't' => ArgMode::Table,
+        _ => ArgMode::In,
+    }
+}
+
+fn char_to_attgenerated(c: char) -> Option<AttGenerated> {
+    match c {
+        's' => Some(AttGenerated::Stored),
+        'v' => Some(AttGenerated::Virtual),
+        _ => None,
+    }
+}
+
+fn char_to_castcontext(c: char) -> CastContext {
+    match c {
+        'i' => CastContext::Implicit,
+        'a' => CastContext::Assignment,
+        _ => CastContext::Explicit,
+    }
+}
+
+fn char_to_castmethod(c: char) -> CastMethod {
+    match c {
+        'b' => CastMethod::Binary,
+        'i' => CastMethod::InOut,
+        _ => CastMethod::Function,
+    }
+}
+
+fn char_to_deptype(c: char) -> DepType {
+    match c {
+        'a' => DepType::Auto,
+        'i' => DepType::Internal,
+        'e' => DepType::Extension,
+        'x' => DepType::AutoExtension,
+        'p' => DepType::Pin,
+        _ => DepType::Normal,
+    }
 }

@@ -5,22 +5,25 @@ use pg_query::protobuf::{
     CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, node,
 };
 
-use crate::qualified_name::QualifiedName;
-use crate::schema::{CompositeField, TypeEntry, TypeKind};
+use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgTypeOid};
+use crate::pg_catalog::{
+    CastContext, CastMethod, PgAttribute, PgCast, PgClass, PgEnum, PgRange, PgType, RelKind,
+    TypCategory, TypType,
+};
 
 use super::DdlError;
 use super::util::{
-    extract_names, names_key, node_string, register_composite_to_record_cast, resolve_type_name,
+    ensure_namespace, ensure_qualified_name, names_key, node_string,
+    register_composite_to_record_cast, resolve_type_name,
 };
 use crate::pg_catalog::PgCatalog;
 
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
 
 pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.domainname, interp);
-    let key = QualifiedName::new(&schema, &name);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.domainname);
 
-    if interp.type_by_name.contains_key(&key) {
+    if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
@@ -32,42 +35,37 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .and_then(|tn| resolve_type_name(tn, interp))
         .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
 
-    let oid = interp.alloc_oid();
-    let array_oid = interp.alloc_oid();
-
     // Domains inherit category/preferred from their base type.
-    let (category, is_preferred) = interp
-        .types
+    let (typcategory, typispreferred) = interp
+        .pg_type
         .get(&base_type_oid)
-        .map(|t| (t.category, t.is_preferred))
-        .unwrap_or(('U', false));
-    interp.types.insert(
+        .map(|t| (t.typcategory, t.typispreferred))
+        .unwrap_or((TypCategory::UserDefined, false));
+
+    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_type(PgType {
         oid,
-        TypeEntry {
-            oid,
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: TypeKind::Domain { base_type_oid },
-            category,
-            is_preferred,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(key, oid);
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Domain,
+        typcategory,
+        typispreferred,
+        typrelid: None,
+        typelem: None,
+        typarray: None,
+        typbasetype: Some(base_type_oid),
+    });
 
-    // Array type for the domain.
-    register_array_type(interp, array_oid, &schema, &name, oid);
-
+    register_array_type(interp, nsoid, &name, oid);
     Ok(())
 }
 
 // ─── CREATE TYPE AS ENUM ────────────────────────────────────────────────────
 
 pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.type_name, interp);
-    let key = QualifiedName::new(&schema, &name);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.type_name);
 
-    if interp.type_by_name.contains_key(&key) {
+    if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
@@ -79,25 +77,30 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         .filter_map(|n| node_string(n).map(|s| s.to_owned()))
         .collect();
 
-    let oid = interp.alloc_oid();
-    let array_oid = interp.alloc_oid();
-
-    interp.types.insert(
+    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_type(PgType {
         oid,
-        TypeEntry {
-            oid,
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: TypeKind::Enum { labels },
-            category: 'E',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(key, oid);
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Enum,
+        typcategory: TypCategory::Enum,
+        typispreferred: false,
+        typrelid: None,
+        typelem: None,
+        typarray: None,
+        typbasetype: None,
+    });
+    for (i, label) in labels.into_iter().enumerate() {
+        let enum_oid = PgEnumOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        interp.insert_pg_enum(PgEnum {
+            oid: enum_oid,
+            enumtypid: oid,
+            enumsortorder: (i + 1) as f32,
+            enumlabel: label,
+        });
+    }
 
-    register_array_type(interp, array_oid, &schema, &name, oid);
-
+    register_array_type(interp, nsoid, &name, oid);
     Ok(())
 }
 
@@ -113,55 +116,72 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         interp
             .search_path
             .first()
-            .cloned()
+            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
             .unwrap_or_else(|| "public".to_owned())
     } else {
         rv.schemaname.clone()
     };
+    let nsoid = ensure_namespace(interp, &schema);
     let name = rv.relname.clone();
-    let key = QualifiedName::new(&schema, &name);
 
-    if interp.type_by_name.contains_key(&key) {
+    if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
     }
 
-    let mut fields = Vec::new();
+    // Collect column definitions before mutating, so we can resolve type
+    // names against the catalog without holding a mutable borrow.
+    let mut field_defs: Vec<(String, PgTypeOid, bool)> = Vec::new();
     for col_node in &stmt.coldeflist {
-        if let Some(node::Node::ColumnDef(cd)) = col_node.node.as_ref() {
-            let type_oid = cd
+        if let Some(node::Node::ColumnDef(cd)) = col_node.node.as_ref()
+            && let Some(type_oid) = cd
                 .type_name
                 .as_ref()
                 .and_then(|tn| resolve_type_name(tn, interp))
-                .unwrap_or(0);
-            fields.push(CompositeField {
-                name: cd.colname.clone(),
-                type_oid,
-                not_null: cd.is_not_null,
-            });
+        {
+            field_defs.push((cd.colname.clone(), type_oid, cd.is_not_null));
         }
     }
 
-    let oid = interp.alloc_oid();
-    let array_oid = interp.alloc_oid();
+    let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let type_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
 
-    interp.types.insert(
-        oid,
-        TypeEntry {
-            oid,
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: TypeKind::Composite { fields },
-            category: 'C',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(key, oid);
+    interp.insert_pg_class(PgClass {
+        oid: class_oid,
+        relname: name.clone(),
+        relnamespace: nsoid,
+        relkind: RelKind::CompositeType,
+        reltype: Some(type_oid),
+        relviewdef: Vec::new(),
+        viewbindings: Vec::new(),
+    });
+    for (i, (fname, ftype, fnotnull)) in field_defs.into_iter().enumerate() {
+        interp.insert_pg_attribute(PgAttribute {
+            attrelid: class_oid,
+            attname: fname,
+            atttypid: ftype,
+            attnum: (i + 1) as i16,
+            attnotnull: fnotnull,
+            atthasdef: false,
+            attgenerated: None,
+        });
+    }
+    interp.insert_pg_type(PgType {
+        oid: type_oid,
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Composite,
+        typcategory: TypCategory::Composite,
+        typispreferred: false,
+        typrelid: Some(class_oid),
+        typelem: None,
+        typarray: None,
+        typbasetype: None,
+    });
 
-    register_array_type(interp, array_oid, &schema, &name, oid);
-    register_composite_to_record_cast(interp, oid);
+    register_array_type(interp, nsoid, &name, type_oid);
+    register_composite_to_record_cast(interp, type_oid);
 
     Ok(())
 }
@@ -169,46 +189,48 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 // ─── CREATE TYPE AS RANGE ───────────────────────────────────────────────────
 
 pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.type_name, interp);
-    let key = QualifiedName::new(&schema, &name);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.type_name);
 
-    if interp.type_by_name.contains_key(&key) {
+    if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
             "type \"{name}\" already exists"
         )));
     }
 
     // Extract subtype from params (look for DefElem with defname="subtype").
-    let mut subtype_oid = 0u32;
+    let mut subtype_oid: Option<PgTypeOid> = None;
     for param_node in &stmt.params {
         if let Some(node::Node::DefElem(de)) = param_node.node.as_ref()
             && de.defname == "subtype"
             && let Some(arg) = de.arg.as_deref()
             && let Some(node::Node::TypeName(tn)) = arg.node.as_ref()
         {
-            subtype_oid = resolve_type_name(tn, interp).unwrap_or(0);
+            subtype_oid = resolve_type_name(tn, interp);
         }
     }
+    let Some(subtype_oid) = subtype_oid else {
+        return Ok(());
+    };
 
-    let oid = interp.alloc_oid();
-    let array_oid = interp.alloc_oid();
-
-    interp.types.insert(
+    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_type(PgType {
         oid,
-        TypeEntry {
-            oid,
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: TypeKind::Range { subtype_oid },
-            category: 'R',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(key, oid);
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Range,
+        typcategory: TypCategory::Range,
+        typispreferred: false,
+        typrelid: None,
+        typelem: None,
+        typarray: None,
+        typbasetype: None,
+    });
+    interp.insert_pg_range(PgRange {
+        rngtypid: oid,
+        rngsubtype: subtype_oid,
+    });
 
-    register_array_type(interp, array_oid, &schema, &name, oid);
-
+    register_array_type(interp, nsoid, &name, oid);
     Ok(())
 }
 
@@ -216,41 +238,83 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
 
 pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
     let key = names_key(&stmt.type_name, interp);
+    let nsoid = match interp.namespace_oid(&key.schema) {
+        Some(oid) => oid,
+        None => return Err(DdlError::TypeNotFound(key.to_string())),
+    };
 
-    let Some(&oid) = interp.type_by_name.get(&key) else {
-        // IF NOT EXISTS applies to the VALUE, not the TYPE.
-        // Type must always exist.
+    let Some(&oid) = interp.type_by_qname.get(&(nsoid, key.name.clone())) else {
         return Err(DdlError::TypeNotFound(key.to_string()));
     };
 
-    let Some(te) = interp.types.get_mut(&oid) else {
-        return Err(DdlError::TypeNotFound(key.to_string()));
-    };
+    if !matches!(
+        interp.pg_type.get(&oid).map(|t| t.typtype),
+        Some(TypType::Enum)
+    ) {
+        return Ok(());
+    }
 
-    if let TypeKind::Enum { labels } = &mut te.kind {
-        if labels.contains(&stmt.new_val) {
-            if stmt.skip_if_new_val_exists {
-                return Ok(());
-            }
-            return Err(DdlError::DuplicateObject(format!(
-                "enum label \"{}\" already exists",
-                stmt.new_val
-            )));
+    let labels = interp.pg_enum.entry(oid).or_default();
+    if labels.iter().any(|e| e.enumlabel == stmt.new_val) {
+        if stmt.skip_if_new_val_exists {
+            return Ok(());
         }
+        return Err(DdlError::DuplicateObject(format!(
+            "enum label \"{}\" already exists",
+            stmt.new_val
+        )));
+    }
 
-        if stmt.new_val_neighbor.is_empty() {
-            // No neighbor specified — append.
-            labels.push(stmt.new_val.clone());
-        } else if let Some(pos) = labels.iter().position(|l| l == &stmt.new_val_neighbor) {
-            if stmt.new_val_is_after {
-                labels.insert(pos + 1, stmt.new_val.clone());
+    let new_sortorder = if stmt.new_val_neighbor.is_empty() {
+        labels
+            .iter()
+            .map(|e| e.enumsortorder)
+            .fold(0.0_f32, f32::max)
+            + 1.0
+    } else if let Some(neighbor) = labels.iter().find(|e| e.enumlabel == stmt.new_val_neighbor) {
+        let neighbor_order = neighbor.enumsortorder;
+        if stmt.new_val_is_after {
+            // Insert immediately after: midpoint with the next-higher
+            // sortorder, or neighbor + 1 if neighbor is last.
+            let next = labels
+                .iter()
+                .filter(|e| e.enumsortorder > neighbor_order)
+                .map(|e| e.enumsortorder)
+                .fold(f32::INFINITY, f32::min);
+            if next.is_finite() {
+                (neighbor_order + next) / 2.0
             } else {
-                labels.insert(pos, stmt.new_val.clone());
+                neighbor_order + 1.0
             }
         } else {
-            labels.push(stmt.new_val.clone());
+            // Insert immediately before: midpoint with the previous-lower
+            // sortorder, or neighbor - 1 if neighbor is first.
+            let prev = labels
+                .iter()
+                .filter(|e| e.enumsortorder < neighbor_order)
+                .map(|e| e.enumsortorder)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if prev.is_finite() {
+                (neighbor_order + prev) / 2.0
+            } else {
+                neighbor_order - 1.0
+            }
         }
-    }
+    } else {
+        labels
+            .iter()
+            .map(|e| e.enumsortorder)
+            .fold(0.0_f32, f32::max)
+            + 1.0
+    };
+
+    let enum_oid = PgEnumOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_enum(PgEnum {
+        oid: enum_oid,
+        enumtypid: oid,
+        enumsortorder: new_sortorder,
+        enumlabel: stmt.new_val.clone(),
+    });
 
     Ok(())
 }
@@ -262,40 +326,30 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
 pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
     let obj_type = ObjectType::try_from(stmt.kind).unwrap_or(ObjectType::Undefined);
     if obj_type != ObjectType::ObjectType {
-        // Not a type definition (could be an operator, aggregate, etc. via DefineStmt).
         return Ok(());
     }
 
-    let (schema, name) = extract_names(&stmt.defnames, interp);
-    let key = QualifiedName::new(&schema, &name);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames);
 
-    // If the type already exists (e.g., shell type followed by full definition), reuse OID.
-    if interp.type_by_name.contains_key(&key) {
+    if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         // Full definition after shell type — just confirm it exists.
         return Ok(());
     }
 
-    // Register as a Base type. We don't distinguish between shell and full definitions
-    // for static analysis — both result in a Base type entry.
-    let oid = interp.alloc_oid();
-    let array_oid = interp.alloc_oid();
-
-    interp.types.insert(
+    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_type(PgType {
         oid,
-        TypeEntry {
-            oid,
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: TypeKind::Base,
-            category: 'U',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(key, oid);
-
-    register_array_type(interp, array_oid, &schema, &name, oid);
-
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Base,
+        typcategory: TypCategory::UserDefined,
+        typispreferred: false,
+        typrelid: None,
+        typelem: None,
+        typarray: None,
+        typbasetype: None,
+    });
+    register_array_type(interp, nsoid, &name, oid);
     Ok(())
 }
 
@@ -312,61 +366,68 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
         .and_then(|tn| resolve_type_name(tn, interp));
 
     let (Some(src), Some(tgt)) = (source_oid, target_oid) else {
-        // Can't resolve types — skip silently.
         return Ok(());
     };
 
-    let context = match CoercionContext::try_from(stmt.context) {
-        Ok(CoercionContext::CoercionImplicit) => crate::schema::CastContext::Implicit,
-        Ok(CoercionContext::CoercionAssignment) => crate::schema::CastContext::Assignment,
-        _ => crate::schema::CastContext::Explicit,
+    let castcontext = match CoercionContext::try_from(stmt.context) {
+        Ok(CoercionContext::CoercionImplicit) => CastContext::Implicit,
+        Ok(CoercionContext::CoercionAssignment) => CastContext::Assignment,
+        _ => CastContext::Explicit,
     };
 
     // Map `CREATE CAST` syntax to pg_cast.castmethod:
     // - WITH FUNCTION f(...)  → 'f' (Function)
     // - WITH INOUT            → 'i' (InOut)
     // - WITHOUT FUNCTION      → 'b' (Binary)
-    let method = if stmt.inout {
-        crate::schema::CastMethod::InOut
+    let castmethod = if stmt.inout {
+        CastMethod::InOut
     } else if stmt.func.is_some() {
-        crate::schema::CastMethod::Function
+        CastMethod::Function
     } else {
-        crate::schema::CastMethod::Binary
+        CastMethod::Binary
     };
 
-    let key = format!("{src}:{tgt}");
-    interp
-        .casts
-        .insert(key, crate::schema::CastInfo::new(context, method));
-
+    let cast_oid = PgCastOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_cast(PgCast {
+        oid: cast_oid,
+        castsource: src,
+        casttarget: tgt,
+        castcontext,
+        castmethod,
+    });
     Ok(())
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Register an array type (`_name`) for a base type.
-fn register_array_type(
+/// Suppress the auto array name when needed; we always use `_<name>`.
+fn array_name(base_name: &str) -> String {
+    format!("_{base_name}")
+}
+
+/// Register an array type (`_name`) for a base type, and back-link the
+/// element type's `typarray` to it so `array_type_of(element)` resolves.
+pub(crate) fn register_array_type(
     interp: &mut PgCatalog,
-    array_oid: u32,
-    schema: &str,
+    nsoid: PgNamespaceOid,
     base_name: &str,
-    element_oid: u32,
-) {
-    let array_name = format!("_{base_name}");
-    let array_key = QualifiedName::new(schema, &array_name);
-    interp.types.insert(
-        array_oid,
-        TypeEntry {
-            oid: array_oid,
-            name: array_name,
-            schema: schema.to_owned(),
-            kind: TypeKind::Array {
-                element_type_oid: element_oid,
-            },
-            category: 'A',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(array_key, array_oid);
+    element_oid: PgTypeOid,
+) -> PgTypeOid {
+    let array_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_type(PgType {
+        oid: array_oid,
+        typname: array_name(base_name),
+        typnamespace: nsoid,
+        typtype: TypType::Base,
+        typcategory: TypCategory::Array,
+        typispreferred: false,
+        typrelid: None,
+        typelem: Some(element_oid),
+        typarray: None,
+        typbasetype: None,
+    });
+    if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
+        elem.typarray = Some(array_oid);
+    }
+    array_oid
 }

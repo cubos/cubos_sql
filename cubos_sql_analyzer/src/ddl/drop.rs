@@ -5,8 +5,11 @@ use pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 use super::DdlError;
 use super::util::{extract_names, node_string, resolve_type_name};
 use super::views;
-use crate::pg_catalog::PgCatalog;
-use crate::qualified_name::QualifiedName;
+use crate::oid::{PgCastOid, PgClassOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
+use crate::pg_catalog::{
+    PG_CAST_RELID, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_NAMESPACE_RELID, PG_OPERATOR_RELID,
+    PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, PgProc, ProKind,
+};
 
 pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlError> {
     let obj_type = ObjectType::try_from(stmt.remove_type).unwrap_or(ObjectType::Undefined);
@@ -68,45 +71,61 @@ fn drop_relation(
     };
 
     let (schema, name) = extract_names(names, interp);
-    let key = QualifiedName::new(&schema, &name);
-
-    if !interp.tables.contains_key(&key) {
+    let Some(nsoid) = interp.namespace_oid(&schema) else {
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(key.to_string()));
-    }
+        return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+    };
+    let Some(class_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied() else {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+    };
 
-    // Check for dependent views.
-    let dependent_views = views::find_dependent_views(interp, &key);
+    let dependent_views = views::find_dependent_views(interp, class_oid);
     if !dependent_views.is_empty() && !cascade {
-        let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
+        let view_names: Vec<String> = dependent_views
+            .iter()
+            .filter_map(|&v| {
+                let c = interp.pg_class.get(&v)?;
+                let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
+                Some(format!("{nsname}.{}", c.relname))
+            })
+            .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {key} because view(s) {} depend on it",
+            "cannot drop {schema}.{name} because view(s) {} depend on it",
             view_names.join(", "),
         )));
     }
 
-    // CASCADE: drop dependent views first.
     if !dependent_views.is_empty() {
         views::drop_views(interp, &dependent_views);
     }
 
-    interp.tables.remove(&key);
-
-    // Also remove the composite type and its array type.
-    if let Some(&composite_oid) = interp.type_by_name.get(&key) {
-        interp.types.remove(&composite_oid);
-        interp.type_by_name.remove(&key);
-
-        let array_key = QualifiedName::new(&schema, format!("_{name}"));
-        if let Some(&array_oid) = interp.type_by_name.get(&array_key) {
-            interp.types.remove(&array_oid);
-            interp.type_by_name.remove(&array_key);
-        }
-    }
-
+    drop_relation_by_oid(interp, class_oid);
     Ok(())
+}
+
+/// Remove a relation row + its `pg_attribute` rows + the composite type +
+/// the array wrapping the composite. Mirrors what `DROP TABLE` /
+/// `DROP VIEW` does in PG.
+pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid) {
+    let Some(class) = interp.remove_pg_class(class_oid) else {
+        return;
+    };
+    let class_obj = crate::oid::PgGenericOid::new(class_oid.get()).unwrap();
+    interp.remove_dependencies_of(PG_CLASS_RELID, class_obj);
+    interp.remove_dependencies_on(PG_CLASS_RELID, class_obj);
+
+    if let Some(reltype) = class.reltype {
+        // Find and drop the array type whose typelem points at the composite.
+        if let Some(arr_oid) = interp.array_type_of(reltype) {
+            interp.remove_pg_type(arr_oid);
+        }
+        interp.remove_pg_type(reltype);
+    }
 }
 
 fn drop_type(
@@ -122,75 +141,67 @@ fn drop_type(
     };
 
     let (schema, name) = extract_names(names, interp);
-    let key = QualifiedName::new(&schema, &name);
-
-    let Some(&type_oid) = interp.type_by_name.get(&key) else {
+    let Some(nsoid) = interp.namespace_oid(&schema) else {
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(key.to_string()));
+        return Err(DdlError::TypeNotFound(format!("{schema}.{name}")));
     };
+    let Some(type_oid) = interp.type_by_qname.get(&(nsoid, name.clone())).copied() else {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TypeNotFound(format!("{schema}.{name}")));
+    };
+    let array_oid = interp.array_type_of(type_oid);
 
-    // Check for tables with columns of this type.
-    let dependents: Vec<QualifiedName> = interp
-        .tables
+    // Find tables/composites with columns of this type (or its array form).
+    let dependent_relations: Vec<PgClassOid> = interp
+        .pg_attribute
         .iter()
-        .filter(|(_, t)| t.columns.iter().any(|c| c.type_oid == type_oid))
-        .map(|(k, _)| k.clone())
+        .filter_map(|(&relid, attrs)| {
+            attrs
+                .iter()
+                .any(|a| a.atttypid == type_oid || array_oid.is_some_and(|arr| a.atttypid == arr))
+                .then_some(relid)
+        })
         .collect();
 
-    // Also check array type usage.
-    let array_key = QualifiedName::new(&schema, format!("_{name}"));
-    let array_oid = interp.type_by_name.get(&array_key).copied();
-
-    let array_dependents: Vec<QualifiedName> = if let Some(arr_oid) = array_oid {
-        interp
-            .tables
+    if !dependent_relations.is_empty() && !cascade {
+        let dep_names: Vec<String> = dependent_relations
             .iter()
-            .filter(|(_, t)| t.columns.iter().any(|c| c.type_oid == arr_oid))
-            .map(|(k, _)| k.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let all_dep_names: Vec<String> = dependents
-        .iter()
-        .chain(array_dependents.iter())
-        .map(|k| k.to_string())
-        .collect();
-
-    if !all_dep_names.is_empty() && !cascade {
+            .filter_map(|&v| {
+                let c = interp.pg_class.get(&v)?;
+                let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
+                Some(format!("{nsname}.{}", c.relname))
+            })
+            .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop type {key} because table(s) {} depend on it",
-            all_dep_names.join(", "),
+            "cannot drop type {schema}.{name} because table(s) {} depend on it",
+            dep_names.join(", "),
         )));
     }
 
-    // CASCADE: drop columns of this type from dependent tables.
     if cascade {
-        for table_key in &dependents {
-            if let Some(table) = interp.tables.get_mut(table_key) {
-                table.columns.retain(|c| c.type_oid != type_oid);
-            }
-        }
-        if let Some(arr_oid) = array_oid {
-            for table_key in &array_dependents {
-                if let Some(table) = interp.tables.get_mut(table_key) {
-                    table.columns.retain(|c| c.type_oid != arr_oid);
-                }
+        for relid in &dependent_relations {
+            if let Some(attrs) = interp.pg_attribute.get_mut(relid) {
+                attrs.retain(|a| {
+                    a.atttypid != type_oid && array_oid.is_none_or(|arr| a.atttypid != arr)
+                });
             }
         }
     }
-
-    interp.types.remove(&type_oid);
-    interp.type_by_name.remove(&key);
 
     if let Some(arr_oid) = array_oid {
-        interp.types.remove(&arr_oid);
-        interp.type_by_name.remove(&array_key);
+        interp.remove_pg_type(arr_oid);
+        let arr_obj = crate::oid::PgGenericOid::new(arr_oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_TYPE_RELID, arr_obj);
+        interp.remove_dependencies_on(PG_TYPE_RELID, arr_obj);
     }
-
+    interp.remove_pg_type(type_oid);
+    let type_obj = crate::oid::PgGenericOid::new(type_oid.get()).unwrap();
+    interp.remove_dependencies_of(PG_TYPE_RELID, type_obj);
+    interp.remove_dependencies_on(PG_TYPE_RELID, type_obj);
     Ok(())
 }
 
@@ -200,13 +211,12 @@ fn drop_extension(
     missing_ok: bool,
     _cascade: bool,
 ) -> Result<(), DdlError> {
-    // Extension name is a String node.
     let name = match obj_node.node.as_ref() {
         Some(node::Node::String(s)) => s.sval.clone(),
         _ => return Ok(()),
     };
 
-    let Some(installed) = interp.installed_extensions.remove(&name) else {
+    let Some(ext_oid) = interp.extension_by_name.get(&name).copied() else {
         if missing_ok {
             return Ok(());
         }
@@ -215,34 +225,55 @@ fn drop_extension(
         )));
     };
 
-    // Remove types created by the extension.
-    for oid in &installed.type_oids {
-        if let Some(te) = interp.types.remove(oid) {
-            let key = QualifiedName::new(&te.schema, &te.name);
-            interp.type_by_name.remove(&key);
+    // Collect every (classid, objid) the extension created via pg_depend.
+    let owned: Vec<(PgClassOid, crate::oid::PgGenericOid)> =
+        interp.extension_objects(ext_oid).collect();
+
+    for (classid, objid) in owned {
+        match classid {
+            c if c == PG_TYPE_RELID => {
+                if let Some(o) = PgTypeOid::new(objid.get()) {
+                    interp.remove_pg_type(o);
+                }
+                interp.remove_dependencies_of(PG_TYPE_RELID, objid);
+                interp.remove_dependencies_on(PG_TYPE_RELID, objid);
+            }
+            c if c == PG_PROC_RELID => {
+                if let Some(o) = PgProcOid::new(objid.get()) {
+                    interp.remove_pg_proc(o);
+                }
+                interp.remove_dependencies_of(PG_PROC_RELID, objid);
+                interp.remove_dependencies_on(PG_PROC_RELID, objid);
+            }
+            c if c == PG_CAST_RELID => {
+                if let Some(o) = PgCastOid::new(objid.get()) {
+                    interp.remove_pg_cast(o);
+                }
+                interp.remove_dependencies_of(PG_CAST_RELID, objid);
+            }
+            c if c == PG_OPERATOR_RELID => {
+                if let Some(o) = PgOperatorOid::new(objid.get()) {
+                    interp.remove_pg_operator(o);
+                }
+                interp.remove_dependencies_of(PG_OPERATOR_RELID, objid);
+            }
+            c if c == PG_CLASS_RELID => {
+                if let Some(o) = PgClassOid::new(objid.get()) {
+                    drop_relation_by_oid(interp, o);
+                }
+            }
+            _ => {}
         }
     }
 
-    // Remove functions created by the extension.
-    for fname in &installed.function_names {
-        interp.functions_by_name.remove(fname);
-    }
-
-    // Remove casts created by the extension.
-    for cast_key in &installed.cast_keys {
-        interp.casts.remove(cast_key);
-    }
-
+    interp.remove_pg_extension(ext_oid);
+    let ext_obj = crate::oid::PgGenericOid::new(ext_oid.get()).unwrap();
+    interp.remove_dependencies_of(PG_EXTENSION_RELID, ext_obj);
+    interp.remove_dependencies_on(PG_EXTENSION_RELID, ext_obj);
     Ok(())
 }
 
-/// `DROP FUNCTION` / `DROP PROCEDURE`. The `remove_type` of the enclosing
-/// `DropStmt` determines which bucket of overloads to consider, so callers
-/// tell us via `expected_kind`.
-///
-/// `cascade` is accepted (and required syntactically for consistency with
-/// PostgreSQL) but has no effect in the analyzer: functions are not allowed
-/// to participate in query-level dependencies that affect static typing.
+/// `DROP FUNCTION` / `DROP PROCEDURE`.
 fn drop_function(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
@@ -267,43 +298,37 @@ fn drop_function(
         _ => return Ok(()),
     };
 
-    // Resolve argument types from objargs to match the specific overload.
-    let arg_oids: Vec<u32> = owa
+    let arg_oids: Vec<PgTypeOid> = owa
         .objargs
         .iter()
         .filter_map(|n| {
             if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-                super::util::resolve_type_name(tn, interp)
+                resolve_type_name(tn, interp)
             } else {
                 None
             }
         })
         .collect();
 
-    // A DROP FUNCTION must match `is_procedure = false`, and DROP PROCEDURE
-    // the opposite — PG enforces the same asymmetry to prevent accidentally
-    // dropping an object of the wrong kind.
     let want_procedure = expected_kind == ObjectType::ObjectProcedure;
-
-    let matches_overload = |f: &crate::schema::FunctionEntry| -> bool {
-        let kind_ok = !f.is_aggregate && f.is_procedure == want_procedure;
+    let matches_overload = move |p: &PgProc| -> bool {
+        let kind_ok = matches!(
+            (p.prokind, want_procedure),
+            (ProKind::Function, false) | (ProKind::Window, false) | (ProKind::Procedure, true)
+        );
         if !kind_ok {
             return false;
         }
         if owa.objargs.is_empty() && owa.args_unspecified {
             true
         } else {
-            f.arg_types == arg_oids
+            p.proargtypes == arg_oids
         }
     };
 
-    // Find the schema-qualified key: either the one given explicitly, or the
-    // first one on `search_path` that actually has a matching overload.
-    let target_key = resolve_function_key(interp, schema_opt.as_deref(), &name, &matches_overload);
+    let target = find_proc(interp, schema_opt.as_deref(), &name, &matches_overload);
 
-    let existed = target_key.as_ref().is_some();
-
-    if !existed && !missing_ok {
+    if target.is_none() && !missing_ok {
         let kind = if want_procedure {
             "procedure"
         } else {
@@ -314,67 +339,51 @@ fn drop_function(
         )));
     }
 
-    if let Some(key) = target_key
-        && let Some(fns) = interp.functions_by_name.get_mut(&key)
-    {
-        fns.retain(|f| !matches_overload(f));
-        if fns.is_empty() {
-            interp.functions_by_name.remove(&key);
-        }
+    if let Some(oid) = target {
+        interp.remove_pg_proc(oid);
+        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_PROC_RELID, obj);
+        interp.remove_dependencies_on(PG_PROC_RELID, obj);
     }
-
     Ok(())
 }
 
-/// Resolve the schema-qualified key for a function-like object.
-///
-/// If `schema` is `Some`, returns the single qualified name when any overload
-/// matches the predicate. If `schema` is `None`, scans the `search_path`
-/// (`pg_catalog` first unless explicitly listed) for the first schema whose
-/// bucket holds a matching overload.
-fn resolve_function_key(
-    snapshot: &crate::pg_catalog::PgCatalog,
+/// Find the first `pg_proc` OID matching the predicate, walking the search
+/// path when `schema` is `None`. Mirrors PG's overload resolution for
+/// schema-less DROP.
+fn find_proc(
+    snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,
-    matches: &dyn Fn(&crate::schema::FunctionEntry) -> bool,
-) -> Option<crate::qualified_name::QualifiedName> {
-    if let Some(s) = schema {
-        let key = crate::qualified_name::QualifiedName::new(s, name);
-        return snapshot
-            .functions_by_name
-            .get(&key)
-            .filter(|fns| fns.iter().any(matches))
-            .map(|_| key);
-    }
-    if !snapshot.search_path.iter().any(|s| s == "pg_catalog") {
-        let k = crate::qualified_name::QualifiedName::new("pg_catalog", name);
-        if snapshot
-            .functions_by_name
-            .get(&k)
-            .is_some_and(|fns| fns.iter().any(matches))
+    matches: &dyn Fn(&PgProc) -> bool,
+) -> Option<PgProcOid> {
+    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
+        snapshot.namespace_oid(s).into_iter().collect()
+    } else {
+        let mut v = Vec::new();
+        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
+            && !snapshot.search_path.contains(&pg_oid)
         {
-            return Some(k);
+            v.push(pg_oid);
         }
-    }
-    for s in &snapshot.search_path {
-        let k = crate::qualified_name::QualifiedName::new(s.clone(), name);
-        if snapshot
-            .functions_by_name
-            .get(&k)
-            .is_some_and(|fns| fns.iter().any(matches))
-        {
-            return Some(k);
+        v.extend(snapshot.search_path.iter().copied());
+        v
+    };
+    for nsoid in candidate_schemas {
+        if let Some(oids) = snapshot.proc_by_qname.get(&(nsoid, name.to_owned())) {
+            for &oid in oids {
+                if let Some(p) = snapshot.pg_proc.get(&oid)
+                    && matches(p)
+                {
+                    return Some(oid);
+                }
+            }
         }
     }
     None
 }
 
-/// DROP AGGREGATE name(argtypes) — shares storage with functions, but we
-/// only remove entries where `is_aggregate = true` so a DROP AGGREGATE cannot
-/// accidentally remove a scalar function with the same signature.
-///
-/// `cascade` is accepted for syntactic parity with PostgreSQL but has no
-/// effect here for the same reason as `drop_function`.
+/// DROP AGGREGATE.
 fn drop_aggregate(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
@@ -397,9 +406,7 @@ fn drop_aggregate(
         _ => return Ok(()),
     };
 
-    // Resolve argument types. A zero-arg aggregate (`DROP AGGREGATE name(*)`)
-    // has an empty objargs list.
-    let arg_oids: Vec<u32> = owa
+    let arg_oids: Vec<PgTypeOid> = owa
         .objargs
         .iter()
         .filter_map(|n| {
@@ -411,31 +418,26 @@ fn drop_aggregate(
         })
         .collect();
 
-    let matches = |f: &crate::schema::FunctionEntry| f.is_aggregate && f.arg_types == arg_oids;
-    let target_key = resolve_function_key(interp, schema_opt.as_deref(), &name, &matches);
+    let matches = |p: &PgProc| matches!(p.prokind, ProKind::Aggregate) && p.proargtypes == arg_oids;
+    let target = find_proc(interp, schema_opt.as_deref(), &name, &matches);
 
-    if target_key.is_none() && !missing_ok {
+    if target.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
             "aggregate {name}({}) does not exist",
             format_arg_oids(&arg_oids, interp),
         )));
     }
 
-    if let Some(key) = target_key
-        && let Some(fns) = interp.functions_by_name.get_mut(&key)
-    {
-        fns.retain(|f| !matches(f));
-        if fns.is_empty() {
-            interp.functions_by_name.remove(&key);
-        }
+    if let Some(oid) = target {
+        interp.remove_pg_proc(oid);
+        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_PROC_RELID, obj);
+        interp.remove_dependencies_on(PG_PROC_RELID, obj);
     }
-
     Ok(())
 }
 
-/// DROP OPERATOR name(lefttype, righttype) — the pg_query AST always emits
-/// two objargs, with a `TypeName` whose names list is empty for NONE (prefix
-/// operators). We detect that by inspecting `names.is_empty()`.
+/// DROP OPERATOR name(lefttype, righttype).
 fn drop_operator(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
@@ -445,7 +447,6 @@ fn drop_operator(
         return Ok(());
     };
 
-    // Operator name: `objname` holds either `[name]` or `[schema, name]`.
     let parts: Vec<String> = owa
         .objname
         .iter()
@@ -460,66 +461,55 @@ fn drop_operator(
 
     let (left_oid, right_oid) = parse_operator_arg_types(&owa.objargs, interp);
     let Some(right_oid) = right_oid else {
-        // Right operand is required for both binary and prefix operators.
         return Ok(());
     };
 
-    let matches = |o: &crate::schema::OperatorEntry| {
-        o.left_type_oid == left_oid && o.right_type_oid == right_oid
-    };
+    let matches = |o: &PgOperator| o.oprleft == left_oid && o.oprright == right_oid;
 
-    let target_key = resolve_operator_key(interp, schema_opt.as_deref(), &op_name, &matches);
+    let target = find_operator(interp, schema_opt.as_deref(), &op_name, &matches);
 
-    if target_key.is_none() && !missing_ok {
+    if target.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
             "operator {op_name} does not exist for the requested operand types"
         )));
     }
 
-    if let Some(key) = target_key
-        && let Some(ops) = interp.operators_by_name.get_mut(&key)
-    {
-        ops.retain(|o| !matches(o));
-        if ops.is_empty() {
-            interp.operators_by_name.remove(&key);
-        }
+    if let Some(oid) = target {
+        interp.remove_pg_operator(oid);
+        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
+        interp.remove_dependencies_on(PG_OPERATOR_RELID, obj);
     }
-
     Ok(())
 }
 
-fn resolve_operator_key(
-    snapshot: &crate::pg_catalog::PgCatalog,
+fn find_operator(
+    snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,
-    matches: &dyn Fn(&crate::schema::OperatorEntry) -> bool,
-) -> Option<crate::qualified_name::QualifiedName> {
-    if let Some(s) = schema {
-        let key = crate::qualified_name::QualifiedName::new(s, name);
-        return snapshot
-            .operators_by_name
-            .get(&key)
-            .filter(|ops| ops.iter().any(matches))
-            .map(|_| key);
-    }
-    if !snapshot.search_path.iter().any(|s| s == "pg_catalog") {
-        let k = crate::qualified_name::QualifiedName::new("pg_catalog", name);
-        if snapshot
-            .operators_by_name
-            .get(&k)
-            .is_some_and(|ops| ops.iter().any(matches))
+    matches: &dyn Fn(&PgOperator) -> bool,
+) -> Option<PgOperatorOid> {
+    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
+        snapshot.namespace_oid(s).into_iter().collect()
+    } else {
+        let mut v = Vec::new();
+        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
+            && !snapshot.search_path.contains(&pg_oid)
         {
-            return Some(k);
+            v.push(pg_oid);
         }
-    }
-    for s in &snapshot.search_path {
-        let k = crate::qualified_name::QualifiedName::new(s.clone(), name);
-        if snapshot
-            .operators_by_name
-            .get(&k)
-            .is_some_and(|ops| ops.iter().any(matches))
-        {
-            return Some(k);
+        v.extend(snapshot.search_path.iter().copied());
+        v
+    };
+    for nsoid in candidate_schemas {
+        if let Some(oids) = snapshot.operator_by_qname.get(&(nsoid, name.to_owned())) {
+            for &oid in oids {
+                if let Some(o) = snapshot.pg_operator.get(&oid)
+                    && matches(o)
+                {
+                    return Some(oid);
+                }
+            }
         }
     }
     None
@@ -530,12 +520,12 @@ fn resolve_operator_key(
 /// `NONE`, indicating a prefix operator (no left operand).
 fn parse_operator_arg_types(
     objargs: &[pg_query::protobuf::Node],
-    snapshot: &crate::pg_catalog::PgCatalog,
-) -> (Option<u32>, Option<u32>) {
-    let resolve = |n: &pg_query::protobuf::Node| -> Option<u32> {
+    snapshot: &PgCatalog,
+) -> (Option<PgTypeOid>, Option<PgTypeOid>) {
+    let resolve = |n: &pg_query::protobuf::Node| -> Option<PgTypeOid> {
         if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
             if tn.names.is_empty() {
-                return None; // NONE — prefix operator
+                return None;
             }
             return resolve_type_name(tn, snapshot);
         }
@@ -549,8 +539,7 @@ fn parse_operator_arg_types(
     }
 }
 
-/// DROP CAST (source AS target) — objects list contains a single `List`
-/// with two `TypeName` elements.
+/// DROP CAST (source AS target).
 fn drop_cast(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
@@ -582,36 +571,36 @@ fn drop_cast(
         return Err(DdlError::TypeNotFound("cast source or target type".into()));
     };
 
-    let key = format!("{src}:{tgt}");
-    if interp.casts.remove(&key).is_none() && !missing_ok {
+    let cast_oid = interp.cast_by_pair.get(&(src, tgt)).copied();
+    if cast_oid.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
-            "cast from OID {src} to OID {tgt} does not exist"
+            "cast from OID {} to OID {} does not exist",
+            src.get(),
+            tgt.get(),
         )));
     }
-
+    if let Some(oid) = cast_oid {
+        interp.remove_pg_cast(oid);
+        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_CAST_RELID, obj);
+    }
     Ok(())
 }
 
 /// Format a list of argument OIDs as PG type names for error messages.
-/// Falls back to `"oid:N"` when a type isn't in the snapshot.
-fn format_arg_oids(oids: &[u32], snapshot: &crate::pg_catalog::PgCatalog) -> String {
+fn format_arg_oids(oids: &[PgTypeOid], snapshot: &PgCatalog) -> String {
     oids.iter()
         .map(|oid| {
             snapshot
                 .get_type(*oid)
-                .map(|t| t.name.clone())
-                .unwrap_or_else(|| format!("oid:{oid}"))
+                .map(|t| t.typname.clone())
+                .unwrap_or_else(|| format!("oid:{}", oid.get()))
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// DROP SCHEMA name [CASCADE | RESTRICT].
-///
-/// Without CASCADE: fail if the schema contains any objects we track.
-/// With CASCADE: remove every table, type, and function living in that
-/// schema (transitively dropping views that depend on them via the normal
-/// `drop_views` machinery).
 fn drop_schema(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
@@ -623,27 +612,18 @@ fn drop_schema(
         _ => return Ok(()),
     };
 
-    // PG's system schemas are never in our snapshot's search_path writable
-    // surface, but users sometimes DROP SCHEMA IF EXISTS them. Treat absence
-    // as missing.
-    let has_objects = interp.tables.keys().any(|k| k.schema == name)
-        || interp.type_by_name.keys().any(|k| k.schema == name)
-        || interp
-            .functions_by_name
-            .values()
-            .any(|fns| fns.iter().any(|f| f.schema == name));
-
-    let exists =
-        interp.schemas.contains(&name) || interp.search_path.contains(&name) || has_objects;
-
-    if !exists {
+    let Some(nsoid) = interp.namespace_oid(&name) else {
         if missing_ok {
             return Ok(());
         }
         return Err(DdlError::DependencyError(format!(
             "schema \"{name}\" does not exist"
         )));
-    }
+    };
+
+    let has_objects = interp.pg_class.values().any(|c| c.relnamespace == nsoid)
+        || interp.pg_type.values().any(|t| t.typnamespace == nsoid)
+        || interp.pg_proc.values().any(|p| p.pronamespace == nsoid);
 
     if has_objects && !cascade {
         return Err(DdlError::DependencyError(format!(
@@ -652,51 +632,61 @@ fn drop_schema(
     }
 
     // CASCADE: gather everything in this schema.
-    let tables_to_drop: Vec<QualifiedName> = interp
-        .tables
-        .keys()
-        .filter(|k| k.schema == name)
-        .cloned()
+    let class_oids: Vec<PgClassOid> = interp
+        .pg_class
+        .values()
+        .filter(|c| c.relnamespace == nsoid)
+        .map(|c| c.oid)
         .collect();
-
-    // Drop views/tables. `drop_views` transitively removes dependents; for
-    // plain tables we also need to strip the composite type + array type,
-    // mirroring the `drop_relation` cleanup logic.
-    views::drop_views(interp, &tables_to_drop);
-    for key in &tables_to_drop {
-        if let Some(te) = interp.tables.remove(key)
-            && let Some(&ctype_oid) = interp.type_by_name.get(key)
-        {
-            interp.types.remove(&ctype_oid);
-            interp.type_by_name.remove(key);
-            let arr_key = QualifiedName::new(&te.schema, format!("_{}", te.name));
-            if let Some(arr_oid) = interp.type_by_name.remove(&arr_key) {
-                interp.types.remove(&arr_oid);
-            }
+    views::drop_views(interp, &class_oids);
+    for class_oid in class_oids {
+        if interp.pg_class.contains_key(&class_oid) {
+            drop_relation_by_oid(interp, class_oid);
         }
     }
 
-    // Remove all remaining types in this schema (enums, domains, ranges,
-    // standalone composites, …).
-    let type_keys: Vec<QualifiedName> = interp
-        .type_by_name
-        .keys()
-        .filter(|k| k.schema == name)
-        .cloned()
+    let type_oids: Vec<PgTypeOid> = interp
+        .pg_type
+        .values()
+        .filter(|t| t.typnamespace == nsoid)
+        .map(|t| t.oid)
         .collect();
-    for key in type_keys {
-        if let Some(oid) = interp.type_by_name.remove(&key) {
-            interp.types.remove(&oid);
-        }
+    for type_oid in type_oids {
+        interp.remove_pg_type(type_oid);
+        let obj = crate::oid::PgGenericOid::new(type_oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_TYPE_RELID, obj);
+        interp.remove_dependencies_on(PG_TYPE_RELID, obj);
     }
 
-    // Remove all functions and operators in this schema.
-    interp.functions_by_name.retain(|k, _| k.schema != name);
-    interp.operators_by_name.retain(|k, _| k.schema != name);
+    let proc_oids: Vec<PgProcOid> = interp
+        .pg_proc
+        .values()
+        .filter(|p| p.pronamespace == nsoid)
+        .map(|p| p.oid)
+        .collect();
+    for proc_oid in proc_oids {
+        interp.remove_pg_proc(proc_oid);
+        let obj = crate::oid::PgGenericOid::new(proc_oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_PROC_RELID, obj);
+        interp.remove_dependencies_on(PG_PROC_RELID, obj);
+    }
 
-    // Finally, drop the schema itself from the search_path and the known set.
-    interp.search_path.retain(|s| s != &name);
-    interp.schemas.remove(&name);
+    let op_oids: Vec<PgOperatorOid> = interp
+        .pg_operator
+        .values()
+        .filter(|o| o.oprnamespace == nsoid)
+        .map(|o| o.oid)
+        .collect();
+    for op_oid in op_oids {
+        interp.remove_pg_operator(op_oid);
+        let obj = crate::oid::PgGenericOid::new(op_oid.get()).unwrap();
+        interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
+    }
 
+    interp.search_path.retain(|&s| s != nsoid);
+    interp.remove_pg_namespace(nsoid);
+    let ns_obj = crate::oid::PgGenericOid::new(nsoid.get()).unwrap();
+    interp.remove_dependencies_of(PG_NAMESPACE_RELID, ns_obj);
+    interp.remove_dependencies_on(PG_NAMESPACE_RELID, ns_obj);
     Ok(())
 }

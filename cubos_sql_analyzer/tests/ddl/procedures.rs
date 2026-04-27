@@ -7,26 +7,23 @@ use crate::common::*;
 
 #[test]
 fn create_procedure_registers_with_is_procedure_flag() {
-    // Procedures land in functions_by_name but must be flagged so the
-    // resolver does not surface them as callable expressions.
     let snap = build(&[(
         "0001.sql",
         "CREATE PROCEDURE do_thing(x int) LANGUAGE SQL AS $$ SELECT $1 $$;",
     )]);
 
-    let fns = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "do_thing"))
-        .expect("do_thing should be registered");
-    assert_eq!(fns.len(), 1);
-    assert!(fns[0].is_procedure);
-    assert!(!fns[0].is_aggregate);
+    let public_oid = snap.namespace_oid("public").unwrap();
+    let procs: Vec<&PgProc> = snap
+        .pg_proc()
+        .values()
+        .filter(|p| p.pronamespace == public_oid && p.proname == "do_thing")
+        .collect();
+    assert_eq!(procs.len(), 1);
+    assert_eq!(procs[0].prokind, ProKind::Procedure);
 }
 
 #[test]
 fn procedure_is_not_callable_in_expressions() {
-    // A `CREATE PROCEDURE` must not be considered a valid expression-level
-    // function. Calling it inside a SELECT should fail analysis.
     let db = build_db(&[(
         "0001.sql",
         "CREATE PROCEDURE do_thing(x int) LANGUAGE SQL AS $$ SELECT $1 $$;",
@@ -50,10 +47,12 @@ fn drop_procedure_does_not_touch_function_of_same_name() {
          DROP PROCEDURE f(int);",
     )]);
 
-    let fns = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "f"))
-        .unwrap();
-    assert_eq!(fns.len(), 1);
-    assert!(!fns[0].is_procedure);
+    let public_oid = snap.namespace_oid("public").unwrap();
+    let procs: Vec<&PgProc> = snap
+        .pg_proc()
+        .values()
+        .filter(|p| p.pronamespace == public_oid && p.proname == "f")
+        .collect();
+    assert_eq!(procs.len(), 1);
+    assert_eq!(procs[0].prokind, ProKind::Function);
 }

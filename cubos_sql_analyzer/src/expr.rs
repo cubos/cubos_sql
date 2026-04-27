@@ -16,10 +16,11 @@ use pg_query::protobuf::{self, a_const, node};
 use crate::coerce::{self, CoercionContext, can_coerce};
 use crate::error::AnalyzeError;
 use crate::functions;
+use crate::functions::OutArg;
 use crate::nullability::NullabilityContext;
+use crate::oid::PgTypeOid;
 use crate::param_collector::ParamCollector;
-use crate::pg_catalog::PgCatalog;
-use crate::schema::oid;
+use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 use crate::scope::Scope;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -33,7 +34,7 @@ use crate::scope::Scope;
 /// with coercion level Y".
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TypeGoal {
-    pub type_oid: u32,
+    pub type_oid: PgTypeOid,
     pub coercion: CoercionContext,
 }
 
@@ -46,7 +47,7 @@ impl TypeGoal {
 
     /// Expression context — only implicit casts allowed
     /// (operator/function argument matching).
-    pub fn implicit(type_oid: u32) -> Self {
+    pub fn implicit(type_oid: PgTypeOid) -> Self {
         Self {
             type_oid,
             coercion: CoercionContext::Implicit,
@@ -55,7 +56,7 @@ impl TypeGoal {
 
     /// Assignment context — implicit + assignment casts allowed
     /// (WHERE, LIMIT, INSERT, UPDATE — matches PG's `COERCION_ASSIGNMENT`).
-    pub fn assignment(type_oid: u32) -> Self {
+    pub fn assignment(type_oid: PgTypeOid) -> Self {
         Self {
             type_oid,
             coercion: CoercionContext::Assignment,
@@ -81,7 +82,7 @@ impl TypeGoal {
 /// behaves like a typmod=-1 dynamic record.
 #[derive(Debug, Clone)]
 pub(crate) struct ExprType {
-    pub type_oid: u32,
+    pub type_oid: PgTypeOid,
     pub nullable: bool,
     pub record_fields: Option<Vec<RecordField>>,
 }
@@ -90,10 +91,10 @@ pub(crate) struct ExprType {
 /// inference. Recursive via `ty: ExprType` — nested rows like
 /// `ROW(1, ROW(2, 3))` survive without a special `nested_fields` channel.
 ///
-/// This is the expression-side counterpart to [`crate::schema::CompositeField`]:
-/// the schema struct is the serialization format used for registered
-/// composite types and SRF out_args; this one is the in-memory form used
-/// during inference. [`RecordField::lift`] bridges from schema to expression.
+/// SRF / OUT-arg outputs live as [`OutArg`]. The `from_*` constructor below
+/// bridges that form into the expression-side shape used during inference.
+/// Composite-type fields are read directly from `pg_attribute` via
+/// [`PgCatalog::composite_fields_of`] in the call sites that need them.
 #[derive(Debug, Clone)]
 pub(crate) struct RecordField {
     pub name: String,
@@ -101,20 +102,16 @@ pub(crate) struct RecordField {
 }
 
 impl RecordField {
-    /// Convert a registered composite/out-arg field (schema form) into the
-    /// expression form by populating an `ExprType` whose `record_fields` is
-    /// `None` — registered composites only carry OIDs, so any nested record
-    /// content is reachable later through snapshot lookup.
-    pub fn lift(f: &crate::schema::CompositeField) -> Self {
+    /// Convert an SRF / OUT-arg field into the expression form.
+    pub fn from_out_arg(a: &OutArg) -> Self {
         Self {
-            name: f.name.clone(),
-            ty: ExprType::scalar(f.type_oid, !f.not_null),
+            name: a.name.clone(),
+            ty: ExprType::scalar(a.type_oid, !a.not_null),
         }
     }
 
-    /// Lift a slice of schema-side composite fields in one shot.
-    pub fn lift_all(fields: &[crate::schema::CompositeField]) -> Vec<Self> {
-        fields.iter().map(Self::lift).collect()
+    pub fn from_out_args(args: &[OutArg]) -> Vec<Self> {
+        args.iter().map(Self::from_out_arg).collect()
     }
 }
 
@@ -122,7 +119,7 @@ impl ExprType {
     /// Construct a scalar (non-record) ExprType. The vast majority of call
     /// sites use this; only ROW constructors and shape-propagating helpers
     /// build with `record_fields: Some(...)`.
-    pub fn scalar(type_oid: u32, nullable: bool) -> Self {
+    pub fn scalar(type_oid: PgTypeOid, nullable: bool) -> Self {
         Self {
             type_oid,
             nullable,
@@ -138,11 +135,14 @@ impl ExprType {
 /// Render a type OID as `schema.name` for error messages. Falls back to
 /// `unknown(<oid>)` when the snapshot doesn't know the OID — should never
 /// happen in practice but avoids panicking during error formatting.
-fn type_oid_display(oid: u32, snapshot: &PgCatalog) -> String {
+fn type_oid_display(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
     snapshot
         .get_type(oid)
-        .map(|t| format!("{}.{}", t.schema, t.name))
-        .unwrap_or_else(|| format!("unknown({oid})"))
+        .map(|t| {
+            let ns = snapshot.namespace_name(t.typnamespace).unwrap_or("?");
+            format!("{ns}.{}", t.typname)
+        })
+        .unwrap_or_else(|| format!("unknown({})", oid.get()))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -188,7 +188,10 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                 };
                 if !name.is_empty() {
                     let candidates = snapshot.find_functions(schema, name);
-                    if candidates.iter().any(|f| f.is_aggregate) {
+                    if candidates
+                        .iter()
+                        .any(|f| matches!(f.prokind, crate::pg_catalog::ProKind::Aggregate))
+                    {
                         out.has_aggregate = true;
                     }
                 }
@@ -329,10 +332,9 @@ pub(crate) fn infer_expr(
                 }
                 any_arg = true;
             }
-            let resolved_type = if mm.minmaxtype != 0 && mm.minmaxtype != oid::UNKNOWN {
-                mm.minmaxtype
-            } else {
-                crate::coerce::find_common_type(&arg_oids, snapshot).unwrap_or(oid::UNKNOWN)
+            let resolved_type = match PgTypeOid::new(mm.minmaxtype) {
+                Some(t) if t != oid::UNKNOWN => t,
+                _ => crate::coerce::find_common_type(&arg_oids, snapshot).unwrap_or(oid::UNKNOWN),
             };
             // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
             Ok(ExprType::scalar(resolved_type, !any_arg || all_nullable))
@@ -355,13 +357,19 @@ pub(crate) fn infer_expr(
             // see through.
             let composite_goal = if goal.has_expectation() {
                 let target = snapshot.unwrap_domain(goal.type_oid);
-                snapshot.get_type(target).and_then(|te| match &te.kind {
-                    crate::schema::TypeKind::Composite { fields }
-                        if fields.len() == row.args.len() =>
+                snapshot.get_type(target).and_then(|te| {
+                    if te.typtype == TypType::Composite
+                        && let Some(relid) = te.typrelid
                     {
-                        Some((target, fields.clone()))
+                        let fields = snapshot.attributes_of(relid).to_vec();
+                        if fields.len() == row.args.len() {
+                            Some((target, fields))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
-                    _ => None,
                 })
             } else {
                 None
@@ -376,7 +384,7 @@ pub(crate) fn infer_expr(
                         null_ctx,
                         snapshot,
                         params,
-                        TypeGoal::assignment(field.type_oid),
+                        TypeGoal::assignment(field.atttypid),
                     )?;
                     any_nullable = any_nullable || t.nullable;
                 }
@@ -434,11 +442,14 @@ pub(crate) fn infer_expr(
             // through the surrounding goal.
             if result.type_oid != oid::UNKNOWN {
                 let base = snapshot.unwrap_domain(result.type_oid);
-                let category = snapshot.get_type(base).map(|t| t.category).unwrap_or('U');
-                if category != 'S' {
+                let category = snapshot
+                    .get_type(base)
+                    .map(|t| t.typcategory)
+                    .unwrap_or(TypCategory::UserDefined);
+                if category != TypCategory::String {
                     let type_name = snapshot
                         .get_type(base)
-                        .map(|t| t.name.clone())
+                        .map(|t| t.typname.clone())
                         .unwrap_or_else(|| format!("oid {base}"));
                     return Err(AnalyzeError::Invalid(format!(
                         "collations are not supported by type {type_name}"
@@ -498,18 +509,21 @@ fn check_goal_compatibility(
     })
 }
 
-fn type_display_name(oid: u32, snapshot: &PgCatalog) -> String {
+fn type_display_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
     snapshot
         .get_type(oid)
-        .map(|t| t.name.clone())
-        .unwrap_or_else(|| format!("oid:{oid}"))
+        .map(|t| t.typname.clone())
+        .unwrap_or_else(|| format!("oid:{}", oid.get()))
 }
 
 /// Return `text` when `node` is an untyped string literal (`'x'`) and its
 /// inferred type is still UNKNOWN. Used by constructs that need to treat a
 /// bare string constant as text for type-compatibility checks — NULLIF,
 /// CASE / COALESCE / ARRAY[...] branch merging, UNION column reconciliation.
-pub(crate) fn unknown_literal_as_text(node: Option<&protobuf::Node>, inferred_oid: u32) -> u32 {
+pub(crate) fn unknown_literal_as_text(
+    node: Option<&protobuf::Node>,
+    inferred_oid: PgTypeOid,
+) -> PgTypeOid {
     if inferred_oid != oid::UNKNOWN {
         return inferred_oid;
     }
@@ -584,7 +598,8 @@ fn infer_column_ref(
             if table.is_none()
                 && let Some(src) = scope.find_source(column)
                 && let Some(qn) = src.source_qn.as_ref()
-                && let Some(&composite_oid) = snapshot.type_by_name.get(qn)
+                && let Some(nsoid) = snapshot.namespace_oid(&qn.schema)
+                && let Some(&composite_oid) = snapshot.type_by_qname.get(&(nsoid, qn.name.clone()))
             {
                 return Ok(ExprType::scalar(composite_oid, false));
             }
@@ -628,15 +643,18 @@ fn infer_star_ref(
         ))
     })?;
 
-    let composite_oid =
-        snapshot
-            .type_by_name
-            .get(qn)
-            .copied()
-            .ok_or_else(|| AnalyzeError::UndefinedType {
-                oid: 0,
-                context: format!("composite type for {qn}"),
-            })?;
+    let composite_oid = snapshot
+        .namespace_oid(&qn.schema)
+        .and_then(|nsoid| {
+            snapshot
+                .type_by_qname
+                .get(&(nsoid, qn.name.clone()))
+                .copied()
+        })
+        .ok_or_else(|| AnalyzeError::UndefinedType {
+            oid: 0,
+            context: format!("composite type for {qn}"),
+        })?;
 
     // A row value from a real relation is never NULL (it exists as soon as
     // the row is produced); individual fields may be null, but the composite
@@ -677,7 +695,7 @@ fn infer_indirection(
     // to the generic walker for any remaining steps (e.g. nested composite
     // unwrap, subscript on a scalar out_arg).
     let from_direct_funccall = if let Some(node::Node::FuncCall(fc)) = arg.node.as_ref() {
-        resolve_funccall_out_args(fc, snapshot, params)?
+        resolve_funccall_out_args(fc, scope, null_ctx, snapshot, params)?
     } else {
         None
     };
@@ -743,14 +761,14 @@ fn infer_indirection(
                 if ai.is_slice {
                     let type_entry = snapshot.get_type(current.type_oid).ok_or_else(|| {
                         AnalyzeError::UndefinedType {
-                            oid: current.type_oid,
+                            oid: current.type_oid.get(),
                             context: "array slice".into(),
                         }
                     })?;
-                    if !matches!(type_entry.kind, crate::schema::TypeKind::Array { .. }) {
+                    if type_entry.typcategory != TypCategory::Array {
                         return Err(AnalyzeError::Unsupported(format!(
                             "slice on non-array type '{}'",
-                            type_entry.name
+                            type_entry.typname
                         )));
                     }
                     // `arr[lo:hi]` keeps the array type. Result is NULL iff
@@ -798,6 +816,8 @@ fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<V
 /// fall back to generic composite/record handling.
 fn resolve_funccall_out_args(
     fc: &protobuf::FuncCall,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<Option<Vec<RecordField>>, AnalyzeError> {
@@ -808,23 +828,16 @@ fn resolve_funccall_out_args(
         _ => return Ok(None),
     };
 
-    // Infer arg types in an empty scope so overload resolution can run.
-    // Function args inside a scalar call don't see a FROM scope in the
-    // typical use sites of this helper.
-    let empty_scope = Scope::default();
-    let empty_null_ctx = NullabilityContext::default();
+    // Infer arg types against the caller's scope so column refs in the
+    // arguments resolve to concrete types — needed for polymorphic
+    // substitution (`anyelement` → element-of-array etc.) when the function
+    // has polymorphic out args like `_pg_expandarray(anyarray) RETURNS
+    // (x anyelement, n int)`.
     let mut arg_types = Vec::with_capacity(fc.args.len());
     for arg in &fc.args {
-        let t = infer_expr(
-            arg,
-            &empty_scope,
-            &empty_null_ctx,
-            snapshot,
-            params,
-            TypeGoal::NONE,
-        )
-        .map(|e| e.type_oid)
-        .unwrap_or(oid::UNKNOWN);
+        let t = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)
+            .map(|e| e.type_oid)
+            .unwrap_or(oid::UNKNOWN);
         arg_types.push(t);
     }
 
@@ -836,7 +849,7 @@ fn resolve_funccall_out_args(
     if resolved.out_args.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(RecordField::lift_all(&resolved.out_args)))
+        Ok(Some(RecordField::from_out_args(&resolved.out_args)))
     }
 }
 
@@ -871,33 +884,36 @@ fn resolve_composite_field(
     let type_entry = snapshot
         .get_type(base_oid)
         .ok_or_else(|| AnalyzeError::UndefinedType {
-            oid: base_oid,
+            oid: base_oid.get(),
             context: format!("composite field access .{field_name}"),
         })?;
 
-    let fields = match &type_entry.kind {
-        crate::schema::TypeKind::Composite { fields } => fields,
-        _ => {
-            return Err(AnalyzeError::Unsupported(format!(
-                "field access .{field_name} on non-composite type '{}'",
-                type_entry.name
-            )));
-        }
+    let Some(relid) = type_entry.typrelid else {
+        return Err(AnalyzeError::Unsupported(format!(
+            "field access .{field_name} on non-composite type '{}'",
+            type_entry.typname
+        )));
     };
-
+    if type_entry.typtype != TypType::Composite {
+        return Err(AnalyzeError::Unsupported(format!(
+            "field access .{field_name} on non-composite type '{}'",
+            type_entry.typname
+        )));
+    }
+    let fields = snapshot.attributes_of(relid);
     let field = fields
         .iter()
-        .find(|f| f.name == field_name)
+        .find(|f| f.attname == field_name)
         .ok_or_else(|| {
             AnalyzeError::UndefinedColumn(format!(
                 "column \"{field_name}\" of composite type \"{}\" does not exist",
-                type_entry.name
+                type_entry.typname
             ))
         })?;
 
     Ok(ExprType::scalar(
-        field.type_oid,
-        current.nullable || !field.not_null,
+        field.atttypid,
+        current.nullable || !field.attnotnull,
     ))
 }
 
@@ -927,7 +943,7 @@ fn infer_array_expr(
             // PG: `ARRAY types <X> and <Y> cannot be matched`. Use the
             // first two distinct concrete types in the message so the
             // diagnostic is stable regardless of ordering tie-breaks.
-            let mut concrete: Vec<u32> = element_types
+            let mut concrete: Vec<PgTypeOid> = element_types
                 .iter()
                 .copied()
                 .filter(|&t| t != oid::UNKNOWN)
@@ -939,7 +955,7 @@ fn infer_array_expr(
                 .map(|&t| {
                     snapshot
                         .get_type(t)
-                        .map(|te| te.name.clone())
+                        .map(|te| te.typname.clone())
                         .unwrap_or_else(|| format!("oid {t}"))
                 })
                 .collect();
@@ -972,19 +988,22 @@ fn resolve_array_element(
         snapshot
             .get_type(current.type_oid)
             .ok_or_else(|| AnalyzeError::UndefinedType {
-                oid: current.type_oid,
+                oid: current.type_oid.get(),
                 context: "array subscript".into(),
             })?;
-    let elem_oid = match &type_entry.kind {
-        crate::schema::TypeKind::Array { element_type_oid } => *element_type_oid,
-        _ => {
-            return Err(AnalyzeError::Unsupported(format!(
-                "subscript on non-array type '{}'",
-                type_entry.name
-            )));
-        }
+    let Some(elem) = type_entry.typelem else {
+        return Err(AnalyzeError::Unsupported(format!(
+            "subscript on non-array type '{}'",
+            type_entry.typname
+        )));
     };
-    Ok(ExprType::scalar(elem_oid, true))
+    if type_entry.typcategory != TypCategory::Array {
+        return Err(AnalyzeError::Unsupported(format!(
+            "subscript on non-array type '{}'",
+            type_entry.typname
+        )));
+    }
+    Ok(ExprType::scalar(elem, true))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1217,7 +1236,20 @@ fn infer_func_call(
             && functions::is_not_null_nonstrict(name))
     };
 
-    Ok(ExprType::scalar(resolved.return_type_oid, nullable))
+    // SRFs / OUT-arg functions carry a static row shape — propagate it as
+    // `record_fields` so downstream `(call(...)).field` / `(scope_col).field`
+    // indirection sees the named columns with their substituted polymorphic
+    // types (e.g. `_pg_expandarray(oid[]).x` → `oid`, not `anyelement`).
+    let record_fields = if resolved.out_args.is_empty() {
+        None
+    } else {
+        Some(RecordField::from_out_args(&resolved.out_args))
+    };
+    Ok(ExprType {
+        type_oid: resolved.return_type_oid,
+        nullable,
+        record_fields,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1458,9 +1490,9 @@ fn infer_a_expr(
         // right is concrete T[], left is unknown → left must be the element type T.
         if right_oid != oid::UNKNOWN
             && left_oid == oid::UNKNOWN
-            && let Some(elem_oid) = snapshot.types.get(&right_oid).and_then(|t| {
-                if let crate::schema::TypeKind::Array { element_type_oid } = t.kind {
-                    Some(element_type_oid)
+            && let Some(elem_oid) = snapshot.get_type(right_oid).and_then(|t| {
+                if t.typcategory == TypCategory::Array {
+                    t.typelem
                 } else {
                     None
                 }
@@ -1719,7 +1751,7 @@ fn infer_coalesce(
 
     // All non-UNKNOWN branches must share a common type, otherwise PG
     // rejects with `could not convert type X to Y`.
-    let concrete_types: Vec<u32> = types
+    let concrete_types: Vec<PgTypeOid> = types
         .iter()
         .copied()
         .filter(|&t| t != oid::UNKNOWN)
@@ -1729,7 +1761,7 @@ fn infer_coalesce(
         // of the string category (usually `text`). Derived from the catalog so
         // we stay honest: no hardcoded OID here.
         snapshot
-            .preferred_type_in_category('S')
+            .preferred_type_in_category(TypCategory::String)
             .unwrap_or(oid::UNKNOWN)
     } else {
         coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
@@ -1811,7 +1843,7 @@ fn infer_case(
 
     // All non-UNKNOWN branches must share a common type, otherwise PG
     // rejects with `could not convert type X to Y`.
-    let concrete_types: Vec<u32> = types
+    let concrete_types: Vec<PgTypeOid> = types
         .iter()
         .copied()
         .filter(|&t| t != oid::UNKNOWN)
@@ -1821,7 +1853,7 @@ fn infer_case(
         // of the string category (usually `text`). Derived from the catalog so
         // we stay honest: no hardcoded OID here.
         snapshot
-            .preferred_type_in_category('S')
+            .preferred_type_in_category(TypCategory::String)
             .unwrap_or(oid::UNKNOWN)
     } else {
         coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
@@ -2068,11 +2100,11 @@ pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
 fn resolve_type_name(
     type_name: Option<&protobuf::TypeName>,
     snapshot: &PgCatalog,
-) -> Result<u32, AnalyzeError> {
+) -> Result<PgTypeOid, AnalyzeError> {
     let tn = type_name.ok_or_else(|| AnalyzeError::Unsupported("missing TypeName".into()))?;
 
-    if tn.type_oid != 0 {
-        return Ok(tn.type_oid);
+    if let Some(oid) = PgTypeOid::new(tn.type_oid) {
+        return Ok(oid);
     }
 
     let parts = extract_string_fields(&tn.names);
@@ -2102,12 +2134,8 @@ fn resolve_type_name(
         if let Some(arr) = snapshot.resolve_type_by_name(schema, &array_name) {
             return Ok(arr.oid);
         }
-        for t in snapshot.types.values() {
-            if let crate::schema::TypeKind::Array { element_type_oid } = t.kind
-                && element_type_oid == type_entry.oid
-            {
-                return Ok(t.oid);
-            }
+        if let Some(arr_oid) = snapshot.array_type_of(type_entry.oid) {
+            return Ok(arr_oid);
         }
     }
 

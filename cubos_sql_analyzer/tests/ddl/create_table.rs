@@ -19,24 +19,25 @@ fn create_table_basic() {
     )]);
 
     let table = snap.resolve_table(Some("public"), "users").unwrap();
-    assert_eq!(table.name, "users");
-    assert_eq!(table.kind, RelationKind::Table);
-    assert_eq!(table.columns.len(), 4);
+    assert_eq!(table.relname, "users");
+    assert_eq!(table.relkind, RelKind::Table);
+    let attrs = snap.attributes_of(table.oid);
+    assert_eq!(attrs.len(), 4);
 
-    let id_col = &table.columns[0];
-    assert_eq!(id_col.name, "id");
-    assert!(id_col.not_null);
-    assert!(id_col.has_default); // IDENTITY
+    let id_col = &attrs[0];
+    assert_eq!(id_col.attname, "id");
+    assert!(id_col.attnotnull);
+    assert!(id_col.atthasdef); // IDENTITY
 
-    let name_col = &table.columns[1];
-    assert_eq!(name_col.name, "name");
-    assert!(name_col.not_null);
-    assert!(!name_col.has_default);
+    let name_col = &attrs[1];
+    assert_eq!(name_col.attname, "name");
+    assert!(name_col.attnotnull);
+    assert!(!name_col.atthasdef);
 
-    let age_col = &table.columns[3];
-    assert_eq!(age_col.name, "age");
-    assert!(!age_col.not_null);
-    assert!(!age_col.has_default);
+    let age_col = &attrs[3];
+    assert_eq!(age_col.attname, "age");
+    assert!(!age_col.attnotnull);
+    assert!(!age_col.atthasdef);
 }
 
 #[test]
@@ -51,15 +52,16 @@ fn create_table_with_default() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let id_col = &table.columns[0];
-    assert!(id_col.has_default); // SERIAL
+    let attrs = snap.attributes_of(table.oid);
+    let id_col = &attrs[0];
+    assert!(id_col.atthasdef); // SERIAL
 
-    let created_col = &table.columns[1];
-    assert!(created_col.has_default); // DEFAULT now()
-    assert!(created_col.not_null);
+    let created_col = &attrs[1];
+    assert!(created_col.atthasdef); // DEFAULT now()
+    assert!(created_col.attnotnull);
 
-    let name_col = &table.columns[2];
-    assert!(!name_col.has_default);
+    let name_col = &attrs[2];
+    assert!(!name_col.atthasdef);
 }
 
 #[test]
@@ -71,11 +73,11 @@ fn create_table_registers_composite_and_array_types() {
 
     // Composite type for the table.
     let ct = snap.resolve_type_by_name(Some("public"), "items").unwrap();
-    assert!(matches!(ct.kind, TypeKind::Composite { .. }));
+    assert_eq!(ct.typtype, TypType::Composite);
 
     // Array type.
     let at = snap.resolve_type_by_name(Some("public"), "_items").unwrap();
-    assert!(matches!(at.kind, TypeKind::Array { .. }));
+    assert_eq!(at.typcategory, TypCategory::Array);
 }
 
 #[test]
@@ -90,7 +92,7 @@ fn create_table_if_not_exists() {
 
     let table = snap.resolve_table(None, "t").unwrap();
     // Should still have original schema (1 column), not the second one.
-    assert_eq!(table.columns.len(), 1);
+    assert_eq!(snap.attributes_of(table.oid).len(), 1);
 }
 
 // ── Schema-qualified tables ─────────────────────────────────────────────────
@@ -104,8 +106,8 @@ fn create_schema_with_table() {
     )]);
 
     let table = snap.resolve_table(Some("myapp"), "items").unwrap();
-    assert_eq!(table.columns.len(), 2);
-    assert_eq!(table.schema, "myapp");
+    assert_eq!(snap.attributes_of(table.oid).len(), 2);
+    assert_eq!(snap.namespace_name(table.relnamespace), Some("myapp"));
 }
 
 // ── No-op DDL shouldn't fail ────────────────────────────────────────────────
@@ -160,27 +162,26 @@ fn create_table_if_not_exists_different_schema_creates_both() {
     )]);
 
     let t1 = snap.resolve_table(Some("public"), "t").unwrap();
-    assert_eq!(t1.columns.len(), 1);
+    assert_eq!(snap.attributes_of(t1.oid).len(), 1);
 
     let t2 = snap.resolve_table(Some("other"), "t").unwrap();
-    assert_eq!(t2.columns.len(), 2);
+    assert_eq!(snap.attributes_of(t2.oid).len(), 2);
 }
 
 // ── SERIAL / BIGSERIAL / SMALLSERIAL ────────────────────────────────────────
 
 #[test]
 fn serial_without_pk_is_nullable() {
-    // PG: SERIAL alone implies a default (from the sequence) but NOT
-    // NOT-NULL — only the PRIMARY KEY constraint adds NOT NULL.
     let snap = build(&[("0001.sql", "CREATE TABLE t (id SERIAL, name TEXT);")]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let id_col = table.columns.iter().find(|c| c.name == "id").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let id_col = attrs.iter().find(|c| c.attname == "id").unwrap();
     assert!(
-        !id_col.not_null,
+        !id_col.attnotnull,
         "SERIAL without PRIMARY KEY should be nullable"
     );
-    assert!(id_col.has_default, "SERIAL should have a default");
+    assert!(id_col.atthasdef, "SERIAL should have a default");
 }
 
 #[test]
@@ -188,17 +189,21 @@ fn bigserial_resolves_to_int8() {
     let snap = build(&[("0001.sql", "CREATE TABLE t (id BIGSERIAL PRIMARY KEY);")]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let id_col = table.columns.iter().find(|c| c.name == "id").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let id_col = attrs.iter().find(|c| c.attname == "id").unwrap();
     let int8_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "int8")
         .unwrap()
         .oid;
     assert_eq!(
-        id_col.type_oid, int8_oid,
+        id_col.atttypid, int8_oid,
         "BIGSERIAL should resolve to int8"
     );
-    assert!(id_col.has_default, "BIGSERIAL should have a default");
-    assert!(id_col.not_null, "BIGSERIAL PRIMARY KEY should be NOT NULL");
+    assert!(id_col.atthasdef, "BIGSERIAL should have a default");
+    assert!(
+        id_col.attnotnull,
+        "BIGSERIAL PRIMARY KEY should be NOT NULL"
+    );
 }
 
 #[test]
@@ -206,13 +211,14 @@ fn smallserial_resolves_to_int2() {
     let snap = build(&[("0001.sql", "CREATE TABLE t (id SMALLSERIAL NOT NULL);")]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let id_col = table.columns.iter().find(|c| c.name == "id").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let id_col = attrs.iter().find(|c| c.attname == "id").unwrap();
     let int2_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "int2")
         .unwrap()
         .oid;
     assert_eq!(
-        id_col.type_oid, int2_oid,
+        id_col.atttypid, int2_oid,
         "SMALLSERIAL should resolve to int2"
     );
 }
@@ -227,17 +233,18 @@ fn varchar_and_char_resolve_to_varchar_and_bpchar() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let name = table.columns.iter().find(|c| c.name == "name").unwrap();
-    let code = table.columns.iter().find(|c| c.name == "code").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let name = attrs.iter().find(|c| c.attname == "name").unwrap();
+    let code = attrs.iter().find(|c| c.attname == "code").unwrap();
 
-    assert_ne!(name.type_oid, 0, "VARCHAR(100) should resolve");
-    assert_ne!(code.type_oid, 0, "CHAR(5) should resolve");
+    assert_ne!(name.atttypid.get(), 0, "VARCHAR(100) should resolve");
+    assert_ne!(code.atttypid.get(), 0, "CHAR(5) should resolve");
 
     let varchar_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "varchar")
         .unwrap()
         .oid;
-    assert_eq!(name.type_oid, varchar_oid);
+    assert_eq!(name.atttypid, varchar_oid);
 }
 
 #[test]
@@ -248,16 +255,17 @@ fn numeric_and_decimal_resolve_to_numeric() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let amount = table.columns.iter().find(|c| c.name == "amount").unwrap();
-    let factor = table.columns.iter().find(|c| c.name == "factor").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let amount = attrs.iter().find(|c| c.attname == "amount").unwrap();
+    let factor = attrs.iter().find(|c| c.attname == "factor").unwrap();
 
     let numeric_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "numeric")
         .unwrap()
         .oid;
-    assert_eq!(amount.type_oid, numeric_oid);
+    assert_eq!(amount.atttypid, numeric_oid);
     assert_eq!(
-        factor.type_oid, numeric_oid,
+        factor.atttypid, numeric_oid,
         "DECIMAL should resolve to numeric"
     );
 }
@@ -276,8 +284,14 @@ fn datetime_types_resolve() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    for col in &table.columns {
-        assert_ne!(col.type_oid, 0, "column '{}' must resolve", col.name);
+    let attrs = snap.attributes_of(table.oid);
+    for col in attrs {
+        assert_ne!(
+            col.atttypid.get(),
+            0,
+            "column '{}' must resolve",
+            col.attname
+        );
     }
 }
 
@@ -289,8 +303,9 @@ fn json_and_jsonb_types_resolve() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let data = table.columns.iter().find(|c| c.name == "data").unwrap();
-    let meta = table.columns.iter().find(|c| c.name == "meta").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let data = attrs.iter().find(|c| c.attname == "data").unwrap();
+    let meta = attrs.iter().find(|c| c.attname == "meta").unwrap();
 
     let jsonb_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "jsonb")
@@ -300,9 +315,9 @@ fn json_and_jsonb_types_resolve() {
         .resolve_type_by_name(Some("pg_catalog"), "json")
         .unwrap()
         .oid;
-    assert_eq!(data.type_oid, jsonb_oid);
-    assert_eq!(meta.type_oid, json_oid);
-    assert!(!meta.not_null, "JSON without NOT NULL should be nullable");
+    assert_eq!(data.atttypid, jsonb_oid);
+    assert_eq!(meta.atttypid, json_oid);
+    assert!(!meta.attnotnull, "JSON without NOT NULL should be nullable");
 }
 
 #[test]
@@ -313,14 +328,15 @@ fn uuid_type_with_default() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let id = table.columns.iter().find(|c| c.name == "id").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let id = attrs.iter().find(|c| c.attname == "id").unwrap();
     let uuid_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "uuid")
         .unwrap()
         .oid;
-    assert_eq!(id.type_oid, uuid_oid);
+    assert_eq!(id.atttypid, uuid_oid);
     assert!(
-        id.has_default,
+        id.atthasdef,
         "DEFAULT gen_random_uuid() must set has_default"
     );
 }
@@ -329,8 +345,6 @@ fn uuid_type_with_default() {
 
 #[test]
 fn unique_constraint_does_not_imply_not_null() {
-    // UNIQUE parses but doesn't add NOT NULL — the user declared `email` as
-    // NOT NULL separately, so it inherits that instead.
     let snap = build(&[(
         "0001.sql",
         "CREATE TABLE t (
@@ -341,15 +355,14 @@ fn unique_constraint_does_not_imply_not_null() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    assert_eq!(table.columns.len(), 3);
-    let email = table.columns.iter().find(|c| c.name == "email").unwrap();
-    assert!(email.not_null);
+    let attrs = snap.attributes_of(table.oid);
+    assert_eq!(attrs.len(), 3);
+    let email = attrs.iter().find(|c| c.attname == "email").unwrap();
+    assert!(email.attnotnull);
 }
 
 #[test]
 fn foreign_key_constraint_parses_without_affecting_column() {
-    // FOREIGN KEY is a cross-table constraint; CREATE TABLE must register
-    // all columns normally and not report the referenced table as missing.
     let snap = build(&[(
         "0001.sql",
         "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
@@ -361,9 +374,10 @@ fn foreign_key_constraint_parses_without_affecting_column() {
     )]);
 
     let posts = snap.resolve_table(None, "posts").unwrap();
-    assert_eq!(posts.columns.len(), 3);
-    let user_id = posts.columns.iter().find(|c| c.name == "user_id").unwrap();
-    assert!(user_id.not_null);
+    let attrs = snap.attributes_of(posts.oid);
+    assert_eq!(attrs.len(), 3);
+    let user_id = attrs.iter().find(|c| c.attname == "user_id").unwrap();
+    assert!(user_id.attnotnull);
 }
 
 #[test]
@@ -378,22 +392,21 @@ fn check_constraint_parses() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    assert_eq!(table.columns.len(), 3);
+    assert_eq!(snap.attributes_of(table.oid).len(), 3);
 }
 
 #[test]
 fn generated_stored_column_has_default() {
-    // GENERATED ALWAYS AS (...) STORED columns are computed — INSERT must not
-    // supply a value for them, so they behave like a column with a default.
     let snap = build(&[(
         "0001.sql",
         "CREATE TABLE t (a INT NOT NULL, b INT GENERATED ALWAYS AS (a * 2) STORED);",
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let b = table.columns.iter().find(|c| c.name == "b").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let b = attrs.iter().find(|c| c.attname == "b").unwrap();
     assert!(
-        b.has_default,
+        b.atthasdef,
         "GENERATED ALWAYS AS (stored) must set has_default"
     );
 }
@@ -402,8 +415,6 @@ fn generated_stored_column_has_default() {
 
 #[test]
 fn param_in_group_by_and_having_is_inferred() {
-    // Params in GROUP BY / HAVING clauses must also be walked. This ensures
-    // the analyzer collects and types them after a fresh CREATE TABLE.
     let db = build_db(&[(
         "0001.sql",
         "CREATE TABLE orders (id BIGINT, total INT NOT NULL);",

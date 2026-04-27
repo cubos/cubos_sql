@@ -15,7 +15,7 @@ fn create_extension_uuid_ossp() {
         .resolve_type_by_name(Some("pg_catalog"), "uuid")
         .unwrap()
         .oid;
-    assert_eq!(fns[0].return_type_oid, uuid_oid);
+    assert_eq!(fns[0].prorettype, uuid_oid);
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn create_extension_citext() {
     let snap = build(&[("0001.sql", "CREATE EXTENSION citext;")]);
 
     let te = snap.resolve_type_by_name(None, "citext").unwrap();
-    assert!(matches!(te.kind, TypeKind::Base));
+    assert_eq!(te.typtype, TypType::Base);
     assert!(
         snap.resolve_type_by_name(Some("public"), "_citext")
             .is_some()
@@ -139,17 +139,17 @@ fn create_extension_tags_types_with_extension_name() {
     let vector = snap
         .resolve_type_by_name(None, "vector")
         .expect("vector type should be registered");
-    assert_eq!(vector.extension.as_deref(), Some("vector"));
+    assert_eq!(snap.extension_of_type(vector.oid), Some("vector"));
 
     let halfvec = snap
         .resolve_type_by_name(None, "halfvec")
         .expect("halfvec type should be registered");
-    assert_eq!(halfvec.extension.as_deref(), Some("vector"));
+    assert_eq!(snap.extension_of_type(halfvec.oid), Some("vector"));
 
     let sparsevec = snap
         .resolve_type_by_name(None, "sparsevec")
         .expect("sparsevec type should be registered");
-    assert_eq!(sparsevec.extension.as_deref(), Some("vector"));
+    assert_eq!(snap.extension_of_type(sparsevec.oid), Some("vector"));
 
     // User-defined types (from the same migration) must NOT be tagged.
     let snap = build(&[(
@@ -160,7 +160,7 @@ fn create_extension_tags_types_with_extension_name() {
     let my_thing = snap
         .resolve_type_by_name(None, "my_thing")
         .expect("my_thing should exist");
-    assert_eq!(my_thing.extension, None);
+    assert_eq!(snap.extension_of_type(my_thing.oid), None);
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn extension_version_creates_at_default() {
 
     // citext should be installed — check the type exists.
     let te = snap.resolve_type_by_name(None, "citext").unwrap();
-    assert!(matches!(te.kind, TypeKind::Base));
+    assert_eq!(te.typtype, TypType::Base);
 
     // Functions from upgrade scripts should also be present.
     let fns = snap.find_functions(None, "citext_hash_extended");
@@ -203,7 +203,7 @@ fn extension_version_specific() {
     let snap = build(&[("0001.sql", "CREATE EXTENSION citext VERSION '1.4';")]);
 
     let te = snap.resolve_type_by_name(None, "citext").unwrap();
-    assert!(matches!(te.kind, TypeKind::Base));
+    assert_eq!(te.typtype, TypType::Base);
 
     // citext_hash_extended is from 1.5->1.6 upgrade, should NOT exist.
     let fns = snap.find_functions(None, "citext_hash_extended");
@@ -245,7 +245,7 @@ fn extension_if_not_exists() {
 
     // Should not error, just skip.
     let te = snap.resolve_type_by_name(None, "citext").unwrap();
-    assert!(matches!(te.kind, TypeKind::Base));
+    assert_eq!(te.typtype, TypType::Base);
 }
 
 #[test]

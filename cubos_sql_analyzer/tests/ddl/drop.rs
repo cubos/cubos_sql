@@ -129,7 +129,7 @@ fn drop_function_removes_only_matching_overload() {
         .unwrap()
         .oid;
     assert_eq!(
-        fns[0].return_type_oid, text_oid,
+        fns[0].prorettype, text_oid,
         "remaining overload should be foo(TEXT)",
     );
 }
@@ -157,7 +157,7 @@ fn drop_column_if_exists_on_nonexistent_is_noop() {
     ]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    assert_eq!(table.columns.len(), 2, "columns unchanged");
+    assert_eq!(snap.attributes_of(table.oid).len(), 2, "columns unchanged");
 }
 
 // ── DROP EXTENSION removes its provided objects ────────────────────────────

@@ -103,7 +103,7 @@ pub async fn setup() -> Pool {
             let mig_cfg = MigrationsConfig::default();
 
             let mut client = bootstrap.get().await.expect("get client");
-            cubos_sql::migrate::run(&mut *client, &source, &mig_cfg)
+            cubos_sql::migrate::run(&mut client, &source, &mig_cfg)
                 .await
                 .expect("run migrations");
             drop(client);

@@ -7,8 +7,6 @@ use crate::common::*;
 
 #[test]
 fn rename_table_preserves_cascade_detection() {
-    // End-to-end: rename underlying table, then DROP it — CASCADE must still
-    // find the dependent view through the rewritten deps.
     let snap = build(&[
         (
             "0001.sql",
@@ -54,22 +52,19 @@ fn rename_table_rewrites_view_ast() {
         ("0002.sql", "ALTER TABLE t RENAME TO nodes;"),
     ]);
 
-    let vd = snap
-        .resolve_table(None, "v")
-        .unwrap()
-        .view_def
-        .as_ref()
-        .unwrap();
-    assert!(!vd.resolved_ast.is_empty());
+    let view = snap.resolve_table(None, "v").unwrap();
+    assert!(!view.relviewdef.is_empty());
+
+    let table_deps = view_table_deps(&snap, view.oid);
     assert!(
-        !vd.depends_on_tables
+        !table_deps
             .iter()
-            .any(|k| k.name == "t" && k.schema == "public"),
+            .any(|k| k.name == "t" && k.schema == "public")
     );
     assert!(
-        vd.depends_on_tables
+        table_deps
             .iter()
-            .any(|k| k.name == "nodes" && k.schema == "public"),
+            .any(|k| k.name == "nodes" && k.schema == "public")
     );
 }
 
@@ -86,19 +81,11 @@ fn rename_column_rewrites_deps_with_self_join() {
         ("0002.sql", "ALTER TABLE t RENAME COLUMN id TO node_id;"),
     ]);
 
-    let vd = snap
-        .resolve_table(None, "v")
-        .unwrap()
-        .view_def
-        .as_ref()
-        .unwrap();
+    let view = snap.resolve_table(None, "v").unwrap();
+    let col_deps = view_column_deps(&snap, view.oid);
     let t = QualifiedName::new("public", "t");
-    assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &t && c == "node_id"),
-    );
-    assert!(vd.depends_on_columns.iter().all(|(_, c)| c != "id"));
+    assert!(col_deps.iter().any(|(k, c)| k == &t && c == "node_id"));
+    assert!(col_deps.iter().all(|(_, c)| c != "id"));
 }
 
 #[test]
@@ -113,23 +100,15 @@ fn rename_schema_rewrites_view_ast() {
         ("0002.sql", "ALTER SCHEMA app RENAME TO core;"),
     ]);
 
-    let vd = snap
-        .resolve_table(Some("core"), "v")
-        .unwrap()
-        .view_def
-        .as_ref()
-        .unwrap();
-    let old = QualifiedName::new("app", "t");
+    let view = snap.resolve_table(Some("core"), "v").unwrap();
+    let table_deps = view_table_deps(&snap, view.oid);
     let new = QualifiedName::new("core", "t");
-    assert!(!vd.depends_on_tables.contains(&old));
-    assert!(vd.depends_on_tables.contains(&new));
+    assert!(table_deps.contains(&new));
+    assert!(!table_deps.iter().any(|k| k.schema == "app"));
 }
 
 #[test]
 fn rename_then_alter_type_reanalyzes_through_renamed_ast() {
-    // End-to-end: rename the table, then ALTER a column's type binary-
-    // coercibly. Without AST rewriting on rename, reanalyze would choke on
-    // "unknown relation t" after step 2 and the ALTER would fail.
     let snap = build(&[
         (
             "0001.sql",
@@ -146,8 +125,9 @@ fn rename_then_alter_type_reanalyzes_through_renamed_ast() {
         .unwrap()
         .oid;
     let view = snap.resolve_table(None, "v").unwrap();
+    let view_attrs = snap.attributes_of(view.oid);
     assert_eq!(
-        view.columns[0].type_oid, int4,
+        view_attrs[0].atttypid, int4,
         "reanalyze must work after rename",
     );
 }

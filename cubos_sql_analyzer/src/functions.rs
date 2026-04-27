@@ -1,39 +1,42 @@
 //! Function and aggregate resolution.
 
 use crate::error::AnalyzeError;
-use crate::pg_catalog::PgCatalog;
-use crate::schema::{CompositeField, FunctionEntry, oid};
+use crate::oid::PgTypeOid;
+use crate::pg_catalog::{ArgMode, PgCatalog, PgProc, ProKind, TypCategory, TypType, oid};
+
+/// One output column of a SRF / OUT-arg function. Mirrors the named-field
+/// shape that the analyzer needs from `pg_proc`'s `proallargtypes` /
+/// `proargmodes` / `proargnames` triple.
+#[derive(Debug, Clone)]
+pub(crate) struct OutArg {
+    pub name: String,
+    pub type_oid: PgTypeOid,
+    pub not_null: bool,
+}
 
 /// Resolved function call result.
 pub(crate) struct ResolvedFunction {
-    pub return_type_oid: u32,
+    pub return_type_oid: PgTypeOid,
     /// The resolved argument types from the matched function signature.
-    pub arg_types: Vec<u32>,
+    pub arg_types: Vec<PgTypeOid>,
     pub schema: String,
     pub is_aggregate: bool,
     pub is_strict: bool,
-    /// Named output columns for SRFs / OUT-arg functions, copied from the
-    /// matched `FunctionEntry`. Empty for plain scalar returns.
-    pub out_args: Vec<CompositeField>,
+    /// Named output columns for SRFs / OUT-arg functions, derived from the
+    /// matched `pg_proc`'s `proallargtypes`/`proargmodes`/`proargnames`.
+    /// Empty for plain scalar returns.
+    pub out_args: Vec<OutArg>,
 }
 
 /// pg_catalog strict functions that can still return NULL with non-null inputs.
-///
-/// These are exceptions to the general rule that pg_catalog strict functions
-/// are "total" (non-null inputs → non-null output). Each function listed here
-/// has legitimate cases where all inputs are non-null but the output is NULL.
 const NULLABLE_STRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
-    // Array: returns NULL if element not found or dimension doesn't exist.
     "array_position",
     "array_upper",
     "array_lower",
     "array_length",
-    // Regex: returns NULL if pattern doesn't match.
     "regexp_match",
     "regexp_matches",
-    // Substring with pattern: returns NULL if no match.
     "substring",
-    // JSON/JSONB field extraction: returns NULL if key/index doesn't exist.
     "json_object_field",
     "json_object_field_text",
     "json_array_element",
@@ -44,54 +47,31 @@ const NULLABLE_STRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
     "jsonb_array_element_text",
     "jsonb_path_query_first",
     "jsonb_path_match",
-    // JSON/JSONB path extraction: returns NULL if path doesn't exist.
     "jsonb_extract_path",
     "jsonb_extract_path_text",
     "json_extract_path",
     "json_extract_path_text",
-    // NULLIF: returns NULL when arguments are equal.
     "nullif",
-    // Catalog description: returns NULL if object has no comment.
     "obj_description",
     "col_description",
     "shobj_description",
-    // NOTE: lower(anyrange)/upper(anyrange) return NULL for empty/unbounded
-    // ranges, but share names with lower(text)/upper(text) which are total.
-    // We can't distinguish by name alone, so they are NOT listed here.
-    // Use "col!" annotation for range lower/upper if needed.
 ];
 
 /// pg_catalog operators that can return NULL with non-null inputs.
-///
-/// Most operators are "total" (non-null inputs → non-null output), but
-/// JSON/JSONB field access operators return NULL when the key/path doesn't exist.
-const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &[
-    // jsonb/json -> key/index: NULL if key doesn't exist.
-    "->",  // jsonb/json ->> key/index: NULL if key doesn't exist.
-    "->>", // jsonb/json #> path: NULL if path doesn't exist.
-    "#>",  // jsonb/json #>> path: NULL if path doesn't exist.
-    "#>>",
-];
+const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &["->", "->>", "#>", "#>>"];
 
 /// Resolve a function call by name and argument types.
 pub(crate) fn resolve_function(
     snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,
-    arg_types: &[u32],
+    arg_types: &[PgTypeOid],
     _is_agg_star: bool,
 ) -> Result<ResolvedFunction, AnalyzeError> {
-    // `COUNT(*)` is not special: it parses with an empty arg list, and
-    // `pg_proc` already has a zero-arg `count()` → int8 entry. Phase 1 exact
-    // match below picks it up. `is_agg_star` is kept in the signature for
-    // callers that still pass it, but the resolution is fully catalog-driven.
-
-    // Procedures are only callable via `CALL stmt`, never inside expressions,
-    // so filter them out of the candidate set for expression-level lookups.
-    let candidates: Vec<&FunctionEntry> = snapshot
+    let candidates: Vec<&PgProc> = snapshot
         .find_functions(schema, name)
         .into_iter()
-        .filter(|f| !f.is_procedure)
+        .filter(|f| !matches!(f.prokind, ProKind::Procedure))
         .collect();
     if candidates.is_empty() {
         return Err(AnalyzeError::UndefinedFunction(format!(
@@ -99,51 +79,36 @@ pub(crate) fn resolve_function(
         )));
     }
 
-    // Phase 1: exact match on arg count and types.
     if let Some(f) = find_exact_match(&candidates, arg_types) {
-        return Ok(make_resolved(f));
+        return Ok(make_resolved(f, snapshot));
     }
-
-    // Phase 1b: match treating UNKNOWN args as compatible with any expected type.
-    // This handles untyped string literals like ', ' in string_agg(col, ', ').
     if let Some(f) = find_unknown_compatible_match(&candidates, arg_types) {
-        return Ok(make_resolved(f));
+        return Ok(make_resolved(f, snapshot));
     }
-
-    // Phase 1c: candidates with trailing DEFAULT params. PG accepts
-    // `jsonb_set(j, p, v)` against the 4-arg `jsonb_set(j, p, v, bool)`
-    // because the 4th param has a default. Match against the prefix only.
     if let Some(f) = find_default_args_match(&candidates, arg_types, snapshot) {
-        return Ok(make_resolved(f));
+        return Ok(make_resolved(f, snapshot));
     }
-
-    // Phase 2: match with implicit casts.
     if let Some(f) = find_cast_match(&candidates, arg_types, snapshot) {
-        return Ok(make_resolved(f));
+        return Ok(make_resolved(f, snapshot));
     }
-
-    // Phase 2b: polymorphic pseudo-types (`anyelement`, `anyarray`, …). These
-    // never appear as concrete arg types, so `find_exact_match`/`find_cast_match`
-    // miss them. Matching `_pg_expandarray(anyarray)` against a concrete
-    // `int4[]` lives here.
     if let Some(f) = find_polymorphic_match(&candidates, arg_types, snapshot) {
         return Ok(make_resolved_polymorphic(f, arg_types, snapshot));
     }
 
-    // Phase 3: for single-candidate aggregates with zero args (e.g., COUNT),
-    // try matching with any number of args.
-    let agg_candidates: Vec<_> = candidates.iter().filter(|f| f.is_aggregate).collect();
+    let agg_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|f| matches!(f.prokind, ProKind::Aggregate))
+        .collect();
     if agg_candidates.len() == 1 {
-        return Ok(make_resolved(agg_candidates[0]));
+        return Ok(make_resolved(agg_candidates[0], snapshot));
     }
 
-    // Phase 4: if only one candidate matches arg count, use it.
     let count_matches: Vec<_> = candidates
         .iter()
-        .filter(|f| f.arg_types.len() == arg_types.len() || f.is_variadic)
+        .filter(|f| f.proargtypes.len() == arg_types.len() || f.provariadic.is_some())
         .collect();
     if count_matches.len() == 1 {
-        return Ok(make_resolved(count_matches[0]));
+        return Ok(make_resolved(count_matches[0], snapshot));
     }
 
     Err(AnalyzeError::UndefinedFunction(format!(
@@ -153,21 +118,18 @@ pub(crate) fn resolve_function(
     )))
 }
 
-/// Match candidates treating UNKNOWN (OID 705) args as compatible with any expected type.
-/// This handles untyped string literals (e.g., `', '` in `string_agg(col, ', ')`).
-/// Returns a match only if exactly one candidate matches (to avoid ambiguity).
 fn find_unknown_compatible_match<'a>(
-    candidates: &[&'a FunctionEntry],
-    arg_types: &[u32],
-) -> Option<&'a FunctionEntry> {
+    candidates: &[&'a PgProc],
+    arg_types: &[PgTypeOid],
+) -> Option<&'a PgProc> {
     if !arg_types.contains(&oid::UNKNOWN) {
         return None;
     }
     let matches: Vec<_> = candidates
         .iter()
         .filter(|f| {
-            f.arg_types.len() == arg_types.len()
-                && f.arg_types
+            f.proargtypes.len() == arg_types.len()
+                && f.proargtypes
                     .iter()
                     .zip(arg_types.iter())
                     .all(|(&expected, &actual)| expected == actual || actual == oid::UNKNOWN)
@@ -180,44 +142,35 @@ fn find_unknown_compatible_match<'a>(
     }
 }
 
-fn find_exact_match<'a>(
-    candidates: &[&'a FunctionEntry],
-    arg_types: &[u32],
-) -> Option<&'a FunctionEntry> {
+fn find_exact_match<'a>(candidates: &[&'a PgProc], arg_types: &[PgTypeOid]) -> Option<&'a PgProc> {
     candidates
         .iter()
-        .find(|f| f.arg_types == arg_types)
+        .find(|f| f.proargtypes == arg_types)
         .copied()
 }
 
-/// Match a candidate that takes more arguments than the call provides,
-/// where the missing trailing arguments are covered by `num_default_args`.
-/// Mirrors PG's behavior of dispatching `jsonb_set(j, p, v)` to the 4-arg
-/// signature when the 4th parameter has a default. Each prefix arg must
-/// match by exact type, UNKNOWN, or implicit cast — same compatibility
-/// rules as the cast-match phase.
 fn find_default_args_match<'a>(
-    candidates: &[&'a FunctionEntry],
-    arg_types: &[u32],
+    candidates: &[&'a PgProc],
+    arg_types: &[PgTypeOid],
     snapshot: &PgCatalog,
-) -> Option<&'a FunctionEntry> {
+) -> Option<&'a PgProc> {
     let provided = arg_types.len();
-    let matching: Vec<&FunctionEntry> = candidates
+    let matching: Vec<&PgProc> = candidates
         .iter()
         .filter(|f| {
-            let total = f.arg_types.len();
-            let defaults = f.num_default_args as usize;
-            // The call must supply at least the required args (total -
-            // defaults) and no more than the full signature.
+            let total = f.proargtypes.len();
+            let defaults = f.pronargdefaults.max(0) as usize;
             total >= provided
                 && defaults >= total - provided
-                && f.arg_types.iter().take(provided).zip(arg_types.iter()).all(
-                    |(&expected, &actual)| {
+                && f.proargtypes
+                    .iter()
+                    .take(provided)
+                    .zip(arg_types.iter())
+                    .all(|(&expected, &actual)| {
                         expected == actual
                             || actual == oid::UNKNOWN
                             || snapshot.has_implicit_cast(actual, expected)
-                    },
-                )
+                    })
         })
         .copied()
         .collect();
@@ -228,22 +181,16 @@ fn find_default_args_match<'a>(
     }
 }
 
-/// Find a candidate where every parameter type either equals the caller's
-/// actual type OR is a polymorphic pseudo-type (`anyelement`, `anyarray`,
-/// `anyenum`, `anyrange`, `anymultirange`, `anynonarray`) compatible with
-/// the actual. Consistency across positions (PG's rule that all `anyelement`
-/// positions must resolve to the same type) is intentionally NOT enforced:
-/// our goal is type inference for view columns, not full call-site checking.
 fn find_polymorphic_match<'a>(
-    candidates: &[&'a FunctionEntry],
-    arg_types: &[u32],
+    candidates: &[&'a PgProc],
+    arg_types: &[PgTypeOid],
     snapshot: &PgCatalog,
-) -> Option<&'a FunctionEntry> {
-    let matching: Vec<&FunctionEntry> = candidates
+) -> Option<&'a PgProc> {
+    let matching: Vec<&PgProc> = candidates
         .iter()
-        .filter(|f| f.arg_types.len() == arg_types.len())
+        .filter(|f| f.proargtypes.len() == arg_types.len())
         .filter(|f| {
-            f.arg_types
+            f.proargtypes
                 .iter()
                 .zip(arg_types.iter())
                 .all(|(&expected, &actual)| {
@@ -257,41 +204,35 @@ fn find_polymorphic_match<'a>(
     if matching.len() == 1 {
         Some(matching[0])
     } else {
-        // If more than one polymorphic candidate matches, we can't
-        // disambiguate without tracking per-position consistency — return
-        // None rather than guessing.
         None
     }
 }
 
-// Polymorphic pseudo-type OIDs (stable across PG versions). The
-// `anycompatible*` family (PG14+) uses the same matching rules as the
-// older `any*` family but binds through PG's common-type algorithm
-// instead of per-position equality. For the analyzer's inference-only
-// use, either family can be unified by checking the shape of `actual`.
-pub(crate) const ANYELEMENT: u32 = 2283;
-pub(crate) const ANYARRAY: u32 = 2277;
-pub(crate) const ANYNONARRAY: u32 = 2776;
-pub(crate) const ANYENUM: u32 = 3500;
-pub(crate) const ANYRANGE: u32 = 3831;
-pub(crate) const ANYMULTIRANGE: u32 = 4537;
-pub(crate) const ANYCOMPATIBLE: u32 = 5077;
-pub(crate) const ANYCOMPATIBLEARRAY: u32 = 5078;
-pub(crate) const ANYCOMPATIBLENONARRAY: u32 = 5079;
-pub(crate) const ANYCOMPATIBLERANGE: u32 = 5080;
-pub(crate) const ANYCOMPATIBLEMULTIRANGE: u32 = 4538;
+// Polymorphic pseudo-type OIDs (stable across PG versions).
+pub(crate) const ANYELEMENT: PgTypeOid = PgTypeOid::from_raw(2283);
+pub(crate) const ANYARRAY: PgTypeOid = PgTypeOid::from_raw(2277);
+pub(crate) const ANYNONARRAY: PgTypeOid = PgTypeOid::from_raw(2776);
+pub(crate) const ANYENUM: PgTypeOid = PgTypeOid::from_raw(3500);
+pub(crate) const ANYRANGE: PgTypeOid = PgTypeOid::from_raw(3831);
+pub(crate) const ANYMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4537);
+pub(crate) const ANYCOMPATIBLE: PgTypeOid = PgTypeOid::from_raw(5077);
+pub(crate) const ANYCOMPATIBLEARRAY: PgTypeOid = PgTypeOid::from_raw(5078);
+pub(crate) const ANYCOMPATIBLENONARRAY: PgTypeOid = PgTypeOid::from_raw(5079);
+pub(crate) const ANYCOMPATIBLERANGE: PgTypeOid = PgTypeOid::from_raw(5080);
+pub(crate) const ANYCOMPATIBLEMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4538);
 
 /// Is `expected` a polymorphic pseudo-type that PG would accept `actual` for?
-pub(crate) fn matches_polymorphic(expected: u32, actual: u32, snapshot: &PgCatalog) -> bool {
-    // Historical array-shaped types that pg_cast doesn't mark as arrays in
-    // the normal sense but still satisfy `anyarray` / `anynonarray` for
-    // legacy catalog functions.
-    const INT2VECTOR: u32 = 22;
-    const OIDVECTOR: u32 = 30;
+pub(crate) fn matches_polymorphic(
+    expected: PgTypeOid,
+    actual: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    const INT2VECTOR: PgTypeOid = PgTypeOid::from_raw(22);
+    const OIDVECTOR: PgTypeOid = PgTypeOid::from_raw(30);
 
     let actual_is_array = matches!(
-        snapshot.get_type(actual).map(|t| &t.kind),
-        Some(crate::schema::TypeKind::Array { .. })
+        snapshot.get_type(actual).map(|t| t.typcategory),
+        Some(TypCategory::Array)
     ) || actual == INT2VECTOR
         || actual == OIDVECTOR;
 
@@ -300,19 +241,18 @@ pub(crate) fn matches_polymorphic(expected: u32, actual: u32, snapshot: &PgCatal
         ANYARRAY | ANYCOMPATIBLEARRAY => actual_is_array,
         ANYNONARRAY | ANYCOMPATIBLENONARRAY => !actual_is_array,
         ANYENUM => matches!(
-            snapshot.get_type(actual).map(|t| &t.kind),
-            Some(crate::schema::TypeKind::Enum { .. })
+            snapshot.get_type(actual).map(|t| t.typtype),
+            Some(TypType::Enum)
         ),
         ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => matches!(
-            snapshot.get_type(actual).map(|t| &t.kind),
-            Some(crate::schema::TypeKind::Range { .. })
+            snapshot.get_type(actual).map(|t| t.typtype),
+            Some(TypType::Range)
         ),
         _ => false,
     }
 }
 
-/// Returns true if `oid` is any of the polymorphic pseudo-types.
-pub(crate) fn is_polymorphic(oid: u32) -> bool {
+pub(crate) fn is_polymorphic(oid: PgTypeOid) -> bool {
     matches!(
         oid,
         ANYELEMENT
@@ -329,42 +269,21 @@ pub(crate) fn is_polymorphic(oid: u32) -> bool {
     )
 }
 
-/// How "narrow" a polymorphic pseudo-type is. Higher = more specific.
-/// Used as a tie-breaker when multiple polymorphic signatures accept the
-/// same operands — PG prefers the most specific shape (e.g. picks
-/// `anycompatiblearray || anycompatiblearray` over
-/// `anycompatible || anycompatiblearray` when both sides are arrays).
-pub(crate) fn polymorphic_specificity(oid: u32) -> u8 {
+pub(crate) fn polymorphic_specificity(oid: PgTypeOid) -> u8 {
     match oid {
-        // Generic — accepts anything.
         ANYELEMENT | ANYCOMPATIBLE => 1,
-        // Shape constraint (array vs non-array).
         ANYARRAY | ANYNONARRAY | ANYCOMPATIBLEARRAY | ANYCOMPATIBLENONARRAY => 2,
-        // Kind constraint (enum / range / multirange).
         ANYENUM | ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => 3,
-        // Concrete type — not polymorphic, counts as maximally specific.
         _ => 10,
     }
 }
 
-/// Given a polymorphic pseudo-type `expected` matched against concrete
-/// `actual`, substitute polymorphic slots on the result side (e.g. the
-/// operator/function return type) with the concrete type derived from
-/// `actual`.
-///
-/// Binding rules:
-/// - `anyelement` / `anynonarray` / `anyenum` / `anycompatible` /
-///   `anycompatiblenonarray` → the concrete arg OID.
-/// - `anyarray` / `anycompatiblearray` → the array OID directly, and the
-///   element OID becomes available for `anyelement`-shaped slots.
-/// - `anyrange` / `anymultirange` / `anycompatiblerange` /
-///   `anycompatiblemultirange` → the range OID.
 pub(crate) fn bind_polymorphic_from(
-    expected: u32,
-    actual: u32,
+    expected: PgTypeOid,
+    actual: PgTypeOid,
     snapshot: &PgCatalog,
-    bound_element: &mut Option<u32>,
-    bound_array: &mut Option<u32>,
+    bound_element: &mut Option<PgTypeOid>,
+    bound_array: &mut Option<PgTypeOid>,
 ) {
     match expected {
         ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
@@ -372,10 +291,11 @@ pub(crate) fn bind_polymorphic_from(
         }
         ANYARRAY | ANYCOMPATIBLEARRAY => {
             bound_array.get_or_insert(actual);
-            if let Some(crate::schema::TypeKind::Array { element_type_oid }) =
-                snapshot.get_type(actual).map(|t| t.kind.clone())
+            if let Some(t) = snapshot.get_type(actual)
+                && t.typcategory == TypCategory::Array
+                && let Some(elem) = t.typelem
             {
-                bound_element.get_or_insert(element_type_oid);
+                bound_element.get_or_insert(elem);
             }
         }
         ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => {
@@ -385,15 +305,12 @@ pub(crate) fn bind_polymorphic_from(
     }
 }
 
-/// Resolve a polymorphic pseudo-type on the result side using bindings
-/// previously collected via [`bind_polymorphic_from`]. Returns `oid`
-/// unchanged if it isn't a polymorphic type.
 pub(crate) fn substitute_polymorphic(
-    oid: u32,
-    bound_element: Option<u32>,
-    bound_array: Option<u32>,
+    oid: PgTypeOid,
+    bound_element: Option<PgTypeOid>,
+    bound_array: Option<PgTypeOid>,
     snapshot: &PgCatalog,
-) -> u32 {
+) -> PgTypeOid {
     match oid {
         ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
             bound_element.unwrap_or(oid)
@@ -409,15 +326,15 @@ pub(crate) fn substitute_polymorphic(
 }
 
 fn find_cast_match<'a>(
-    candidates: &[&'a FunctionEntry],
-    arg_types: &[u32],
+    candidates: &[&'a PgProc],
+    arg_types: &[PgTypeOid],
     snapshot: &PgCatalog,
-) -> Option<&'a FunctionEntry> {
-    let matching: Vec<&FunctionEntry> = candidates
+) -> Option<&'a PgProc> {
+    let matching: Vec<&PgProc> = candidates
         .iter()
-        .filter(|f| f.arg_types.len() == arg_types.len())
+        .filter(|f| f.proargtypes.len() == arg_types.len())
         .filter(|f| {
-            f.arg_types
+            f.proargtypes
                 .iter()
                 .zip(arg_types.iter())
                 .all(|(&expected, &actual)| {
@@ -433,24 +350,14 @@ fn find_cast_match<'a>(
         return matching.into_iter().next();
     }
 
-    // Tie-break for UNKNOWN arguments (PG §10.3 step 4e).
-    //
-    // Untyped literals (`'foo'`, `$1` without context) arrive as UNKNOWN. For
-    // each UNKNOWN-arg position, PG assumes the string category, then:
-    //   1. Keep candidates whose param at that position is in category 'S'.
-    //   2. Among those, prefer candidates whose param is `typispreferred`
-    //      (e.g. `text` over `varchar`/`bpchar`, `text` over `bytea`).
-    //
-    // Without this, relying on the natural pg_proc order would be fragile —
-    // extensions installed later could reorder overloads and flip results.
     if !arg_types.contains(&oid::UNKNOWN) {
         return matching.into_iter().next();
     }
 
-    let string_compatible: Vec<&FunctionEntry> = matching
+    let string_compatible: Vec<&PgProc> = matching
         .iter()
         .filter(|f| {
-            f.arg_types
+            f.proargtypes
                 .iter()
                 .zip(arg_types.iter())
                 .all(|(&param_oid, &actual)| {
@@ -459,7 +366,7 @@ fn find_cast_match<'a>(
                     }
                     snapshot
                         .get_type(param_oid)
-                        .is_some_and(|t| t.category == 'S')
+                        .is_some_and(|t| t.typcategory == TypCategory::String)
                 })
         })
         .copied()
@@ -472,17 +379,19 @@ fn find_cast_match<'a>(
         return Some(string_compatible[0]);
     }
 
-    let preferred: Vec<&FunctionEntry> = string_compatible
+    let preferred: Vec<&PgProc> = string_compatible
         .iter()
         .filter(|f| {
-            f.arg_types
+            f.proargtypes
                 .iter()
                 .zip(arg_types.iter())
                 .all(|(&param_oid, &actual)| {
                     if actual != oid::UNKNOWN {
                         return true;
                     }
-                    snapshot.get_type(param_oid).is_some_and(|t| t.is_preferred)
+                    snapshot
+                        .get_type(param_oid)
+                        .is_some_and(|t| t.typispreferred)
                 })
         })
         .copied()
@@ -494,39 +403,64 @@ fn find_cast_match<'a>(
     string_compatible.into_iter().next()
 }
 
-fn make_resolved(f: &FunctionEntry) -> ResolvedFunction {
+/// Build the named output-argument list for an SRF / OUT-arg function from
+/// its `pg_proc` row. Returns an empty vec when the function has no OUT-like
+/// args.
+fn build_out_args(p: &PgProc) -> Vec<OutArg> {
+    if p.proargmodes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let len = p
+        .proallargtypes
+        .len()
+        .min(p.proargmodes.len())
+        .min(p.proargnames.len());
+    for i in 0..len {
+        let mode = p.proargmodes[i];
+        if !matches!(mode, ArgMode::Out | ArgMode::InOut | ArgMode::Table) {
+            continue;
+        }
+        let name = &p.proargnames[i];
+        if name.is_empty() {
+            continue;
+        }
+        out.push(OutArg {
+            name: name.clone(),
+            type_oid: p.proallargtypes[i],
+            not_null: false,
+        });
+    }
+    out
+}
+
+fn make_resolved(f: &PgProc, snapshot: &PgCatalog) -> ResolvedFunction {
+    let agg_final = snapshot
+        .pg_aggregate
+        .get(&f.oid)
+        .and_then(|a| a.aggfinaltype);
     ResolvedFunction {
-        return_type_oid: f.agg_final_type_oid.unwrap_or(f.return_type_oid),
-        arg_types: f.arg_types.clone(),
-        schema: f.schema.clone(),
-        is_aggregate: f.is_aggregate,
-        is_strict: f.is_strict,
-        out_args: f.out_args.clone(),
+        return_type_oid: agg_final.unwrap_or(f.prorettype),
+        arg_types: f.proargtypes.clone(),
+        schema: snapshot
+            .namespace_name(f.pronamespace)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        is_aggregate: matches!(f.prokind, ProKind::Aggregate),
+        is_strict: f.proisstrict,
+        out_args: build_out_args(f),
     }
 }
 
-/// Build a `ResolvedFunction` after a polymorphic match, substituting every
-/// `any*` OID in the return type and `out_args` with the concrete type
-/// bound at the matching arg position.
-///
-/// The binding rules (simplified vs. PG's full §10.3.4 algorithm):
-/// - `anyelement` / `anynonarray` / `anyenum` → bind to the concrete arg OID.
-/// - `anyarray` → bind to the array OID *and* derive its element OID for
-///   downstream `anyelement` slots.
-/// - `anyrange` / `anymultirange` → bind to the range OID.
-///
-/// If multiple positions leave the bindings inconsistent we keep the first
-/// we see — consistency enforcement happens in the caller via the single-
-/// match rule in `find_polymorphic_match`.
 fn make_resolved_polymorphic(
-    f: &FunctionEntry,
-    actual_args: &[u32],
+    f: &PgProc,
+    actual_args: &[PgTypeOid],
     snapshot: &PgCatalog,
 ) -> ResolvedFunction {
-    let mut bound_element: Option<u32> = None;
-    let mut bound_array: Option<u32> = None;
+    let mut bound_element: Option<PgTypeOid> = None;
+    let mut bound_array: Option<PgTypeOid> = None;
 
-    for (&expected, &actual) in f.arg_types.iter().zip(actual_args.iter()) {
+    for (&expected, &actual) in f.proargtypes.iter().zip(actual_args.iter()) {
         bind_polymorphic_from(
             expected,
             actual,
@@ -536,17 +470,20 @@ fn make_resolved_polymorphic(
         );
     }
 
+    let agg_final = snapshot
+        .pg_aggregate
+        .get(&f.oid)
+        .and_then(|a| a.aggfinaltype);
     let return_type_oid = substitute_polymorphic(
-        f.agg_final_type_oid.unwrap_or(f.return_type_oid),
+        agg_final.unwrap_or(f.prorettype),
         bound_element,
         bound_array,
         snapshot,
     );
-    let out_args = f
-        .out_args
-        .iter()
-        .map(|field| crate::schema::CompositeField {
-            name: field.name.clone(),
+    let out_args = build_out_args(f)
+        .into_iter()
+        .map(|field| OutArg {
+            name: field.name,
             type_oid: substitute_polymorphic(field.type_oid, bound_element, bound_array, snapshot),
             not_null: field.not_null,
         })
@@ -554,37 +491,28 @@ fn make_resolved_polymorphic(
 
     ResolvedFunction {
         return_type_oid,
-        arg_types: f.arg_types.clone(),
-        schema: f.schema.clone(),
-        is_aggregate: f.is_aggregate,
-        is_strict: f.is_strict,
+        arg_types: f.proargtypes.clone(),
+        schema: snapshot
+            .namespace_name(f.pronamespace)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        is_aggregate: matches!(f.prokind, ProKind::Aggregate),
+        is_strict: f.proisstrict,
         out_args,
     }
 }
 
-/// Returns true if a pg_catalog strict function is known to possibly return NULL
-/// even with non-null inputs.
 pub(crate) fn is_nullable_strict_exception(name: &str) -> bool {
     NULLABLE_STRICT_PG_CATALOG_FUNCTIONS.contains(&name)
 }
 
-/// Returns true if an operator can return NULL with non-null inputs.
 pub(crate) fn is_nullable_operator(name: &str) -> bool {
     NULLABLE_PG_CATALOG_OPERATORS.contains(&name)
 }
 
-/// pg_catalog non-strict functions that are guaranteed to NEVER return NULL,
-/// regardless of input nullability. These are safe to mark as NOT NULL
-/// unconditionally.
 const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
-    // String concatenation: treats NULLs as empty strings. `concat_ws` is
-    // handled separately at the call site — its first arg (the separator)
-    // being NULL propagates to NULL, so the "never-NULL" shortcut doesn't
-    // apply.
     "concat",
-    // sprintf-like formatting: NULL args become empty.
     "format",
-    // Current time: no inputs, always returns a value.
     "now",
     "transaction_timestamp",
     "statement_timestamp",
@@ -594,7 +522,6 @@ const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
     "current_date",
     "localtime",
     "localtimestamp",
-    // Session info: always returns a value.
     "current_user",
     "session_user",
     "current_schema",
@@ -605,35 +532,25 @@ const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
     "pg_backend_pid",
     "pg_postmaster_start_time",
     "version",
-    // Random values: always return a value.
     "random",
     "gen_random_uuid",
     "setseed",
-    // Sequence functions: return bigint or error, never NULL.
     "nextval",
     "currval",
     "lastval",
     "setval",
-    // Transaction ID.
     "txid_current",
     "txid_current_if_assigned",
-    // Array constructor: always returns an array (possibly empty).
     "array_cat",
     "array_append",
     "array_prepend",
-    // COALESCE-like: handled as separate AST nodes, but if called as function:
     "coalesce",
     "greatest",
     "least",
-    // JSON constructors: non-strict, always produce a JSON/JSONB value
-    // (a JSON `null` entry for a SQL NULL argument — never SQL NULL).
     "json_build_object",
     "jsonb_build_object",
     "json_build_array",
     "jsonb_build_array",
-    // Ranking window functions: evaluate once per row and always yield an
-    // integer (`row_number`/`rank`/`dense_rank`/`ntile`) or a float
-    // (`percent_rank`/`cume_dist`). Never NULL.
     "row_number",
     "rank",
     "dense_rank",
@@ -642,8 +559,6 @@ const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
     "ntile",
 ];
 
-/// Returns true if a pg_catalog non-strict function is guaranteed to never
-/// return NULL.
 pub(crate) fn is_not_null_nonstrict(name: &str) -> bool {
     NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS.contains(&name)
 }

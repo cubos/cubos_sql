@@ -1,18 +1,17 @@
 //! `ALTER ... RENAME TO` and `ALTER ... SET SCHEMA` handlers.
 //!
-//! These cover the subset of `ALTER FUNCTION`, `ALTER AGGREGATE`, `ALTER
-//! PROCEDURE`, `ALTER TABLE`, `ALTER TYPE`, and `ALTER DOMAIN` that changes
-//! the *identity* of an object — everything else (attributes like STRICT,
-//! VOLATILE, owner, tablespace, …) is irrelevant for static type analysis and
-//! remains a no-op.
+//! Cover the subset of `ALTER FUNCTION`, `ALTER AGGREGATE`, `ALTER PROCEDURE`,
+//! `ALTER TABLE`, `ALTER TYPE`, and `ALTER DOMAIN` that changes the *identity*
+//! of an object — every other attribute (STRICT, VOLATILE, owner, tablespace,
+//! …) is irrelevant for static type analysis and remains a no-op.
 
 use pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, node};
 
 use super::DdlError;
-use super::util::{node_string, resolve_type_name};
+use super::util::{ensure_namespace, node_string, resolve_type_name};
 use super::views;
-use crate::pg_catalog::PgCatalog;
-use crate::qualified_name::QualifiedName;
+use crate::oid::{PgNamespaceOid, PgProcOid, PgTypeOid};
+use crate::pg_catalog::{PgCatalog, PgProc, ProKind};
 
 // ─── ALTER ... RENAME TO ────────────────────────────────────────────────────
 
@@ -20,28 +19,16 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
     let rename_type = ObjectType::try_from(stmt.rename_type).unwrap_or(ObjectType::Undefined);
 
     match rename_type {
-        // ── Relations (handled via `relation` field) ────────────────────
         ObjectType::ObjectTable
         | ObjectType::ObjectView
         | ObjectType::ObjectMatview
         | ObjectType::ObjectForeignTable => rename_relation(interp, stmt),
-
-        // ── Functions / procedures / aggregates (handled via `object`) ──
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
             rename_function_like(interp, stmt, rename_type)
         }
-
-        // ── Types / domains ─────────────────────────────────────────────
         ObjectType::ObjectType | ObjectType::ObjectDomain => rename_type_obj(interp, stmt),
-
-        // ── Schemas ─────────────────────────────────────────────────────
         ObjectType::ObjectSchema => rename_schema(interp, stmt),
-
-        // ── Columns — `ALTER TABLE t RENAME COLUMN a TO b` ──────────────
         ObjectType::ObjectColumn => rename_column(interp, stmt),
-
-        // Everything else (index, trigger, policy, role, …) has no impact
-        // on static type analysis.
         _ => Ok(()),
     }
 }
@@ -50,52 +37,53 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let schema = if rv.schemaname.is_empty() {
+    let schema_name = if rv.schemaname.is_empty() {
         interp
             .search_path
             .first()
-            .cloned()
+            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
             .unwrap_or_else(|| "public".to_owned())
     } else {
         rv.schemaname.clone()
     };
-    let old_key = QualifiedName::new(&schema, &rv.relname);
-    let Some(mut entry) = interp.tables.remove(&old_key) else {
+    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(old_key.to_string()));
+        return Err(DdlError::TableNotFound(format!(
+            "{schema_name}.{}",
+            rv.relname
+        )));
+    };
+    let Some(class_oid) = interp
+        .class_by_qname
+        .get(&(nsoid, rv.relname.clone()))
+        .copied()
+    else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TableNotFound(format!(
+            "{schema_name}.{}",
+            rv.relname
+        )));
     };
 
-    let new_key = QualifiedName::new(&schema, &stmt.newname);
-    entry.name = stmt.newname.clone();
-    interp.tables.insert(new_key.clone(), entry);
+    let old_name = rv.relname.clone();
+    let new_name = stmt.newname.clone();
 
-    // Composite type mirroring the table name: rename it too.
-    if let Some(&ctype_oid) = interp.type_by_name.get(&old_key) {
-        if let Some(te) = interp.types.get_mut(&ctype_oid) {
-            te.name = stmt.newname.clone();
-        }
-        interp.type_by_name.remove(&old_key);
-        interp
-            .type_by_name
-            .insert(QualifiedName::new(&schema, &stmt.newname), ctype_oid);
+    interp.rename_pg_class(class_oid, new_name.clone(), nsoid);
 
-        let old_array_key = QualifiedName::new(&schema, format!("_{}", rv.relname));
-        if let Some(arr_oid) = interp.type_by_name.remove(&old_array_key) {
-            if let Some(te) = interp.types.get_mut(&arr_oid) {
-                te.name = format!("_{}", stmt.newname);
-            }
-            interp.type_by_name.insert(
-                QualifiedName::new(&schema, format!("_{}", stmt.newname)),
-                arr_oid,
-            );
+    // Composite type mirroring the relation: rename it and the array.
+    if let Some(&type_oid) = interp.type_by_qname.get(&(nsoid, old_name.clone())) {
+        interp.rename_pg_type(type_oid, new_name.clone(), nsoid);
+        let arr_old = format!("_{old_name}");
+        if let Some(&arr_oid) = interp.type_by_qname.get(&(nsoid, arr_old)) {
+            interp.rename_pg_type(arr_oid, format!("_{new_name}"), nsoid);
         }
     }
 
-    // Point every view's deps at the new key so downstream CASCADE/DROP
-    // queries still resolve correctly.
-    views::rewrite_deps_on_table_rename(interp, &old_key, &new_key);
+    views::rewrite_views_on_table_rename(interp, &schema_name, &old_name, &schema_name, &new_name);
 
     Ok(())
 }
@@ -104,26 +92,44 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let schema = if rv.schemaname.is_empty() {
+    let schema_name = if rv.schemaname.is_empty() {
         interp
             .search_path
             .first()
-            .cloned()
+            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
             .unwrap_or_else(|| "public".to_owned())
     } else {
         rv.schemaname.clone()
     };
-    let key = QualifiedName::new(&schema, &rv.relname);
-    let Some(table) = interp.tables.get_mut(&key) else {
+    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(key.to_string()));
+        return Err(DdlError::TableNotFound(format!(
+            "{schema_name}.{}",
+            rv.relname
+        )));
     };
-    if let Some(col) = table.columns.iter_mut().find(|c| c.name == stmt.subname) {
-        col.name = stmt.newname.clone();
+    let Some(relid) = interp
+        .class_by_qname
+        .get(&(nsoid, rv.relname.clone()))
+        .copied()
+    else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TableNotFound(format!(
+            "{schema_name}.{}",
+            rv.relname
+        )));
+    };
+
+    if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+        && let Some(col) = attrs.iter_mut().find(|c| c.attname == stmt.subname)
+    {
+        col.attname = stmt.newname.clone();
     }
-    views::rewrite_deps_on_column_rename(interp, &key, &stmt.subname, &stmt.newname);
+    views::rewrite_views_on_column_rename(interp, relid, &stmt.subname, &stmt.newname);
     Ok(())
 }
 
@@ -132,19 +138,27 @@ fn rename_function_like(
     stmt: &RenameStmt,
     expected: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some((schema, old_name, arg_oids)) = extract_func_target(&stmt.object, interp) else {
+    let Some((schema_opt, old_name, arg_oids)) = extract_func_target(&stmt.object, interp) else {
         return Ok(());
     };
 
-    let is_aggregate = expected == ObjectType::ObjectAggregate;
-    let is_procedure = expected == ObjectType::ObjectProcedure;
-
-    // Resolve the (schema, name) key — either explicit, or the first hit on
-    // the search path that has a matching overload.
-    let matches = |f: &crate::schema::FunctionEntry| {
-        f.arg_types == arg_oids && f.is_aggregate == is_aggregate && f.is_procedure == is_procedure
+    let want_kind = match expected {
+        ObjectType::ObjectAggregate => ProKind::Aggregate,
+        ObjectType::ObjectProcedure => ProKind::Procedure,
+        _ => ProKind::Function,
     };
-    let Some(old_key) = find_function_key(interp, schema.as_deref(), &old_name, &matches) else {
+    let matches_kind = move |k: ProKind| {
+        matches!(
+            (want_kind, k),
+            (ProKind::Function, ProKind::Function)
+                | (ProKind::Function, ProKind::Window)
+                | (ProKind::Procedure, ProKind::Procedure)
+                | (ProKind::Aggregate, ProKind::Aggregate)
+        )
+    };
+    let matches = move |p: &PgProc| matches_kind(p.prokind) && p.proargtypes == arg_oids;
+
+    let Some((nsoid, oid)) = find_proc(interp, schema_opt.as_deref(), &old_name, &matches) else {
         if stmt.missing_ok {
             return Ok(());
         }
@@ -158,62 +172,8 @@ fn rename_function_like(
         )));
     };
 
-    // Remove the matching overload from the old key's bucket.
-    let fns = interp.functions_by_name.get_mut(&old_key).unwrap();
-    let pos = fns.iter().position(matches).unwrap();
-    let mut entry = fns.remove(pos);
-    if fns.is_empty() {
-        interp.functions_by_name.remove(&old_key);
-    }
-
-    entry.name = stmt.newname.clone();
-    let new_key = QualifiedName::new(&old_key.schema, &stmt.newname);
-    interp
-        .functions_by_name
-        .entry(new_key)
-        .or_default()
-        .push(entry);
-
+    interp.rename_pg_proc(oid, stmt.newname.clone(), nsoid);
     Ok(())
-}
-
-/// Find the schema-qualified key of a function-like object, scanning the
-/// search_path when `schema` is `None`.
-fn find_function_key(
-    snapshot: &crate::pg_catalog::PgCatalog,
-    schema: Option<&str>,
-    name: &str,
-    matches: &dyn Fn(&crate::schema::FunctionEntry) -> bool,
-) -> Option<QualifiedName> {
-    if let Some(s) = schema {
-        let k = QualifiedName::new(s, name);
-        return snapshot
-            .functions_by_name
-            .get(&k)
-            .filter(|fns| fns.iter().any(matches))
-            .map(|_| k);
-    }
-    if !snapshot.search_path.iter().any(|s| s == "pg_catalog") {
-        let k = QualifiedName::new("pg_catalog", name);
-        if snapshot
-            .functions_by_name
-            .get(&k)
-            .is_some_and(|fns| fns.iter().any(matches))
-        {
-            return Some(k);
-        }
-    }
-    for s in &snapshot.search_path {
-        let k = QualifiedName::new(s.clone(), name);
-        if snapshot
-            .functions_by_name
-            .get(&k)
-            .is_some_and(|fns| fns.iter().any(matches))
-        {
-            return Some(k);
-        }
-    }
-    None
 }
 
 fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
@@ -226,46 +186,39 @@ fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         _ => return Ok(()),
     };
 
-    let (schema, old_name) = match parts.as_slice() {
+    let (schema_name, old_name) = match parts.as_slice() {
         [s, n] => ((*s).to_owned(), (*n).to_owned()),
-        [n] => (
-            interp
+        [n] => {
+            let s = interp
                 .search_path
                 .first()
-                .cloned()
-                .unwrap_or_else(|| "public".to_owned()),
-            (*n).to_owned(),
-        ),
+                .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
+                .unwrap_or_else(|| "public".to_owned());
+            (s, (*n).to_owned())
+        }
         _ => return Ok(()),
     };
 
-    let old_key = QualifiedName::new(&schema, &old_name);
-    let Some(&oid) = interp.type_by_name.get(&old_key) else {
+    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(old_key.to_string()));
+        return Err(DdlError::TypeNotFound(format!("{schema_name}.{old_name}")));
+    };
+    let Some(&type_oid) = interp.type_by_qname.get(&(nsoid, old_name.clone())) else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TypeNotFound(format!("{schema_name}.{old_name}")));
     };
 
-    if let Some(te) = interp.types.get_mut(&oid) {
-        te.name = stmt.newname.clone();
-    }
-    interp.type_by_name.remove(&old_key);
-    let new_key = QualifiedName::new(&schema, &stmt.newname);
-    interp.type_by_name.insert(new_key, oid);
+    let new_name = stmt.newname.clone();
+    interp.rename_pg_type(type_oid, new_name.clone(), nsoid);
 
-    // Rename the matching `_<name>` array type as well.
-    let old_array_key = QualifiedName::new(&schema, format!("_{old_name}"));
-    if let Some(arr_oid) = interp.type_by_name.remove(&old_array_key) {
-        if let Some(te) = interp.types.get_mut(&arr_oid) {
-            te.name = format!("_{}", stmt.newname);
-        }
-        interp.type_by_name.insert(
-            QualifiedName::new(&schema, format!("_{}", stmt.newname)),
-            arr_oid,
-        );
+    let arr_old = format!("_{old_name}");
+    if let Some(&arr_oid) = interp.type_by_qname.get(&(nsoid, arr_old)) {
+        interp.rename_pg_type(arr_oid, format!("_{new_name}"), nsoid);
     }
-
     Ok(())
 }
 
@@ -273,90 +226,17 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     let old = &stmt.subname;
     let new = &stmt.newname;
 
-    // Rewrite all tables, types, and functions that live in the old schema.
-    let rekeyed_tables: Vec<(QualifiedName, QualifiedName)> = interp
-        .tables
-        .keys()
-        .filter(|k| k.schema == *old)
-        .map(|k| (k.clone(), QualifiedName::new(new.clone(), &k.name)))
-        .collect();
-    for (old_key, new_key) in rekeyed_tables {
-        if let Some(mut entry) = interp.tables.remove(&old_key) {
-            entry.schema = new.clone();
-            interp.tables.insert(new_key, entry);
+    let Some(nsoid) = interp.namespace_oid(old) else {
+        if stmt.missing_ok {
+            return Ok(());
         }
-    }
+        return Err(DdlError::DependencyError(format!(
+            "schema \"{old}\" does not exist"
+        )));
+    };
 
-    let rekeyed_types: Vec<(QualifiedName, QualifiedName, u32)> = interp
-        .type_by_name
-        .iter()
-        .filter_map(|(k, &oid)| {
-            if k.schema == *old {
-                Some((k.clone(), QualifiedName::new(new.clone(), &k.name), oid))
-            } else {
-                None
-            }
-        })
-        .collect();
-    for (old_key, new_key, oid) in rekeyed_types {
-        interp.type_by_name.remove(&old_key);
-        interp.type_by_name.insert(new_key, oid);
-        if let Some(t) = interp.types.get_mut(&oid) {
-            t.schema = new.clone();
-        }
-    }
-
-    let rekeyed_functions: Vec<(QualifiedName, QualifiedName)> = interp
-        .functions_by_name
-        .keys()
-        .filter(|k| k.schema == *old)
-        .map(|k| (k.clone(), QualifiedName::new(new.clone(), &k.name)))
-        .collect();
-    for (old_key, new_key) in rekeyed_functions {
-        if let Some(mut fns) = interp.functions_by_name.remove(&old_key) {
-            for f in fns.iter_mut() {
-                f.schema = new.clone();
-            }
-            interp
-                .functions_by_name
-                .entry(new_key)
-                .or_default()
-                .extend(fns);
-        }
-    }
-
-    let rekeyed_operators: Vec<(QualifiedName, QualifiedName)> = interp
-        .operators_by_name
-        .keys()
-        .filter(|k| k.schema == *old)
-        .map(|k| (k.clone(), QualifiedName::new(new.clone(), &k.name)))
-        .collect();
-    for (old_key, new_key) in rekeyed_operators {
-        if let Some(ops) = interp.operators_by_name.remove(&old_key) {
-            interp
-                .operators_by_name
-                .entry(new_key)
-                .or_default()
-                .extend(ops);
-        }
-    }
-
-    // Update `search_path` if it referenced the old name.
-    for s in interp.search_path.iter_mut() {
-        if *s == *old {
-            *s = new.clone();
-        }
-    }
-
-    // And the set of known schemas.
-    if interp.schemas.remove(old) {
-        interp.schemas.insert(new.clone());
-    }
-
-    // Rewrite view dependencies so anything that pointed at `old.*` now
-    // points at `new.*`.
-    views::rewrite_deps_on_schema_rename(interp, old, new);
-
+    interp.rename_pg_namespace(nsoid, new.clone());
+    views::rewrite_views_on_schema_rename(interp, old, new);
     Ok(())
 }
 
@@ -365,25 +245,20 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
 pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
     let object_type = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
     let new_schema = stmt.newschema.clone();
+    let new_nsoid = ensure_namespace(interp, &new_schema);
 
     match object_type {
-        // ── Relations ────────────────────────────────────────────────────
         ObjectType::ObjectTable
         | ObjectType::ObjectView
         | ObjectType::ObjectMatview
         | ObjectType::ObjectForeignTable
-        | ObjectType::ObjectSequence => set_relation_schema(interp, stmt, new_schema),
-
-        // ── Functions / procedures / aggregates ─────────────────────────
+        | ObjectType::ObjectSequence => set_relation_schema(interp, stmt, new_nsoid, &new_schema),
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
-            set_function_like_schema(interp, stmt, new_schema, object_type)
+            set_function_like_schema(interp, stmt, new_nsoid, object_type)
         }
-
-        // ── Types / domains ─────────────────────────────────────────────
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
-            set_type_schema(interp, stmt, new_schema)
+            set_type_schema(interp, stmt, new_nsoid)
         }
-
         _ => Ok(()),
     }
 }
@@ -391,7 +266,8 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
 fn set_relation_schema(
     interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
-    new_schema: String,
+    new_nsoid: PgNamespaceOid,
+    new_schema: &str,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -400,65 +276,75 @@ fn set_relation_schema(
         interp
             .search_path
             .first()
-            .cloned()
+            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
             .unwrap_or_else(|| "public".to_owned())
     } else {
         rv.schemaname.clone()
     };
-    let old_key = QualifiedName::new(&old_schema, &rv.relname);
-    let Some(mut entry) = interp.tables.remove(&old_key) else {
+    let Some(old_nsoid) = interp.namespace_oid(&old_schema) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(old_key.to_string()));
+        return Err(DdlError::TableNotFound(format!(
+            "{old_schema}.{}",
+            rv.relname
+        )));
     };
-    let new_key = QualifiedName::new(&new_schema, &rv.relname);
-    entry.schema = new_schema.clone();
-    interp.tables.insert(new_key.clone(), entry);
-
-    // Move the composite type + array type to the new schema as well.
-    if let Some(&ctype_oid) = interp.type_by_name.get(&old_key) {
-        interp.type_by_name.remove(&old_key);
-        interp
-            .type_by_name
-            .insert(QualifiedName::new(&new_schema, &rv.relname), ctype_oid);
-        if let Some(te) = interp.types.get_mut(&ctype_oid) {
-            te.schema = new_schema.clone();
+    let Some(class_oid) = interp
+        .class_by_qname
+        .get(&(old_nsoid, rv.relname.clone()))
+        .copied()
+    else {
+        if stmt.missing_ok {
+            return Ok(());
         }
-        let old_arr_key = QualifiedName::new(&old_schema, format!("_{}", rv.relname));
-        if let Some(arr_oid) = interp.type_by_name.remove(&old_arr_key) {
-            interp.type_by_name.insert(
-                QualifiedName::new(&new_schema, format!("_{}", rv.relname)),
-                arr_oid,
-            );
-            if let Some(te) = interp.types.get_mut(&arr_oid) {
-                te.schema = new_schema;
-            }
+        return Err(DdlError::TableNotFound(format!(
+            "{old_schema}.{}",
+            rv.relname
+        )));
+    };
+
+    let name = rv.relname.clone();
+    interp.rename_pg_class(class_oid, name.clone(), new_nsoid);
+
+    if let Some(&type_oid) = interp.type_by_qname.get(&(old_nsoid, name.clone())) {
+        interp.rename_pg_type(type_oid, name.clone(), new_nsoid);
+        let arr_key = format!("_{name}");
+        if let Some(&arr_oid) = interp.type_by_qname.get(&(old_nsoid, arr_key.clone())) {
+            interp.rename_pg_type(arr_oid, arr_key, new_nsoid);
         }
     }
 
-    // Point every view's deps at the new key.
-    views::rewrite_deps_on_table_rename(interp, &old_key, &new_key);
-
+    views::rewrite_views_on_table_rename(interp, &old_schema, &name, new_schema, &name);
     Ok(())
 }
 
 fn set_function_like_schema(
     interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
-    new_schema: String,
+    new_nsoid: PgNamespaceOid,
     expected: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some((schema, name, arg_oids)) = extract_func_target(&stmt.object, interp) else {
+    let Some((schema_opt, name, arg_oids)) = extract_func_target(&stmt.object, interp) else {
         return Ok(());
     };
-    let is_aggregate = expected == ObjectType::ObjectAggregate;
-    let is_procedure = expected == ObjectType::ObjectProcedure;
-
-    let matches = |f: &crate::schema::FunctionEntry| {
-        f.arg_types == arg_oids && f.is_aggregate == is_aggregate && f.is_procedure == is_procedure
+    let want_kind = match expected {
+        ObjectType::ObjectAggregate => ProKind::Aggregate,
+        ObjectType::ObjectProcedure => ProKind::Procedure,
+        _ => ProKind::Function,
     };
-    let Some(old_key) = find_function_key(interp, schema.as_deref(), &name, &matches) else {
+    let matches_kind = move |k: ProKind| {
+        matches!(
+            (want_kind, k),
+            (ProKind::Function, ProKind::Function)
+                | (ProKind::Function, ProKind::Window)
+                | (ProKind::Procedure, ProKind::Procedure)
+                | (ProKind::Aggregate, ProKind::Aggregate)
+        )
+    };
+    let matches = move |p: &PgProc| matches_kind(p.prokind) && p.proargtypes == arg_oids;
+
+    let Some((_, oid)) = find_proc(interp, schema_opt.as_deref(), &name, &matches) else {
         if stmt.missing_ok {
             return Ok(());
         }
@@ -472,27 +358,14 @@ fn set_function_like_schema(
         )));
     };
 
-    // Pull the matching overload from the old bucket, retarget its schema,
-    // and re-insert under the new key.
-    let fns = interp.functions_by_name.get_mut(&old_key).unwrap();
-    let pos = fns.iter().position(matches).unwrap();
-    let mut entry = fns.remove(pos);
-    if fns.is_empty() {
-        interp.functions_by_name.remove(&old_key);
-    }
-    entry.schema = new_schema.clone();
-    interp
-        .functions_by_name
-        .entry(QualifiedName::new(&new_schema, &name))
-        .or_default()
-        .push(entry);
+    interp.rename_pg_proc(oid, name, new_nsoid);
     Ok(())
 }
 
 fn set_type_schema(
     interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
-    new_schema: String,
+    new_nsoid: PgNamespaceOid,
 ) -> Result<(), DdlError> {
     let Some(object) = stmt.object.as_deref() else {
         return Ok(());
@@ -504,40 +377,35 @@ fn set_type_schema(
     };
     let (old_schema, name) = match parts.as_slice() {
         [s, n] => ((*s).to_owned(), (*n).to_owned()),
-        [n] => (
-            interp
+        [n] => {
+            let s = interp
                 .search_path
                 .first()
-                .cloned()
-                .unwrap_or_else(|| "public".to_owned()),
-            (*n).to_owned(),
-        ),
+                .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
+                .unwrap_or_else(|| "public".to_owned());
+            (s, (*n).to_owned())
+        }
         _ => return Ok(()),
     };
 
-    let old_key = QualifiedName::new(&old_schema, &name);
-    let Some(&oid) = interp.type_by_name.get(&old_key) else {
+    let Some(old_nsoid) = interp.namespace_oid(&old_schema) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(old_key.to_string()));
+        return Err(DdlError::TypeNotFound(format!("{old_schema}.{name}")));
     };
-    interp.type_by_name.remove(&old_key);
-    interp
-        .type_by_name
-        .insert(QualifiedName::new(&new_schema, &name), oid);
-    if let Some(te) = interp.types.get_mut(&oid) {
-        te.schema = new_schema.clone();
-    }
-
-    let old_arr_key = QualifiedName::new(&old_schema, format!("_{name}"));
-    if let Some(arr_oid) = interp.type_by_name.remove(&old_arr_key) {
-        interp
-            .type_by_name
-            .insert(QualifiedName::new(&new_schema, format!("_{name}")), arr_oid);
-        if let Some(te) = interp.types.get_mut(&arr_oid) {
-            te.schema = new_schema;
+    let Some(&type_oid) = interp.type_by_qname.get(&(old_nsoid, name.clone())) else {
+        if stmt.missing_ok {
+            return Ok(());
         }
+        return Err(DdlError::TypeNotFound(format!("{old_schema}.{name}")));
+    };
+
+    interp.rename_pg_type(type_oid, name.clone(), new_nsoid);
+
+    let arr_key = format!("_{name}");
+    if let Some(&arr_oid) = interp.type_by_qname.get(&(old_nsoid, arr_key.clone())) {
+        interp.rename_pg_type(arr_oid, arr_key, new_nsoid);
     }
 
     Ok(())
@@ -545,12 +413,11 @@ fn set_type_schema(
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Extract `(schema, name, arg_oids)` from an `ObjectWithArgs` target. The
-/// schema is optional — when `None`, callers should match across schemas.
+/// Extract `(schema_opt, name, arg_oids)` from an `ObjectWithArgs` target.
 fn extract_func_target(
     object: &Option<Box<pg_query::protobuf::Node>>,
-    snapshot: &crate::pg_catalog::PgCatalog,
-) -> Option<(Option<String>, String, Vec<u32>)> {
+    interp: &PgCatalog,
+) -> Option<(Option<String>, String, Vec<PgTypeOid>)> {
     let node = object.as_deref()?;
     let owa = match node.node.as_ref()? {
         node::Node::ObjectWithArgs(owa) => owa,
@@ -564,12 +431,12 @@ fn extract_func_target(
         _ => return None,
     };
 
-    let arg_oids: Vec<u32> = owa
+    let arg_oids: Vec<PgTypeOid> = owa
         .objargs
         .iter()
         .filter_map(|n| {
             if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-                resolve_type_name(tn, snapshot)
+                resolve_type_name(tn, interp)
             } else {
                 None
             }
@@ -577,4 +444,38 @@ fn extract_func_target(
         .collect();
 
     Some((schema, name, arg_oids))
+}
+
+/// Resolve `(nspoid, oid)` of a `pg_proc` row matching `predicate`, walking
+/// the search path when `schema` is `None`.
+fn find_proc(
+    snapshot: &PgCatalog,
+    schema: Option<&str>,
+    name: &str,
+    matches: &dyn Fn(&PgProc) -> bool,
+) -> Option<(PgNamespaceOid, PgProcOid)> {
+    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
+        snapshot.namespace_oid(s).into_iter().collect()
+    } else {
+        let mut v = Vec::new();
+        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
+            && !snapshot.search_path.contains(&pg_oid)
+        {
+            v.push(pg_oid);
+        }
+        v.extend(snapshot.search_path.iter().copied());
+        v
+    };
+    for nsoid in candidate_schemas {
+        if let Some(oids) = snapshot.proc_by_qname.get(&(nsoid, name.to_owned())) {
+            for &oid in oids {
+                if let Some(p) = snapshot.pg_proc.get(&oid)
+                    && matches(p)
+                {
+                    return Some((nsoid, oid));
+                }
+            }
+        }
+    }
+    None
 }

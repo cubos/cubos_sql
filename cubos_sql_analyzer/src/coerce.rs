@@ -1,7 +1,7 @@
 //! Type coercion and common-type resolution.
 
-use crate::pg_catalog::PgCatalog;
-use crate::schema::{CastContext, CastInfo, oid};
+use crate::oid::PgTypeOid;
+use crate::pg_catalog::{CastContext, PgCatalog, oid};
 
 /// Describes the level of implicit coercion allowed in a given context.
 ///
@@ -20,41 +20,36 @@ pub(crate) enum CoercionContext {
 /// Check whether a cast from `source` to `target` is permitted under
 /// the given coercion context, consulting the snapshot's cast catalog.
 pub(crate) fn can_coerce(
-    source: u32,
-    target: u32,
+    source: PgTypeOid,
+    target: PgTypeOid,
     context: CoercionContext,
     snapshot: &PgCatalog,
 ) -> bool {
     if source == target {
         return true;
     }
-    // Unwrap domains before checking.
     let source = snapshot.unwrap_domain(source);
     let target_unwrapped = snapshot.unwrap_domain(target);
     if source == target_unwrapped {
         return true;
     }
-    let key = format!("{source}:{target_unwrapped}");
-    matches!(
-        (context, snapshot.casts.get(&key)),
-        (
-            _,
-            Some(CastInfo {
-                context: CastContext::Implicit,
-                ..
-            })
-        ) | (
-            CoercionContext::Assignment,
-            Some(CastInfo {
-                context: CastContext::Assignment,
-                ..
-            })
-        )
-    )
+    let cast = snapshot
+        .cast_by_pair
+        .get(&(source, target_unwrapped))
+        .and_then(|oid| snapshot.pg_cast.get(oid));
+    match (context, cast) {
+        (_, Some(c)) if matches!(c.castcontext, CastContext::Implicit) => true,
+        (CoercionContext::Assignment, Some(c))
+            if matches!(c.castcontext, CastContext::Assignment) =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Numeric type promotion order (lower index = less preferred).
-const NUMERIC_PROMOTION: &[(u32, u8)] = &[
+const NUMERIC_PROMOTION: &[(PgTypeOid, u8)] = &[
     (oid::INT2, 0),
     (oid::INT4, 1),
     (oid::INT8, 2),
@@ -63,7 +58,7 @@ const NUMERIC_PROMOTION: &[(u32, u8)] = &[
     (oid::FLOAT8, 5),
 ];
 
-fn numeric_rank(type_oid: u32) -> Option<u8> {
+fn numeric_rank(type_oid: PgTypeOid) -> Option<u8> {
     NUMERIC_PROMOTION
         .iter()
         .find(|(oid, _)| *oid == type_oid)
@@ -71,44 +66,39 @@ fn numeric_rank(type_oid: u32) -> Option<u8> {
 }
 
 /// Check if a type is a string-like type.
-fn is_string_type(type_oid: u32) -> bool {
+fn is_string_type(type_oid: PgTypeOid) -> bool {
     matches!(type_oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME)
 }
 
 /// Find the common supertype for a list of types.
 ///
 /// Used for CASE, COALESCE, UNION column reconciliation.
-pub(crate) fn find_common_type(types: &[u32], snapshot: &PgCatalog) -> Option<u32> {
+pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Option<PgTypeOid> {
     if types.is_empty() {
         return None;
     }
 
-    // Filter out UNKNOWN (untyped literals).
-    let concrete: Vec<u32> = types
+    let concrete: Vec<PgTypeOid> = types
         .iter()
         .copied()
         .filter(|&t| t != oid::UNKNOWN)
         .collect();
     if concrete.is_empty() {
-        return Some(oid::TEXT); // All unknown → text
+        return Some(oid::TEXT);
     }
 
-    // If all the same, return that.
     if concrete.iter().all(|&t| t == concrete[0]) {
         return Some(concrete[0]);
     }
 
-    // Try numeric promotion.
     if concrete.iter().all(|t| numeric_rank(*t).is_some()) {
         return concrete.iter().max_by_key(|t| numeric_rank(**t)).copied();
     }
 
-    // Try string types → text.
     if concrete.iter().all(|t| is_string_type(*t)) {
         return Some(oid::TEXT);
     }
 
-    // Try implicit casts: find a type that all others can cast to.
     for &candidate in &concrete {
         if concrete
             .iter()
@@ -118,7 +108,6 @@ pub(crate) fn find_common_type(types: &[u32], snapshot: &PgCatalog) -> Option<u3
         }
     }
 
-    // Fallback: try text (many types can cast to text).
     if concrete
         .iter()
         .all(|&t| t == oid::TEXT || snapshot.has_implicit_cast(t, oid::TEXT))

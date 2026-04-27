@@ -12,8 +12,13 @@
 
 use pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt};
 
-use super::{DdlError, InstalledExtension};
-use crate::pg_catalog::PgCatalog;
+use super::DdlError;
+use super::util::ensure_namespace;
+use crate::oid::{PgCastOid, PgClassOid, PgExtensionOid, PgGenericOid, PgProcOid, PgTypeOid};
+use crate::pg_catalog::{
+    DepType, PG_CAST_RELID, PG_EXTENSION_RELID, PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgDepend,
+    PgExtension,
+};
 
 // ─── Extension version graph ────────────────────────────────────────────────
 
@@ -1010,7 +1015,7 @@ pub fn create_extension(
     let name = &stmt.extname;
 
     // Check if already installed.
-    if interp.installed_extensions.contains_key(name.as_str()) {
+    if interp.extension_by_name.contains_key(name.as_str()) {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -1037,55 +1042,29 @@ pub fn create_extension(
     // Find the install path: base version, then upgrades to target.
     let path = find_install_path(ext, &target_version)?;
 
-    // Snapshot state before install to track what the extension creates.
-    let types_before: std::collections::HashSet<u32> = interp.types.keys().copied().collect();
-    let funcs_before: std::collections::HashSet<crate::qualified_name::QualifiedName> =
-        interp.functions_by_name.keys().cloned().collect();
-    let casts_before: std::collections::HashSet<String> = interp.casts.keys().cloned().collect();
+    // Allocate the pg_extension row up front so we can reference its OID
+    // when tagging objects created during installation.
+    let target_nsoid = ensure_namespace(interp, &target_schema);
+    let ext_oid = PgExtensionOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_extension(PgExtension {
+        oid: ext_oid,
+        extname: name.clone(),
+        extnamespace: target_nsoid,
+        extversion: target_version,
+    });
 
-    // Apply scripts with schema override.
+    // Snapshot OIDs before install so the `pg_depend` tagging step can
+    // identify the objects the extension created.
+    let types_before: std::collections::HashSet<PgTypeOid> =
+        interp.pg_type.keys().copied().collect();
+    let procs_before: std::collections::HashSet<PgProcOid> =
+        interp.pg_proc.keys().copied().collect();
+    let casts_before: std::collections::HashSet<PgCastOid> =
+        interp.pg_cast.keys().copied().collect();
+
     apply_with_schema(interp, &target_schema, &path)?;
 
-    // Compute diff: what was created by the extension.
-    let type_oids: Vec<u32> = interp
-        .types
-        .keys()
-        .filter(|k| !types_before.contains(k))
-        .copied()
-        .collect();
-
-    // Tag each newly-created type with the extension name. This lets the
-    // Rust type resolver route extension types (e.g. pgvector's `vector`)
-    // to crate-specific Rust types without needing a config entry.
-    for oid in &type_oids {
-        if let Some(te) = interp.types.get_mut(oid) {
-            te.extension = Some(name.clone());
-        }
-    }
-    let function_names: Vec<crate::qualified_name::QualifiedName> = interp
-        .functions_by_name
-        .keys()
-        .filter(|k| !funcs_before.contains(*k))
-        .cloned()
-        .collect();
-    let cast_keys: Vec<String> = interp
-        .casts
-        .keys()
-        .filter(|k| !casts_before.contains(k.as_str()))
-        .cloned()
-        .collect();
-
-    // Record as installed.
-    interp.installed_extensions.insert(
-        name.clone(),
-        InstalledExtension {
-            version: target_version,
-            schema: target_schema,
-            type_oids,
-            function_names,
-            cast_keys,
-        },
-    );
+    record_extension_membership(interp, ext_oid, &types_before, &procs_before, &casts_before);
 
     Ok(())
 }
@@ -1095,11 +1074,20 @@ pub fn create_extension(
 pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Result<(), DdlError> {
     let name = &stmt.extname;
 
-    let installed = interp
-        .installed_extensions
+    let ext_oid = *interp
+        .extension_by_name
         .get(name.as_str())
-        .cloned()
         .ok_or_else(|| DdlError::ExtensionError(format!("extension '{name}' is not installed")))?;
+    let installed_version = interp
+        .pg_extension
+        .get(&ext_oid)
+        .map(|e| e.extversion.clone())
+        .unwrap_or_default();
+    let installed_nsname = interp
+        .pg_extension
+        .get(&ext_oid)
+        .and_then(|e| interp.namespace_name(e.extnamespace).map(str::to_owned))
+        .unwrap_or_else(|| "public".to_owned());
 
     let ext = REGISTRY
         .iter()
@@ -1109,32 +1097,82 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
     let target_version = extract_option(&stmt.options, "new_version")
         .unwrap_or_else(|| ext.default_version.to_owned());
 
-    if installed.version == target_version {
+    if installed_version == target_version {
         return Ok(()); // Already at target version.
     }
 
-    // Find upgrade path from current version to target.
-    let path = find_upgrade_path(ext, &installed.version, &target_version)?;
+    let path = find_upgrade_path(ext, &installed_version, &target_version)?;
 
-    // Track new objects created by upgrade scripts.
-    let funcs_before: std::collections::HashSet<crate::qualified_name::QualifiedName> =
-        interp.functions_by_name.keys().cloned().collect();
+    // Track new objects created by upgrade scripts via pg_depend tagging.
+    let types_before: std::collections::HashSet<PgTypeOid> =
+        interp.pg_type.keys().copied().collect();
+    let procs_before: std::collections::HashSet<PgProcOid> =
+        interp.pg_proc.keys().copied().collect();
+    let casts_before: std::collections::HashSet<PgCastOid> =
+        interp.pg_cast.keys().copied().collect();
 
-    apply_with_schema(interp, &installed.schema, &path)?;
+    apply_with_schema(interp, &installed_nsname, &path)?;
 
-    let new_funcs: Vec<crate::qualified_name::QualifiedName> = interp
-        .functions_by_name
-        .keys()
-        .filter(|k| !funcs_before.contains(*k))
-        .cloned()
-        .collect();
+    record_extension_membership(interp, ext_oid, &types_before, &procs_before, &casts_before);
 
-    // Update installed version and track new objects.
-    let entry = interp.installed_extensions.get_mut(name.as_str()).unwrap();
-    entry.version = target_version;
-    entry.function_names.extend(new_funcs);
+    if let Some(entry) = interp.pg_extension.get_mut(&ext_oid) {
+        entry.extversion = target_version;
+    }
 
     Ok(())
+}
+
+/// Diff `pg_type`/`pg_proc`/`pg_cast` against the snapshot taken before the
+/// extension scripts ran, and add `pg_depend` rows for every newly-created
+/// object so that `DROP EXTENSION` can find them.
+fn record_extension_membership(
+    interp: &mut PgCatalog,
+    ext_oid: PgExtensionOid,
+    types_before: &std::collections::HashSet<PgTypeOid>,
+    procs_before: &std::collections::HashSet<PgProcOid>,
+    casts_before: &std::collections::HashSet<PgCastOid>,
+) {
+    let new_types: Vec<PgTypeOid> = interp
+        .pg_type
+        .keys()
+        .filter(|k| !types_before.contains(k))
+        .copied()
+        .collect();
+    let new_procs: Vec<PgProcOid> = interp
+        .pg_proc
+        .keys()
+        .filter(|k| !procs_before.contains(k))
+        .copied()
+        .collect();
+    let new_casts: Vec<PgCastOid> = interp
+        .pg_cast
+        .keys()
+        .filter(|k| !casts_before.contains(k))
+        .copied()
+        .collect();
+
+    let ref_oid = PgGenericOid::new(ext_oid.get()).expect("ext_oid non-zero");
+    let ext_dep = |classid: PgClassOid, objid: PgGenericOid| PgDepend {
+        classid,
+        objid,
+        objsubid: 0,
+        refclassid: PG_EXTENSION_RELID,
+        refobjid: ref_oid,
+        refobjsubid: 0,
+        deptype: DepType::Extension,
+    };
+    for type_oid in new_types {
+        let g = PgGenericOid::new(type_oid.get()).unwrap();
+        interp.add_dependency(ext_dep(PG_TYPE_RELID, g));
+    }
+    for proc_oid in new_procs {
+        let g = PgGenericOid::new(proc_oid.get()).unwrap();
+        interp.add_dependency(ext_dep(PG_PROC_RELID, g));
+    }
+    for cast_oid in new_casts {
+        let g = PgGenericOid::new(cast_oid.get()).unwrap();
+        interp.add_dependency(ext_dep(PG_CAST_RELID, g));
+    }
 }
 
 // ─── Path resolution ────────────────────────────────────────────────────────
@@ -1209,15 +1247,17 @@ fn find_upgrade_path<'a>(
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Apply a list of SQL scripts with a temporary search_path override.
+/// Apply a list of SQL scripts with a temporary `search_path` prepend so
+/// unqualified names in the extension SQL resolve into the target schema.
 fn apply_with_schema(
     interp: &mut PgCatalog,
     schema: &str,
     scripts: &[&str],
 ) -> Result<(), DdlError> {
     let original = interp.search_path.clone();
-    if interp.search_path.first().is_none_or(|s| s != schema) {
-        interp.search_path.insert(0, schema.to_owned());
+    let target_oid = ensure_namespace(interp, schema);
+    if interp.search_path.first().copied() != Some(target_oid) {
+        interp.search_path.insert(0, target_oid);
     }
 
     let mut result = Ok(());

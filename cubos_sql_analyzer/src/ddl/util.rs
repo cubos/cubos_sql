@@ -2,9 +2,11 @@
 
 use pg_query::protobuf::{Node, RangeVar, TypeName, node};
 
-use crate::pg_catalog::PgCatalog;
+use crate::oid::{PgCastOid, PgNamespaceOid, PgTypeOid};
+use crate::pg_catalog::{
+    CastContext, CastMethod, PgCast, PgCatalog, PgNamespace, oid as builtin_oid,
+};
 use crate::qualified_name::QualifiedName;
-use crate::schema::{CastContext, CastInfo, CastMethod, oid};
 
 /// Extract the (schema, name) pair from a `RangeVar`.
 /// If no schema is specified, defaults to the first entry in `search_path`.
@@ -13,7 +15,7 @@ pub fn range_var_names(rv: &RangeVar, snapshot: &PgCatalog) -> (String, String) 
         snapshot
             .search_path
             .first()
-            .cloned()
+            .and_then(|&oid| snapshot.namespace_name(oid).map(str::to_owned))
             .unwrap_or_else(|| "public".to_owned())
     } else {
         rv.schemaname.clone()
@@ -21,14 +23,9 @@ pub fn range_var_names(rv: &RangeVar, snapshot: &PgCatalog) -> (String, String) 
     (schema, rv.relname.clone())
 }
 
-/// Extract schema-qualified key from a `RangeVar`.
-pub fn range_var_key(rv: &RangeVar, snapshot: &PgCatalog) -> QualifiedName {
-    let (schema, name) = range_var_names(rv, snapshot);
-    QualifiedName::new(schema, name)
-}
-
-/// Extract (schema, name) from a list of name nodes (e.g., `domainname`, `type_name` in DDL).
-/// Handles both `["name"]` and `["schema", "name"]` forms.
+/// Extract (schema, name) from a list of name nodes (e.g., `domainname`,
+/// `type_name` in DDL). Handles both `["name"]` and `["schema", "name"]`
+/// forms.
 pub fn extract_names(names: &[Node], snapshot: &PgCatalog) -> (String, String) {
     let parts: Vec<&str> = names
         .iter()
@@ -44,7 +41,7 @@ pub fn extract_names(names: &[Node], snapshot: &PgCatalog) -> (String, String) {
             let schema = snapshot
                 .search_path
                 .first()
-                .cloned()
+                .and_then(|&oid| snapshot.namespace_name(oid).map(str::to_owned))
                 .unwrap_or_else(|| "public".to_owned());
             (schema, (*name).to_owned())
         }
@@ -58,6 +55,39 @@ pub fn names_key(names: &[Node], snapshot: &PgCatalog) -> QualifiedName {
     QualifiedName::new(schema, name)
 }
 
+/// Look up (or implicitly create) the OID of the named namespace.
+///
+/// PG would error on a missing schema, but the analyzer historically tolerates
+/// `CREATE TABLE my_schema.foo` without a prior `CREATE SCHEMA my_schema`. We
+/// keep that leniency by registering the schema on demand, allocating a fresh
+/// OID. Callers that *need* strict checks (e.g. `ALTER … RENAME TO`) should
+/// look at [`PgCatalog::namespace_oid`] directly and surface their own errors.
+pub fn ensure_namespace(interp: &mut PgCatalog, name: &str) -> PgNamespaceOid {
+    if let Some(oid) = interp.namespace_oid(name) {
+        return oid;
+    }
+    let oid = PgNamespaceOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_namespace(PgNamespace {
+        oid,
+        nspname: name.to_owned(),
+    });
+    oid
+}
+
+/// Extract a `(nspoid, name)` pair, creating the namespace if it doesn't
+/// exist yet. Convenience wrapper around `extract_names` + `ensure_namespace`
+/// for DDL handlers that are about to insert a row.
+pub fn ensure_qualified_name(interp: &mut PgCatalog, names: &[Node]) -> (PgNamespaceOid, String) {
+    let (schema, name) = extract_names(names, interp);
+    (ensure_namespace(interp, &schema), name)
+}
+
+/// Same as `ensure_qualified_name` but for `RangeVar` inputs.
+pub fn ensure_range_var(interp: &mut PgCatalog, rv: &RangeVar) -> (PgNamespaceOid, String) {
+    let (schema, name) = range_var_names(rv, interp);
+    (ensure_namespace(interp, &schema), name)
+}
+
 /// Resolve a `TypeName` AST node to a type OID in the snapshot.
 ///
 /// Handles:
@@ -65,7 +95,7 @@ pub fn names_key(names: &[Node], snapshot: &PgCatalog) -> QualifiedName {
 /// - Unqualified names: `int4`, `text`, `uuid`
 /// - Array bounds: `int4[]` → array element type OID
 /// - Shorthand aliases: `integer` → `int4`, `bigint` → `int8`, etc.
-pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<u32> {
+pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<PgTypeOid> {
     let parts: Vec<&str> = tn
         .names
         .iter()
@@ -81,47 +111,13 @@ pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<u32> {
         _ => return None,
     };
 
-    // Normalize shorthand aliases.
     let name = normalize_type_name(raw_name);
+    let base_oid = snapshot.resolve_type_by_name(schema, name).map(|t| t.oid)?;
 
-    // Try to find the type by name.
-    let oid = if let Some(schema) = schema {
-        let key = QualifiedName::new(schema, name);
-        snapshot.type_by_name.get(&key).copied()
-    } else {
-        // Search path then pg_catalog.
-        let mut found = None;
-        for s in &snapshot.search_path {
-            let key = QualifiedName::new(s.clone(), name);
-            if let Some(oid) = snapshot.type_by_name.get(&key) {
-                found = Some(*oid);
-                break;
-            }
-        }
-        if found.is_none() {
-            let key = QualifiedName::new("pg_catalog", name);
-            found = snapshot.type_by_name.get(&key).copied();
-        }
-        found
-    };
-
-    // Handle array bounds: if the type name has array_bounds, look up the array type.
-    if !tn.array_bounds.is_empty()
-        && let Some(base_oid) = oid
-    {
-        return snapshot.types.values().find_map(|t| {
-            if let crate::schema::TypeKind::Array {
-                element_type_oid: elem,
-            } = &t.kind
-                && *elem == base_oid
-            {
-                return Some(t.oid);
-            }
-            None
-        });
+    if !tn.array_bounds.is_empty() {
+        return snapshot.array_type_of(base_oid);
     }
-
-    oid
+    Some(base_oid)
 }
 
 /// Normalize PostgreSQL type name aliases to their canonical form.
@@ -151,15 +147,17 @@ pub fn node_string(n: &Node) -> Option<&str> {
     }
 }
 
-/// Register the implicit `composite_oid → record` cast that PG creates for
-/// every composite type (CREATE TYPE foo AS (...) and the row type implicitly
-/// generated for each table). Used by the operator resolver so that
-/// `composite = composite` reaches the polymorphic `record = record`
-/// (record_eq) operator via cast lookup.
-pub fn register_composite_to_record_cast(snapshot: &mut PgCatalog, composite_oid: u32) {
-    let key = format!("{composite_oid}:{}", oid::RECORD);
-    snapshot.casts.insert(
-        key,
-        CastInfo::new(CastContext::Implicit, CastMethod::Binary),
-    );
+/// Register the implicit `composite_oid → record` cast PG creates for every
+/// composite type. Used by the operator resolver so that `composite =
+/// composite` reaches the polymorphic `record = record` (record_eq) operator
+/// via cast lookup.
+pub fn register_composite_to_record_cast(interp: &mut PgCatalog, composite_oid: PgTypeOid) {
+    let cast_oid = PgCastOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_cast(PgCast {
+        oid: cast_oid,
+        castsource: composite_oid,
+        casttarget: builtin_oid::RECORD,
+        castcontext: CastContext::Implicit,
+        castmethod: CastMethod::Binary,
+    });
 }

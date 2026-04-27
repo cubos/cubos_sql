@@ -71,21 +71,8 @@ impl std::error::Error for DdlError {
     }
 }
 
-// ─── Installed extension state ──────────────────────────────────────────────
-
-/// Tracks an installed extension's version, schema, and created objects.
-#[derive(Debug, Clone)]
-pub struct InstalledExtension {
-    pub version: String,
-    pub schema: String,
-    /// OIDs of types created by this extension.
-    pub type_oids: Vec<u32>,
-    /// Schema-qualified names of functions created by this extension
-    /// (for cleanup on DROP EXTENSION).
-    pub function_names: Vec<crate::qualified_name::QualifiedName>,
-    /// Keys of casts created by this extension.
-    pub cast_keys: Vec<String>,
-}
+// Extension membership is tracked via `pg_depend` rows with deptype=Extension
+// (refclassid=PG_EXTENSION_RELID); see `ddl/extensions.rs`.
 
 // ─── Dispatcher ─────────────────────────────────────────────────────────────
 

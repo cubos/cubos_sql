@@ -4,15 +4,17 @@ use pg_query::protobuf::{
     AlterTableCmd, AlterTableStmt, AlterTableType, ConstrType, CreateStmt, DropBehavior, node,
 };
 
-use crate::schema::{CompositeField, RelationKind, TableColumn, TableEntry, TypeEntry, TypeKind};
+use crate::oid::{PgClassOid, PgTypeOid};
+use crate::pg_catalog::{
+    AttGenerated, PgAttribute, PgClass, PgType, RelKind, TypCategory, TypType,
+};
 
 use super::DdlError;
 use super::util::{
-    range_var_key, range_var_names, register_composite_to_record_cast, resolve_type_name,
+    ensure_range_var, range_var_names, register_composite_to_record_cast, resolve_type_name,
 };
 use super::views;
 use crate::pg_catalog::PgCatalog;
-use crate::qualified_name::QualifiedName;
 
 // ─── CREATE TABLE ───────────────────────────────────────────────────────────
 
@@ -22,11 +24,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE TABLE without relation".into()))?;
 
-    let key = range_var_key(rv, interp);
-    let (schema, name) = range_var_names(rv, interp);
+    let (nsoid, name) = ensure_range_var(interp, rv);
 
-    // Check for existing table.
-    if interp.tables.contains_key(&key) {
+    if interp.class_by_qname.contains_key(&(nsoid, name.clone())) {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -35,8 +35,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         )));
     }
 
-    // Collect columns and constraints.
-    let mut columns = Vec::new();
+    let mut columns: Vec<ParsedColumn> = Vec::new();
     let mut pk_columns: Vec<String> = Vec::new();
 
     // First pass: extract table-level PRIMARY KEY constraint keys.
@@ -83,81 +82,82 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         columns.push(col);
     }
 
-    // Allocate OIDs for the composite and array types (tables don't need
-    // their own OID — the map key is the qualified name).
-    let composite_oid = interp.alloc_oid();
-    let array_oid = interp.alloc_oid();
+    // Allocate OIDs for the relation row, its composite type, and the array
+    // type wrapping the composite.
+    let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let composite_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let array_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
 
-    // Register composite type (PG creates one for each table).
-    let composite_fields: Vec<CompositeField> = columns
-        .iter()
-        .map(|c| CompositeField {
-            name: c.name.clone(),
-            type_oid: c.type_oid,
-            not_null: c.not_null,
-        })
-        .collect();
-
-    let composite_key = QualifiedName::new(&schema, &name);
-    interp.types.insert(
-        composite_oid,
-        TypeEntry {
-            oid: composite_oid,
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: TypeKind::Composite {
-                fields: composite_fields,
-            },
-            category: 'C',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(composite_key, composite_oid);
+    interp.insert_pg_class(PgClass {
+        oid: class_oid,
+        relname: name.clone(),
+        relnamespace: nsoid,
+        relkind: RelKind::Table,
+        reltype: Some(composite_oid),
+        relviewdef: Vec::new(),
+        viewbindings: Vec::new(),
+    });
+    for (i, col) in columns.iter().enumerate() {
+        interp.insert_pg_attribute(PgAttribute {
+            attrelid: class_oid,
+            attname: col.name.clone(),
+            atttypid: col.type_oid,
+            attnum: (i + 1) as i16,
+            attnotnull: col.not_null,
+            atthasdef: col.has_default,
+            attgenerated: col.is_generated.then_some(AttGenerated::Stored),
+        });
+    }
+    interp.insert_pg_type(PgType {
+        oid: composite_oid,
+        typname: name.clone(),
+        typnamespace: nsoid,
+        typtype: TypType::Composite,
+        typcategory: TypCategory::Composite,
+        typispreferred: false,
+        typrelid: Some(class_oid),
+        typelem: None,
+        typarray: Some(array_oid),
+        typbasetype: None,
+    });
     register_composite_to_record_cast(interp, composite_oid);
 
-    // Register array type for the composite.
-    let array_name = format!("_{name}");
-    let array_key = QualifiedName::new(&schema, &array_name);
-    interp.types.insert(
-        array_oid,
-        TypeEntry {
-            oid: array_oid,
-            name: array_name,
-            schema: schema.clone(),
-            kind: TypeKind::Array {
-                element_type_oid: composite_oid,
-            },
-            category: 'A',
-            is_preferred: false,
-            extension: None,
-        },
-    );
-    interp.type_by_name.insert(array_key, array_oid);
-
-    // Register the table.
-    interp.tables.insert(
-        key,
-        TableEntry {
-            name: name.clone(),
-            schema: schema.clone(),
-            kind: RelationKind::Table,
-            columns,
-            view_def: None,
-        },
-    );
+    // Array type for the composite (`_<name>` in the same schema).
+    interp.insert_pg_type(PgType {
+        oid: array_oid,
+        typname: format!("_{name}"),
+        typnamespace: nsoid,
+        typtype: TypType::Base,
+        typcategory: TypCategory::Array,
+        typispreferred: false,
+        typrelid: None,
+        typelem: Some(composite_oid),
+        typarray: None,
+        typbasetype: None,
+    });
 
     Ok(())
 }
 
-/// Parse a `ColumnDef` AST node into a `TableColumn`.
+/// Parsed column definition shared between `CREATE TABLE` and `ALTER TABLE`.
+#[derive(Clone)]
+struct ParsedColumn {
+    name: String,
+    type_oid: PgTypeOid,
+    not_null: bool,
+    has_default: bool,
+    is_generated: bool,
+}
+
+/// Parse a `ColumnDef` AST node into a `ParsedColumn` (shared between
+/// CREATE TABLE and ALTER TABLE ADD COLUMN paths).
 fn parse_column_def(
     interp: &PgCatalog,
     cd: &pg_query::protobuf::ColumnDef,
     pk_columns: &[String],
-) -> Result<TableColumn, DdlError> {
+) -> Result<ParsedColumn, DdlError> {
     // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — pg_query keeps the
-    // original name and does NOT rewrite to int4 + nextval(...) like older versions.
+    // original name and does NOT rewrite to int4 + nextval(...).
     let is_serial = cd.type_name.as_ref().is_some_and(|tn| {
         tn.names.iter().any(|n| {
             matches!(n.node.as_ref(), Some(node::Node::String(s))
@@ -169,32 +169,26 @@ fn parse_column_def(
         .type_name
         .as_ref()
         .and_then(|tn| resolve_type_name(tn, interp))
-        .unwrap_or(0); // 0 if unresolved — will produce a warning downstream.
+        .unwrap_or(crate::pg_catalog::oid::UNKNOWN);
 
     let mut not_null = cd.is_not_null;
     let mut has_default = cd.raw_default.is_some() || cd.cooked_default.is_some();
     let mut is_generated = false;
 
-    // SERIAL/BIGSERIAL/SMALLSERIAL imply has_default (auto-sequence).
     if is_serial {
         has_default = true;
     }
 
-    // Check IDENTITY.
     if !cd.identity.is_empty() {
         has_default = true;
         not_null = true;
     }
 
-    // Check GENERATED. `cd.generated` is "s" for STORED on PG14+ and
-    // empty for non-generated columns; non-empty means this column is
-    // computed and rejects user-supplied values.
     if !cd.generated.is_empty() {
         has_default = true;
         is_generated = true;
     }
 
-    // Check column-level constraints.
     for c_node in &cd.constraints {
         if let Some(node::Node::Constraint(c)) = c_node.node.as_ref() {
             match ConstrType::try_from(c.contype) {
@@ -218,12 +212,11 @@ fn parse_column_def(
         }
     }
 
-    // Table-level PRIMARY KEY includes this column → NOT NULL.
     if pk_columns.iter().any(|pk| pk == &cd.colname) {
         not_null = true;
     }
 
-    Ok(TableColumn {
+    Ok(ParsedColumn {
         name: cd.colname.clone(),
         type_oid,
         not_null,
@@ -240,21 +233,28 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         .as_ref()
         .ok_or_else(|| DdlError::Parse("ALTER TABLE without relation".into()))?;
 
-    let key = range_var_key(rv, interp);
-
-    // Verify the table exists. Handle missing_ok (IF EXISTS).
-    if !interp.tables.contains_key(&key) {
+    let (schema, name) = range_var_names(rv, interp);
+    let Some(nsoid) = interp.namespace_oid(&schema) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(key.to_string()));
-    }
+        return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+    };
+    let class_oid = match interp.class_by_qname.get(&(nsoid, name.clone())).copied() {
+        Some(oid) => oid,
+        None => {
+            if stmt.missing_ok {
+                return Ok(());
+            }
+            return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+        }
+    };
 
     for cmd_node in &stmt.cmds {
         let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
             continue;
         };
-        apply_alter_cmd(interp, &key, cmd)?;
+        apply_alter_cmd(interp, class_oid, cmd)?;
     }
 
     Ok(())
@@ -262,21 +262,21 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
 
 fn apply_alter_cmd(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let subtype = AlterTableType::try_from(cmd.subtype).unwrap_or(AlterTableType::Undefined);
 
     match subtype {
         AlterTableType::AtAddColumn | AlterTableType::AtAddColumnToView => {
-            add_column(interp, table_key, cmd)
+            add_column(interp, relid, cmd)
         }
-        AlterTableType::AtDropColumn => drop_column(interp, table_key, cmd),
-        AlterTableType::AtSetNotNull => set_not_null(interp, table_key, &cmd.name, true),
-        AlterTableType::AtDropNotNull => set_not_null(interp, table_key, &cmd.name, false),
-        AlterTableType::AtColumnDefault => set_default(interp, table_key, cmd),
-        AlterTableType::AtAlterColumnType => alter_column_type(interp, table_key, cmd),
-        AlterTableType::AtAddConstraint => add_constraint(interp, table_key, cmd),
+        AlterTableType::AtDropColumn => drop_column(interp, relid, cmd),
+        AlterTableType::AtSetNotNull => set_not_null(interp, relid, &cmd.name, true),
+        AlterTableType::AtDropNotNull => set_not_null(interp, relid, &cmd.name, false),
+        AlterTableType::AtColumnDefault => set_default(interp, relid, cmd),
+        AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd),
+        AlterTableType::AtAddConstraint => add_constraint(interp, relid, cmd),
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
@@ -284,7 +284,7 @@ fn apply_alter_cmd(
 
 fn add_column(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
@@ -294,13 +294,11 @@ fn add_column(
         return Ok(());
     };
 
-    let table = interp
-        .tables
-        .get(table_key)
-        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-
-    // Check for duplicate column.
-    if table.columns.iter().any(|c| c.name == cd.colname) {
+    if interp
+        .attributes_of(relid)
+        .iter()
+        .any(|a| a.attname == cd.colname)
+    {
         if cmd.missing_ok {
             return Ok(());
         }
@@ -311,29 +309,35 @@ fn add_column(
     }
 
     let col = parse_column_def(interp, cd, &[])?;
-
-    // Mutate table and composite type.
-    let table = interp.tables.get_mut(table_key).unwrap();
-    table.columns.push(col.clone());
-
-    // Update composite type.
-    update_composite_for_table(interp, table_key);
-
+    let next_attnum = interp
+        .attributes_of(relid)
+        .iter()
+        .map(|a| a.attnum)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    interp.insert_pg_attribute(PgAttribute {
+        attrelid: relid,
+        attname: col.name.clone(),
+        atttypid: col.type_oid,
+        attnum: next_attnum,
+        attnotnull: col.not_null,
+        atthasdef: col.has_default,
+        attgenerated: col.is_generated.then_some(AttGenerated::Stored),
+    });
     Ok(())
 }
 
 fn drop_column(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let table = interp
-        .tables
-        .get(table_key)
-        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-
-    // Check column exists.
-    if !table.columns.iter().any(|c| c.name == cmd.name) {
+    if !interp
+        .attributes_of(relid)
+        .iter()
+        .any(|a| a.attname == cmd.name)
+    {
         if cmd.missing_ok {
             return Ok(());
         }
@@ -348,79 +352,78 @@ fn drop_column(
         Ok(DropBehavior::DropCascade)
     );
 
-    // Check for dependent views.
-    let dependent_views = views::find_views_depending_on_column(interp, table_key, &cmd.name);
+    // Find dependent views from pg_depend.
+    let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
     if !dependent_views.is_empty() && !cascade {
-        let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
+        let view_names: Vec<String> = dependent_views
+            .iter()
+            .filter_map(|&v| {
+                let c = interp.pg_class.get(&v)?;
+                let nsname = interp.namespace_name(c.relnamespace)?;
+                Some(format!("{nsname}.{}", c.relname))
+            })
+            .collect();
+        let relname = interp
+            .pg_class
+            .get(&relid)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop column {}.{} because view(s) {} depend on it",
-            table_key,
+            "cannot drop column {relname}.{} because view(s) {} depend on it",
             cmd.name,
             view_names.join(", "),
         )));
     }
 
-    // CASCADE: drop dependent views.
     if !dependent_views.is_empty() {
         views::drop_views(interp, &dependent_views);
     }
 
-    let table = interp.tables.get_mut(table_key).unwrap();
-    table.columns.retain(|c| c.name != cmd.name);
-    update_composite_for_table(interp, table_key);
+    if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
+        attrs.retain(|a| a.attname != cmd.name);
+    }
     Ok(())
 }
 
 fn set_not_null(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     col_name: &str,
     not_null: bool,
 ) -> Result<(), DdlError> {
-    let table = interp
-        .tables
-        .get_mut(table_key)
-        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-
-    let col = table
-        .columns
-        .iter_mut()
-        .find(|c| c.name == col_name)
-        .ok_or_else(|| {
-            DdlError::Parse(format!("column \"{col_name}\" of relation does not exist"))
-        })?;
-    col.not_null = not_null;
-    update_composite_for_table(interp, table_key);
+    let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
+        return Err(DdlError::TableNotFound(format!("relation oid {relid}")));
+    };
+    let Some(col) = attrs.iter_mut().find(|c| c.attname == col_name) else {
+        return Err(DdlError::Parse(format!(
+            "column \"{col_name}\" of relation does not exist"
+        )));
+    };
+    col.attnotnull = not_null;
     Ok(())
 }
 
 fn set_default(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let table = interp
-        .tables
-        .get_mut(table_key)
-        .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-
-    let col = table
-        .columns
-        .iter_mut()
-        .find(|c| c.name == cmd.name)
-        .ok_or_else(|| {
-            DdlError::Parse(format!(
-                "column \"{}\" of relation does not exist",
-                cmd.name
-            ))
-        })?;
-    col.has_default = cmd.def.is_some();
+    let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
+        return Err(DdlError::TableNotFound(format!("relation oid {relid}")));
+    };
+    let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name) else {
+        return Err(DdlError::Parse(format!(
+            "column \"{}\" of relation does not exist",
+            cmd.name
+        )));
+    };
+    col.atthasdef = cmd.def.is_some();
     Ok(())
 }
 
 fn alter_column_type(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
@@ -434,19 +437,13 @@ fn alter_column_type(
         .type_name
         .as_ref()
         .and_then(|tn| resolve_type_name(tn, interp))
-        .unwrap_or(0);
+        .unwrap_or(crate::pg_catalog::oid::UNKNOWN);
 
-    if !interp.tables.contains_key(table_key) {
-        return Err(DdlError::TableNotFound(table_key.to_string()));
-    }
-
-    // Pull the current OID before mutating, so we can decide whether PG would
-    // allow the ALTER in the presence of dependent views.
     let old_type_oid = interp
-        .tables
-        .get(table_key)
-        .and_then(|t| t.columns.iter().find(|c| c.name == cmd.name))
-        .map(|c| c.type_oid)
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attname == cmd.name)
+        .map(|a| a.atttypid)
         .ok_or_else(|| {
             DdlError::Parse(format!(
                 "column \"{}\" of relation does not exist",
@@ -454,42 +451,39 @@ fn alter_column_type(
             ))
         })?;
 
-    // PG's rule (parse_coerce.c:IsBinaryCoercible): ALTER COLUMN TYPE is
-    // allowed when the new type is binary coercible with the old one — no
-    // table rewrite, so dependent views keep working. Any other change
-    // fails unless the user drops the view first.
-    let dependent_views = views::find_views_depending_on_column(interp, table_key, &cmd.name);
+    let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
     if !dependent_views.is_empty() && !interp.is_binary_coercible(old_type_oid, new_type_oid) {
-        let view_names: Vec<String> = dependent_views.iter().map(|k| k.to_string()).collect();
+        let view_names: Vec<String> = dependent_views
+            .iter()
+            .filter_map(|&v| {
+                let c = interp.pg_class.get(&v)?;
+                let nsname = interp.namespace_name(c.relnamespace)?;
+                Some(format!("{nsname}.{}", c.relname))
+            })
+            .collect();
+        let relname = interp
+            .pg_class
+            .get(&relid)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot alter type of column {}.{} because view(s) {} depend on it \
+            "cannot alter type of column {relname}.{} because view(s) {} depend on it \
              and the new type is not binary coercible with the old one \
              (hint: drop the view(s) first, alter the column, then recreate)",
-            table_key,
             cmd.name,
             view_names.join(", "),
         )));
     }
 
-    // Apply the type change.
-    let table = interp.tables.get_mut(table_key).unwrap();
-    let col = table
-        .columns
-        .iter_mut()
-        .find(|c| c.name == cmd.name)
-        .unwrap();
-    col.type_oid = new_type_oid;
-    update_composite_for_table(interp, table_key);
+    if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+        && let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name)
+    {
+        col.atttypid = new_type_oid;
+    }
 
-    // Re-analyze each dependent view against the updated snapshot so its
-    // column OIDs follow the new base type. This is where having the view's
-    // AST paid off — the analyzer sees the post-ALTER world without needing
-    // the original SQL. If a view lacks a stored AST (legacy snapshot), the
-    // call is a no-op and the stale-OID hazard remains, but that only
-    // affects snapshots that haven't been regenerated since the upgrade.
-    let _ = old_type_oid; // no longer needed for the view fix-up path
-    for view_key in &dependent_views {
-        views::reanalyze_view(interp, view_key)?;
+    let _ = old_type_oid;
+    for view_oid in &dependent_views {
+        views::reanalyze_view(interp, *view_oid)?;
     }
 
     Ok(())
@@ -497,7 +491,7 @@ fn alter_column_type(
 
 fn add_constraint(
     interp: &mut PgCatalog,
-    table_key: &QualifiedName,
+    relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
@@ -507,7 +501,6 @@ fn add_constraint(
         return Ok(());
     };
 
-    // PRIMARY KEY: mark referenced columns as NOT NULL.
     if c.contype == ConstrType::ConstrPrimary as i32 {
         let pk_cols: Vec<String> = c
             .keys
@@ -520,68 +513,33 @@ fn add_constraint(
                 }
             })
             .collect();
-
-        let table = interp
-            .tables
-            .get_mut(table_key)
-            .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-
-        for col in &mut table.columns {
-            if pk_cols.contains(&col.name) {
-                col.not_null = true;
+        if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
+            for col in attrs.iter_mut() {
+                if pk_cols.contains(&col.attname) {
+                    col.attnotnull = true;
+                }
             }
         }
-        update_composite_for_table(interp, table_key);
     }
 
-    // NOT NULL constraint.
     if c.contype == ConstrType::ConstrNotnull as i32 {
-        let table = interp
-            .tables
-            .get_mut(table_key)
-            .ok_or_else(|| DdlError::TableNotFound(table_key.to_string()))?;
-
-        // The column name may be in keys[0] or cmd.name.
         let col_name = c
             .keys
             .first()
             .and_then(|k| {
                 if let Some(node::Node::String(s)) = k.node.as_ref() {
-                    Some(s.sval.as_str())
+                    Some(s.sval.clone())
                 } else {
                     None
                 }
             })
-            .unwrap_or(&cmd.name);
-
-        if let Some(col) = table.columns.iter_mut().find(|col| col.name == col_name) {
-            col.not_null = true;
+            .unwrap_or_else(|| cmd.name.clone());
+        if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+            && let Some(col) = attrs.iter_mut().find(|col| col.attname == col_name)
+        {
+            col.attnotnull = true;
         }
-        update_composite_for_table(interp, table_key);
     }
 
     Ok(())
-}
-
-/// Sync the composite type fields with the table's columns.
-fn update_composite_for_table(interp: &mut PgCatalog, table_key: &QualifiedName) {
-    let Some(table) = interp.tables.get(table_key) else {
-        return;
-    };
-    let Some(&composite_oid) = interp.type_by_name.get(table_key) else {
-        return;
-    };
-    let fields: Vec<CompositeField> = table
-        .columns
-        .iter()
-        .map(|c| CompositeField {
-            name: c.name.clone(),
-            type_oid: c.type_oid,
-            not_null: c.not_null,
-        })
-        .collect();
-
-    if let Some(te) = interp.types.get_mut(&composite_oid) {
-        te.kind = TypeKind::Composite { fields };
-    }
 }

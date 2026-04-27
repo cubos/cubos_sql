@@ -16,22 +16,19 @@ fn create_function_basic() {
     let fns = snap.find_functions(None, "add_one");
     assert_eq!(fns.len(), 1);
     let f = fns[0];
-    assert_eq!(f.arg_types.len(), 1);
+    assert_eq!(f.proargtypes.len(), 1);
     let int4_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "int4")
         .unwrap()
         .oid;
-    assert_eq!(f.arg_types[0], int4_oid);
-    assert_eq!(f.return_type_oid, int4_oid);
+    assert_eq!(f.proargtypes[0], int4_oid);
+    assert_eq!(f.prorettype, int4_oid);
 }
 
 // ── CREATE / DROP AGGREGATE ─────────────────────────────────────────────────
 
 #[test]
 fn create_aggregate_registers_function() {
-    // CREATE AGGREGATE should register the aggregate in functions_by_name
-    // with is_aggregate = true and the STYPE as the return type when no
-    // FINALFUNC is declared.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION my_sum_sfunc(int8, int4) RETURNS int8
@@ -46,7 +43,7 @@ fn create_aggregate_registers_function() {
     let fns = snap.find_functions(None, "my_sum");
     let agg = fns
         .iter()
-        .find(|f| f.is_aggregate)
+        .find(|f| matches!(f.prokind, ProKind::Aggregate))
         .expect("my_sum should be registered as an aggregate");
     let int4_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "int4")
@@ -56,17 +53,15 @@ fn create_aggregate_registers_function() {
         .resolve_type_by_name(Some("pg_catalog"), "int8")
         .unwrap()
         .oid;
-    assert_eq!(agg.arg_types, vec![int4_oid]);
+    assert_eq!(agg.proargtypes, vec![int4_oid]);
     assert_eq!(
-        agg.return_type_oid, int8_oid,
+        agg.prorettype, int8_oid,
         "no FINALFUNC ⇒ return type equals STYPE"
     );
 }
 
 #[test]
 fn create_aggregate_with_finalfunc_uses_final_return_type() {
-    // When FINALFUNC is declared, the aggregate's effective return type is
-    // the final function's return type, not the STYPE.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION my_avg_sfunc(int8, int4) RETURNS int8
@@ -87,16 +82,16 @@ fn create_aggregate_with_finalfunc_uses_final_return_type() {
     let agg = snap
         .find_functions(None, "my_avg")
         .into_iter()
-        .find(|f| f.is_aggregate)
+        .find(|f| matches!(f.prokind, ProKind::Aggregate))
         .expect("my_avg aggregate should exist");
-    assert_eq!(agg.return_type_oid, float8_oid);
-    assert_eq!(agg.agg_final_type_oid, Some(float8_oid));
+    // The aggregate's effective return type is the finalfn's prorettype,
+    // which is recorded in pg_aggregate.aggfinaltype.
+    let agg_row = snap.pg_aggregate().get(&agg.oid).expect("pg_aggregate row");
+    assert_eq!(agg_row.aggfinaltype, Some(float8_oid));
 }
 
 #[test]
 fn drop_aggregate_removes_only_aggregate() {
-    // DROP AGGREGATE must match on (name, arg_types, is_aggregate) — a
-    // scalar function with the same name/signature must survive.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION dup(int4) RETURNS int4 AS 'SELECT $1' LANGUAGE SQL;
@@ -110,7 +105,7 @@ fn drop_aggregate_removes_only_aggregate() {
 
     let fns = snap.find_functions(None, "dup");
     assert_eq!(fns.len(), 1, "scalar dup(int4) should remain");
-    assert!(!fns[0].is_aggregate);
+    assert_eq!(fns[0].prokind, ProKind::Function);
 }
 
 #[test]
@@ -139,21 +134,16 @@ fn alter_function_rename_moves_overload() {
     )]);
 
     assert!(
-        !snap
-            .functions_by_name()
-            .contains_key(&QualifiedName::new("public", "add_one")),
+        snap.find_functions(None, "add_one").is_empty(),
         "old name should be gone"
     );
-    let fns = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "plus_one"))
-        .expect("renamed function should exist");
+    let fns = snap.find_functions(None, "plus_one");
     assert_eq!(fns.len(), 1);
     let int4_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "int4")
         .unwrap()
         .oid;
-    assert_eq!(fns[0].arg_types, vec![int4_oid]);
+    assert_eq!(fns[0].proargtypes, vec![int4_oid]);
 }
 
 #[test]
@@ -165,17 +155,14 @@ fn alter_function_set_schema_moves_it() {
          ALTER FUNCTION add_one(int) SET SCHEMA utils;",
     )]);
 
-    let fns = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("utils", "add_one"))
-        .unwrap();
-    assert_eq!(fns[0].schema, "utils");
+    let fns = snap.find_functions(Some("utils"), "add_one");
+    assert_eq!(fns.len(), 1);
+    let utils_oid = snap.namespace_oid("utils").unwrap();
+    assert_eq!(fns[0].pronamespace, utils_oid);
 }
 
 #[test]
 fn alter_function_rename_with_overloads_only_moves_matching_signature() {
-    // Two overloads of the same function; the rename must only move the
-    // one whose arg_types match.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION do_it(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
@@ -192,29 +179,21 @@ fn alter_function_rename_with_overloads_only_moves_matching_signature() {
         .unwrap()
         .oid;
 
-    let renamed = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "do_it_int"))
-        .unwrap();
+    let renamed = snap.find_functions(None, "do_it_int");
     assert_eq!(renamed.len(), 1);
-    assert_eq!(renamed[0].arg_types, vec![int4_oid]);
+    assert_eq!(renamed[0].proargtypes, vec![int4_oid]);
 
-    let remaining = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "do_it"))
-        .unwrap();
+    let remaining = snap.find_functions(None, "do_it");
     assert_eq!(
         remaining.len(),
         1,
         "text overload should still be under do_it"
     );
-    assert_eq!(remaining[0].arg_types, vec![text_oid]);
+    assert_eq!(remaining[0].proargtypes, vec![text_oid]);
 }
 
 #[test]
 fn alter_aggregate_rename_only_touches_aggregate() {
-    // A scalar function and an aggregate share the same name. ALTER
-    // AGGREGATE must only rename the aggregate.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION ag(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
@@ -224,28 +203,20 @@ fn alter_aggregate_rename_only_touches_aggregate() {
     )]);
 
     // Scalar survives under original name.
-    let scalar = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "ag"))
-        .unwrap();
+    let scalar = snap.find_functions(None, "ag");
     assert_eq!(scalar.len(), 1);
-    assert!(!scalar[0].is_aggregate);
+    assert_eq!(scalar[0].prokind, ProKind::Function);
 
     // Aggregate moved.
-    let moved = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "ag_total"))
-        .unwrap();
+    let moved = snap.find_functions(None, "ag_total");
     assert_eq!(moved.len(), 1);
-    assert!(moved[0].is_aggregate);
+    assert_eq!(moved[0].prokind, ProKind::Aggregate);
 }
 
 // ── DROP FUNCTION vs procedure of same name ────────────────────────────────
 
 #[test]
 fn drop_function_does_not_touch_procedure_of_same_name() {
-    // DROP FUNCTION must not remove a procedure with the same name+sig,
-    // mirroring PostgreSQL's asymmetry between the two object kinds.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION f(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
@@ -253,20 +224,21 @@ fn drop_function_does_not_touch_procedure_of_same_name() {
          DROP FUNCTION f(int);",
     )]);
 
-    let fns = snap
-        .functions_by_name()
-        .get(&QualifiedName::new("public", "f"))
-        .unwrap();
-    assert_eq!(fns.len(), 1, "procedure must survive DROP FUNCTION");
-    assert!(fns[0].is_procedure);
+    // find_functions filters out procedures, so look at pg_proc directly.
+    let public_oid = snap.namespace_oid("public").unwrap();
+    let procs: Vec<&PgProc> = snap
+        .pg_proc()
+        .values()
+        .filter(|p| p.pronamespace == public_oid && p.proname == "f")
+        .collect();
+    assert_eq!(procs.len(), 1, "procedure must survive DROP FUNCTION");
+    assert_eq!(procs[0].prokind, ProKind::Procedure);
 }
 
 // ── CREATE OR REPLACE / overloading ────────────────────────────────────────
 
 #[test]
 fn create_or_replace_function_updates_existing() {
-    // CREATE OR REPLACE with the same signature replaces the prior function,
-    // including a different return type.
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x $$ LANGUAGE sql;
@@ -280,7 +252,7 @@ fn create_or_replace_function_updates_existing() {
         .unwrap()
         .oid;
     assert_eq!(
-        fns[0].return_type_oid, int8_oid,
+        fns[0].prorettype, int8_oid,
         "return type must be updated to int8",
     );
 }
@@ -299,8 +271,6 @@ fn create_function_overloading_distinct_arg_types() {
 
 #[test]
 fn create_function_duplicate_signature_errors() {
-    // Without OR REPLACE, creating a second function with the same name+sig
-    // must fail with a DuplicateObject variant.
     let result = try_apply(&[(
         "0001.sql",
         "CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x $$ LANGUAGE sql;
@@ -348,20 +318,18 @@ fn full_blog_schema() {
 
     // Users table has 6 columns now (id, name, email, age, created_at, bio).
     let users = snap.resolve_table(None, "users").unwrap();
-    assert_eq!(users.columns.len(), 6);
-    assert_eq!(users.columns[5].name, "bio");
-    assert!(!users.columns[5].not_null);
+    let user_attrs = snap.attributes_of(users.oid);
+    assert_eq!(user_attrs.len(), 6);
+    assert_eq!(user_attrs[5].attname, "bio");
+    assert!(!user_attrs[5].attnotnull);
 
     // Posts table.
     let posts = snap.resolve_table(None, "posts").unwrap();
-    assert_eq!(posts.columns.len(), 7);
+    assert_eq!(snap.attributes_of(posts.oid).len(), 7);
 
     // post_status enum has 4 values.
     let ps = snap.resolve_type_by_name(None, "post_status").unwrap();
-    match &ps.kind {
-        TypeKind::Enum { labels } => {
-            assert_eq!(labels, &["draft", "published", "archived", "deleted"]);
-        }
-        _ => panic!("expected Enum"),
-    }
+    assert_eq!(ps.typtype, TypType::Enum);
+    let labels = snap.enum_labels_of(ps.oid);
+    assert_eq!(labels, vec!["draft", "published", "archived", "deleted"]);
 }

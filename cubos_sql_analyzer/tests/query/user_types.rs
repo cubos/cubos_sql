@@ -234,14 +234,16 @@ fn text_array_column_type_resolves_to_array_kind() {
         .unwrap();
 
     let table = db.resolve_table(None, "t").unwrap();
-    let tags_col = table.columns.iter().find(|c| c.name == "tags").unwrap();
-    assert_ne!(tags_col.type_oid, 0);
+    let attrs = db.attributes_of(table.oid);
+    let tags_col = attrs.iter().find(|c| c.attname == "tags").unwrap();
+    assert_ne!(tags_col.atttypid.get(), 0);
 
-    let type_entry = db.get_type(tags_col.type_oid).unwrap();
-    assert!(
-        matches!(type_entry.kind, TypeKind::Array { .. }),
+    let type_entry = db.get_type(tags_col.atttypid).unwrap();
+    assert_eq!(
+        type_entry.typcategory,
+        TypCategory::Array,
         "TEXT[] should be an Array type, got {:?}",
-        type_entry.kind
+        type_entry.typcategory
     );
 }
 
@@ -292,13 +294,14 @@ fn builtin_type_aliases_resolve_to_canonical_oid() {
         .unwrap()
         .oid;
 
-    assert_eq!(table.columns[0].type_oid, int4_oid, "integer -> int4");
-    assert_eq!(table.columns[1].type_oid, int4_oid, "int -> int4");
-    assert_eq!(table.columns[2].type_oid, int8_oid, "bigint -> int8");
-    assert_eq!(table.columns[3].type_oid, int2_oid, "smallint -> int2");
-    assert_eq!(table.columns[4].type_oid, bool_oid, "boolean -> bool");
-    assert_eq!(table.columns[5].type_oid, float4_oid, "real -> float4");
-    assert_eq!(table.columns[6].type_oid, text_oid, "text -> text");
+    let attrs = db.attributes_of(table.oid);
+    assert_eq!(attrs[0].atttypid, int4_oid, "integer -> int4");
+    assert_eq!(attrs[1].atttypid, int4_oid, "int -> int4");
+    assert_eq!(attrs[2].atttypid, int8_oid, "bigint -> int8");
+    assert_eq!(attrs[3].atttypid, int2_oid, "smallint -> int2");
+    assert_eq!(attrs[4].atttypid, bool_oid, "boolean -> bool");
+    assert_eq!(attrs[5].atttypid, float4_oid, "real -> float4");
+    assert_eq!(attrs[6].atttypid, text_oid, "text -> text");
 }
 
 // ── Generated columns (GENERATED ALWAYS AS (expr) STORED) ──────────────────

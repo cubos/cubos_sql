@@ -1,16 +1,12 @@
 //! CREATE OPERATOR handler.
-//!
-//! Registers binary (and prefix) operators defined via `CREATE OPERATOR`.
-//! The result type is inferred from the procedure's return type by looking up
-//! the function signature already registered in the snapshot.
 
 use pg_query::protobuf::{DefineStmt, node};
 
-use crate::qualified_name::QualifiedName;
-use crate::schema::OperatorEntry;
+use crate::oid::{PgOperatorOid, PgTypeOid};
+use crate::pg_catalog::PgOperator;
 
 use super::DdlError;
-use super::util::resolve_type_name;
+use super::util::{ensure_namespace, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
@@ -28,16 +24,17 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
             interp
                 .search_path
                 .first()
-                .cloned()
+                .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
                 .unwrap_or_else(|| "public".to_owned()),
             name.clone(),
         ),
         [schema, name] => (schema.clone(), name.clone()),
         _ => return Ok(()),
     };
+    let nsoid = ensure_namespace(interp, &schema);
 
-    let mut left_type: Option<u32> = None;
-    let mut right_type: Option<u32> = None;
+    let mut left_type: Option<PgTypeOid> = None;
+    let mut right_type: Option<PgTypeOid> = None;
     let mut procedure: Option<(Option<String>, String)> = None;
 
     for opt in &stmt.definition {
@@ -65,36 +62,30 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         }
     }
 
-    // Right operand is required for both prefix and binary operators.
     let Some(right_oid) = right_type else {
         return Ok(());
     };
 
-    let result_oid = procedure
-        .as_ref()
-        .and_then(|(schema, name)| {
-            resolve_procedure_return(interp, schema.as_deref(), name, left_type, right_oid)
-        })
-        .unwrap_or(0);
+    let Some(result_oid) = procedure.as_ref().and_then(|(schema, name)| {
+        resolve_procedure_return(interp, schema.as_deref(), name, left_type, right_oid)
+    }) else {
+        return Ok(());
+    };
 
-    interp
-        .operators_by_name
-        .entry(QualifiedName::new(schema, &op_name))
-        .or_default()
-        .push(OperatorEntry {
-            name: op_name,
-            left_type_oid: left_type,
-            right_type_oid: right_oid,
-            result_type_oid: result_oid,
-        });
+    let oid = PgOperatorOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_operator(PgOperator {
+        oid,
+        oprname: op_name,
+        oprnamespace: nsoid,
+        oprleft: left_type,
+        oprright: right_oid,
+        oprresult: result_oid,
+    });
 
     Ok(())
 }
 
-/// Parse a function name from a DefElem argument. `pg_query` represents the
-/// value of `PROCEDURE = foo` as a [`TypeName`] whose `names` field holds the
-/// (schema-qualified) name parts — the same shape used for other identifier
-/// references in DefElem options.
+/// Parse a function name from a DefElem argument.
 fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
     let parts: Vec<&str> = match arg.node.as_ref()? {
         node::Node::TypeName(tn) => tn
@@ -124,22 +115,21 @@ fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, St
     }
 }
 
-/// Look up a procedure in the snapshot and return its result type, matching
-/// on the operator's operand types.
+/// Look up a procedure in the snapshot and return its result type.
 fn resolve_procedure_return(
     interp: &PgCatalog,
     schema: Option<&str>,
     name: &str,
-    left: Option<u32>,
-    right: u32,
-) -> Option<u32> {
+    left: Option<PgTypeOid>,
+    right: PgTypeOid,
+) -> Option<PgTypeOid> {
     let candidates = interp.find_functions(schema, name);
     candidates
         .into_iter()
-        .find(|f| match (left, f.arg_types.as_slice()) {
+        .find(|f| match (left, f.proargtypes.as_slice()) {
             (Some(l), [a, b]) => *a == l && *b == right,
             (None, [a]) => *a == right,
             _ => false,
         })
-        .map(|f| f.return_type_oid)
+        .map(|f| f.prorettype)
 }

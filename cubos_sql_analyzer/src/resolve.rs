@@ -10,10 +10,10 @@ use crate::error::AnalyzeError;
 use crate::expr::{self, TypeGoal};
 use crate::functions;
 use crate::nullability::{self, NullabilityContext};
+use crate::oid::PgTypeOid;
 use crate::param::LexOutput;
 use crate::param_collector::ParamCollector;
-use crate::pg_catalog::PgCatalog;
-use crate::schema::{TypeKind, oid};
+use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 use crate::scope::{Scope, ScopeColumn};
 use crate::types::Type;
 
@@ -213,7 +213,7 @@ pub(crate) fn analyze_static(
 /// A positional parameter slot: `(position, type_oid, nullable)`. Shared by
 /// the analyzer internals that thread params through overload resolution
 /// before they are merged with lexer-side info.
-pub(crate) type RawParam = (i32, u32, bool);
+pub(crate) type RawParam = (i32, PgTypeOid, bool);
 
 /// Lower-level analyzer entry point: returns the raw columns (keyed by OID)
 /// and sorted param list without converting to [`Type`]. Used by the DDL
@@ -233,6 +233,17 @@ pub(crate) fn analyze_raw(
         .and_then(|n| n.node.as_ref())
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
+    analyze_raw_node(snapshot, stmt, param_nullability)
+}
+
+/// Same as [`analyze_raw`] but consumes a pre-parsed AST node directly. View
+/// reanalysis uses this to skip the deparse → reparse round-trip: the stored
+/// AST + binding side-table already gives us the post-RENAME tree.
+pub(crate) fn analyze_raw_node(
+    snapshot: &PgCatalog,
+    stmt: &node::Node,
+    param_nullability: &[Option<bool>],
+) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
     let mut params = ParamCollector::default();
 
     // Seed explicit nullable annotations from lexer ($foo? / $foo! syntax).
@@ -340,7 +351,7 @@ fn infer_expr_propagate_mismatch(
 #[derive(Clone)]
 pub(crate) struct RawColumn {
     pub name: String,
-    pub type_oid: u32,
+    pub type_oid: PgTypeOid,
     pub nullable: bool,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
@@ -350,7 +361,7 @@ pub(crate) struct RawColumn {
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.
-type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, u32, bool)>>), AnalyzeError>;
+type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, PgTypeOid, bool)>>), AnalyzeError>;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // SELECT
@@ -580,16 +591,24 @@ fn analyze_insert(
         })
         .collect();
 
+    let table_oid = table.oid;
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table_oid).to_vec();
+
     // Validate every column mentioned in the INSERT target list exists on the
     // table. PostgreSQL rejects unknown columns with a clear error; without
     // this check the analyzer would silently treat the corresponding `$N`
     // parameter as text via the UNKNOWN fallback, masking a real bug in the
     // caller's SQL.
     for col in &col_names {
-        if !table.columns.iter().any(|c| &c.name == col) {
+        if !table_attrs.iter().any(|c| &c.attname == col) {
             return Err(AnalyzeError::UndefinedColumn(format!(
                 "column \"{col}\" of relation \"{}\" does not exist",
-                table.name,
+                table_relname,
             )));
         }
     }
@@ -611,7 +630,7 @@ fn analyze_insert(
                     // column list (or, when no column list is given, the
                     // full table width).
                     let expected_len = if col_names.is_empty() {
-                        table.columns.len()
+                        table_attrs.len()
                     } else {
                         col_names.len()
                     };
@@ -619,44 +638,40 @@ fn analyze_insert(
                         return Err(AnalyzeError::Invalid(format!(
                             "INSERT into `{}` expects {expected_len} values per row, \
                              got {} in one row",
-                            table.name,
+                            table_relname,
                             list.items.len(),
                         )));
                     }
                     for (i, val) in list.items.iter().enumerate() {
                         let target_col = col_names
                             .get(i)
-                            .and_then(|cn| table.columns.iter().find(|c| &c.name == cn));
+                            .and_then(|cn| table_attrs.iter().find(|c| &c.attname == cn));
                         if let Some(tc) = target_col
-                            && tc.not_null
+                            && tc.attnotnull
                             && is_sql_null_literal(val)
                         {
                             return Err(AnalyzeError::Invalid(format!(
                                 "cannot insert NULL into NOT NULL column `{}.{}`",
-                                table.name, tc.name,
+                                table_relname, tc.attname,
                             )));
                         }
-                        // Generated columns reject any value other than
-                        // DEFAULT — PG: `cannot insert a non-DEFAULT value
-                        // into column "x"`.
                         if let Some(tc) = target_col
-                            && tc.is_generated
+                            && tc.attgenerated.is_some()
                             && !is_set_to_default(val)
                         {
                             return Err(AnalyzeError::Invalid(format!(
                                 "cannot insert a non-DEFAULT value into generated column `{}.{}`",
-                                table.name, tc.name,
+                                table_relname, tc.attname,
                             )));
                         }
                         let goal = target_col
-                            .map(|tc| TypeGoal::assignment(tc.type_oid))
+                            .map(|tc| TypeGoal::assignment(tc.atttypid))
                             .unwrap_or(TypeGoal::NONE);
                         expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
-                        // Infer nullable from column definition.
                         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                             && let Some(tc) = target_col
-                            && !tc.not_null
+                            && !tc.attnotnull
                         {
                             params.infer_nullable(p.number, true);
                         }
@@ -664,10 +679,8 @@ fn analyze_insert(
                 }
             }
         } else {
-            // INSERT ... SELECT — analyze the SELECT for param inference and
-            // check column count matches.
             let expected_len = if col_names.is_empty() {
-                table.columns.len()
+                table_attrs.len()
             } else {
                 col_names.len()
             };
@@ -675,27 +688,23 @@ fn analyze_insert(
                 return Err(AnalyzeError::Invalid(format!(
                     "INSERT into `{}` expects {expected_len} columns, \
                      SELECT produces {}",
-                    table.name,
+                    table_relname,
                     val_sel.target_list.len(),
                 )));
             }
             let _ = analyze_select(val_sel, snapshot, params);
 
-            // Back-fill ParamRef targets with column types from INSERT columns.
-            // We only handle direct ParamRef (not complex expressions like p.id)
-            // because the SELECT analysis above already inferred types within
-            // its own scope.
             for (i, target) in val_sel.target_list.iter().enumerate() {
                 if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
                     && let Some(val) = &rt.val
                     && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                     && let Some(col_name) = col_names.get(i)
-                    && let Some(tc) = table.columns.iter().find(|c| &c.name == col_name)
+                    && let Some(tc) = table_attrs.iter().find(|c| &c.attname == col_name)
                 {
                     if params.get(p.number) == oid::UNKNOWN {
-                        params.record(p.number, tc.type_oid);
+                        params.record(p.number, tc.atttypid);
                     }
-                    if !tc.not_null {
+                    if !tc.attnotnull {
                         params.infer_nullable(p.number, true);
                     }
                 }
@@ -712,21 +721,18 @@ fn analyze_insert(
     // the conflict handler runs.
     if let Some(on_conflict) = &ins.on_conflict_clause {
         let mut conflict_scope = Scope::default();
-        let target_qn = crate::qualified_name::QualifiedName::new(&table.schema, &table.name);
-        conflict_scope.add_dml_target(&relation.relname, target_qn.clone(), &table.columns);
-        conflict_scope.add_dml_target("excluded", target_qn, &table.columns);
+        let target_qn = crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname);
+        conflict_scope.add_dml_target(&relation.relname, target_qn.clone(), &table_attrs);
+        conflict_scope.add_dml_target("excluded", target_qn, &table_attrs);
         let conflict_null_ctx = NullabilityContext::default();
         for set_item in &on_conflict.target_list {
             if let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref()
                 && let Some(val) = &rt.val
             {
-                // Find the target column's type so the rhs param can be
-                // inferred — mirrors the VALUES path above.
-                let goal = table
-                    .columns
+                let goal = table_attrs
                     .iter()
-                    .find(|c| c.name == rt.name)
-                    .map(|tc| TypeGoal::assignment(tc.type_oid))
+                    .find(|c| c.attname == rt.name)
+                    .map(|tc| TypeGoal::assignment(tc.atttypid))
                     .unwrap_or(TypeGoal::NONE);
                 let _ = expr::infer_expr(
                     val,
@@ -755,8 +761,8 @@ fn analyze_insert(
     let ret_null_ctx = NullabilityContext::default();
     ret_scope.add_dml_target(
         &relation.relname,
-        crate::qualified_name::QualifiedName::new(&table.schema, &table.name),
-        &table.columns,
+        crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
+        &table_attrs,
     );
 
     let columns = resolve_target_list(
@@ -796,6 +802,14 @@ fn analyze_update(
             ))
         })?;
 
+    let table_oid = table.oid;
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table_oid).to_vec();
+
     // Build scope with target table + FROM clause tables.
     let mut scope = Scope::default();
     let mut null_ctx = NullabilityContext::default();
@@ -806,8 +820,8 @@ fn analyze_update(
         .unwrap_or(&relation.relname);
     scope.add_dml_target(
         alias,
-        crate::qualified_name::QualifiedName::new(&table.schema, &table.name),
-        &table.columns,
+        crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
+        &table_attrs,
     );
 
     // Process FROM clause (UPDATE ... FROM ... WHERE ...).
@@ -829,40 +843,36 @@ fn analyze_update(
             // Same reasoning as analyze_insert: reject unknown columns up
             // front instead of letting the parameter fall back to text via
             // the UNKNOWN path.
-            let tc = table
-                .columns
+            let tc = table_attrs
                 .iter()
-                .find(|c| c.name == rt.name)
+                .find(|c| c.attname == rt.name)
                 .ok_or_else(|| {
                     AnalyzeError::UndefinedColumn(format!(
                         "column \"{}\" of relation \"{}\" does not exist",
-                        rt.name, table.name,
+                        rt.name, table_relname,
                     ))
                 })?;
             // Catch `UPDATE … SET not_null_col = NULL` statically — PG
             // raises a runtime `null value in column … violates not-null
             // constraint` error, and we can do better by failing the macro
             // at compile time.
-            if tc.not_null && is_sql_null_literal(val) {
+            if tc.attnotnull && is_sql_null_literal(val) {
                 return Err(AnalyzeError::Invalid(format!(
                     "cannot assign NULL to NOT NULL column `{}.{}`",
-                    table.name, tc.name,
+                    table_relname, tc.attname,
                 )));
             }
-            // Generated columns can only be reset to DEFAULT (PG:
-            // `column "x" can only be updated to DEFAULT`).
-            if tc.is_generated && !is_set_to_default(val) {
+            if tc.attgenerated.is_some() && !is_set_to_default(val) {
                 return Err(AnalyzeError::Invalid(format!(
                     "generated column `{}.{}` can only be updated to DEFAULT",
-                    table.name, tc.name,
+                    table_relname, tc.attname,
                 )));
             }
-            let goal = TypeGoal::assignment(tc.type_oid);
+            let goal = TypeGoal::assignment(tc.atttypid);
             expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
-            // Infer nullable from column definition.
             if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-                && !tc.not_null
+                && !tc.attnotnull
             {
                 params.infer_nullable(p.number, true);
             }
@@ -911,12 +921,19 @@ fn analyze_delete(
             ))
         })?;
 
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table.oid).to_vec();
+
     let mut scope = Scope::default();
     let null_ctx = NullabilityContext::default();
     scope.add_dml_target(
         &relation.relname,
-        crate::qualified_name::QualifiedName::new(&table.schema, &table.name),
-        &table.columns,
+        crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
+        &table_attrs,
     );
 
     // WHERE — BOOL goal with assignment coercion.
@@ -993,11 +1010,14 @@ fn analyze_set_operation(
 }
 
 /// Render a type OID as `schema.name` for user-facing errors.
-fn type_oid_name(oid: u32, snapshot: &PgCatalog) -> String {
+fn type_oid_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
     snapshot
         .get_type(oid)
-        .map(|t| format!("{}.{}", t.schema, t.name))
-        .unwrap_or_else(|| format!("unknown({oid})"))
+        .map(|t| {
+            let ns = snapshot.namespace_name(t.typnamespace).unwrap_or("?");
+            format!("{ns}.{}", t.typname)
+        })
+        .unwrap_or_else(|| format!("unknown({})", oid.get()))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1170,11 +1190,7 @@ fn append_search_cycle_columns(
         if !cycle.cycle_mark_column.is_empty() {
             // PG: when `TO/DEFAULT` are omitted the mark column is bool;
             // otherwise the AST exposes the inferred type via `cycle_mark_type`.
-            let mark_oid = if cycle.cycle_mark_type != 0 {
-                cycle.cycle_mark_type
-            } else {
-                oid::BOOL
-            };
+            let mark_oid = PgTypeOid::new(cycle.cycle_mark_type).unwrap_or(oid::BOOL);
             cols.push(ScopeColumn {
                 name: cycle.cycle_mark_column.clone(),
                 type_oid: mark_oid,
@@ -1431,8 +1447,13 @@ fn process_range_function(
     // `LATERAL` keyword on a `RangeFunction` is a noise word, because
     // the args can already refer to earlier FROM items implicitly. So
     // we copy the visible sources unconditionally, not just when
-    // `rf.lateral` is set.
+    // `rf.lateral` is set. We also propagate `outer_sources` so SRF
+    // args inside a correlated sublink can reach aliases bound by the
+    // enclosing query (e.g. `pg_stats_ext` does
+    // `(SELECT … FROM unnest(s.stxkeys) …)` where `s` is from the outer
+    // FROM).
     let arg_scope_sources = scope.sources.clone();
+    let arg_scope_outer = scope.outer_sources.clone();
     let _ = rf.lateral;
     // Each entry in `functions` is a 2-element `List` — [FuncCall, coldeflist].
     // We support only the simple form: a single function call, no explicit
@@ -1496,6 +1517,7 @@ fn process_range_function(
     // Non-LATERAL SRF args can't see the enclosing FROM; LATERAL args can.
     let mut arg_scope = Scope::default();
     arg_scope.sources.extend(arg_scope_sources);
+    arg_scope.outer_sources.extend(arg_scope_outer);
     let empty_null_ctx = NullabilityContext::default();
     let mut arg_types = Vec::with_capacity(func_call.args.len());
     let mut arg_nullable = Vec::with_capacity(func_call.args.len());
@@ -1546,15 +1568,18 @@ fn process_range_function(
                 record_fields: None,
             })
             .collect()
-    } else if let Some(crate::schema::TypeKind::Composite { fields }) =
-        snapshot.get_type(resolved.return_type_oid).map(|t| &t.kind)
-    {
-        fields
+    } else if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
+        (t.typtype == TypType::Composite)
+            .then_some(t.typrelid)
+            .flatten()
+    }) {
+        snapshot
+            .attributes_of(typrelid)
             .iter()
             .map(|f| ScopeColumn {
-                name: f.name.clone(),
-                type_oid: f.type_oid,
-                base_not_null: f.not_null,
+                name: f.attname.clone(),
+                type_oid: f.atttypid,
+                base_not_null: f.attnotnull,
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
@@ -1723,7 +1748,7 @@ fn analyze_values_lists(
     let empty_scope = Scope::default();
     let empty_null = NullabilityContext::default();
 
-    let mut column_types: Vec<Vec<u32>> = vec![Vec::new(); arity];
+    let mut column_types: Vec<Vec<PgTypeOid>> = vec![Vec::new(); arity];
     let mut column_nullable: Vec<bool> = vec![false; arity];
 
     for row_node in values_lists {
@@ -1796,7 +1821,7 @@ fn resolve_funccall_record_fields(
     if resolved.out_args.is_empty() {
         None
     } else {
-        Some(crate::expr::RecordField::lift_all(&resolved.out_args))
+        Some(crate::expr::RecordField::from_out_args(&resolved.out_args))
     }
 }
 
@@ -1837,7 +1862,7 @@ fn build_column(rc: RawColumn, snapshot: &PgCatalog) -> Result<AnalyzedColumn, A
 /// `shape` is `Some` and the OID is `record`, we build a `Type::AnonymousRecord`
 /// from the shape recursively. Otherwise falls through to the OID-only path.
 fn resolve_type_with_shape(
-    type_oid: u32,
+    type_oid: PgTypeOid,
     shape: Option<&[crate::expr::RecordField]>,
     snapshot: &PgCatalog,
 ) -> Result<Type, AnalyzeError> {
@@ -1862,7 +1887,7 @@ fn resolve_type_with_shape(
 }
 
 fn build_param_info(
-    type_oid: u32,
+    type_oid: PgTypeOid,
     nullable: bool,
     snapshot: &PgCatalog,
 ) -> Result<ParamInfo, AnalyzeError> {
@@ -1874,57 +1899,88 @@ fn build_param_info(
 /// wrappers. Unknown OIDs (pseudo `UNKNOWN` included) are surfaced as
 /// [`Type::Basic`] named `pg_catalog.unknown` so consumers can fall back to
 /// `String` without the analyzer having to know about Rust.
-fn resolve_type(type_oid: u32, snapshot: &PgCatalog) -> Result<Type, AnalyzeError> {
+fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, AnalyzeError> {
     if let Some(te) = snapshot.get_type(type_oid) {
-        match &te.kind {
-            TypeKind::Domain { base_type_oid } => {
-                let base = resolve_type(*base_type_oid, snapshot)?;
+        let schema = snapshot
+            .namespace_name(te.typnamespace)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "pg_catalog".to_owned());
+        let name = te.typname.clone();
+        let extension = snapshot.extension_of_type(type_oid).map(str::to_owned);
+
+        // Arrays first: in PG, `_int4` is typtype=Base + typcategory=Array +
+        // typelem=int4. They aren't a separate `typtype`.
+        if te.typcategory == TypCategory::Array
+            && let Some(elem) = te.typelem
+        {
+            let element = resolve_type(elem, snapshot)?;
+            return Ok(Type::Array {
+                element: Box::new(element),
+            });
+        }
+
+        match te.typtype {
+            TypType::Domain => {
+                let base_oid = te.typbasetype.ok_or_else(|| AnalyzeError::UndefinedType {
+                    oid: type_oid.get(),
+                    context: "domain base type".into(),
+                })?;
+                let base = resolve_type(base_oid, snapshot)?;
                 return Ok(Type::Domain {
-                    schema: te.schema.clone(),
-                    name: te.name.clone(),
+                    schema,
+                    name,
                     base: Box::new(base),
-                    extension: te.extension.clone(),
+                    extension,
                 });
             }
-            TypeKind::Array { element_type_oid } => {
-                let element = resolve_type(*element_type_oid, snapshot)?;
-                return Ok(Type::Array {
-                    element: Box::new(element),
-                });
-            }
-            TypeKind::Enum { labels } => {
+            TypType::Enum => {
+                let labels = snapshot
+                    .enum_labels_of(type_oid)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
                 return Ok(Type::Enum {
-                    schema: te.schema.clone(),
-                    name: te.name.clone(),
-                    labels: labels.clone(),
-                    extension: te.extension.clone(),
+                    schema,
+                    name,
+                    labels,
+                    extension,
                 });
             }
-            TypeKind::Range { subtype_oid } => {
-                let subtype = resolve_type(*subtype_oid, snapshot)?;
+            TypType::Range | TypType::Multirange => {
+                let subtype_oid = snapshot
+                    .pg_range
+                    .get(&type_oid)
+                    .map(|r| r.rngsubtype)
+                    .unwrap_or(oid::UNKNOWN);
+                let subtype = resolve_type(subtype_oid, snapshot)?;
                 return Ok(Type::Range {
-                    schema: te.schema.clone(),
-                    name: te.name.clone(),
+                    schema,
+                    name,
                     subtype: Box::new(subtype),
-                    extension: te.extension.clone(),
+                    extension,
                 });
             }
-            TypeKind::Composite { fields } => {
-                let mut out = Vec::with_capacity(fields.len());
-                for f in fields {
+            TypType::Composite => {
+                let attrs = if let Some(relid) = te.typrelid {
+                    snapshot.attributes_of(relid).to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut out = Vec::with_capacity(attrs.len());
+                for f in &attrs {
                     out.push(crate::types::RecordField {
-                        name: f.name.clone(),
-                        ty: resolve_type(f.type_oid, snapshot)?,
-                        nullable: !f.not_null,
+                        name: f.attname.clone(),
+                        ty: resolve_type(f.atttypid, snapshot)?,
+                        nullable: !f.attnotnull,
                     });
                 }
                 return Ok(Type::AnonymousRecord { fields: out });
             }
-            TypeKind::Base | TypeKind::Pseudo => {
+            TypType::Base | TypType::Pseudo => {
                 return Ok(Type::Basic {
-                    schema: te.schema.clone(),
-                    name: te.name.clone(),
-                    extension: te.extension.clone(),
+                    schema,
+                    name,
+                    extension,
                 });
             }
         }
@@ -1940,8 +1996,8 @@ fn resolve_type(type_oid: u32, snapshot: &PgCatalog) -> Result<Type, AnalyzeErro
     }
 
     Err(AnalyzeError::UndefinedType {
-        oid: type_oid,
-        context: format!("OID {type_oid}"),
+        oid: type_oid.get(),
+        context: format!("OID {}", type_oid.get()),
     })
 }
 

@@ -1,24 +1,22 @@
 //! Scope tracking for table aliases, columns, and CTEs.
 
 use crate::error::AnalyzeError;
-use crate::pg_catalog::PgCatalog;
+use crate::oid::PgTypeOid;
+use crate::pg_catalog::{PgAttribute, PgCatalog};
 use crate::qualified_name::QualifiedName;
-use crate::schema::TableColumn;
 
 /// A resolved column with its type and base nullability (from table definition).
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeColumn {
     pub name: String,
-    pub type_oid: u32,
+    pub type_oid: PgTypeOid,
     /// NOT NULL from the table definition (before JOIN effects).
     pub base_not_null: bool,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
     /// Named-field structure when the column holds a record value: SRF /
     /// OUT-arg functions populate this from `out_args`, ROW constructors fill
-    /// it from the inferred shape, subqueries propagate it through. Lets
-    /// `(alias.col).field` resolve through to the field's real type without
-    /// needing a registered composite OID.
+    /// it from the inferred shape, subqueries propagate it through.
     pub record_fields: Option<Vec<crate::expr::RecordField>>,
 }
 
@@ -33,13 +31,6 @@ pub(crate) struct TableSource {
     pub source_qn: Option<QualifiedName>,
 }
 
-/// Tracks all table sources visible in the current query scope.
-///
-/// `sources` holds the local FROM-clause aliases. `outer_sources` mirrors
-/// PG's correlated-reference fallback: a subquery's column lookup tries the
-/// local sources first, and only falls back to outer sources when the local
-/// search fails (so an inner `FROM users` shadowing an outer `users` works
-/// the same way it does in PG).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
@@ -47,7 +38,7 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    /// Add a table from the schema snapshot.
+    /// Add a table from the catalog.
     pub fn add_table(
         &mut self,
         snapshot: &PgCatalog,
@@ -58,14 +49,20 @@ impl Scope {
         let table = snapshot.resolve_table(schema, name).ok_or_else(|| {
             AnalyzeError::UndefinedTable(format!("relation \"{name}\" does not exist"))
         })?;
+        let table_oid = table.oid;
+        let nspname = snapshot
+            .namespace_name(table.relnamespace)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "public".to_owned());
+        let relname = table.relname.clone();
 
-        let columns = table
-            .columns
+        let columns: Vec<ScopeColumn> = snapshot
+            .attributes_of(table_oid)
             .iter()
             .map(|c| ScopeColumn {
-                name: c.name.clone(),
-                type_oid: c.type_oid,
-                base_not_null: c.not_null,
+                name: c.attname.clone(),
+                type_oid: c.atttypid,
+                base_not_null: c.attnotnull,
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
@@ -74,7 +71,7 @@ impl Scope {
         self.sources.push(TableSource {
             alias: alias.to_owned(),
             columns,
-            source_qn: Some(QualifiedName::new(&table.schema, &table.name)),
+            source_qn: Some(QualifiedName::new(nspname, relname)),
         });
         Ok(())
     }
@@ -88,16 +85,14 @@ impl Scope {
         });
     }
 
-    /// Add columns from a DML target table (for RETURNING), recording the
-    /// relation's qualified name so `alias.*` expressions resolve to its
-    /// composite type OID.
-    pub fn add_dml_target(&mut self, alias: &str, qn: QualifiedName, columns: &[TableColumn]) {
+    /// Add columns from a DML target table (for RETURNING).
+    pub fn add_dml_target(&mut self, alias: &str, qn: QualifiedName, columns: &[PgAttribute]) {
         let cols = columns
             .iter()
             .map(|c| ScopeColumn {
-                name: c.name.clone(),
-                type_oid: c.type_oid,
-                base_not_null: c.not_null,
+                name: c.attname.clone(),
+                type_oid: c.atttypid,
+                base_not_null: c.attnotnull,
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
@@ -109,8 +104,6 @@ impl Scope {
         });
     }
 
-    /// Look up a `TableSource` by its alias (user alias or generated relname).
-    /// Tries local sources first, then outer (correlated) sources.
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
         self.sources
             .iter()
@@ -118,11 +111,6 @@ impl Scope {
             .find(|s| s.alias == alias)
     }
 
-    /// Resolve a column reference. If `table` is Some, look only in that alias.
-    /// Otherwise search all sources (error if ambiguous). Outer (correlated)
-    /// sources are only consulted when the local lookup turns up nothing —
-    /// this matches PG's lexical rule that inner `FROM` aliases shadow outer
-    /// ones with the same name.
     pub fn resolve_column(
         &self,
         table: Option<&str>,
@@ -141,8 +129,6 @@ impl Scope {
             )));
         }
 
-        // Try local sources first, then outer (correlated) sources. Within
-        // each tier we still detect ambiguous matches.
         for tier in [&self.sources, &self.outer_sources] {
             let mut found: Option<&ScopeColumn> = None;
             for source in tier {
@@ -164,8 +150,6 @@ impl Scope {
         )))
     }
 
-    /// Get all columns (for SELECT *) from the local FROM clause only —
-    /// outer correlated sources don't expand under `*`.
     pub fn all_columns(&self) -> Vec<&ScopeColumn> {
         self.sources.iter().flat_map(|s| s.columns.iter()).collect()
     }

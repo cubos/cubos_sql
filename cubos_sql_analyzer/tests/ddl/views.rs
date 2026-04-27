@@ -16,16 +16,15 @@ fn view_basic_columns_resolved_at_creation() {
     )]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.kind, RelationKind::View);
-    assert_eq!(view.columns.len(), 2);
-    assert_eq!(view.columns[0].name, "id");
-    assert_eq!(view.columns[1].name, "name");
+    assert_eq!(view.relkind, RelKind::View);
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].attname, "id");
+    assert_eq!(attrs[1].attname, "name");
 }
 
 #[test]
 fn view_star_expanded_at_creation_time() {
-    // PG expands SELECT * at CREATE VIEW time.
-    // Adding a column AFTER does NOT change the view.
     let snap = build(&[
         (
             "0001.sql",
@@ -36,18 +35,17 @@ fn view_star_expanded_at_creation_time() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    // View should have 2 columns (expanded at creation), NOT 3.
+    let attrs = snap.attributes_of(view.oid);
     assert_eq!(
-        view.columns.len(),
+        attrs.len(),
         2,
         "SELECT * should be expanded at creation time"
     );
-    assert_eq!(view.columns[0].name, "id");
-    assert_eq!(view.columns[1].name, "name");
+    assert_eq!(attrs[0].attname, "id");
+    assert_eq!(attrs[1].attname, "name");
 
-    // The table itself has 3 columns.
     let table = snap.resolve_table(None, "t").unwrap();
-    assert_eq!(table.columns.len(), 3);
+    assert_eq!(snap.attributes_of(table.oid).len(), 3);
 }
 
 #[test]
@@ -62,8 +60,9 @@ fn view_add_unrelated_column_succeeds() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.columns.len(), 1);
-    assert_eq!(view.columns[0].name, "id");
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].attname, "id");
 }
 
 #[test]
@@ -77,9 +76,10 @@ fn view_with_join() {
     )]);
 
     let view = snap.resolve_table(None, "user_posts").unwrap();
-    assert_eq!(view.columns.len(), 2);
-    assert_eq!(view.columns[0].name, "name");
-    assert_eq!(view.columns[1].name, "title");
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].attname, "name");
+    assert_eq!(attrs[1].attname, "title");
 }
 
 #[test]
@@ -91,8 +91,9 @@ fn view_with_aliases() {
     )]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.columns[0].name, "the_id");
-    assert_eq!(view.columns[1].name, "the_name");
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs[0].attname, "the_id");
+    assert_eq!(attrs[1].attname, "the_name");
 }
 
 // ── DROP COLUMN with view dependency ───────────────────────────────────────
@@ -127,8 +128,9 @@ fn view_drop_referenced_column_cascade_drops_view() {
         "view should be dropped by CASCADE"
     );
     let table = snap.resolve_table(None, "t").unwrap();
-    assert_eq!(table.columns.len(), 1);
-    assert_eq!(table.columns[0].name, "id");
+    let attrs = snap.attributes_of(table.oid);
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].attname, "id");
 }
 
 #[test]
@@ -143,7 +145,7 @@ fn view_drop_unrelated_column_succeeds() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.columns.len(), 2);
+    assert_eq!(snap.attributes_of(view.oid).len(), 2);
 }
 
 // ── ALTER COLUMN TYPE with view dependency ─────────────────────────────────
@@ -164,8 +166,6 @@ fn view_alter_type_fails_without_cascade() {
 
 #[test]
 fn view_alter_type_drop_view_then_alter_then_recreate() {
-    // In PG, ALTER COLUMN TYPE always fails with dependent views.
-    // The correct pattern is: DROP VIEW, ALTER TYPE, CREATE VIEW.
     let snap = build(&[
         (
             "0001.sql",
@@ -181,13 +181,14 @@ fn view_alter_type_drop_view_then_alter_then_recreate() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.columns.len(), 2);
-    let amount = view.columns.iter().find(|c| c.name == "amount").unwrap();
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs.len(), 2);
+    let amount = attrs.iter().find(|c| c.attname == "amount").unwrap();
     let int8_oid = snap
         .resolve_type_by_name(Some("pg_catalog"), "int8")
         .unwrap()
         .oid;
-    assert_eq!(amount.type_oid, int8_oid);
+    assert_eq!(amount.atttypid, int8_oid);
 }
 
 #[test]
@@ -202,7 +203,7 @@ fn view_alter_unrelated_column_succeeds() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.columns.len(), 2);
+    assert_eq!(snap.attributes_of(view.oid).len(), 2);
 }
 
 // ── DROP TABLE with view dependency ────────────────────────────────────────
@@ -251,8 +252,6 @@ fn view_with_invalid_column_fails_migration() {
 
 #[test]
 fn view_deps_only_track_referenced_columns() {
-    // Both users and orders have a column named `id`; the view only uses
-    // users.id. The structured walker must not list (orders, id) as a dep.
     let snap = build(&[(
         "0001.sql",
         "CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL);
@@ -261,37 +260,27 @@ fn view_deps_only_track_referenced_columns() {
              SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id;",
     )]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().expect("view_def must be present");
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
 
     let users = QualifiedName::new("public", "users");
     let orders = QualifiedName::new("public", "orders");
 
-    assert!(vd.depends_on_tables.contains(&users));
-    assert!(vd.depends_on_tables.contains(&orders));
+    assert!(table_deps.contains(&users));
+    assert!(table_deps.contains(&orders));
 
-    // The SELECT list references users.id only; join predicate touches
-    // orders.user_id and users.id. orders.id must NOT be in the dep list.
     assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &users && c == "id"),
-        "users.id must be tracked: {:?}",
-        vd.depends_on_columns
+        col_deps.iter().any(|(k, c)| k == &users && c == "id"),
+        "users.id must be tracked: {col_deps:?}",
     );
     assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &orders && c == "user_id"),
-        "orders.user_id must be tracked: {:?}",
-        vd.depends_on_columns
+        col_deps.iter().any(|(k, c)| k == &orders && c == "user_id"),
+        "orders.user_id must be tracked: {col_deps:?}",
     );
     assert!(
-        !vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &orders && c == "id"),
-        "orders.id must NOT be tracked — it was never referenced: {:?}",
-        vd.depends_on_columns
+        !col_deps.iter().any(|(k, c)| k == &orders && c == "id"),
+        "orders.id must NOT be tracked: {col_deps:?}",
     );
 }
 
@@ -304,17 +293,15 @@ fn view_deps_track_schema_qualified_columns() {
          CREATE VIEW v AS SELECT app.users.id FROM app.users;",
     )]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
     let users = QualifiedName::new("app", "users");
 
-    assert!(vd.depends_on_tables.contains(&users));
+    assert!(table_deps.contains(&users));
     assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &users && c == "id"),
-        "schema-qualified column ref must resolve to (app.users, id): {:?}",
-        vd.depends_on_columns
+        col_deps.iter().any(|(k, c)| k == &users && c == "id"),
+        "schema-qualified column ref must resolve to (app.users, id): {col_deps:?}",
     );
 }
 
@@ -328,26 +315,22 @@ fn view_deps_dedup_on_self_join() {
              FROM t a JOIN t b ON b.id = a.parent_id;",
     )]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
     let t = QualifiedName::new("public", "t");
 
-    // After dedup, the self-joined table appears only once in the table list.
-    let t_count = vd.depends_on_tables.iter().filter(|k| *k == &t).count();
+    let t_count = table_deps.iter().filter(|k| *k == &t).count();
     assert_eq!(
         t_count, 1,
-        "self-joined table must be dedup'd: {:?}",
-        vd.depends_on_tables
+        "self-joined table must be dedup'd: {table_deps:?}"
     );
 
-    // Column deps for id and parent_id are present exactly once.
-    let id_count = vd
-        .depends_on_columns
+    let id_count = col_deps
         .iter()
         .filter(|(k, c)| k == &t && c == "id")
         .count();
-    let parent_count = vd
-        .depends_on_columns
+    let parent_count = col_deps
         .iter()
         .filter(|(k, c)| k == &t && c == "parent_id")
         .count();
@@ -365,20 +348,16 @@ fn view_with_cte_does_not_treat_cte_as_table_dep() {
              SELECT id, name FROM u;",
     )]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
 
-    // The underlying users table is the only real dep.
     let users = QualifiedName::new("public", "users");
-    assert!(vd.depends_on_tables.contains(&users));
-    assert_eq!(vd.depends_on_tables.len(), 1);
-
-    // And users.id / users.name are the columns — the CTE alias `u` must not
-    // sneak in as a qualified name key.
+    assert!(table_deps.contains(&users));
+    assert_eq!(table_deps.len(), 1);
     assert!(
-        vd.depends_on_columns.iter().all(|(k, _)| k == &users),
-        "no CTE-qualified entries should appear: {:?}",
-        vd.depends_on_columns,
+        col_deps.iter().all(|(k, _)| k == &users),
+        "no CTE-qualified entries should appear: {col_deps:?}",
     );
 }
 
@@ -395,28 +374,16 @@ fn view_deps_updated_after_rename_table() {
         ("0002.sql", "ALTER TABLE t RENAME TO t2;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
-    let old = QualifiedName::new("public", "t");
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
     let new = QualifiedName::new("public", "t2");
 
-    assert!(!vd.depends_on_tables.contains(&old));
-    assert!(vd.depends_on_tables.contains(&new));
-    assert!(
-        vd.depends_on_columns.iter().all(|(k, _)| k != &old),
-        "no dep should still point at old key: {:?}",
-        vd.depends_on_columns,
-    );
-    assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &new && c == "id"),
-    );
-    assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &new && c == "name"),
-    );
+    // Dep references are by OID — rename doesn't change OIDs, but the
+    // resolved name follows the new relname.
+    assert!(table_deps.contains(&new));
+    assert!(col_deps.iter().any(|(k, c)| k == &new && c == "id"));
+    assert!(col_deps.iter().any(|(k, c)| k == &new && c == "name"));
 }
 
 #[test]
@@ -430,21 +397,17 @@ fn view_deps_updated_after_rename_column() {
         ("0002.sql", "ALTER TABLE t RENAME COLUMN name TO full_name;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let col_deps = view_column_deps(&snap, view_oid);
     let t = QualifiedName::new("public", "t");
 
     assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &t && c == "full_name"),
-        "renamed column must appear in deps: {:?}",
-        vd.depends_on_columns,
+        col_deps.iter().any(|(k, c)| k == &t && c == "full_name"),
+        "renamed column must appear in deps: {col_deps:?}",
     );
     assert!(
-        vd.depends_on_columns.iter().all(|(_, c)| c != "name"),
-        "old column name must be gone from deps: {:?}",
-        vd.depends_on_columns,
+        col_deps.iter().all(|(_, c)| c != "name"),
+        "old column name must be gone from deps: {col_deps:?}",
     );
 }
 
@@ -460,19 +423,13 @@ fn view_deps_updated_after_set_schema() {
         ("0002.sql", "ALTER TABLE t SET SCHEMA app;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
-    let old = QualifiedName::new("public", "t");
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
     let new = QualifiedName::new("app", "t");
 
-    assert!(!vd.depends_on_tables.contains(&old));
-    assert!(vd.depends_on_tables.contains(&new));
-    assert!(
-        vd.depends_on_columns
-            .iter()
-            .any(|(k, c)| k == &new && c == "id"),
-    );
-    assert!(vd.depends_on_columns.iter().all(|(k, _)| k != &old));
+    assert!(table_deps.contains(&new));
+    assert!(col_deps.iter().any(|(k, c)| k == &new && c == "id"));
 }
 
 #[test]
@@ -487,19 +444,14 @@ fn view_deps_updated_after_rename_schema() {
         ("0002.sql", "ALTER SCHEMA app RENAME TO core;"),
     ]);
 
-    let view = snap.resolve_table(Some("core"), "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
-    let old = QualifiedName::new("app", "users");
+    let view_oid = class_oid(&snap, Some("core"), "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
     let new = QualifiedName::new("core", "users");
 
-    assert!(!vd.depends_on_tables.contains(&old));
-    assert!(vd.depends_on_tables.contains(&new));
-    assert!(vd.depends_on_columns.iter().all(|(k, _)| k.schema != "app"));
-    assert!(
-        vd.depends_on_columns.iter().any(|(k, _)| k == &new),
-        "at least one column dep should now point at core.users: {:?}",
-        vd.depends_on_columns,
-    );
+    assert!(table_deps.contains(&new));
+    assert!(col_deps.iter().any(|(k, _)| k == &new));
+    assert!(col_deps.iter().all(|(k, _)| k.schema != "app"));
 }
 
 #[test]
@@ -514,16 +466,13 @@ fn view_deps_unchanged_on_unrelated_rename() {
         ("0002.sql", "ALTER TABLE other RENAME TO other2;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
+    let col_deps = view_column_deps(&snap, view_oid);
     let t = QualifiedName::new("public", "t");
 
-    assert_eq!(vd.depends_on_tables, vec![t.clone()]);
-    assert!(
-        vd.depends_on_columns
-            .iter()
-            .all(|(k, c)| k == &t && c == "id"),
-    );
+    assert_eq!(table_deps, vec![t.clone()]);
+    assert!(col_deps.iter().all(|(k, c)| k == &t && c == "id"));
 }
 
 #[test]
@@ -537,16 +486,14 @@ fn view_deps_rename_column_unrelated_is_noop() {
         ("0002.sql", "ALTER TABLE t RENAME COLUMN age TO years;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let col_deps = view_column_deps(&snap, view_oid);
     let t = QualifiedName::new("public", "t");
 
-    // Only id and name are deps — age/years was never referenced.
-    let names: Vec<&str> = vd
-        .depends_on_columns
+    let names: Vec<&str> = col_deps
         .iter()
         .filter(|(k, _)| k == &t)
-        .map(|(_, c): &(QualifiedName, String)| c.as_str())
+        .map(|(_, c)| c.as_str())
         .collect();
     assert!(names.contains(&"id"));
     assert!(names.contains(&"name"));
@@ -567,18 +514,16 @@ fn view_deps_rename_preserves_self_join_dedup() {
         ("0002.sql", "ALTER TABLE t RENAME TO nodes;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
+    let view_oid = class_oid(&snap, None, "v");
+    let table_deps = view_table_deps(&snap, view_oid);
     let nodes = QualifiedName::new("public", "nodes");
 
-    let count = vd.depends_on_tables.iter().filter(|k| *k == &nodes).count();
+    let count = table_deps.iter().filter(|k| *k == &nodes).count();
     assert_eq!(
         count, 1,
-        "self-join dedup must survive rename: {:?}",
-        vd.depends_on_tables
+        "self-join dedup must survive rename: {table_deps:?}"
     );
-
-    assert!(!vd.depends_on_tables.iter().any(|k| k.name == "t"));
+    assert!(!table_deps.iter().any(|k| k.name == "t"));
 }
 
 // ── Stored AST + serde roundtrip ───────────────────────────────────────────
@@ -592,18 +537,14 @@ fn view_def_stores_resolved_ast() {
     )]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    let vd = view.view_def.as_ref().unwrap();
     assert!(
-        !vd.resolved_ast.is_empty(),
-        "resolved_ast should be populated for freshly-created views",
+        !view.relviewdef.is_empty(),
+        "relviewdef should be populated for freshly-created views",
     );
 }
 
 #[test]
 fn view_def_serde_roundtrip_preserves_ast() {
-    // Serializing the catalog to JSON and back must reproduce the AST
-    // byte-for-byte. Base64 is load-bearing: without it the JSON blows
-    // up to one int per byte.
     let snap = build(&[(
         "0001.sql",
         "CREATE TABLE t (id INT NOT NULL, name TEXT);
@@ -613,68 +554,17 @@ fn view_def_serde_roundtrip_preserves_ast() {
     let json = serde_json::to_string(&snap.to_seed()).unwrap();
     let back: PgCatalog = PgCatalog::from_seed(serde_json::from_str(&json).unwrap());
 
-    let original = snap
-        .resolve_table(None, "v")
-        .unwrap()
-        .view_def
-        .as_ref()
-        .unwrap();
-    let restored = back
-        .resolve_table(None, "v")
-        .unwrap()
-        .view_def
-        .as_ref()
-        .unwrap();
-    assert_eq!(original.resolved_ast, restored.resolved_ast);
-    assert_eq!(original.depends_on_tables, restored.depends_on_tables);
-    assert_eq!(original.depends_on_columns, restored.depends_on_columns);
-}
+    let original = snap.resolve_table(None, "v").unwrap();
+    let restored = back.resolve_table(None, "v").unwrap();
+    assert_eq!(original.relviewdef, restored.relviewdef);
 
-#[test]
-fn view_def_accepts_legacy_json_without_resolved_ast() {
-    // Older snapshots predate `resolved_ast`. Loading them must still work;
-    // the absent field just defaults to empty, disabling rename propagation
-    // into the AST (the deps arrays still cover CASCADE detection).
-    let legacy = r#"{
-        "types": {},
-        "type_by_name": {},
-        "tables": {
-            "public.t": {
-                "name": "t",
-                "schema": "public",
-                "kind": "Table",
-                "columns": [
-                    {"name": "id", "type_oid": 23, "not_null": true, "has_default": false}
-                ]
-            },
-            "public.v": {
-                "name": "v",
-                "schema": "public",
-                "kind": "View",
-                "columns": [
-                    {"name": "id", "type_oid": 23, "not_null": true, "has_default": false}
-                ],
-                "view_def": {
-                    "depends_on_tables": ["public.t"],
-                    "depends_on_columns": [["public.t", "id"]]
-                }
-            }
-        },
-        "functions_by_name": {},
-        "operators_by_name": {},
-        "casts": {},
-        "search_path": ["public"]
-    }"#;
+    let original_table_deps = view_table_deps(&snap, original.oid);
+    let restored_table_deps = view_table_deps(&back, restored.oid);
+    assert_eq!(original_table_deps, restored_table_deps);
 
-    let snap: PgCatalog = PgCatalog::from_seed(serde_json::from_str(legacy).unwrap());
-    let vd = snap
-        .resolve_table(None, "v")
-        .unwrap()
-        .view_def
-        .as_ref()
-        .unwrap();
-    assert!(vd.resolved_ast.is_empty());
-    assert_eq!(vd.depends_on_tables.len(), 1);
+    let original_col_deps = view_column_deps(&snap, original.oid);
+    let restored_col_deps = view_column_deps(&back, restored.oid);
+    assert_eq!(original_col_deps, restored_col_deps);
 }
 
 // ── CREATE OR REPLACE VIEW ─────────────────────────────────────────────────
@@ -694,8 +584,9 @@ fn create_or_replace_view() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert_eq!(view.columns.len(), 3);
-    assert_eq!(view.columns[2].name, "age");
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs.len(), 3);
+    assert_eq!(attrs[2].attname, "age");
 }
 
 // ── CREATE / DROP MATERIALIZED VIEW ────────────────────────────────────────
@@ -711,10 +602,11 @@ fn create_materialized_view_is_registered() {
     let view = snap
         .resolve_table(None, "item_names")
         .expect("materialized view should be registered as a relation");
-    assert_eq!(view.kind, RelationKind::MaterializedView);
-    assert_eq!(view.columns.len(), 2);
-    assert_eq!(view.columns[0].name, "id");
-    assert_eq!(view.columns[1].name, "name");
+    assert_eq!(view.relkind, RelKind::MaterializedView);
+    let attrs = snap.attributes_of(view.oid);
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].attname, "id");
+    assert_eq!(attrs[1].attname, "name");
 }
 
 #[test]
@@ -733,8 +625,6 @@ fn drop_materialized_view_removes_it() {
 
 #[test]
 fn drop_column_referenced_by_view_expression_fails() {
-    // The view's output column is "next_id" but the expression references
-    // "id". The structured walker must find the ColumnRef and block the drop.
     let result = try_apply(&[
         (
             "0001.sql",
@@ -792,8 +682,6 @@ fn drop_column_referenced_in_view_order_by_fails() {
 
 #[test]
 fn drop_column_aliased_by_view_fails() {
-    // PG tracks the underlying column through the alias: even though the view
-    // exposes the column as "n", the dependency is on t.name.
     let result = try_apply(&[
         (
             "0001.sql",
@@ -808,8 +696,6 @@ fn drop_column_aliased_by_view_fails() {
 
 #[test]
 fn drop_column_not_referenced_by_view_despite_name_match_succeeds() {
-    // The view's "age" is count(*), not t.age — no real dependency.
-    // The structured walker must not be fooled by output column names.
     let snap = build(&[
         (
             "0001.sql",
@@ -819,10 +705,9 @@ fn drop_column_not_referenced_by_view_despite_name_match_succeeds() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN age;"),
     ]);
 
-    // Table loses the column; the view survives because count(*) doesn't
-    // actually reference t.age.
     let table = snap.resolve_table(None, "t").unwrap();
-    assert!(table.columns.iter().all(|c| c.name != "age"));
+    let attrs = snap.attributes_of(table.oid);
+    assert!(attrs.iter().all(|c| c.attname != "age"));
     assert!(snap.resolve_table(None, "v").is_some());
 }
 
@@ -857,6 +742,5 @@ fn drop_view_cascade_removes_dependent_views() {
 
     assert!(snap.resolve_table(None, "v1").is_none());
     assert!(snap.resolve_table(None, "v2").is_none());
-    // Underlying table is untouched.
     assert!(snap.resolve_table(None, "t").is_some());
 }

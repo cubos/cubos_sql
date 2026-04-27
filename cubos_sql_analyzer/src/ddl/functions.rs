@@ -2,85 +2,102 @@
 
 use pg_query::protobuf::{CreateFunctionStmt, FunctionParameterMode, node};
 
-use crate::qualified_name::QualifiedName;
-use crate::schema::{CompositeField, FunctionEntry, oid as builtin_oid};
+use crate::oid::{PgProcOid, PgTypeOid};
+use crate::pg_catalog::{ArgMode, PgProc, ProKind, oid as builtin_oid};
 
 use super::DdlError;
-use super::util::{extract_names, resolve_type_name};
+use super::util::{ensure_qualified_name, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.funcname, interp);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.funcname);
 
     // Walk parameters once, splitting IN/INOUT/VARIADIC into the call
     // signature and OUT/TABLE/INOUT into the named output columns.
-    // pg_query uses FuncParamDefault for implicit IN parameters; Undefined
-    // (0) is the parser's catch-all that we also treat as IN.
-    let mut arg_types = Vec::new();
-    let mut out_args: Vec<CompositeField> = Vec::new();
-    let mut is_variadic = false;
+    let mut proargtypes: Vec<PgTypeOid> = Vec::new();
+    let mut proallargtypes: Vec<PgTypeOid> = Vec::new();
+    let mut proargmodes: Vec<ArgMode> = Vec::new();
+    let mut proargnames: Vec<String> = Vec::new();
+    let mut variadic_oid: Option<PgTypeOid> = None;
     for param_node in &stmt.parameters {
         let Some(node::Node::FunctionParameter(fp)) = param_node.node.as_ref() else {
             continue;
         };
         let mode =
             FunctionParameterMode::try_from(fp.mode).unwrap_or(FunctionParameterMode::FuncParamIn);
-        let resolved_oid = fp
+        let Some(resolved_oid) = fp
             .arg_type
             .as_ref()
             .and_then(|tn| resolve_type_name(tn, interp))
-            .unwrap_or(0);
+        else {
+            continue;
+        };
 
-        match mode {
+        let arg_mode = match mode {
             FunctionParameterMode::FuncParamIn
             | FunctionParameterMode::FuncParamDefault
-            | FunctionParameterMode::Undefined => {
-                arg_types.push(resolved_oid);
+            | FunctionParameterMode::Undefined => ArgMode::In,
+            FunctionParameterMode::FuncParamVariadic => ArgMode::Variadic,
+            FunctionParameterMode::FuncParamInout => ArgMode::InOut,
+            FunctionParameterMode::FuncParamOut => ArgMode::Out,
+            FunctionParameterMode::FuncParamTable => ArgMode::Table,
+        };
+
+        match arg_mode {
+            ArgMode::In => proargtypes.push(resolved_oid),
+            ArgMode::Variadic => {
+                proargtypes.push(resolved_oid);
+                variadic_oid = Some(resolved_oid);
             }
-            FunctionParameterMode::FuncParamVariadic => {
-                arg_types.push(resolved_oid);
-                is_variadic = true;
-            }
-            FunctionParameterMode::FuncParamInout => {
-                arg_types.push(resolved_oid);
-                out_args.push(CompositeField {
-                    name: fp.name.clone(),
-                    type_oid: resolved_oid,
-                    not_null: false,
-                });
-            }
-            FunctionParameterMode::FuncParamOut | FunctionParameterMode::FuncParamTable => {
-                out_args.push(CompositeField {
-                    name: fp.name.clone(),
-                    type_oid: resolved_oid,
-                    not_null: false,
-                });
-            }
+            ArgMode::InOut => proargtypes.push(resolved_oid),
+            ArgMode::Out | ArgMode::Table => {}
         }
+        proallargtypes.push(resolved_oid);
+        proargmodes.push(arg_mode);
+        proargnames.push(fp.name.clone());
+    }
+
+    // Drop proallargtypes/modes/names if every entry is an IN with no name —
+    // PG only stores them when there's something interesting to record.
+    let all_simple_in = proargmodes.iter().all(|m| matches!(m, ArgMode::In))
+        && proargnames.iter().all(|n| n.is_empty());
+    if all_simple_in {
+        proallargtypes.clear();
+        proargmodes.clear();
+        proargnames.clear();
     }
 
     // Resolve return type. PG synthesizes one when there's no explicit
-    // RETURNS but OUT/INOUT params are present:
-    //   - exactly one OUT/INOUT slot → that slot's type bubbles up.
-    //   - multiple slots             → pseudo `record` (out_args carries
-    //                                  the named columns for SRF callers).
+    // RETURNS but OUT/INOUT params are present.
     let explicit_return_oid = stmt
         .return_type
         .as_ref()
         .and_then(|tn| resolve_type_name(tn, interp));
-    let return_type_oid = match explicit_return_oid {
+    let out_count = proargmodes
+        .iter()
+        .filter(|m| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
+        .count();
+    let prorettype = match explicit_return_oid {
         Some(oid) => oid,
-        None => match out_args.len() {
-            0 => 0,
-            1 => out_args[0].type_oid,
+        None => match out_count {
+            // Procedures + plain RETURNS-less functions: PG records void here.
+            // We don't have a void constant in `oid::*`, so fall back to
+            // UNKNOWN — these never appear as expression results anyway.
+            0 => builtin_oid::UNKNOWN,
+            1 => proargmodes
+                .iter()
+                .zip(proallargtypes.iter())
+                .find(|(m, _)| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
+                .map(|(_, &oid)| oid)
+                .unwrap_or(builtin_oid::UNKNOWN),
             _ => builtin_oid::RECORD,
         },
     };
 
-    let is_set_returning = stmt.return_type.as_ref().is_some_and(|tn| tn.setof);
+    let proretset = stmt.return_type.as_ref().is_some_and(|tn| tn.setof);
 
     // Check options for STRICT (CALLED ON NULL INPUT vs RETURNS NULL ON NULL INPUT).
-    let is_strict = stmt.options.iter().any(|n| {
+    let proisstrict = stmt.options.iter().any(|n| {
         if let Some(node::Node::DefElem(de)) = n.node.as_ref()
             && de.defname == "strict"
             && let Some(arg) = de.arg.as_deref()
@@ -95,38 +112,26 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         false
     });
 
-    let entry = FunctionEntry {
-        name: name.clone(),
-        schema,
-        arg_types,
-        return_type_oid,
-        is_aggregate: false,
-        is_window: false,
-        is_variadic,
-        is_set_returning,
-        is_strict,
-        is_procedure: stmt.is_procedure,
-        agg_final_type_oid: None,
-        out_args,
-        num_default_args: 0,
+    let prokind = if stmt.is_procedure {
+        ProKind::Procedure
+    } else {
+        ProKind::Function
     };
 
-    // Check for existing entry with same (signature, kind). Functions and
-    // procedures share the `functions_by_name` bucket but PG treats them as
-    // separate object kinds, so a CREATE FUNCTION may coexist with a
-    // CREATE PROCEDURE of the same name and signature.
-    let key = QualifiedName::new(&entry.schema, &entry.name);
-    if let Some(fns) = interp.functions_by_name.get_mut(&key) {
-        let exists = fns
-            .iter()
-            .any(|f| f.arg_types == entry.arg_types && f.is_procedure == entry.is_procedure);
-        if exists {
+    // Check for an existing entry with the same (signature, kind).
+    let key = (nsoid, name.clone());
+    if let Some(oids) = interp.proc_by_qname.get(&key).cloned() {
+        let conflict = oids.iter().find(|&&oid| {
+            interp.pg_proc.get(&oid).is_some_and(|p| {
+                p.proargtypes == proargtypes
+                    && std::mem::discriminant(&p.prokind) == std::mem::discriminant(&prokind)
+            })
+        });
+        if let Some(&conflict_oid) = conflict {
             if stmt.replace {
-                fns.retain(|f| {
-                    f.arg_types != entry.arg_types || f.is_procedure != entry.is_procedure
-                });
+                interp.remove_pg_proc(conflict_oid);
             } else {
-                let kind = if entry.is_procedure {
+                let kind = if matches!(prokind, ProKind::Procedure) {
                     "procedure"
                 } else {
                     "function"
@@ -138,7 +143,22 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         }
     }
 
-    interp.functions_by_name.entry(key).or_default().push(entry);
+    let oid = PgProcOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_proc(PgProc {
+        oid,
+        proname: name,
+        pronamespace: nsoid,
+        prokind,
+        proargtypes,
+        prorettype,
+        proretset,
+        provariadic: variadic_oid,
+        proisstrict,
+        pronargdefaults: 0,
+        proallargtypes,
+        proargmodes,
+        proargnames,
+    });
 
     Ok(())
 }

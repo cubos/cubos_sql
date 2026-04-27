@@ -10,13 +10,9 @@ fn create_domain() {
     let snap = build(&[("0001.sql", "CREATE DOMAIN email AS TEXT;")]);
 
     let te = snap.resolve_type_by_name(None, "email").unwrap();
-    match &te.kind {
-        TypeKind::Domain { base_type_oid } => {
-            let base = snap.get_type(*base_type_oid).unwrap();
-            assert_eq!(base.name, "text");
-        }
-        _ => panic!("expected Domain, got {:?}", te.kind),
-    }
+    assert_eq!(te.typtype, TypType::Domain);
+    let base = snap.get_type(te.typbasetype.unwrap()).unwrap();
+    assert_eq!(base.typname, "text");
 
     // Array type.
     assert!(
@@ -35,12 +31,9 @@ fn create_enum() {
     )]);
 
     let te = snap.resolve_type_by_name(None, "mood").unwrap();
-    match &te.kind {
-        TypeKind::Enum { labels } => {
-            assert_eq!(labels, &["sad", "ok", "happy"]);
-        }
-        _ => panic!("expected Enum, got {:?}", te.kind),
-    }
+    assert_eq!(te.typtype, TypType::Enum);
+    let labels = snap.enum_labels_of(te.oid);
+    assert_eq!(labels, vec!["sad", "ok", "happy"]);
 }
 
 #[test]
@@ -57,12 +50,9 @@ fn alter_enum_add_value() {
     ]);
 
     let te = snap.resolve_type_by_name(None, "mood").unwrap();
-    match &te.kind {
-        TypeKind::Enum { labels } => {
-            assert_eq!(labels, &["sad", "ok", "happy", "ecstatic"]);
-        }
-        _ => panic!("expected Enum"),
-    }
+    assert_eq!(te.typtype, TypType::Enum);
+    let labels = snap.enum_labels_of(te.oid);
+    assert_eq!(labels, vec!["sad", "ok", "happy", "ecstatic"]);
 }
 
 #[test]
@@ -79,12 +69,9 @@ fn alter_enum_add_value_before() {
     ]);
 
     let te = snap.resolve_type_by_name(None, "mood").unwrap();
-    match &te.kind {
-        TypeKind::Enum { labels } => {
-            assert_eq!(labels, &["anxious", "sad", "ok", "happy"]);
-        }
-        _ => panic!("expected Enum"),
-    }
+    assert_eq!(te.typtype, TypType::Enum);
+    let labels = snap.enum_labels_of(te.oid);
+    assert_eq!(labels, vec!["anxious", "sad", "ok", "happy"]);
 }
 
 // ── CREATE TYPE AS (composite) ──────────────────────────────────────────────
@@ -101,15 +88,12 @@ fn create_composite_type() {
     )]);
 
     let te = snap.resolve_type_by_name(None, "address").unwrap();
-    match &te.kind {
-        TypeKind::Composite { fields } => {
-            assert_eq!(fields.len(), 3);
-            assert_eq!(fields[0].name, "street");
-            assert_eq!(fields[1].name, "city");
-            assert_eq!(fields[2].name, "zip");
-        }
-        _ => panic!("expected Composite"),
-    }
+    assert_eq!(te.typtype, TypType::Composite);
+    let fields = snap.composite_fields_of(te.oid);
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].attname, "street");
+    assert_eq!(fields[1].attname, "city");
+    assert_eq!(fields[2].attname, "zip");
 }
 
 #[test]
@@ -124,22 +108,19 @@ fn composite_type_field_types_resolved() {
     )]);
 
     let te = snap.resolve_type_by_name(None, "address").unwrap();
-    match &te.kind {
-        TypeKind::Composite { fields } => {
-            let text_oid = snap
-                .resolve_type_by_name(Some("pg_catalog"), "text")
-                .unwrap()
-                .oid;
-            let int4_oid = snap
-                .resolve_type_by_name(Some("pg_catalog"), "int4")
-                .unwrap()
-                .oid;
-            assert_eq!(fields[0].type_oid, text_oid);
-            assert_eq!(fields[1].type_oid, text_oid);
-            assert_eq!(fields[2].type_oid, int4_oid);
-        }
-        _ => panic!("expected Composite"),
-    }
+    assert_eq!(te.typtype, TypType::Composite);
+    let fields = snap.composite_fields_of(te.oid);
+    let text_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "text")
+        .unwrap()
+        .oid;
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
+        .unwrap()
+        .oid;
+    assert_eq!(fields[0].atttypid, text_oid);
+    assert_eq!(fields[1].atttypid, text_oid);
+    assert_eq!(fields[2].atttypid, int4_oid);
 }
 
 // ── CREATE TYPE AS RANGE ────────────────────────────────────────────────────
@@ -152,16 +133,24 @@ fn create_range_type_with_subtype() {
     )]);
 
     let te = snap.resolve_type_by_name(None, "floatrange").unwrap();
-    match &te.kind {
-        TypeKind::Range { subtype_oid } => {
-            let float8_oid = snap
-                .resolve_type_by_name(Some("pg_catalog"), "float8")
-                .unwrap()
-                .oid;
-            assert_eq!(*subtype_oid, float8_oid);
-        }
-        _ => panic!("expected Range"),
-    }
+    assert_eq!(te.typtype, TypType::Range);
+    let rng = snap.pg_type();
+    let _ = rng;
+    let float8_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "float8")
+        .unwrap()
+        .oid;
+    assert_eq!(snap.pg_type().get(&te.oid).map(|_| ()), Some(()));
+    // Subtype lives in pg_range, keyed by rngtypid.
+    let pg_range_subtype = {
+        // We don't have a public pg_range() accessor, but we can use to_seed().
+        let seed = snap.to_seed();
+        seed.pg_range
+            .iter()
+            .find(|r| r.rngtypid == te.oid)
+            .map(|r| r.rngsubtype)
+    };
+    assert_eq!(pg_range_subtype, Some(float8_oid));
 }
 
 // ── User-defined types as column types ─────────────────────────────────────
@@ -175,9 +164,10 @@ fn enum_as_column_type() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let s_col = table.columns.iter().find(|c| c.name == "s").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let s_col = attrs.iter().find(|c| c.attname == "s").unwrap();
     let status_oid = snap.resolve_type_by_name(None, "status").unwrap().oid;
-    assert_eq!(s_col.type_oid, status_oid);
+    assert_eq!(s_col.atttypid, status_oid);
 }
 
 #[test]
@@ -189,9 +179,10 @@ fn domain_as_column_type() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let contact = table.columns.iter().find(|c| c.name == "contact").unwrap();
+    let attrs = snap.attributes_of(table.oid);
+    let contact = attrs.iter().find(|c| c.attname == "contact").unwrap();
     let email_oid = snap.resolve_type_by_name(None, "email").unwrap().oid;
-    assert_eq!(contact.type_oid, email_oid);
+    assert_eq!(contact.atttypid, email_oid);
 }
 
 #[test]
@@ -203,14 +194,16 @@ fn enum_array_as_column_type_is_array_kind() {
     )]);
 
     let table = snap.resolve_table(None, "t").unwrap();
-    let roles = table.columns.iter().find(|c| c.name == "roles").unwrap();
-    assert_ne!(roles.type_oid, 0);
+    let attrs = snap.attributes_of(table.oid);
+    let roles = attrs.iter().find(|c| c.attname == "roles").unwrap();
+    assert_ne!(roles.atttypid.get(), 0);
 
-    let type_entry = snap.get_type(roles.type_oid).unwrap();
-    assert!(
-        matches!(type_entry.kind, TypeKind::Array { .. }),
+    let type_entry = snap.get_type(roles.atttypid).unwrap();
+    assert_eq!(
+        type_entry.typcategory,
+        TypCategory::Array,
         "role[] should be an Array type, got {:?}",
-        type_entry.kind
+        type_entry.typcategory
     );
 }
 
@@ -252,7 +245,6 @@ fn create_range_duplicate_errors() {
 
 #[test]
 fn alter_enum_add_duplicate_value_errors() {
-    // PG: without IF NOT EXISTS on the VALUE, adding an existing label fails.
     let result = try_apply(&[
         ("0001.sql", "CREATE TYPE mood AS ENUM ('happy', 'sad');"),
         ("0002.sql", "ALTER TYPE mood ADD VALUE 'happy';"),
@@ -263,8 +255,6 @@ fn alter_enum_add_duplicate_value_errors() {
 
 #[test]
 fn alter_enum_add_value_if_not_exists_on_missing_type_errors() {
-    // IF NOT EXISTS modifies only the VALUE clause — not the TYPE clause.
-    // A missing type must still surface as an error.
     let result = try_apply(&[(
         "0001.sql",
         "ALTER TYPE nonexistent ADD VALUE IF NOT EXISTS 'x';",

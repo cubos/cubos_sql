@@ -12,8 +12,7 @@
 //!
 //! | Item | Role |
 //! |------|------|
-//! | [`PgCatalog`] | Mutable schema: seed the PG18 catalog, then apply DDL and analyze queries against it. |
-//! | [`AnalyzerConfig`] | Rust-type overrides for user-defined SQL types (domains, enums, custom types). |
+//! | [`PgCatalog`] | Mutable catalog: seed the PG18 catalog, then apply DDL and analyze queries against it. |
 //! | [`AnalyzedQuery`] | Result of analysis: rewritten SQL + typed parameters, spreads, and output columns. |
 //! | [`AnalyzedParam`] | A named parameter with its inferred Rust type and the byte offsets where it appears. |
 //! | [`AnalyzedSpread`] | A `$..name { ... }` spread with its insertion offset and typed fields. |
@@ -27,10 +26,7 @@
 //! ```ignore
 //! let mut db = PgCatalog::new();
 //! db.apply_sql("CREATE TABLE users (id bigint primary key, name text not null);")?;
-//! let result = db.analyze(
-//!     "SELECT id, name FROM users WHERE id = $id",
-//!     &AnalyzerConfig::default(),
-//! )?;
+//! let result = db.analyze("SELECT id, name FROM users WHERE id = $id")?;
 //! // result.columns[0].rust_type == "i64"
 //! // result.params[0].rust_type  == "i64"
 //! ```
@@ -41,7 +37,9 @@ mod error;
 mod expr;
 mod functions;
 mod lexer;
+mod lookup;
 mod nullability;
+mod oid;
 mod param;
 mod param_collector;
 mod pg_catalog;
@@ -57,13 +55,16 @@ pub(crate) mod qualified_name {
     pub use cubos_sql_core::QualifiedName;
 }
 
+pub use oid::{
+    PgCastOid, PgClassOid, PgEnumOid, PgExtensionOid, PgGenericOid, PgNamespaceOid, PgOperatorOid,
+    PgProcOid, PgTypeOid,
+};
 #[cfg(any(test, feature = "internal"))]
-pub mod schema;
-#[cfg(not(any(test, feature = "internal")))]
-mod schema;
-
-#[cfg(any(test, feature = "internal"))]
-pub use seed::SchemaSeed;
+pub use pg_catalog::{
+    ArgMode, AttGenerated, CastContext, CastMethod, DepType, PgAggregate, PgAttribute, PgCast,
+    PgCatalogSeed, PgClass, PgDepend, PgEnum, PgExtension, PgNamespace, PgOperator, PgProc,
+    PgRange, PgType, ProKind, RelKind, TypCategory, TypType, ViewBinding,
+};
 
 pub use cubos_sql_core::{ParseQualifiedNameError, QualifiedName};
 pub use ddl::DdlError;

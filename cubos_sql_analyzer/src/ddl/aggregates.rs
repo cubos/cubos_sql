@@ -1,33 +1,32 @@
 //! CREATE AGGREGATE handler.
 //!
-//! Aggregates are stored in the same `functions_by_name` map as ordinary
-//! functions, with `is_aggregate = true`. The reported return type is the
-//! `FINALFUNC` return type when one is specified, otherwise the `STYPE`
-//! (state type), mirroring how PostgreSQL resolves aggregate result types.
+//! Aggregates produce two rows: a `pg_proc` entry with `prokind = Aggregate`
+//! and a `pg_aggregate` entry pointed at by `aggfnoid`. The reported return
+//! type is the FINALFUNC return type when one is specified, otherwise the
+//! STYPE (state type), mirroring how PostgreSQL resolves aggregate result
+//! types.
 
 use pg_query::protobuf::{DefineStmt, FunctionParameterMode, node};
 
-use crate::schema::FunctionEntry;
+use crate::oid::{PgProcOid, PgTypeOid};
+use crate::pg_catalog::{PgAggregate, PgProc, ProKind};
 
 use super::DdlError;
-use super::util::{extract_names, resolve_type_name};
+use super::util::{ensure_qualified_name, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
-    let (schema, name) = extract_names(&stmt.defnames, interp);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames);
 
     // Argument types come from `args`. The shape varies between
     //   CREATE AGGREGATE name (type1, type2)        — bare type list
     //   CREATE AGGREGATE name (a int, b int)        — FunctionParameter list
     //   CREATE AGGREGATE name (* )                  — zero-arg aggregate
-    // The bare-list form may be wrapped in a nested `args[0] = List`. We
-    // accept both shapes for robustness.
-    let mut arg_types: Vec<u32> = Vec::new();
-    let mut is_variadic = false;
+    let mut arg_types: Vec<PgTypeOid> = Vec::new();
+    let mut variadic_oid: Option<PgTypeOid> = None;
     let arg_nodes: Vec<&pg_query::protobuf::Node> = if stmt.args.len() == 2
         && let Some(node::Node::List(list)) = stmt.args[0].node.as_ref()
     {
-        // Wrapped form: args = [List(types), Integer(num_direct_args)]
         list.items.iter().collect()
     } else {
         stmt.args.iter().collect()
@@ -38,24 +37,29 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
             Some(node::Node::FunctionParameter(fp)) => {
                 let mode = FunctionParameterMode::try_from(fp.mode)
                     .unwrap_or(FunctionParameterMode::FuncParamIn);
+                let Some(resolved) = fp
+                    .arg_type
+                    .as_ref()
+                    .and_then(|tn| resolve_type_name(tn, interp))
+                else {
+                    continue;
+                };
                 if mode == FunctionParameterMode::FuncParamVariadic {
-                    is_variadic = true;
+                    variadic_oid = Some(resolved);
                 }
-                if let Some(tn) = &fp.arg_type {
-                    let oid = resolve_type_name(tn, interp).unwrap_or(0);
-                    arg_types.push(oid);
-                }
+                arg_types.push(resolved);
             }
             Some(node::Node::TypeName(tn)) => {
-                let oid = resolve_type_name(tn, interp).unwrap_or(0);
-                arg_types.push(oid);
+                if let Some(oid) = resolve_type_name(tn, interp) {
+                    arg_types.push(oid);
+                }
             }
             _ => {}
         }
     }
 
     // Walk the option list (`SFUNC`, `STYPE`, `FINALFUNC`, …).
-    let mut state_type: Option<u32> = None;
+    let mut state_type: Option<PgTypeOid> = None;
     let mut finalfunc: Option<(Option<String>, String)> = None;
 
     for opt in &stmt.definition {
@@ -83,35 +87,37 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     //   2. Otherwise the state type.
     let final_return = finalfunc.as_ref().and_then(|(schema, name)| {
         let candidates = interp.find_functions(schema.as_deref(), name);
-        candidates.into_iter().next().map(|f| f.return_type_oid)
+        candidates.into_iter().next().map(|f| f.prorettype)
     });
-
-    let return_type_oid = final_return.or(state_type).unwrap_or(0);
-
-    let entry = FunctionEntry {
-        name: name.clone(),
-        schema,
-        arg_types,
-        return_type_oid,
-        is_aggregate: true,
-        is_window: false,
-        is_variadic,
-        is_set_returning: false,
-        is_strict: false,
-        is_procedure: false,
-        agg_final_type_oid: final_return,
-        out_args: Vec::new(),
-        num_default_args: 0,
+    let Some(prorettype) = final_return.or(state_type) else {
+        return Ok(());
     };
 
-    let key = crate::qualified_name::QualifiedName::new(&entry.schema, &entry.name);
-    interp.functions_by_name.entry(key).or_default().push(entry);
+    let proc_oid = PgProcOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_proc(PgProc {
+        oid: proc_oid,
+        proname: name,
+        pronamespace: nsoid,
+        prokind: ProKind::Aggregate,
+        proargtypes: arg_types,
+        prorettype,
+        proretset: false,
+        provariadic: variadic_oid,
+        proisstrict: false,
+        pronargdefaults: 0,
+        proallargtypes: Vec::new(),
+        proargmodes: Vec::new(),
+        proargnames: Vec::new(),
+    });
+    interp.insert_pg_aggregate(PgAggregate {
+        aggfnoid: proc_oid,
+        aggfinaltype: final_return,
+    });
 
     Ok(())
 }
 
-/// Parse a function name from a DefElem argument. Same shapes as in
-/// `operators::parse_func_name` (TypeName / String / List).
+/// Parse a function name from a DefElem argument.
 fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
     let parts: Vec<&str> = match arg.node.as_ref()? {
         node::Node::TypeName(tn) => tn
