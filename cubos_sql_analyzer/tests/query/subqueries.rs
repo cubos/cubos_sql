@@ -346,6 +346,53 @@ fn stress_aggregate_subquery_in_select() {
 
 // ── Torture ──────────────────────────────────────────────────────────────────
 
+// ── Multi-column IN (a, b) IN (SELECT …) ─────────────────────────────────────
+
+#[test]
+fn multi_column_in_subquery() {
+    let db = setup();
+    // PG: `(user_id, post_id) IN (SELECT a, b FROM …)` — the LHS row must
+    // align with the subquery's column count, and the analyzer must not
+    // collapse it to a single-column comparison.
+    let s = db
+        .analyze(
+            "SELECT id FROM comments \
+             WHERE (post_id, author_name) IN ( \
+                 SELECT id, title FROM posts \
+             )",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn multi_column_in_subquery_arity_mismatch_rejected() {
+    let db = setup();
+    // PG: `subquery has too few columns`. LHS has 2, subquery emits 1.
+    assert_analyze_err!(
+        db.analyze(
+            "SELECT id FROM comments \
+             WHERE (post_id, author_name) IN (SELECT id FROM posts)"
+        ),
+        AnalyzeError::Invalid(_),
+        "",
+    );
+}
+
+#[test]
+fn multi_column_not_in_subquery() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id FROM comments \
+             WHERE (post_id, author_name) NOT IN ( \
+                 SELECT id, title FROM posts \
+             )",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
 #[test]
 fn torture_union_in_subquery_in_from() {
     let db = setup();

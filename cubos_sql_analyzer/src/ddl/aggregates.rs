@@ -101,6 +101,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         is_procedure: false,
         agg_final_type_oid: final_return,
         out_args: Vec::new(),
+        num_default_args: 0,
     };
 
     let key = crate::qualified_name::QualifiedName::new(&entry.schema, &entry.name);

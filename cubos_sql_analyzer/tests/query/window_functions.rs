@@ -203,3 +203,102 @@ fn named_window_clause() {
         .unwrap();
     assert_cols(&s, vec![c("id", int8()), c("rn", int8())]);
 }
+
+// ── Explicit frame: ROWS / RANGE / GROUPS ───────────────────────────────────
+//
+// The frame doesn't change the analyzed return type — but it must parse
+// cleanly. These act as smoke tests that each frame syntax is accepted and
+// produces the same shape as the implicit-frame case.
+
+#[test]
+fn rows_unbounded_preceding_to_current_row() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT id, SUM(views) OVER ( \
+                ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+             ) AS running FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), cn("running", int8())]);
+}
+
+#[test]
+fn rows_n_preceding_to_n_following() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT SUM(views) OVER ( \
+                ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING \
+             ) AS s FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("s", int8())]);
+}
+
+#[test]
+fn range_unbounded_preceding_default() {
+    let db = setup();
+    // `RANGE UNBOUNDED PRECEDING` is the implicit default; spelling it out
+    // shouldn't change the result.
+    let s = db
+        .analyze("SELECT SUM(views) OVER (ORDER BY id RANGE UNBOUNDED PRECEDING) AS s FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("s", int8())]);
+}
+
+#[test]
+fn range_between_with_value_offset() {
+    let db = setup();
+    // RANGE with an interval offset against an int4 column.
+    let s = db
+        .analyze(
+            "SELECT SUM(views) OVER ( \
+                ORDER BY views RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING \
+             ) AS s FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("s", int8())]);
+}
+
+#[test]
+fn groups_frame_syntax() {
+    let db = setup();
+    // GROUPS frame (PG 11+).
+    let s = db
+        .analyze(
+            "SELECT SUM(views) OVER ( \
+                ORDER BY user_id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             ) AS s FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("s", int8())]);
+}
+
+#[test]
+fn frame_with_exclude_current_row() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT SUM(views) OVER ( \
+                ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                EXCLUDE CURRENT ROW \
+             ) AS s FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("s", int8())]);
+}
+
+#[test]
+fn frame_with_exclude_group() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT SUM(views) OVER ( \
+                ORDER BY user_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                EXCLUDE GROUP \
+             ) AS s FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("s", int8())]);
+}

@@ -108,6 +108,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         is_procedure: stmt.is_procedure,
         agg_final_type_oid: None,
         out_args,
+        num_default_args: 0,
     };
 
     // Check for existing entry with same (signature, kind). Functions and

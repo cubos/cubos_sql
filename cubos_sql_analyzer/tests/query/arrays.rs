@@ -203,3 +203,99 @@ fn unnest_in_select_list_int() {
     // `nums` is NOT NULL, so the per-element projection is NOT NULL too.
     assert_cols(&s, vec![c("n", int4())]);
 }
+
+// ── Slice extras ─────────────────────────────────────────────────────────────
+
+#[test]
+fn array_slice_open_lower_bound() {
+    let db = setup();
+    // `nums[:3]` — PG accepts an omitted lower bound (defaults to 1). The
+    // analyzer should preserve the array type.
+    let s = db.analyze("SELECT nums[:3] AS slice FROM users").unwrap();
+    assert_cols(&s, vec![c("slice", array_of(int4()))]);
+}
+
+#[test]
+fn array_slice_open_upper_bound() {
+    let db = setup();
+    // `nums[2:]` — omitted upper bound (defaults to array length).
+    let s = db.analyze("SELECT nums[2:] AS slice FROM users").unwrap();
+    assert_cols(&s, vec![c("slice", array_of(int4()))]);
+}
+
+// ── Multi-dimensional arrays ────────────────────────────────────────────────
+
+#[test]
+#[ignore = "multi-dim arrays declared as `INT[][]` are typed as text in DDL — open bug"]
+fn multi_dim_array_constructor() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
+        .unwrap();
+    // PG types `INT[][]` the same as `INT[]` (postgres collapses dimensions
+    // in pg_type), and the array literal `ARRAY[ARRAY[1,2], ARRAY[3,4]]` is
+    // also `int4[]`. We just want the analyzer to land on the same type.
+    let s = db
+        .analyze("SELECT ARRAY[ARRAY[1, 2], ARRAY[3, 4]] AS grid")
+        .unwrap();
+    assert_cols(&s, vec![c("grid", array_of(int4()))]);
+}
+
+#[test]
+#[ignore = "subscripting twice on a multi-dim array drops the array type after the first index"]
+fn multi_dim_subscript_two_levels() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
+        .unwrap();
+    // `grid[1][2]` projects an int4. Always nullable (out-of-bounds → NULL).
+    let s = db.analyze("SELECT grid[1][2] AS cell FROM m").unwrap();
+    assert_cols(&s, vec![cn("cell", int4())]);
+}
+
+// ── unnest in FROM ──────────────────────────────────────────────────────────
+
+#[test]
+fn unnest_in_from_clause_aliased_column() {
+    let db = setup();
+    // `FROM unnest(arr) AS t(x)` — PG-supported, the analyzer must register
+    // the aliased column `x` in scope and resolve it.
+    let s = db
+        .analyze("SELECT t.x FROM unnest(ARRAY[1, 2, 3]) AS t(x)")
+        .unwrap();
+    assert_cols(&s, vec![c("x", int4())]);
+}
+
+#[test]
+#[ignore = "multi-array unnest(arr1, arr2) overload not registered"]
+fn unnest_in_from_two_arrays_aligned() {
+    let db = setup();
+    // `unnest(arr1, arr2)` — multi-array form expands into one column per arg.
+    let s = db
+        .analyze("SELECT t.a, t.b FROM unnest(ARRAY[1, 2], ARRAY['x'::text, 'y']) AS t(a, b)")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), c("b", text())]);
+}
+
+#[test]
+fn unnest_in_from_with_ordinality() {
+    let db = setup();
+    // WITH ORDINALITY appends an int8 NOT NULL ordinal column.
+    let s = db
+        .analyze(
+            "SELECT t.x, t.ord \
+             FROM unnest(ARRAY[10, 20, 30]) WITH ORDINALITY AS t(x, ord)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("x", int4()), c("ord", int8())]);
+}
+
+#[test]
+fn unnest_of_text_column_in_from() {
+    let db = setup();
+    // `FROM users u, unnest(u.tags) AS t(tag)` — column reference from
+    // outer table requires LATERAL semantics. PG implicitly enables LATERAL
+    // for set-returning FROM functions.
+    let s = db
+        .analyze("SELECT u.id, t.tag FROM users u, unnest(u.tags) AS t(tag)")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), cn("tag", text())]);
+}

@@ -283,6 +283,12 @@ fn is_sql_null_literal(node: &protobuf::Node) -> bool {
     )
 }
 
+/// `true` for the literal `DEFAULT` keyword used in INSERT VALUES /
+/// UPDATE SET. Mirrors PG's `SetToDefault` AST node.
+fn is_set_to_default(node: &protobuf::Node) -> bool {
+    matches!(node.node.as_ref(), Some(node::Node::SetToDefault(_)))
+}
+
 /// Reject aggregate / window function calls in a context where PG forbids
 /// them. Matches PG's `aggregate functions are not allowed in WHERE` /
 /// `window functions are not allowed in WHERE` errors. `context` goes into
@@ -629,6 +635,18 @@ fn analyze_insert(
                                 table.name, tc.name,
                             )));
                         }
+                        // Generated columns reject any value other than
+                        // DEFAULT — PG: `cannot insert a non-DEFAULT value
+                        // into column "x"`.
+                        if let Some(tc) = target_col
+                            && tc.is_generated
+                            && !is_set_to_default(val)
+                        {
+                            return Err(AnalyzeError::Invalid(format!(
+                                "cannot insert a non-DEFAULT value into generated column `{}.{}`",
+                                table.name, tc.name,
+                            )));
+                        }
                         let goal = target_col
                             .map(|tc| TypeGoal::assignment(tc.type_oid))
                             .unwrap_or(TypeGoal::NONE);
@@ -827,6 +845,14 @@ fn analyze_update(
             if tc.not_null && is_sql_null_literal(val) {
                 return Err(AnalyzeError::Invalid(format!(
                     "cannot assign NULL to NOT NULL column `{}.{}`",
+                    table.name, tc.name,
+                )));
+            }
+            // Generated columns can only be reset to DEFAULT (PG:
+            // `column "x" can only be updated to DEFAULT`).
+            if tc.is_generated && !is_set_to_default(val) {
+                return Err(AnalyzeError::Invalid(format!(
+                    "generated column `{}.{}` can only be updated to DEFAULT",
                     table.name, tc.name,
                 )));
             }
@@ -1030,7 +1056,7 @@ fn analyze_cte(
             ));
         }
 
-        let unified: Vec<ScopeColumn> = seed_cols
+        let mut unified: Vec<ScopeColumn> = seed_cols
             .into_iter()
             .zip(rec_cols)
             .map(|(s, r)| {
@@ -1046,6 +1072,7 @@ fn analyze_cte(
                 }
             })
             .collect();
+        append_search_cycle_columns(cte, &mut unified, snapshot);
         return Ok(unified);
     }
 
@@ -1106,6 +1133,69 @@ fn analyze_cte(
         _ => Err(AnalyzeError::Unsupported(
             "CTE with unsupported statement type".into(),
         )),
+    }
+}
+
+/// Append synthetic columns introduced by `SEARCH BREADTH/DEPTH FIRST BY
+/// … SET col` and `CYCLE … SET mark USING path` clauses on a recursive
+/// CTE. PG defines each clause as adding one or two named, NOT NULL
+/// columns to the CTE's output:
+///
+/// - `SEARCH BFS BY k SET ord` → `ord record NOT NULL` (a row of
+///   `(integer, k...)` PG materializes during recursion).
+/// - `CYCLE k SET is_cycle USING path` → `is_cycle <mark_type> NOT NULL`
+///   (defaults to bool when the user didn't specify `TO/DEFAULT`) and
+///   `path record[] NOT NULL` (an array of `(k...)` rows).
+///
+/// Without this, downstream `SELECT id, ord, is_cycle, path FROM cte`
+/// fails with `column "ord" does not exist`.
+fn append_search_cycle_columns(
+    cte: &protobuf::CommonTableExpr,
+    cols: &mut Vec<ScopeColumn>,
+    snapshot: &SchemaSnapshot,
+) {
+    if let Some(search) = cte.search_clause.as_ref()
+        && !search.search_seq_column.is_empty()
+    {
+        cols.push(ScopeColumn {
+            name: search.search_seq_column.clone(),
+            type_oid: oid::RECORD,
+            base_not_null: true,
+            table_alias: cte.ctename.clone(),
+            record_fields: None,
+        });
+    }
+    if let Some(cycle) = cte.cycle_clause.as_ref() {
+        if !cycle.cycle_mark_column.is_empty() {
+            // PG: when `TO/DEFAULT` are omitted the mark column is bool;
+            // otherwise the AST exposes the inferred type via `cycle_mark_type`.
+            let mark_oid = if cycle.cycle_mark_type != 0 {
+                cycle.cycle_mark_type
+            } else {
+                oid::BOOL
+            };
+            cols.push(ScopeColumn {
+                name: cycle.cycle_mark_column.clone(),
+                type_oid: mark_oid,
+                base_not_null: true,
+                table_alias: cte.ctename.clone(),
+                record_fields: None,
+            });
+        }
+        if !cycle.cycle_path_column.is_empty() {
+            // The path column is `record[]` — let `array_type_of(RECORD)`
+            // walk the snapshot's `pg_type.typarray` link instead of
+            // hardcoding the OID, mirroring how PG resolves the
+            // automatic `_record` array type.
+            let path_oid = snapshot.array_type_of(oid::RECORD).unwrap_or(oid::UNKNOWN);
+            cols.push(ScopeColumn {
+                name: cycle.cycle_path_column.clone(),
+                type_oid: path_oid,
+                base_not_null: true,
+                table_alias: cte.ctename.clone(),
+                record_fields: None,
+            });
+        }
     }
 }
 
@@ -1300,6 +1390,16 @@ fn process_from_item(
         node::Node::RangeFunction(rf) => {
             process_range_function(rf, scope, snapshot, params)?;
         }
+        node::Node::RangeTableSample(ts) => {
+            // `TABLESAMPLE` only changes how rows are picked at runtime —
+            // it does not affect the relation's column shape or
+            // nullability. Pass through to the wrapped `relation` and
+            // ignore method/args/repeatable.
+            let relation = ts.relation.as_ref().ok_or_else(|| {
+                AnalyzeError::Unsupported("RangeTableSample without relation".into())
+            })?;
+            return process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params);
+        }
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
                 "FROM item type: {:?}",
@@ -1326,15 +1426,13 @@ fn process_range_function(
     snapshot: &SchemaSnapshot,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    // In LATERAL position (`FROM users u, LATERAL unnest(u.tags) …`) the SRF
-    // args see the previously-listed FROM items, same as a LATERAL subquery.
-    // Without this the arg would resolve to UNKNOWN and overload selection
-    // would collapse into the wrong polymorphic candidate.
-    let arg_scope_sources = if rf.lateral {
-        scope.sources.clone()
-    } else {
-        Vec::new()
-    };
+    // PG always treats a function-call FROM item as LATERAL: the
+    // `LATERAL` keyword on a `RangeFunction` is a noise word, because
+    // the args can already refer to earlier FROM items implicitly. So
+    // we copy the visible sources unconditionally, not just when
+    // `rf.lateral` is set.
+    let arg_scope_sources = scope.sources.clone();
+    let _ = rf.lateral;
     // Each entry in `functions` is a 2-element `List` — [FuncCall, coldeflist].
     // We support only the simple form: a single function call, no explicit
     // column definitions. `ROWS FROM (…)` with multiple functions or user-
@@ -1399,8 +1497,9 @@ fn process_range_function(
     arg_scope.sources.extend(arg_scope_sources);
     let empty_null_ctx = NullabilityContext::default();
     let mut arg_types = Vec::with_capacity(func_call.args.len());
+    let mut arg_nullable = Vec::with_capacity(func_call.args.len());
     for arg in &func_call.args {
-        let t = match expr::infer_expr(
+        let (t, n) = match expr::infer_expr(
             arg,
             &arg_scope,
             &empty_null_ctx,
@@ -1408,16 +1507,18 @@ fn process_range_function(
             params,
             crate::expr::TypeGoal::NONE,
         ) {
-            Ok(e) => e.type_oid,
+            Ok(e) => (e.type_oid, e.nullable),
             // `FROM a, f(a.col)` without LATERAL — PG rejects with `invalid
             // reference to FROM-clause entry for table "a"`. The scope we
             // built above is empty precisely so this fails; don't let the
             // old `.unwrap_or(UNKNOWN)` swallow it.
             Err(e @ AnalyzeError::UndefinedColumn(_)) if !rf.lateral => return Err(e),
-            Err(_) => oid::UNKNOWN,
+            Err(_) => (oid::UNKNOWN, true),
         };
         arg_types.push(t);
+        arg_nullable.push(n);
     }
+    let any_arg_nullable = arg_nullable.iter().any(|&n| n);
 
     let (schema, name) = match func_name_parts.as_slice() {
         [n] => (None, n.as_str()),
@@ -1458,10 +1559,16 @@ fn process_range_function(
             })
             .collect()
     } else {
+        // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from
+        // their arguments — `FROM unnest(int4[] NOT NULL)` produces
+        // NOT NULL int4 elements, just like `SELECT unnest(arr)` in
+        // the projection.
+        let strict_not_null =
+            resolved.is_strict && resolved.schema == "pg_catalog" && !any_arg_nullable;
         vec![ScopeColumn {
             name: name.to_owned(),
             type_oid: resolved.return_type_oid,
-            base_not_null: false,
+            base_not_null: strict_not_null,
             table_alias: alias.to_owned(),
             record_fields: None,
         }]

@@ -337,7 +337,8 @@ fn export_tables(
     )?;
 
     let col_rows = client.query(
-        "SELECT a.attrelid, a.attname, a.atttypid, a.attnotnull, a.atthasdef \
+        "SELECT a.attrelid, a.attname, a.atttypid, a.attnotnull, a.atthasdef, \
+                a.attgenerated \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -352,11 +353,15 @@ fn export_tables(
     let mut columns_map: HashMap<u32, Vec<TableColumn>> = HashMap::new();
     for row in &col_rows {
         let relid: u32 = row.get(0);
+        // `attgenerated` is one byte: 's' for STORED, 'v' for VIRTUAL
+        // (PG18), '\0' for non-generated.
+        let attgenerated: i8 = row.get(5);
         columns_map.entry(relid).or_default().push(TableColumn {
             name: row.get(1),
             type_oid: row.get(2),
             not_null: row.get(3),
             has_default: row.get(4),
+            is_generated: attgenerated != 0,
         });
     }
 
@@ -402,7 +407,8 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
                 p.proargtypes::int4[]::int4[], p.prorettype, \
                 p.proisstrict, p.proretset, p.provariadic != 0 as is_variadic, \
                 p.prokind, \
-                p.proallargtypes::int4[], p.proargmodes, p.proargnames \
+                p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
+                p.pronargdefaults \
          FROM pg_catalog.pg_proc p \
          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname NOT IN ('pg_toast') \
@@ -443,6 +449,10 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
         // `proargmodes` is `char[]` → Vec<i8> with one byte per arg.
         let arg_modes: Option<Vec<i8>> = row.get(10);
         let arg_names: Option<Vec<String>> = row.get(11);
+        // `pronargdefaults` — count of trailing IN args with DEFAULT
+        // expressions. Lets the analyzer accept calls that omit the
+        // tail (e.g. `jsonb_set(j, p, v)` against the 4-arg signature).
+        let pronargdefaults: i16 = row.get(12);
 
         let is_aggregate = prokind as u8 as char == 'a';
         let is_window = prokind as u8 as char == 'w';
@@ -471,6 +481,7 @@ fn export_functions(client: &mut postgres::Client) -> Result<Vec<FunctionEntry>,
             is_procedure: false,
             agg_final_type_oid,
             out_args,
+            num_default_args: pronargdefaults.max(0) as u8,
         });
     }
 

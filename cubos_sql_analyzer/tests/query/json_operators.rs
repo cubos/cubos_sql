@@ -110,3 +110,102 @@ fn json_build_array_returns_json() {
     let s = db.analyze("SELECT json_build_array(1, 'a') AS x").unwrap();
     assert_cols(&s, vec![c("x", json_ty())]);
 }
+
+// ── jsonpath operators: @?, @@ ──────────────────────────────────────────────
+
+#[test]
+fn jsonb_jsonpath_exists_returns_bool() {
+    let db = setup();
+    // `@?` takes (jsonb, jsonpath) and returns bool. NOT NULL because the
+    // operator is strict on a NOT NULL `meta`.
+    let s = db
+        .analyze("SELECT meta @? '$.a'::jsonpath AS exists FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("exists", bool_ty())]);
+}
+
+#[test]
+fn jsonb_jsonpath_match_returns_bool() {
+    let db = setup();
+    // `@@` takes (jsonb, jsonpath) and returns bool.
+    let s = db
+        .analyze("SELECT meta @@ '$.a > 0'::jsonpath AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("m", bool_ty())]);
+}
+
+#[test]
+fn jsonb_jsonpath_exists_nullable_lhs_propagates() {
+    let db = setup();
+    // `prefs @? '$.a'` — strict, prefs nullable → result nullable.
+    let s = db
+        .analyze("SELECT prefs @? '$.a'::jsonpath AS exists FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("exists", bool_ty())]);
+}
+
+// ── jsonb_set / jsonb_insert ────────────────────────────────────────────────
+
+#[test]
+fn jsonb_set_returns_jsonb() {
+    let db = setup();
+    // `jsonb_set(jsonb, text[], jsonb)` — strict, NOT NULL `meta` → NOT NULL.
+    let s = db
+        .analyze("SELECT jsonb_set(meta, '{a}', '1'::jsonb) AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("m", jsonb())]);
+}
+
+#[test]
+fn jsonb_set_with_create_missing_flag() {
+    let db = setup();
+    // 4-arg form `jsonb_set(jsonb, text[], jsonb, bool)`. Same return type.
+    let s = db
+        .analyze("SELECT jsonb_set(meta, '{a}', '1'::jsonb, true) AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("m", jsonb())]);
+}
+
+#[test]
+fn jsonb_set_on_nullable_lhs() {
+    let db = setup();
+    // Nullable lhs propagates to nullable output.
+    let s = db
+        .analyze("SELECT jsonb_set(prefs, '{a}', '1'::jsonb) AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("m", jsonb())]);
+}
+
+#[test]
+fn jsonb_insert_returns_jsonb() {
+    let db = setup();
+    // `jsonb_insert(jsonb, text[], jsonb)` — strict on NOT NULL `meta`.
+    let s = db
+        .analyze("SELECT jsonb_insert(meta, '{a}', '1'::jsonb) AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("m", jsonb())]);
+}
+
+#[test]
+fn jsonb_insert_with_after_flag() {
+    let db = setup();
+    // 4-arg form with the `insert_after` boolean.
+    let s = db
+        .analyze("SELECT jsonb_insert(meta, '{a}', '1'::jsonb, true) AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("m", jsonb())]);
+}
+
+#[test]
+fn jsonb_set_lax_two_arg_defaults() {
+    let db = setup();
+    // `jsonb_set_lax` has 2 trailing default args (`create_if_missing` and
+    // `null_value_treatment`); the 3-required-arg call must resolve.
+    // PG marks `jsonb_set_lax` as non-strict, so the analyzer is allowed
+    // to keep the result nullable (a NULL new_value can yield NULL via
+    // the default `null_value_treatment = 'use_json_null'`).
+    let s = db
+        .analyze("SELECT jsonb_set_lax(meta, '{a}', '1'::jsonb) AS m FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("m", jsonb())]);
+}

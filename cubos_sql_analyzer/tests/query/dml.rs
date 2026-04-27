@@ -413,6 +413,54 @@ fn insert_on_conflict_do_update_with_excluded() {
 }
 
 #[test]
+fn insert_on_conflict_do_nothing_returning_not_null_columns() {
+    let db = setup();
+    // `ON CONFLICT DO NOTHING RETURNING` only emits a row when the INSERT
+    // actually inserts. Each returned row is a fresh INSERT, so NOT NULL
+    // columns are still NOT NULL — the analyzer should NOT promote them
+    // to nullable just because the statement might return zero rows.
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (email) DO NOTHING \
+             RETURNING id, name, email",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![c("id", int8()), c("name", text()), c("email", text())],
+    );
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+fn insert_on_conflict_do_nothing_returning_star() {
+    let db = setup();
+    // `RETURNING *` over DO NOTHING — every column has its base nullability.
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (email) DO NOTHING RETURNING *",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("id", int8()),
+            c("name", text()),
+            c("email", text()),
+            cn("age", int4()),
+            c(
+                "role",
+                enum_ty("public", "user_role", &["admin", "editor", "viewer"]),
+            ),
+            cn("preferences", domain("public", "user_prefs", jsonb())),
+            c("created_at", timestamptz()),
+        ],
+    );
+}
+
+#[test]
 fn insert_on_conflict_do_update_with_param_expression() {
     let db = setup();
     // `SET age = EXCLUDED.age + $p3` mixes a column reference with a new
@@ -506,6 +554,64 @@ fn torture_update_from_join() {
         &info,
         vec![c("id", int8()), c("title", text()), cn("body", text())],
     );
+}
+
+// ── MERGE (PG 15+) ───────────────────────────────────────────────────────────
+//
+// Marked ignored: MERGE support is not implemented in the analyzer yet.
+// These tests pin the expected shape so they can be flipped on once the
+// feature lands.
+
+#[test]
+#[ignore = "MERGE statement not yet supported"]
+fn merge_when_matched_update() {
+    let db = setup();
+    // Classic upsert via MERGE. RETURNING preserves the target table's
+    // base nullabilities — `id` and `name` NOT NULL, `age` nullable.
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id, $p2::text AS name) src \
+             ON u.id = src.id \
+             WHEN MATCHED THEN UPDATE SET name = src.name \
+             WHEN NOT MATCHED THEN INSERT (name, email) VALUES (src.name, $p3) \
+             RETURNING u.id, u.name",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+    assert_params(&s, vec![p(int8()), p(text()), p(text())]);
+}
+
+#[test]
+#[ignore = "MERGE statement not yet supported"]
+fn merge_when_not_matched_insert() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::text AS email) src \
+             ON u.email = src.email \
+             WHEN NOT MATCHED THEN INSERT (name, email) VALUES ($p2, src.email)",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+#[ignore = "MERGE statement not yet supported"]
+fn merge_when_matched_delete() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id) src \
+             ON u.id = src.id \
+             WHEN MATCHED THEN DELETE \
+             RETURNING u.id, u.name",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+    assert_params(&s, vec![p(int8())]);
 }
 
 #[test]

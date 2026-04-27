@@ -164,6 +164,7 @@ fn resolve_view_now(
                 type_oid: col.type_oid,
                 not_null: !col.nullable,
                 has_default: false,
+                is_generated: false,
             }
         })
         .collect();

@@ -109,6 +109,13 @@ pub(crate) fn resolve_function(
         return Ok(make_resolved(f));
     }
 
+    // Phase 1c: candidates with trailing DEFAULT params. PG accepts
+    // `jsonb_set(j, p, v)` against the 4-arg `jsonb_set(j, p, v, bool)`
+    // because the 4th param has a default. Match against the prefix only.
+    if let Some(f) = find_default_args_match(&candidates, arg_types, snapshot) {
+        return Ok(make_resolved(f));
+    }
+
     // Phase 2: match with implicit casts.
     if let Some(f) = find_cast_match(&candidates, arg_types, snapshot) {
         return Ok(make_resolved(f));
@@ -180,6 +187,44 @@ fn find_exact_match<'a>(
         .iter()
         .find(|f| f.arg_types == arg_types)
         .copied()
+}
+
+/// Match a candidate that takes more arguments than the call provides,
+/// where the missing trailing arguments are covered by `num_default_args`.
+/// Mirrors PG's behavior of dispatching `jsonb_set(j, p, v)` to the 4-arg
+/// signature when the 4th parameter has a default. Each prefix arg must
+/// match by exact type, UNKNOWN, or implicit cast — same compatibility
+/// rules as the cast-match phase.
+fn find_default_args_match<'a>(
+    candidates: &[&'a FunctionEntry],
+    arg_types: &[u32],
+    snapshot: &SchemaSnapshot,
+) -> Option<&'a FunctionEntry> {
+    let provided = arg_types.len();
+    let matching: Vec<&FunctionEntry> = candidates
+        .iter()
+        .filter(|f| {
+            let total = f.arg_types.len();
+            let defaults = f.num_default_args as usize;
+            // The call must supply at least the required args (total -
+            // defaults) and no more than the full signature.
+            total >= provided
+                && defaults >= total - provided
+                && f.arg_types.iter().take(provided).zip(arg_types.iter()).all(
+                    |(&expected, &actual)| {
+                        expected == actual
+                            || actual == oid::UNKNOWN
+                            || snapshot.has_implicit_cast(actual, expected)
+                    },
+                )
+        })
+        .copied()
+        .collect();
+    if matching.len() == 1 {
+        Some(matching[0])
+    } else {
+        None
+    }
 }
 
 /// Find a candidate where every parameter type either equals the caller's

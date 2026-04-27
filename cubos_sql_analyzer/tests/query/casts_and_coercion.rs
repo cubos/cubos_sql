@@ -109,3 +109,165 @@ fn cast_in_values_subquery() {
         .unwrap();
     assert_cols(&s, vec![c("x", int8())]);
 }
+
+// ── Domain → base ────────────────────────────────────────────────────────────
+
+fn setup_with_domain() -> PgCatalog {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0);
+         CREATE TABLE accounts (
+            id      BIGINT PRIMARY KEY,
+            balance positive_int NOT NULL
+         );",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn domain_cast_to_base_strips_domain_wrapper() {
+    let db = setup_with_domain();
+    // `balance::int4` peels the domain off and lands on the base type.
+    let s = db
+        .analyze("SELECT balance::int4 AS b FROM accounts")
+        .unwrap();
+    assert_cols(&s, vec![c("b", int4())]);
+}
+
+#[test]
+fn domain_select_preserves_domain_wrapper() {
+    let db = setup_with_domain();
+    // Without an explicit cast the domain wrapper survives in the output —
+    // matches PG's RowDescription, which reports the domain OID.
+    let s = db.analyze("SELECT balance FROM accounts").unwrap();
+    assert_cols(
+        &s,
+        vec![c("balance", domain("public", "positive_int", int4()))],
+    );
+}
+
+#[test]
+fn domain_implicit_arithmetic_falls_back_to_base() {
+    let db = setup_with_domain();
+    // `balance + 1` — the `+` operator is defined on the base int4, so the
+    // result is int4, not the domain. Same as PG's behavior.
+    let s = db
+        .analyze("SELECT balance + 1 AS bigger FROM accounts")
+        .unwrap();
+    assert_cols(&s, vec![c("bigger", int4())]);
+}
+
+// ── citext (extension) ↔ text ───────────────────────────────────────────────
+
+fn setup_citext() -> PgCatalog {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE EXTENSION citext;
+         CREATE TABLE users (
+            id    BIGINT PRIMARY KEY,
+            email citext NOT NULL
+         );",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn citext_column_keeps_citext_type() {
+    let db = setup_citext();
+    let s = db.analyze("SELECT email FROM users").unwrap();
+    // citext lives in `public` once the extension is created.
+    assert_cols(
+        &s,
+        vec![c("email", basic_ext("public", "citext", "citext"))],
+    );
+}
+
+#[test]
+fn cast_text_to_citext() {
+    let db = setup_citext();
+    // `'x'::citext` — bare `citext` (unqualified) resolves through search_path.
+    let s = db.analyze("SELECT 'x'::citext AS e").unwrap();
+    assert_cols(&s, vec![c("e", basic_ext("public", "citext", "citext"))]);
+}
+
+#[test]
+fn cast_citext_to_text() {
+    let db = setup_citext();
+    let s = db.analyze("SELECT email::text AS e FROM users").unwrap();
+    assert_cols(&s, vec![c("e", text())]);
+}
+
+// ── Mixed-type array literal: common-type resolution ────────────────────────
+
+#[test]
+fn array_literal_int_and_numeric_resolves_to_numeric() {
+    let db = setup();
+    // PG: ARRAY[1, 2.5] resolves the common type to numeric (int4 → numeric).
+    let s = db.analyze("SELECT ARRAY[1, 2.5] AS xs").unwrap();
+    assert_cols(&s, vec![c("xs", array_of(numeric()))]);
+}
+
+#[test]
+fn array_literal_int4_and_int8_resolves_to_int8() {
+    let db = setup();
+    // ARRAY[1, 2::int8] — int4 + int8 → int8.
+    let s = db.analyze("SELECT ARRAY[1, 2::int8] AS xs").unwrap();
+    assert_cols(&s, vec![c("xs", array_of(int8()))]);
+}
+
+#[test]
+fn array_literal_int_and_float8_resolves_to_float8() {
+    let db = setup();
+    let s = db.analyze("SELECT ARRAY[1, 2::float8] AS xs").unwrap();
+    assert_cols(&s, vec![c("xs", array_of(float8()))]);
+}
+
+#[test]
+fn array_literal_incompatible_types_rejected() {
+    let db = setup();
+    // PG: `ARRAY types text and integer cannot be matched` — once a
+    // concrete type pins the element category, the analyzer must reject
+    // siblings that don't fit. Note: bare `'x'` (unknown) + `1` is fine
+    // both in PG and here (PG defers to runtime); the test below uses
+    // explicit `'x'::text` to force a real type clash at parse time.
+    assert_analyze_err!(
+        db.analyze("SELECT ARRAY['x'::text, 1]"),
+        AnalyzeError::TypeMismatch { .. },
+        "ARRAY types",
+    );
+}
+
+#[test]
+fn array_literal_bool_and_int_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT ARRAY[true, 1]"),
+        AnalyzeError::TypeMismatch { .. },
+        "ARRAY types",
+    );
+}
+
+#[test]
+fn array_literal_unknown_and_int_accepted_like_pg() {
+    let db = setup();
+    // `'x'` is an *unknown* literal; PG defers the cast to runtime and
+    // happily lands the array on `int4[]`. The analyzer mirrors that —
+    // we don't flag a type error here because PG itself doesn't.
+    let s = db.analyze("SELECT ARRAY['x', 1] AS xs").unwrap();
+    assert_cols(&s, vec![c("xs", array_of(int4()))]);
+}
+
+// ── Domain preservation through ::base round-trip ───────────────────────────
+
+#[test]
+fn domain_cast_to_base_then_back_returns_base() {
+    let db = setup_with_domain();
+    // `(balance::int4)` strips the domain. There's no implicit way back —
+    // the analyzer should not silently reattach the domain wrapper.
+    let s = db
+        .analyze("SELECT (balance::int4) AS b FROM accounts")
+        .unwrap();
+    assert_cols(&s, vec![c("b", int4())]);
+}

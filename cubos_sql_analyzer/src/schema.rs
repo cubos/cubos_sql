@@ -203,6 +203,10 @@ pub struct TableColumn {
     pub type_oid: u32,
     pub not_null: bool,
     pub has_default: bool,
+    /// `GENERATED ALWAYS AS (...) STORED` columns reject any value other
+    /// than `DEFAULT` in INSERT/UPDATE. Mirrors PG `pg_attribute.attgenerated`.
+    #[serde(default)]
+    pub is_generated: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -241,6 +245,21 @@ pub struct FunctionEntry {
     /// carries the real named columns PG would expand into at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_args: Vec<CompositeField>,
+
+    /// Number of trailing parameters that have a `DEFAULT` in PG (mirrors
+    /// `pg_proc.pronargdefaults`). When > 0, the function can be called
+    /// with fewer arguments than `arg_types.len()` — the missing
+    /// trailing args are filled by PG's default expressions. The
+    /// analyzer doesn't evaluate the defaults but it must accept the
+    /// shorter call form so overload resolution doesn't reject e.g.
+    /// `jsonb_set(jsonb, text[], jsonb)` (3 args), which PG dispatches
+    /// to the 4-arg signature with `create_if_missing := true`.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub num_default_args: u8,
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

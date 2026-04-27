@@ -420,6 +420,35 @@ pub(crate) fn infer_expr(
                 false,
             ))
         }
+        node::Node::CollateClause(c) => {
+            // `expr COLLATE "x"` is metadata-only — it changes how the
+            // surrounding operator compares strings, not the result type or
+            // nullability. Forward the goal so a `$param COLLATE "x"`
+            // placeholder still picks up its expected type.
+            let arg = c
+                .arg
+                .as_ref()
+                .ok_or_else(|| AnalyzeError::Internal("CollateClause without arg".into()))?;
+            let result = infer_expr(arg, scope, null_ctx, snapshot, params, goal)?;
+            // PG rejects `COLLATE` on non-string-category types with
+            // `collations are not supported by type X`. Accept UNKNOWN
+            // (untyped literal/param) — the parser already coerces it
+            // through the surrounding goal.
+            if result.type_oid != oid::UNKNOWN {
+                let base = snapshot.unwrap_domain(result.type_oid);
+                let category = snapshot.get_type(base).map(|t| t.category).unwrap_or('U');
+                if category != 'S' {
+                    let type_name = snapshot
+                        .get_type(base)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_else(|| format!("oid {base}"));
+                    return Err(AnalyzeError::Invalid(format!(
+                        "collations are not supported by type {type_name}"
+                    )));
+                }
+            }
+            return Ok(result);
+        }
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)
@@ -894,7 +923,39 @@ fn infer_array_expr(
         element_types.push(t.type_oid);
         any_nullable |= t.nullable;
     }
-    let common = coerce::find_common_type(&element_types, snapshot).unwrap_or(oid::UNKNOWN);
+    let common = match coerce::find_common_type(&element_types, snapshot) {
+        Some(t) => t,
+        None => {
+            // PG: `ARRAY types <X> and <Y> cannot be matched`. Use the
+            // first two distinct concrete types in the message so the
+            // diagnostic is stable regardless of ordering tie-breaks.
+            let mut concrete: Vec<u32> = element_types
+                .iter()
+                .copied()
+                .filter(|&t| t != oid::UNKNOWN)
+                .collect();
+            concrete.dedup();
+            let names: Vec<String> = concrete
+                .iter()
+                .take(2)
+                .map(|&t| {
+                    snapshot
+                        .get_type(t)
+                        .map(|te| te.name.clone())
+                        .unwrap_or_else(|| format!("oid {t}"))
+                })
+                .collect();
+            return Err(AnalyzeError::TypeMismatch {
+                actual: names.first().cloned().unwrap_or_default(),
+                expected: names.get(1).cloned().unwrap_or_default(),
+                context: format!(
+                    "ARRAY types {} and {} cannot be matched",
+                    names.first().map(String::as_str).unwrap_or("?"),
+                    names.get(1).map(String::as_str).unwrap_or("?"),
+                ),
+            });
+        }
+    };
     let array_oid = snapshot.array_type_of(common).unwrap_or(oid::UNKNOWN);
     // An ARRAY[...] constructor is never NULL itself — it's always at least
     // an empty array. Element nullability is tracked separately by Rust's

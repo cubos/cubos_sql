@@ -156,3 +156,131 @@ fn non_recursive_cte_with_column_aliases() {
         .unwrap();
     assert_cols(&s, vec![c("renamed", text())]);
 }
+
+// ── SEARCH BREADTH/DEPTH FIRST BY … SET … ───────────────────────────────────
+//
+// Adds a synthetic ordering column populated by PG. Result type:
+// BREADTH FIRST → record(int8, array_of_keys) packed into the SET column.
+// DEPTH FIRST   → similar, with a different shape.
+// PG materializes the SET column with type `text` for label-only callers.
+// These tests pin behavior against PG; they're ignored until the analyzer
+// learns to register the SET column.
+
+#[test]
+fn recursive_search_breadth_first_registers_path_column() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH RECURSIVE tree(id, parent_id) AS ( \
+                SELECT id, parent_id FROM categories WHERE parent_id IS NULL \
+                UNION ALL \
+                SELECT c.id, c.parent_id \
+                FROM categories c JOIN tree t ON c.parent_id = t.id \
+             ) SEARCH BREADTH FIRST BY id SET ord \
+             SELECT id, parent_id, ord FROM tree",
+        )
+        .unwrap();
+    // PG: `ord` is the synthetic path/order column registered by SEARCH.
+    // It surfaces as a non-null array type (records of (depth, id)).
+    assert_eq!(
+        s.columns
+            .iter()
+            .find(|c| c.name == "ord")
+            .map(|c| c.nullable),
+        Some(false)
+    );
+}
+
+#[test]
+fn recursive_search_depth_first_registers_path_column() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH RECURSIVE tree(id, parent_id) AS ( \
+                SELECT id, parent_id FROM categories WHERE parent_id IS NULL \
+                UNION ALL \
+                SELECT c.id, c.parent_id \
+                FROM categories c JOIN tree t ON c.parent_id = t.id \
+             ) SEARCH DEPTH FIRST BY id SET ord \
+             SELECT id, parent_id, ord FROM tree",
+        )
+        .unwrap();
+    assert_eq!(
+        s.columns
+            .iter()
+            .find(|c| c.name == "ord")
+            .map(|c| c.nullable),
+        Some(false)
+    );
+}
+
+// ── CYCLE … SET … USING … ───────────────────────────────────────────────────
+//
+// Adds two synthetic columns: an `is_cycle` bool and a `path` array.
+// Without analyzer support these references will fail.
+
+#[test]
+fn recursive_cycle_clause_registers_columns() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH RECURSIVE tree(id, parent_id) AS ( \
+                SELECT id, parent_id FROM categories WHERE parent_id IS NULL \
+                UNION ALL \
+                SELECT c.id, c.parent_id \
+                FROM categories c JOIN tree t ON c.parent_id = t.id \
+             ) CYCLE id SET is_cycle USING path \
+             SELECT id, is_cycle, path FROM tree",
+        )
+        .unwrap();
+    // PG: `is_cycle bool NOT NULL`, `path` array of records — NOT NULL.
+    assert_eq!(
+        s.columns
+            .iter()
+            .find(|c| c.name == "is_cycle")
+            .map(|c| (c.pg_type.clone(), c.nullable)),
+        Some((bool_ty(), false)),
+    );
+}
+
+#[test]
+fn recursive_cycle_clause_with_explicit_mark_values() {
+    let db = setup();
+    // `CYCLE k SET mark TO 'Y' DEFAULT 'N'` — the mark column type is
+    // inferred from the literal. Both `mark` and `path` are NOT NULL.
+    let s = db
+        .analyze(
+            "WITH RECURSIVE tree(id, parent_id) AS ( \
+                SELECT id, parent_id FROM categories WHERE parent_id IS NULL \
+                UNION ALL \
+                SELECT c.id, c.parent_id \
+                FROM categories c JOIN tree t ON c.parent_id = t.id \
+             ) CYCLE id SET mark TO 'Y' DEFAULT 'N' USING path \
+             SELECT id, mark FROM tree",
+        )
+        .unwrap();
+    // The mark column is NOT NULL; we don't pin the exact type because
+    // pg_query reports the inferred type via cycle_mark_type, which
+    // depends on the literals — the important assertions are name+nullability.
+    let mark = s.columns.iter().find(|c| c.name == "mark").unwrap();
+    assert!(!mark.nullable);
+}
+
+#[test]
+fn recursive_search_breadth_first_with_other_columns_intact() {
+    let db = setup();
+    // SEARCH must not disturb the user-declared columns (`id`, `parent_id`):
+    // they keep their pre-search types and nullability.
+    let s = db
+        .analyze(
+            "WITH RECURSIVE tree(id, parent_id) AS ( \
+                SELECT id, parent_id FROM categories WHERE parent_id IS NULL \
+                UNION ALL \
+                SELECT c.id, c.parent_id \
+                FROM categories c JOIN tree t ON c.parent_id = t.id \
+             ) SEARCH BREADTH FIRST BY id SET ord \
+             SELECT id, parent_id FROM tree",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), cn("parent_id", int8())]);
+}

@@ -176,6 +176,7 @@ fn parse_column_def(
 
     let mut not_null = cd.is_not_null;
     let mut has_default = cd.raw_default.is_some() || cd.cooked_default.is_some();
+    let mut is_generated = false;
 
     // SERIAL/BIGSERIAL/SMALLSERIAL imply has_default (auto-sequence).
     if is_serial {
@@ -188,9 +189,12 @@ fn parse_column_def(
         not_null = true;
     }
 
-    // Check GENERATED.
+    // Check GENERATED. `cd.generated` is "s" for STORED on PG14+ and
+    // empty for non-generated columns; non-empty means this column is
+    // computed and rejects user-supplied values.
     if !cd.generated.is_empty() {
         has_default = true;
+        is_generated = true;
     }
 
     // Check column-level constraints.
@@ -210,6 +214,7 @@ fn parse_column_def(
                 }
                 Ok(ConstrType::ConstrGenerated) => {
                     has_default = true;
+                    is_generated = true;
                 }
                 _ => {}
             }
@@ -226,6 +231,7 @@ fn parse_column_def(
         type_oid,
         not_null,
         has_default,
+        is_generated,
     })
 }
 

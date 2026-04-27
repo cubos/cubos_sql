@@ -135,3 +135,57 @@ fn array_agg_with_filter_and_order_by() {
         .unwrap();
     assert_cols(&s, vec![cn("top", array_of(text()))]);
 }
+
+// ── WITHIN GROUP — ordered-set aggregates ────────────────────────────────────
+//
+// These currently fail overload resolution in the analyzer. Mark as ignored
+// until the WITHIN GROUP path lands. Each test states the type PG would
+// return so the assertion can be flipped on once the feature works.
+
+#[test]
+#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
+fn percentile_cont_returns_float8() {
+    let db = setup();
+    // PG: percentile_cont(0.5) WITHIN GROUP (ORDER BY int) -> float8.
+    // Result is nullable: WITHIN GROUP yields NULL for empty input.
+    let s = db
+        .analyze("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY views) AS median FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("median", float8())]);
+}
+
+#[test]
+#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
+fn percentile_disc_returns_input_type() {
+    let db = setup();
+    // PG: percentile_disc(numeric) WITHIN GROUP (ORDER BY int) -> int4.
+    let s = db
+        .analyze("SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY views) AS p50 FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("p50", int4())]);
+}
+
+#[test]
+#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
+fn mode_returns_input_type() {
+    let db = setup();
+    // PG: mode() WITHIN GROUP (ORDER BY text) -> text.
+    let s = db
+        .analyze("SELECT mode() WITHIN GROUP (ORDER BY title) AS top_title FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![cn("top_title", text())]);
+}
+
+#[test]
+#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
+fn percentile_cont_array_form_returns_float8_array() {
+    let db = setup();
+    // PG: percentile_cont(numeric[]) WITHIN GROUP (ORDER BY int) -> float8[].
+    let s = db
+        .analyze(
+            "SELECT percentile_cont(ARRAY[0.25, 0.5, 0.75]) \
+                 WITHIN GROUP (ORDER BY views) AS quartiles FROM posts",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("quartiles", array_of(float8()))]);
+}

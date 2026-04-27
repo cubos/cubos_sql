@@ -303,6 +303,109 @@ fn builtin_type_aliases_resolve_to_canonical_oid() {
     assert_eq!(table.columns[6].type_oid, text_oid, "text -> text");
 }
 
+// ── Generated columns (GENERATED ALWAYS AS (expr) STORED) ──────────────────
+
+fn setup_generated() -> PgCatalog {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE invoices (
+            id        BIGINT PRIMARY KEY,
+            net       NUMERIC(12,2) NOT NULL,
+            tax_rate  NUMERIC(4,3)  NOT NULL,
+            gross     NUMERIC(12,2) GENERATED ALWAYS AS (net * (1 + tax_rate)) STORED
+         );",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn generated_column_select_uses_declared_type() {
+    let db = setup_generated();
+    // The declared type wins over the expression type.
+    let s = db.analyze("SELECT gross FROM invoices").unwrap();
+    assert_cols(&s, vec![cn("gross", numeric())]);
+}
+
+#[test]
+fn insert_into_generated_column_rejected() {
+    let db = setup_generated();
+    // PG: `cannot insert a non-DEFAULT value into column "gross"`. The
+    // analyzer should reject this statically — the column is generated,
+    // and accepting a $p1 value here would mask a real bug.
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO invoices (id, net, tax_rate, gross) \
+             VALUES ($p1, $p2, $p3, $p4)",
+        ),
+        AnalyzeError::Invalid(_),
+        "generated",
+    );
+}
+
+#[test]
+fn update_generated_column_rejected() {
+    let db = setup_generated();
+    // PG: `column "gross" can only be updated to DEFAULT`.
+    assert_analyze_err!(
+        db.analyze("UPDATE invoices SET gross = $p1 WHERE id = $p2"),
+        AnalyzeError::Invalid(_),
+        "generated",
+    );
+}
+
+#[test]
+fn insert_into_generated_column_with_literal_rejected() {
+    let db = setup_generated();
+    // Even a NUMERIC literal cannot be assigned to a generated column.
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO invoices (id, net, tax_rate, gross) \
+             VALUES ($p1, $p2, $p3, 42.0)",
+        ),
+        AnalyzeError::Invalid(_),
+        "generated",
+    );
+}
+
+#[test]
+fn update_generated_column_to_default_accepted() {
+    let db = setup_generated();
+    // PG accepts `UPDATE … SET gen_col = DEFAULT` (resets the computed value).
+    let s = db
+        .analyze("UPDATE invoices SET gross = DEFAULT WHERE id = $p1 RETURNING gross")
+        .unwrap();
+    assert_cols(&s, vec![cn("gross", numeric())]);
+}
+
+#[test]
+fn insert_into_generated_column_with_default_keyword_accepted() {
+    let db = setup_generated();
+    // `DEFAULT` is the only value PG accepts for a generated column. The
+    // analyzer must not reject this case.
+    let s = db
+        .analyze(
+            "INSERT INTO invoices (id, net, tax_rate, gross) \
+             VALUES ($p1, $p2, $p3, DEFAULT) RETURNING gross",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("gross", numeric())]);
+}
+
+#[test]
+fn insert_skipping_generated_column_accepted() {
+    let db = setup_generated();
+    // The standard pattern: just leave the generated column out of the
+    // column list. PG fills it in itself.
+    let s = db
+        .analyze(
+            "INSERT INTO invoices (id, net, tax_rate) \
+             VALUES ($p1, $p2, $p3) RETURNING gross",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("gross", numeric())]);
+}
+
 #[test]
 fn schema_qualified_domain_param() {
     let db = setup_user_types();

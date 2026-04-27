@@ -345,3 +345,107 @@ fn complex_mixed_computed_and_direct_cols() {
         ],
     );
 }
+
+// ── TABLESAMPLE ─────────────────────────────────────────────────────────────
+//
+// `TABLESAMPLE BERNOULLI(p)` / `TABLESAMPLE SYSTEM(p)` is a FROM-clause
+// modifier — it doesn't change the projected columns or their nullability.
+// PG accepts it; the analyzer should too.
+
+#[test]
+fn tablesample_bernoulli_preserves_columns() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id, name FROM users TABLESAMPLE BERNOULLI(50)")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+}
+
+#[test]
+fn tablesample_system_with_repeatable() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users TABLESAMPLE SYSTEM(10) REPEATABLE(42)")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn tablesample_with_alias_preserves_columns() {
+    let db = setup();
+    // Per PG syntax the alias goes on the relation, then TABLESAMPLE.
+    let s = db
+        .analyze("SELECT u.id, u.name FROM users AS u TABLESAMPLE BERNOULLI(50)")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+}
+
+#[test]
+fn tablesample_with_join_resolves_other_table() {
+    let db = setup();
+    // TABLESAMPLE on one side of a join doesn't affect the other side.
+    let s = db
+        .analyze(
+            "SELECT u.id, p.title \
+             FROM users AS u TABLESAMPLE BERNOULLI(10) \
+             JOIN posts p ON p.user_id = u.id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("title", text())]);
+}
+
+// ── FOR UPDATE / FOR SHARE ──────────────────────────────────────────────────
+//
+// Locking clauses don't affect the row shape — projections come back
+// exactly the same. The analyzer must accept them and not reject the
+// query.
+
+#[test]
+fn select_for_update_preserves_columns() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id, name FROM users WHERE id = $p1 FOR UPDATE")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+    assert_params(&s, vec![p(int8())]);
+}
+
+#[test]
+fn select_for_share_preserves_columns() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE id = $p1 FOR SHARE")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn select_for_update_skip_locked() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE id = $p1 FOR UPDATE SKIP LOCKED")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn select_for_update_nowait() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE id = $p1 FOR UPDATE NOWAIT")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn select_for_update_of_specific_table() {
+    let db = setup();
+    // `FOR UPDATE OF u` — only locks the named table in a join.
+    let s = db
+        .analyze(
+            "SELECT u.id, p.title FROM users u JOIN posts p ON p.user_id = u.id \
+             FOR UPDATE OF u",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("title", text())]);
+}

@@ -423,12 +423,17 @@ fn lateral_unnest_correlated_array_built_from_outer_column() {
     // scope wiring for RangeFunction args, `u.name` would resolve to
     // UNKNOWN and `unnest` would pick the wrong polymorphic overload
     // (`anymultirange -> anyrange`).
+    //
+    // Both elements (`u.name` text NOT NULL + the literal `'extra'`) are
+    // non-null, so the unnested column inherits NOT NULL — the analyzer
+    // is allowed to be more precise than PG's RowDescription, which
+    // would conservatively report nullable.
     let sql = "SELECT u.id, t.tag \
                FROM users u, LATERAL unnest(ARRAY[u.name, 'extra']) AS t(tag)";
     let info = db.analyze(sql).unwrap();
     assert_eq!(col(&info, "id").pg_type, int8());
     assert_eq!(col(&info, "tag").pg_type, text());
-    assert!(col(&info, "tag").nullable);
+    assert!(!col(&info, "tag").nullable);
 }
 
 // ── Nested LATERAL ───────────────────────────────────────────────────────────
@@ -450,15 +455,18 @@ fn nested_lateral_inner_sees_outermost_scope() {
 // ── Plain (non-LATERAL) FROM does NOT inherit scope ──────────────────────────
 
 #[test]
-fn non_lateral_srf_cannot_see_outer_scope() {
+fn function_in_from_can_see_outer_scope_implicitly() {
     let db = setup();
-    // `FROM users u, generate_series(1, u.id) g(n)` without LATERAL must
-    // fail — PG `invalid reference to FROM-clause entry for table "u"`.
-    assert_analyze_err!(
-        db.analyze("SELECT u.id, g.n FROM users u, generate_series(1, u.id) g(n)"),
-        AnalyzeError::UndefinedColumn(_),
-        "u.id",
-    );
+    // PG: `LATERAL` is a noise word in front of a function-call FROM item —
+    // the args can reference earlier FROM items either way. So
+    // `FROM users u, generate_series(1, u.id) g(n)` resolves cleanly even
+    // without an explicit `LATERAL` keyword. Since `u.id` is int8, PG
+    // picks the `generate_series(int8, int8) -> int8` overload.
+    let info = db
+        .analyze("SELECT u.id, g.n FROM users u, generate_series(1, u.id) g(n)")
+        .unwrap();
+    assert_eq!(col(&info, "id").pg_type, int8());
+    assert_eq!(col(&info, "n").pg_type, int8());
 }
 
 #[test]
