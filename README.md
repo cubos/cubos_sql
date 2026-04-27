@@ -341,6 +341,55 @@ sql!(pool, "UPDATE profiles SET preferences = $prefs WHERE user_id = $id", prefs
 
 Non-JSONB domains (e.g. `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)`) are transparently unwrapped to their base type.
 
+## PostgreSQL extensions
+
+`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, `vector` (pgvector), and the rest of the contrib bundle all work without extra setup.
+
+For pgvector specifically, the macro auto-routes `vector` / `halfvec` / `sparsevec` columns to the [`pgvector`](https://docs.rs/pgvector) crate:
+
+```sql
+CREATE EXTENSION vector;
+
+CREATE TABLE documents (
+    id        SERIAL PRIMARY KEY,
+    title     TEXT NOT NULL,
+    embedding vector(384) NOT NULL
+);
+```
+
+```rust
+use pgvector::Vector;
+
+// Top-5 nearest neighbours by cosine distance.
+let query: Vector = embed("how do I write a CTE?");
+
+let similar = sql!(pool,
+    "SELECT id, title, embedding <=> $query AS distance
+     FROM documents
+     ORDER BY embedding <=> $query
+     LIMIT $k",
+    k = 5_i64)
+    .fetch_all().await?;
+
+for doc in &similar {
+    // doc.id      : i32
+    // doc.title   : String
+    // doc.distance: f64               (`<=>` returns float8)
+    // $query was inferred as pgvector::Vector from the operator's left operand
+    println!("{}: {:.3}", doc.title, doc.distance);
+}
+```
+
+The analyzer knows the `<=>`, `<->`, and `<#>` operators (and the matching index ops), so wrong operand types are caught at compile time just like for built-in types.
+
+For extension types without a built-in mapping (e.g. `citext`, `hstore`), point them at the Rust type in `Cargo.toml`:
+
+```toml
+[package.metadata.cubos_sql.types]
+"public.citext" = "String"
+"public.hstore" = "::std::collections::HashMap<String, Option<String>>"
+```
+
 ## Transactions
 
 Pass a transaction directly to `sql!`:
@@ -456,6 +505,16 @@ The `sql!` macro performs **fully static analysis** at compile time:
 Everything runs in-process during `cargo build`. No external dependencies, fast builds, fully reproducible.
 
 Extensions are supported via built-in SQL definitions that the DDL interpreter processes automatically when it sees `CREATE EXTENSION`.
+
+## Known limitations
+
+The analyzer covers the vast majority of `SELECT` / `INSERT` / `UPDATE` / `DELETE` syntax, but a handful of constructs aren't recognized yet. Queries using these will fail at the `sql!` stage:
+
+- **`MERGE`** — the statement isn't parsed yet.
+- **`GROUPING SETS` / `ROLLUP` / `CUBE`** — including the `GROUPING()` function. Workaround: `UNION ALL` over multiple `GROUP BY` queries.
+- **Ordered-set aggregates** (`WITHIN GROUP (ORDER BY ...)`) — `percentile_cont`, `percentile_disc`, `mode`.
+- **Multi-dimensional arrays** — `INT[][]` columns are accepted by `CREATE TABLE` but typed as text; chained subscripts (`arr[i][j]`) also drop the array type after the first index.
+- **`unnest(arr1, arr2, …)`** — the multi-array overload that aligns elements column-wise.
 
 ## Requirements
 
