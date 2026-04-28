@@ -411,6 +411,45 @@ fn generated_stored_column_has_default() {
     );
 }
 
+// ── pg_proc.provolatile not modeled — VOLATILE in CHECK / generated cols ───
+//
+// PG forbids VOLATILE functions (random(), now() in some forms, nextval())
+// from CHECK constraints and from `GENERATED … STORED` expressions —
+// otherwise the constraint or generated value could change between rows.
+// Without `provolatile` the analyzer can't enforce this.
+
+#[test]
+#[ignore = "pg_proc.provolatile not modeled — VOLATILE function in CHECK constraint is not rejected"]
+fn volatile_function_in_check_constraint_should_error() {
+    // PG: `cannot use volatile function "random" in check constraint`.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL CHECK (id < (random() * 100)::int));",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "volatile function",
+    );
+}
+
+#[test]
+#[ignore = "pg_proc.provolatile not modeled — VOLATILE function in generated column is not rejected"]
+fn volatile_function_in_generated_stored_column_should_error() {
+    // PG: `generation expression is not immutable`. The expression must be
+    // pure of the row's own columns.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id INT NOT NULL,
+                noise NUMERIC GENERATED ALWAYS AS (random() * id) STORED
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "not immutable",
+    );
+}
+
 // ── Param inference after DDL (GROUP BY / HAVING context) ───────────────────
 
 #[test]

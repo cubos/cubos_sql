@@ -42,6 +42,8 @@ mod views;
 // ── Coverage gaps (empty; populate as features get covered) ──────────────────
 #[path = "ddl/indexes.rs"]
 mod indexes;
+#[path = "ddl/inheritance.rs"]
+mod inheritance;
 #[path = "ddl/sequences.rs"]
 mod sequences;
 #[path = "ddl/triggers.rs"]

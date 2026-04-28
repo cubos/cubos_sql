@@ -1,11 +1,8 @@
 //! Array operations: constructor, element access, slicing, length /
 //! cardinality, concatenation, `ANY`/`ALL` on arrays, `unnest` in the
-//! projection, `array_position` / `array_length` return types.
-//!
-//! Known gaps (not covered here — produce `Unsupported`/`UndefinedColumn`
-//! today): `unnest(arr)` used as a relation in `FROM` (the resulting column
-//! is not bound by name). These should move out of this file's ignore list
-//! as the analyzer learns them.
+//! projection (including the multi-array variadic form in `FROM`),
+//! `array_position` / `array_length` return types, and multi-dimensional
+//! array constructors / chained subscripts.
 
 use crate::common::*;
 
@@ -226,7 +223,6 @@ fn array_slice_open_upper_bound() {
 // ── Multi-dimensional arrays ────────────────────────────────────────────────
 
 #[test]
-#[ignore = "multi-dim arrays declared as `INT[][]` are typed as text in DDL — open bug"]
 fn multi_dim_array_constructor() {
     let mut db = PgCatalog::new();
     db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
@@ -241,7 +237,6 @@ fn multi_dim_array_constructor() {
 }
 
 #[test]
-#[ignore = "subscripting twice on a multi-dim array drops the array type after the first index"]
 fn multi_dim_subscript_two_levels() {
     let mut db = PgCatalog::new();
     db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
@@ -249,6 +244,64 @@ fn multi_dim_subscript_two_levels() {
     // `grid[1][2]` projects an int4. Always nullable (out-of-bounds → NULL).
     let s = db.analyze("SELECT grid[1][2] AS cell FROM m").unwrap();
     assert_cols(&s, vec![cn("cell", int4())]);
+}
+
+#[test]
+fn three_dim_array_constructor() {
+    let db = setup();
+    // Triple-nested array literal still collapses to the same array OID.
+    let s = db
+        .analyze("SELECT ARRAY[ARRAY[ARRAY[1, 2], ARRAY[3, 4]]] AS cube")
+        .unwrap();
+    assert_cols(&s, vec![c("cube", array_of(int4()))]);
+}
+
+#[test]
+fn multi_dim_subscript_three_levels() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE c (id BIGINT PRIMARY KEY, cube INT[][][] NOT NULL);")
+        .unwrap();
+    // Three consecutive subscripts on a 3-dim array reduce all the way down
+    // to the element type.
+    let s = db.analyze("SELECT cube[1][2][3] AS cell FROM c").unwrap();
+    assert_cols(&s, vec![cn("cell", int4())]);
+}
+
+#[test]
+fn multi_dim_subscript_intermediate_keeps_array() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
+        .unwrap();
+    // PG does not actually track the declared dimensions in the type system —
+    // any number of subscripts on an array is accepted, with the next-but-last
+    // result still typed as the array.  `grid[1]` here keeps the array type
+    // because the analyzer cannot know without runtime data whether the row
+    // really has 2 dimensions.
+    let s = db.analyze("SELECT grid[1] AS row1 FROM m").unwrap();
+    assert_cols(&s, vec![cn("row1", int4())]);
+}
+
+#[test]
+fn multi_dim_array_text_constructor() {
+    let db = setup();
+    // Same collapsing rule for non-numeric element types.
+    let s = db
+        .analyze("SELECT ARRAY[ARRAY['a','b'], ARRAY['c','d']]::text[] AS m")
+        .unwrap();
+    assert_cols(&s, vec![c("m", array_of(text()))]);
+}
+
+#[test]
+fn multi_dim_subscript_then_field_chain() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TYPE pt AS (x INT, y INT);").unwrap();
+    db.apply_sql("CREATE TABLE board (id BIGINT PRIMARY KEY, cells pt[][] NOT NULL);")
+        .unwrap();
+    // After two subscripts we land on a composite; `.x` walks the field.
+    let s = db
+        .analyze("SELECT (cells[1][2]).x AS cx FROM board")
+        .unwrap();
+    assert_cols(&s, vec![cn("cx", int4())]);
 }
 
 // ── unnest in FROM ──────────────────────────────────────────────────────────
@@ -265,7 +318,6 @@ fn unnest_in_from_clause_aliased_column() {
 }
 
 #[test]
-#[ignore = "multi-array unnest(arr1, arr2) overload not registered"]
 fn unnest_in_from_two_arrays_aligned() {
     let db = setup();
     // `unnest(arr1, arr2)` — multi-array form expands into one column per arg.
@@ -298,4 +350,63 @@ fn unnest_of_text_column_in_from() {
         .analyze("SELECT u.id, t.tag FROM users u, unnest(u.tags) AS t(tag)")
         .unwrap();
     assert_cols(&s, vec![c("id", int8()), cn("tag", text())]);
+}
+
+#[test]
+fn unnest_in_from_three_arrays_aligned() {
+    let db = setup();
+    // The multi-array form generalises to any arity.
+    let s = db
+        .analyze(
+            "SELECT t.a, t.b, t.c FROM unnest(\
+                ARRAY[1, 2], \
+                ARRAY['x'::text, 'y'], \
+                ARRAY[true, false]\
+             ) AS t(a, b, c)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), c("b", text()), c("c", bool_ty())]);
+}
+
+#[test]
+fn unnest_in_from_two_arrays_with_ordinality() {
+    let db = setup();
+    // ORDINALITY adds a single trailing int8 column shared across all unnested
+    // input arrays — not one per input.
+    let s = db
+        .analyze(
+            "SELECT t.a, t.b, t.ord \
+             FROM unnest(ARRAY[1, 2], ARRAY['x'::text, 'y']) WITH ORDINALITY AS t(a, b, ord)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), c("b", text()), c("ord", int8())]);
+}
+
+#[test]
+fn unnest_in_from_two_columns_lateral() {
+    let db = setup();
+    // `unnest(u.tags, u.nums)` — both columns from the same outer row are
+    // visible thanks to implicit LATERAL on function-call FROM items.
+    // `u.nums` is NOT NULL → column `n` stays NOT NULL; `u.tags` is nullable
+    // → column `t` is nullable.
+    let s = db
+        .analyze(
+            "SELECT u.id, x.t, x.n \
+             FROM users u, unnest(u.tags, u.nums) AS x(t, n)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), cn("t", text()), c("n", int4())]);
+}
+
+#[test]
+fn unnest_in_from_multi_arg_non_array_errors() {
+    let db = setup();
+    // A scalar argument to multi-arg unnest must surface as a clear error,
+    // not silently produce a column of unknown type.
+    let r = db.analyze("SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)");
+    assert!(
+        r.is_err(),
+        "expected unnest with a non-array argument to error, got {:?}",
+        r
+    );
 }

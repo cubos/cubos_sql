@@ -407,6 +407,47 @@ fn insert_skipping_generated_column_accepted() {
     assert_cols(&s, vec![cn("gross", numeric())]);
 }
 
+// ── Domain with NOT NULL — `pg_type.typnotnull` is not modeled ─────────────
+//
+// In PG, `CREATE DOMAIN d AS int NOT NULL` makes every column of type `d`
+// non-nullable, even when the column is declared without an explicit `NOT
+// NULL`. The catalog mirror in `pg_catalog.rs` (PgType) doesn't carry
+// `typnotnull`, so the analyzer can't propagate that constraint — the
+// column comes back as nullable.
+
+#[test]
+#[ignore = "pg_type.typnotnull is not modeled — domain NOT NULL is dropped on column inheritance"]
+fn domain_not_null_propagates_to_column_nullability() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE DOMAIN nn_int AS INT NOT NULL;
+         CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",
+    )
+    .unwrap();
+    // PG: `x` is NOT NULL (domain forbids nulls), regardless of column-level
+    // declaration. The analyzer surfaces it as nullable today.
+    let s = db.analyze("SELECT x FROM t").unwrap();
+    assert_cols(&s, vec![c("x", domain("public", "nn_int", int4()))]);
+}
+
+#[test]
+#[ignore = "pg_type.typnotnull is not modeled — INSERT NULL into nn_int column is not rejected"]
+fn insert_null_into_nn_domain_column_is_rejected() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE DOMAIN nn_int AS INT NOT NULL;
+         CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",
+    )
+    .unwrap();
+    // PG: `domain nn_int does not allow null values`. The analyzer should
+    // statically reject this — it knows `x` has a domain that bans NULLs.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t (id, x) VALUES ($p1, NULL)"),
+        AnalyzeError::Invalid(_),
+        "domain nn_int does not allow null",
+    );
+}
+
 #[test]
 fn schema_qualified_domain_param() {
     let db = setup_user_types();

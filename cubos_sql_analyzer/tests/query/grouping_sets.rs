@@ -22,7 +22,6 @@ fn setup() -> PgCatalog {
 // ── GROUPING SETS ───────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GROUPING SETS not yet supported"]
 fn grouping_sets_promotes_omitted_columns_to_nullable() {
     let db = setup();
     // Two grouping sets: one groups by `region`, the other groups by
@@ -38,7 +37,6 @@ fn grouping_sets_promotes_omitted_columns_to_nullable() {
 }
 
 #[test]
-#[ignore = "GROUPING SETS not yet supported"]
 fn grouping_sets_explicit_two_sets() {
     let db = setup();
     // GROUP BY GROUPING SETS ((region), (product)) — both columns become
@@ -58,7 +56,6 @@ fn grouping_sets_explicit_two_sets() {
 // ── ROLLUP / CUBE ───────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "ROLLUP not yet supported"]
 fn rollup_makes_grouped_columns_nullable() {
     let db = setup();
     let s = db
@@ -78,7 +75,6 @@ fn rollup_makes_grouped_columns_nullable() {
 }
 
 #[test]
-#[ignore = "CUBE not yet supported"]
 fn cube_makes_grouped_columns_nullable() {
     let db = setup();
     let s = db
@@ -96,7 +92,6 @@ fn cube_makes_grouped_columns_nullable() {
 // ── GROUPING() function ─────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "GROUPING() function not yet supported"]
 fn grouping_function_returns_int4_not_null() {
     let db = setup();
     // `GROUPING(col)` returns int4 marking whether `col` is part of the
@@ -116,7 +111,6 @@ fn grouping_function_returns_int4_not_null() {
 // ── HAVING with GROUPING SETS ───────────────────────────────────────────────
 
 #[test]
-#[ignore = "GROUPING SETS not yet supported"]
 fn grouping_sets_with_having() {
     let db = setup();
     let s = db

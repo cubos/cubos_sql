@@ -271,3 +271,40 @@ fn domain_cast_to_base_then_back_returns_base() {
         .unwrap();
     assert_cols(&s, vec![c("b", int4())]);
 }
+
+// ── Type modifier (atttypmod) is not modeled ────────────────────────────────
+//
+// PG carries precision/scale (numeric(p,s), varchar(n), etc.) in
+// `pg_attribute.atttypmod`. The catalog mirror drops it, so the analyzer
+// can't detect a literal that overflows the declared precision — PG would
+// reject the INSERT at runtime, but here it sails through.
+
+#[test]
+#[ignore = "pg_attribute.atttypmod not modeled — numeric(p,s) precision overflow is not detected"]
+fn numeric_typmod_overflow_should_be_rejected() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
+        .unwrap();
+    // `12345.67` does not fit numeric(4,2) (max 99.99). PG: `numeric field
+    // overflow`. The analyzer accepts it because typmod is invisible.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t (id, amount) VALUES ($p1, 12345.67)"),
+        AnalyzeError::TypeMismatch { .. },
+        "numeric field overflow",
+    );
+}
+
+#[test]
+#[ignore = "pg_attribute.atttypmod not modeled — varchar(n) length is not preserved on the column"]
+fn varchar_typmod_string_literal_too_long_should_be_rejected() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL);")
+        .unwrap();
+    // PG: `value too long for type character varying(3)`. The analyzer has
+    // no way to know the column is bounded.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t (slug) VALUES ('toolong')"),
+        AnalyzeError::TypeMismatch { .. },
+        "too long for type character varying",
+    );
+}

@@ -36,6 +36,7 @@ mod ddl;
 mod error;
 mod expr;
 mod functions;
+mod grouping;
 mod lexer;
 mod lookup;
 mod nullability;

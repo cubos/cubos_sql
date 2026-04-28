@@ -12,6 +12,19 @@ pub(crate) struct NullabilityContext {
     /// When true, each group has ≥1 row, so aggregates with NOT NULL inputs
     /// produce NOT NULL results.
     pub has_group_by: bool,
+    /// `(table_alias, column_name)` pairs for columns that are present in
+    /// some grouping sets but omitted from others (under `GROUPING SETS`,
+    /// `ROLLUP`, or `CUBE`). PG fills these with NULL for the rows of any
+    /// grouping set that doesn't include them, so the analyzer must promote
+    /// such references to nullable.
+    pub grouping_omitted: HashSet<(String, String)>,
+    /// Whether any grouping set in the current `GROUP BY` is empty — i.e.
+    /// the query carries an "aggregate over the whole input" row. When the
+    /// table is empty, that row produces NULL for non-COUNT aggregates, so
+    /// they must be reported as nullable even with a `GROUP BY` present.
+    /// `ROLLUP(...)` and `CUBE(...)` always include the empty set; explicit
+    /// `GROUPING SETS (..., ())` does too.
+    pub has_empty_grouping_set: bool,
 }
 
 impl NullabilityContext {
@@ -22,16 +35,23 @@ impl NullabilityContext {
         }
     }
 
-    /// Check if a column is nullable, considering both the column's base
-    /// definition and whether its source table is on a nullable JOIN side.
-    pub fn is_nullable(&self, table_alias: &str, base_not_null: bool) -> bool {
+    /// Check if a column is nullable, considering the column's base
+    /// definition, whether its source table is on a nullable JOIN side, and
+    /// whether some grouping set in `GROUPING SETS`/`ROLLUP`/`CUBE` omits it.
+    pub fn is_nullable(&self, table_alias: &str, column_name: &str, base_not_null: bool) -> bool {
         if self.nullable_aliases.contains(table_alias) {
             // Table is on nullable side of JOIN → column is always nullable.
-            true
-        } else {
-            // Column nullability comes from table definition.
-            !base_not_null
+            return true;
         }
+        if self
+            .grouping_omitted
+            .contains(&(table_alias.to_owned(), column_name.to_owned()))
+        {
+            // Some grouping set excludes this column → PG produces NULL there.
+            return true;
+        }
+        // Column nullability comes from table definition.
+        !base_not_null
     }
 }
 

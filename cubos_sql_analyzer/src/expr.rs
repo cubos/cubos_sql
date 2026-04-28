@@ -297,6 +297,17 @@ pub(crate) fn infer_expr(
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => infer_type_cast(cast, scope, null_ctx, snapshot, params),
         node::Node::FuncCall(func) => infer_func_call(func, scope, null_ctx, snapshot, params),
+        node::Node::GroupingFunc(g) => {
+            // `GROUPING(expr, …)` — returns int4 indicating which of the
+            // listed expressions are *missing* from the current grouping
+            // set. Always defined → NOT NULL. We walk the args so any
+            // params they contain still get typed, even though the result
+            // type is fixed.
+            for arg in &g.args {
+                let _ = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+            }
+            Ok(ExprType::scalar(oid::INT4, false))
+        }
         node::Node::AExpr(expr) => infer_a_expr(expr, scope, null_ctx, snapshot, params),
         node::Node::BoolExpr(expr) => infer_bool_expr(expr, scope, null_ctx, snapshot, params),
         node::Node::NullTest(_) => Ok(ExprType::scalar(oid::BOOL, false)),
@@ -579,7 +590,7 @@ fn infer_column_ref(
 
     match scope.resolve_column(table, column) {
         Ok(col) => {
-            let nullable = null_ctx.is_nullable(&col.table_alias, col.base_not_null);
+            let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
             Ok(ExprType {
                 type_oid: col.type_oid,
                 nullable,
@@ -735,7 +746,7 @@ fn infer_indirection(
         None => infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?,
     };
 
-    for step in ind.indirection.iter().skip(start_step) {
+    for (idx, step) in ind.indirection.iter().enumerate().skip(start_step) {
         match step.node.as_ref() {
             Some(node::Node::String(s)) => {
                 current = resolve_composite_field(&current, &s.sval, snapshot)?;
@@ -777,9 +788,25 @@ fn infer_indirection(
                     current =
                         ExprType::scalar(current.type_oid, current.nullable || any_bound_nullable);
                 } else {
-                    // `arr[i]` is always nullable (out-of-bounds → NULL,
-                    // even with non-null array and non-null index).
-                    current = resolve_array_element(&current, snapshot)?;
+                    // Adjacent non-slice subscripts (`arr[i][j]`) keep the
+                    // array type for all but the last step. PG accepts an
+                    // arbitrary number of subscripts on any array (multi-dim
+                    // arrays collapse into the same type OID), so we mirror
+                    // that by reducing to the element type only when no
+                    // further `[…]` step follows in the same chain.
+                    let next_is_subscript = ind.indirection.get(idx + 1).is_some_and(|s| {
+                        matches!(
+                            s.node.as_ref(),
+                            Some(node::Node::AIndices(next)) if !next.is_slice
+                        )
+                    });
+                    if next_is_subscript {
+                        current = ExprType::scalar(current.type_oid, true);
+                    } else {
+                        // `arr[i]` is always nullable (out-of-bounds → NULL,
+                        // even with non-null array and non-null index).
+                        current = resolve_array_element(&current, snapshot)?;
+                    }
                 }
             }
             _ => {
@@ -970,7 +997,18 @@ fn infer_array_expr(
             });
         }
     };
-    let array_oid = snapshot.array_type_of(common).unwrap_or(oid::UNKNOWN);
+    // PG collapses array dimensions into the same type OID:
+    // `ARRAY[ARRAY[1,2], ARRAY[3,4]]` is `int4[]`, not `int4[][]`. So if the
+    // common element type is already an array, reuse it instead of trying to
+    // wrap it (`array_type_of` on an array type returns `None`).
+    let common_is_array = snapshot
+        .get_type(common)
+        .is_some_and(|t| t.typcategory == TypCategory::Array);
+    let array_oid = if common_is_array {
+        common
+    } else {
+        snapshot.array_type_of(common).unwrap_or(oid::UNKNOWN)
+    };
     // An ARRAY[...] constructor is never NULL itself — it's always at least
     // an empty array. Element nullability is tracked separately by Rust's
     // `Option<T>` inside `Vec<T>`.
@@ -1086,6 +1124,23 @@ fn infer_func_call(
         }
     };
 
+    // `WITHIN GROUP (ORDER BY …)` marks an ordered-set aggregate. PG forbids
+    // combining it with `OVER` or `DISTINCT`; reject those before going
+    // further so the error message points at the actual conflict instead of
+    // a misleading overload-resolution failure.
+    if func.agg_within_group {
+        if func.over.is_some() {
+            return Err(AnalyzeError::Invalid(
+                "WITHIN GROUP cannot be used with OVER".into(),
+            ));
+        }
+        if func.agg_distinct {
+            return Err(AnalyzeError::Invalid(
+                "DISTINCT is not implemented for ordered-set aggregates".into(),
+            ));
+        }
+    }
+
     // Pass 1: infer args bottom-up with no goal.
     let mut arg_types = Vec::new();
     let mut arg_nullable = Vec::with_capacity(func.args.len());
@@ -1095,6 +1150,27 @@ fn infer_func_call(
         any_arg_nullable = any_arg_nullable || t.nullable;
         arg_nullable.push(t.nullable);
         arg_types.push(t.type_oid);
+    }
+
+    // For ordered-set aggregates, append the types of the `WITHIN GROUP
+    // (ORDER BY …)` expressions to the arg list so overload resolution sees
+    // the full signature (PG records both direct args and ordered args in
+    // `pg_proc.proargtypes`). Each item is a `SortBy` wrapping the actual
+    // sort expression in `node`.
+    let direct_arg_count = arg_types.len();
+    if func.agg_within_group {
+        for order_item in &func.agg_order {
+            let sort_inner = match order_item.node.as_ref() {
+                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+                _ => Some(order_item),
+            };
+            if let Some(inner) = sort_inner {
+                let t = infer_expr(inner, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+                any_arg_nullable = any_arg_nullable || t.nullable;
+                arg_nullable.push(t.nullable);
+                arg_types.push(t.type_oid);
+            }
+        }
     }
 
     // Resolve function with inferred arg types (UNKNOWN treated as wildcard).
@@ -1120,8 +1196,14 @@ fn infer_func_call(
     }
 
     // Pass 2: back-fill UNKNOWN args with expected types from the resolved
-    // function signature (equivalent to PG's coerce_func_args).
+    // function signature (equivalent to PG's coerce_func_args). Only the
+    // direct args correspond to `func.args`; ordered args (when
+    // `agg_within_group` is set) come from `func.agg_order` and are walked
+    // separately below.
     for (i, arg) in func.args.iter().enumerate() {
+        if i >= direct_arg_count {
+            break;
+        }
         if arg_types[i] == oid::UNKNOWN
             && let Some(&expected) = resolved.arg_types.get(i)
             && expected != oid::UNKNOWN
@@ -1151,15 +1233,21 @@ fn infer_func_call(
             TypeGoal::implicit(oid::BOOL),
         );
     }
-    for order_item in &func.agg_order {
-        let _ = infer_expr(
-            order_item,
-            scope,
-            null_ctx,
-            snapshot,
-            params,
-            TypeGoal::NONE,
-        );
+    // Per-aggregate `ORDER BY` (e.g. `array_agg(x ORDER BY y)`) — walked here
+    // for param coverage. For ordered-set aggregates (`WITHIN GROUP`) the
+    // sort expressions were already inferred above as part of the arg list,
+    // so skip to avoid double inference / param recording.
+    if !func.agg_within_group {
+        for order_item in &func.agg_order {
+            let _ = infer_expr(
+                order_item,
+                scope,
+                null_ctx,
+                snapshot,
+                params,
+                TypeGoal::NONE,
+            );
+        }
     }
     if let Some(over) = &func.over {
         for item in &over.partition_clause {
@@ -1213,6 +1301,12 @@ fn infer_func_call(
             // COUNT is never NULL (returns 0 for empty input, even with FILTER).
             false
         } else if has_filter {
+            true
+        } else if null_ctx.has_empty_grouping_set {
+            // GROUPING SETS / ROLLUP / CUBE include an empty grouping set
+            // (or `GROUP BY ()` does explicitly). For that row the aggregate
+            // sees the whole input — and an empty input still produces NULL
+            // for non-COUNT aggregates.
             true
         } else if null_ctx.has_group_by {
             any_arg_nullable

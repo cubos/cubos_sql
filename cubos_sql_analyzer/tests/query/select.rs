@@ -449,3 +449,32 @@ fn select_for_update_of_specific_table() {
         .unwrap();
     assert_cols(&s, vec![c("id", int8()), c("title", text())]);
 }
+
+// ── Inherited tables — `pg_inherits` not modeled ─────────────────────────────
+//
+// `SELECT FROM child` should resolve every inherited column from the
+// parent. Without `pg_inherits` the analyzer can't find them, so columns
+// listed only in the parent come back as `UndefinedColumn`.
+
+#[test]
+#[ignore = "pg_inherits not modeled — child inherits parent columns invisibly"]
+fn select_from_child_table_sees_inherited_columns() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE animals (
+            name  TEXT NOT NULL,
+            sound TEXT NOT NULL
+         );
+         CREATE TABLE dogs (
+            breed TEXT NOT NULL
+         ) INHERITS (animals);",
+    )
+    .unwrap();
+
+    // PG: `name` and `sound` are visible on `dogs` via inheritance.
+    let s = db.analyze("SELECT name, sound, breed FROM dogs").unwrap();
+    assert_cols(
+        &s,
+        vec![c("name", text()), c("sound", text()), c("breed", text())],
+    );
+}

@@ -476,6 +476,94 @@ fn insert_on_conflict_do_update_with_param_expression() {
     assert_params(&s, vec![p(text()), p(text()), pn(int4()), p(int4())]);
 }
 
+// ── ON CONFLICT target validation — `pg_constraint` / `pg_index` not modeled ─
+//
+// In PG, `ON CONFLICT (col)` requires `col` to be covered by a UNIQUE or
+// PRIMARY KEY constraint (or a unique index). Without those rows in the
+// catalog, the analyzer can't validate the conflict target and silently
+// accepts any column.
+
+#[test]
+#[ignore = "pg_constraint / pg_index not modeled — ON CONFLICT (non-unique-col) is not rejected"]
+fn on_conflict_on_non_unique_column_should_error() {
+    let db = setup();
+    // `name` has no unique/primary key constraint. PG: `there is no unique
+    // or exclusion constraint matching the ON CONFLICT specification`.
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (name) DO NOTHING",
+        ),
+        AnalyzeError::Invalid(_),
+        "no unique or exclusion constraint",
+    );
+}
+
+#[test]
+#[ignore = "pg_constraint not modeled — ON CONFLICT ON CONSTRAINT with a missing name is not rejected"]
+fn on_conflict_on_nonexistent_constraint_name_should_error() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            id   BIGINT PRIMARY KEY,
+            slug TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    // PG: `constraint "nope" for table "t" does not exist`. The analyzer
+    // accepts it because it has no `pg_constraint` to look the name up in.
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
+             ON CONFLICT ON CONSTRAINT nope DO NOTHING",
+        ),
+        AnalyzeError::Invalid(_),
+        "constraint \"nope\"",
+    );
+}
+
+// ── GENERATED ALWAYS AS IDENTITY — `pg_attribute.attidentity` not modeled ──
+//
+// `attidentity` carries `'a'` (ALWAYS) / `'d'` (BY DEFAULT) / `'\0'` (none).
+// The catalog mirror only has `attgenerated` (for STORED/VIRTUAL generated
+// columns), so the analyzer can't tell an identity column apart from any
+// other NOT NULL column with a default.
+
+#[test]
+#[ignore = "pg_attribute.attidentity not modeled — direct INSERT into GENERATED ALWAYS column is not rejected"]
+fn insert_into_generated_always_as_identity_should_error() {
+    let db = setup();
+    // PG: `cannot insert a non-DEFAULT value into column "id"` — `id` is
+    // GENERATED ALWAYS AS IDENTITY (see setup()). Today the analyzer
+    // accepts it as if `id` were any ordinary BIGINT column.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (id, name, email) VALUES ($p1, $p2, $p3)"),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+#[ignore = "pg_attribute.attidentity not modeled — OVERRIDING SYSTEM VALUE is not validated"]
+fn overriding_system_value_on_table_without_identity_should_error() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE plain (
+            id   INT NOT NULL,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    // PG: `OVERRIDING SYSTEM VALUE is not allowed for a non-identity column`.
+    // The override is only meaningful when there's an identity column —
+    // without `attidentity` the analyzer can't enforce that.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO plain (id, name) OVERRIDING SYSTEM VALUE VALUES ($p1, $p2)",),
+        AnalyzeError::Invalid(_),
+        "OVERRIDING SYSTEM VALUE",
+    );
+}
+
 // ── Stress ───────────────────────────────────────────────────────────────────
 
 #[test]
@@ -557,13 +645,8 @@ fn torture_update_from_join() {
 }
 
 // ── MERGE (PG 15+) ───────────────────────────────────────────────────────────
-//
-// Marked ignored: MERGE support is not implemented in the analyzer yet.
-// These tests pin the expected shape so they can be flipped on once the
-// feature lands.
 
 #[test]
-#[ignore = "MERGE statement not yet supported"]
 fn merge_when_matched_update() {
     let db = setup();
     // Classic upsert via MERGE. RETURNING preserves the target table's
@@ -583,7 +666,6 @@ fn merge_when_matched_update() {
 }
 
 #[test]
-#[ignore = "MERGE statement not yet supported"]
 fn merge_when_not_matched_insert() {
     let db = setup();
     let s = db
@@ -598,7 +680,6 @@ fn merge_when_not_matched_insert() {
 }
 
 #[test]
-#[ignore = "MERGE statement not yet supported"]
 fn merge_when_matched_delete() {
     let db = setup();
     let s = db
@@ -612,6 +693,160 @@ fn merge_when_matched_delete() {
         .unwrap();
     assert_cols(&s, vec![c("id", int8()), c("name", text())]);
     assert_params(&s, vec![p(int8())]);
+}
+
+#[test]
+fn merge_when_matched_with_extra_condition() {
+    let db = setup();
+    // `WHEN MATCHED AND age > $p2 THEN ...` — the extra condition must
+    // be walked as a BOOL predicate; its placeholder gets `int4` from the
+    // column comparison, not a `text` fallback.
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id) src \
+             ON u.id = src.id \
+             WHEN MATCHED AND u.age > $p2 THEN UPDATE SET name = 'aged'",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int8()), p(int4())]);
+}
+
+#[test]
+fn merge_with_multiple_set_columns() {
+    let db = setup();
+    // UPDATE with several SET targets: each value gets its own column-typed
+    // assignment goal. `age` is nullable on the table — passing `$p3` to it
+    // should infer the param as nullable.
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id) src \
+             ON u.id = src.id \
+             WHEN MATCHED THEN UPDATE SET name = $p2, age = $p3",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int8()), p(text()), pn(int4())]);
+}
+
+#[test]
+fn merge_when_not_matched_do_nothing() {
+    let db = setup();
+    // `WHEN NOT MATCHED THEN DO NOTHING` — no target / value walk, just
+    // the optional condition (none here). Source-side params still get
+    // inferred from their explicit casts.
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::text AS email) src \
+             ON u.email = src.email \
+             WHEN NOT MATCHED THEN DO NOTHING",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(text())]);
+}
+
+#[test]
+fn merge_with_cte() {
+    let db = setup();
+    // A WITH clause feeding the MERGE source. The CTE must be visible to
+    // both the source FROM-item and the join condition.
+    let s = db
+        .analyze(
+            "WITH new_emails AS (SELECT $p1::text AS email) \
+             MERGE INTO users u \
+             USING new_emails src \
+             ON u.email = src.email \
+             WHEN NOT MATCHED THEN INSERT (name, email) VALUES ($p2, src.email)",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+fn merge_without_returning_yields_no_columns() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id) src \
+             ON u.id = src.id \
+             WHEN MATCHED THEN DELETE",
+        )
+        .unwrap();
+    assert_cols(&s, vec![]);
+    assert_params(&s, vec![p(int8())]);
+}
+
+#[test]
+fn merge_update_unknown_column_errors() {
+    let db = setup();
+    // Same rule the analyzer enforces for plain UPDATE: an unknown column
+    // in `WHEN MATCHED THEN UPDATE SET ghost = …` must surface clearly,
+    // not get silently typed as text via the UNKNOWN fallback.
+    assert_analyze_err!(
+        db.analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id) src \
+             ON u.id = src.id \
+             WHEN MATCHED THEN UPDATE SET ghost = 'x'"
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\"",
+    );
+}
+
+#[test]
+fn merge_insert_null_into_not_null_column_errors() {
+    let db = setup();
+    // Compile-time NOT NULL guard mirrors the existing INSERT path.
+    assert_analyze_err!(
+        db.analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::text AS email) src \
+             ON u.email = src.email \
+             WHEN NOT MATCHED THEN INSERT (name, email) VALUES (NULL, src.email)"
+        ),
+        AnalyzeError::Invalid(_),
+        "NOT NULL column",
+    );
+}
+
+#[test]
+fn merge_update_set_not_null_to_null_literal_errors() {
+    let db = setup();
+    // `name` is NOT NULL — the analyzer rejects `SET name = NULL` at
+    // compile time, same as plain UPDATE.
+    assert_analyze_err!(
+        db.analyze(
+            "MERGE INTO users u \
+             USING (SELECT $p1::bigint AS id) src \
+             ON u.id = src.id \
+             WHEN MATCHED THEN UPDATE SET name = NULL"
+        ),
+        AnalyzeError::Invalid(_),
+        "NOT NULL column",
+    );
+}
+
+#[test]
+fn merge_with_real_table_as_source() {
+    let db = setup();
+    // Source is a real table (not a subquery), joined on a non-trivial
+    // predicate. RETURNING projects target columns with their base
+    // nullability — `body` is nullable on `posts`-comparable shape, but
+    // here we project from `users` so `id` / `name` stay NOT NULL.
+    let s = db
+        .analyze(
+            "MERGE INTO users u \
+             USING posts p \
+             ON p.user_id = u.id AND p.title = $p1 \
+             WHEN MATCHED THEN UPDATE SET name = p.title \
+             RETURNING u.id, u.name",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8()), c("name", text())]);
+    assert_params(&s, vec![p(text())]);
 }
 
 #[test]

@@ -181,12 +181,34 @@ fn find_default_args_match<'a>(
     }
 }
 
+/// `has_implicit_cast` extended with PG's element-wise rule for arrays:
+/// `numeric[] → float8[]` is allowed because `numeric → float8` is. This is
+/// only used by overload resolution; the bare `has_implicit_cast` query
+/// stays strict so explicit cast lookups don't get accidentally relaxed.
+fn casts_implicitly(source: PgTypeOid, target: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    if snapshot.has_implicit_cast(source, target) {
+        return true;
+    }
+    let (Some(s), Some(t)) = (snapshot.get_type(source), snapshot.get_type(target)) else {
+        return false;
+    };
+    if s.typcategory != TypCategory::Array || t.typcategory != TypCategory::Array {
+        return false;
+    }
+    let (Some(se), Some(te)) = (s.typelem, t.typelem) else {
+        return false;
+    };
+    snapshot.has_implicit_cast(se, te)
+}
+
 fn find_polymorphic_match<'a>(
     candidates: &[&'a PgProc],
     arg_types: &[PgTypeOid],
     snapshot: &PgCatalog,
 ) -> Option<&'a PgProc> {
-    let matching: Vec<&PgProc> = candidates
+    // First pass: only exact / UNKNOWN / polymorphic matches — what PG calls
+    // a "type-conformant" candidate without any cast.
+    let strict: Vec<&PgProc> = candidates
         .iter()
         .filter(|f| f.proargtypes.len() == arg_types.len())
         .filter(|f| {
@@ -201,11 +223,35 @@ fn find_polymorphic_match<'a>(
         })
         .copied()
         .collect();
-    if matching.len() == 1 {
-        Some(matching[0])
-    } else {
-        None
+    if strict.len() == 1 {
+        return Some(strict[0]);
     }
+    if !strict.is_empty() {
+        return None;
+    }
+
+    // Second pass: allow implicit casts on the non-polymorphic args. This is
+    // what makes `percentile_disc(0.5) WITHIN GROUP (ORDER BY int_col)`
+    // resolve — the direct arg is `numeric` but the candidate expects
+    // `float8`, while the ordered arg matches the polymorphic `anyelement`.
+    let lax: Vec<&PgProc> = candidates
+        .iter()
+        .filter(|f| f.proargtypes.len() == arg_types.len())
+        .filter(|f| {
+            f.proargtypes
+                .iter()
+                .zip(arg_types.iter())
+                .all(|(&expected, &actual)| {
+                    expected == actual
+                        || actual == oid::UNKNOWN
+                        || matches_polymorphic(expected, actual, snapshot)
+                        || (!is_polymorphic(expected)
+                            && casts_implicitly(actual, expected, snapshot))
+                })
+        })
+        .copied()
+        .collect();
+    if lax.len() == 1 { Some(lax[0]) } else { None }
 }
 
 // Polymorphic pseudo-type OIDs (stable across PG versions).
@@ -340,7 +386,7 @@ fn find_cast_match<'a>(
                 .all(|(&expected, &actual)| {
                     expected == actual
                         || actual == oid::UNKNOWN
-                        || snapshot.has_implicit_cast(actual, expected)
+                        || casts_implicitly(actual, expected, snapshot)
                 })
         })
         .copied()

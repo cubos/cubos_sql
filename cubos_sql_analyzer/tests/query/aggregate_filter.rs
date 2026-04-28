@@ -1,13 +1,8 @@
-//! Aggregate modifiers: `FILTER (WHERE cond)`, `DISTINCT`, and
-//! per-aggregate `ORDER BY`. These all sit on top of an ordinary aggregate
-//! call and must not change its return type — only the set of rows the
-//! aggregate sees.
-//!
-//! Not exercised yet (intentionally, because the analyzer doesn't handle
-//! them today): `WITHIN GROUP (ORDER BY …)` ordered-set aggregates like
-//! `percentile_cont`/`percentile_disc`/`mode`, which currently fail
-//! overload resolution (`cannot resolve function percentile_cont with 1
-//! args (found 4 candidates)`).
+//! Aggregate modifiers: `FILTER (WHERE cond)`, `DISTINCT`, per-aggregate
+//! `ORDER BY`, and `WITHIN GROUP (ORDER BY …)` for ordered-set aggregates.
+//! These sit on top of an ordinary aggregate call and must not change its
+//! return type — only the set of rows the aggregate sees, or (for
+//! ordered-set aggregates) the order in which they're consumed.
 
 use crate::common::*;
 
@@ -137,13 +132,8 @@ fn array_agg_with_filter_and_order_by() {
 }
 
 // ── WITHIN GROUP — ordered-set aggregates ────────────────────────────────────
-//
-// These currently fail overload resolution in the analyzer. Mark as ignored
-// until the WITHIN GROUP path lands. Each test states the type PG would
-// return so the assertion can be flipped on once the feature works.
 
 #[test]
-#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
 fn percentile_cont_returns_float8() {
     let db = setup();
     // PG: percentile_cont(0.5) WITHIN GROUP (ORDER BY int) -> float8.
@@ -155,7 +145,6 @@ fn percentile_cont_returns_float8() {
 }
 
 #[test]
-#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
 fn percentile_disc_returns_input_type() {
     let db = setup();
     // PG: percentile_disc(numeric) WITHIN GROUP (ORDER BY int) -> int4.
@@ -166,7 +155,6 @@ fn percentile_disc_returns_input_type() {
 }
 
 #[test]
-#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
 fn mode_returns_input_type() {
     let db = setup();
     // PG: mode() WITHIN GROUP (ORDER BY text) -> text.
@@ -177,7 +165,6 @@ fn mode_returns_input_type() {
 }
 
 #[test]
-#[ignore = "WITHIN GROUP / ordered-set aggregates not yet supported"]
 fn percentile_cont_array_form_returns_float8_array() {
     let db = setup();
     // PG: percentile_cont(numeric[]) WITHIN GROUP (ORDER BY int) -> float8[].

@@ -506,16 +506,6 @@ Everything runs in-process during `cargo build`. No external dependencies, fast 
 
 Extensions are supported via built-in SQL definitions that the DDL interpreter processes automatically when it sees `CREATE EXTENSION`.
 
-## Known limitations
-
-The analyzer covers the vast majority of `SELECT` / `INSERT` / `UPDATE` / `DELETE` syntax, but a handful of constructs aren't recognized yet. Queries using these will fail at the `sql!` stage:
-
-- **`MERGE`** — the statement isn't parsed yet.
-- **`GROUPING SETS` / `ROLLUP` / `CUBE`** — including the `GROUPING()` function. Workaround: `UNION ALL` over multiple `GROUP BY` queries.
-- **Ordered-set aggregates** (`WITHIN GROUP (ORDER BY ...)`) — `percentile_cont`, `percentile_disc`, `mode`.
-- **Multi-dimensional arrays** — `INT[][]` columns are accepted by `CREATE TABLE` but typed as text; chained subscripts (`arr[i][j]`) also drop the array type after the first index.
-- **`unnest(arr1, arr2, …)`** — the multi-array overload that aligns elements column-wise.
-
 ## Requirements
 
 - Rust 1.85+

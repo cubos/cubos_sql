@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 
-use pg_query::protobuf::{self, JoinType, SetOperation, node};
+use pg_query::protobuf::{self, CmdType, JoinType, SetOperation, node};
 
 use crate::error::AnalyzeError;
 use crate::expr::{self, TypeGoal};
 use crate::functions;
+use crate::grouping;
 use crate::nullability::{self, NullabilityContext};
 use crate::oid::PgTypeOid;
 use crate::param::LexOutput;
@@ -258,6 +259,7 @@ pub(crate) fn analyze_raw_node(
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
         node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
         node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
+        node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
                 "statement type: {:?}",
@@ -475,6 +477,13 @@ fn analyze_select_with_ctes_and_outer(
         params,
     )?;
 
+    // Expand `GROUPING SETS` / `ROLLUP` / `CUBE`: promote columns that
+    // some grouping set omits to nullable, and remember whether any
+    // grouping set is empty (drives aggregate-result nullability).
+    let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope);
+    null_ctx.grouping_omitted = expansion.omitted;
+    null_ctx.has_empty_grouping_set = expansion.has_empty_set;
+
     // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal.
     if let Some(where_clause) = &sel.where_clause {
         // PG rejects aggregate / window function calls inside WHERE
@@ -493,16 +502,11 @@ fn analyze_select_with_ctes_and_outer(
 
     // Process GROUP BY expressions — no type expectation, but we still need
     // to walk them so any parameters referenced are collected and typed.
+    // `GroupingSet` nodes (`GROUPING SETS`/`ROLLUP`/`CUBE`) are not real
+    // expressions; recurse into their `content` to reach the underlying
+    // column references and aggregate-rejection checks.
     for group_node in &sel.group_clause {
-        check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
-        let _ = expr::infer_expr(
-            group_node,
-            &scope,
-            &null_ctx,
-            snapshot,
-            params,
-            TypeGoal::NONE,
-        );
+        walk_group_clause_node(group_node, &scope, &null_ctx, snapshot, params)?;
     }
 
     // Process HAVING clause — same boolean goal as WHERE.
@@ -546,6 +550,35 @@ fn analyze_select_with_ctes_and_outer(
     let columns = resolve_target_list(&sel.target_list, &scope, &null_ctx, snapshot, params)?;
 
     Ok((columns, None))
+}
+
+/// Walk one entry from `sel.group_clause`, recursing into `GroupingSet`
+/// nodes (`GROUPING SETS`/`ROLLUP`/`CUBE`) to reach the underlying
+/// expressions. The walk type-checks parameters and rejects aggregates /
+/// window calls inside the grouping expressions (PG forbids those too).
+fn walk_group_clause_node(
+    group_node: &protobuf::Node,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref() {
+        for inner in &gs.content {
+            walk_group_clause_node(inner, scope, null_ctx, snapshot, params)?;
+        }
+        return Ok(());
+    }
+    check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
+    let _ = expr::infer_expr(
+        group_node,
+        scope,
+        null_ctx,
+        snapshot,
+        params,
+        TypeGoal::NONE,
+    );
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -950,6 +983,265 @@ fn analyze_delete(
 
     let columns = resolve_target_list(&del.returning_list, &scope, &null_ctx, snapshot, params)?;
     Ok((columns, None))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MERGE (PG 15+)
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn analyze_merge(
+    merge: &protobuf::MergeStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> AnalyzeResult {
+    let relation = merge
+        .relation
+        .as_ref()
+        .ok_or_else(|| AnalyzeError::Unsupported("MERGE without relation".into()))?;
+
+    let table = snapshot
+        .resolve_table(
+            if relation.schemaname.is_empty() {
+                None
+            } else {
+                Some(&relation.schemaname)
+            },
+            &relation.relname,
+        )
+        .ok_or_else(|| {
+            AnalyzeError::UndefinedTable(format!(
+                "relation \"{}\" does not exist",
+                relation.relname
+            ))
+        })?;
+
+    let table_oid = table.oid;
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table_oid).to_vec();
+    let target_alias = relation
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.as_str())
+        .unwrap_or(&relation.relname)
+        .to_owned();
+    let target_qn = crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname);
+
+    // Process the optional `WITH` clause first (CTEs visible to source +
+    // ON + every WHEN branch).
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    if let Some(with) = &merge.with_clause {
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
+
+    // Build the scope shared by `ON`, every `WHEN ... THEN` action, and the
+    // `RETURNING` list: target table on the left, source on the right (so
+    // the source side is on the nullable arm of an outer-style join in
+    // `WHEN NOT MATCHED` rows, but PG handles that NULL semantically — we
+    // just need both visible for type/parameter inference).
+    let mut scope = Scope::default();
+    scope.add_dml_target(&target_alias, target_qn.clone(), &table_attrs);
+
+    let mut null_ctx = NullabilityContext::default();
+    if let Some(source_relation) = &merge.source_relation {
+        process_from_item(
+            source_relation,
+            &mut scope,
+            &mut null_ctx,
+            snapshot,
+            &cte_scopes,
+            params,
+        )?;
+    }
+
+    if let Some(join_condition) = &merge.join_condition {
+        infer_expr_propagate_mismatch(
+            join_condition,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::BOOL),
+        )?;
+    }
+
+    for when_node in &merge.merge_when_clauses {
+        if let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() {
+            walk_merge_when_clause(
+                when,
+                &scope,
+                &null_ctx,
+                snapshot,
+                params,
+                &table_attrs,
+                &table_relname,
+            )?;
+        }
+    }
+
+    // RETURNING (PG 17+) sees the target table only — `merge_action()` and
+    // source columns are also visible at runtime, but NULL-vs-not depends
+    // on which branch fired. Following the existing UPDATE/DELETE style,
+    // we project against the target with its base nullability.
+    let mut ret_scope = Scope::default();
+    ret_scope.add_dml_target(&target_alias, target_qn, &table_attrs);
+    let ret_null_ctx = NullabilityContext::default();
+    let columns = resolve_target_list(
+        &merge.returning_list,
+        &ret_scope,
+        &ret_null_ctx,
+        snapshot,
+        params,
+    )?;
+    Ok((columns, None))
+}
+
+fn walk_merge_when_clause(
+    when: &protobuf::MergeWhenClause,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    table_attrs: &[crate::pg_catalog::PgAttribute],
+    table_relname: &str,
+) -> Result<(), AnalyzeError> {
+    if let Some(condition) = &when.condition {
+        infer_expr_propagate_mismatch(
+            condition,
+            scope,
+            null_ctx,
+            snapshot,
+            params,
+            TypeGoal::assignment(oid::BOOL),
+        )?;
+    }
+
+    let cmd = CmdType::try_from(when.command_type).unwrap_or(CmdType::Undefined);
+    match cmd {
+        CmdType::CmdUpdate => {
+            // `UPDATE SET col = expr [, ...]` — each entry is a `ResTarget`
+            // with `name = column` and `val = expression`. Validate the
+            // column exists, then walk the value with an assignment goal.
+            for set_item in &when.target_list {
+                let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref() else {
+                    continue;
+                };
+                let Some(val) = &rt.val else { continue };
+                let tc = table_attrs
+                    .iter()
+                    .find(|c| c.attname == rt.name)
+                    .ok_or_else(|| {
+                        AnalyzeError::UndefinedColumn(format!(
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            rt.name, table_relname,
+                        ))
+                    })?;
+                if tc.attnotnull && is_sql_null_literal(val) {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "cannot assign NULL to NOT NULL column `{}.{}`",
+                        table_relname, tc.attname,
+                    )));
+                }
+                if tc.attgenerated.is_some() && !is_set_to_default(val) {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "generated column `{}.{}` can only be updated to DEFAULT",
+                        table_relname, tc.attname,
+                    )));
+                }
+                expr::infer_expr(
+                    val,
+                    scope,
+                    null_ctx,
+                    snapshot,
+                    params,
+                    TypeGoal::assignment(tc.atttypid),
+                )?;
+                if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                    && !tc.attnotnull
+                {
+                    params.infer_nullable(p.number, true);
+                }
+            }
+        }
+        CmdType::CmdInsert => {
+            // `INSERT (cols...) VALUES (vals...)` — `target_list` holds the
+            // column names (each as a `ResTarget` with `name`), `values`
+            // holds the parallel value expressions. When `target_list` is
+            // empty PG implies the full attribute list.
+            let col_names: Vec<String> = when
+                .target_list
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    node::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let target_attrs: Vec<&crate::pg_catalog::PgAttribute> = if col_names.is_empty() {
+                table_attrs.iter().collect()
+            } else {
+                col_names
+                    .iter()
+                    .map(|name| {
+                        table_attrs
+                            .iter()
+                            .find(|c| &c.attname == name)
+                            .ok_or_else(|| {
+                                AnalyzeError::UndefinedColumn(format!(
+                                    "column \"{}\" of relation \"{}\" does not exist",
+                                    name, table_relname,
+                                ))
+                            })
+                    })
+                    .collect::<Result<_, _>>()?
+            };
+            for (i, val) in when.values.iter().enumerate() {
+                let target_col = target_attrs.get(i).copied();
+                if let Some(tc) = target_col {
+                    if tc.attnotnull && is_sql_null_literal(val) {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "cannot insert NULL into NOT NULL column `{}.{}`",
+                            table_relname, tc.attname,
+                        )));
+                    }
+                    if tc.attgenerated.is_some() && !is_set_to_default(val) {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "cannot insert a non-DEFAULT value into generated column `{}.{}`",
+                            table_relname, tc.attname,
+                        )));
+                    }
+                }
+                let goal = target_col
+                    .map(|tc| TypeGoal::assignment(tc.atttypid))
+                    .unwrap_or(TypeGoal::NONE);
+                expr::infer_expr(val, scope, null_ctx, snapshot, params, goal)?;
+                if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                    && let Some(tc) = target_col
+                    && !tc.attnotnull
+                {
+                    params.infer_nullable(p.number, true);
+                }
+            }
+        }
+        CmdType::CmdDelete | CmdType::CmdNothing => {
+            // No target / value expressions to walk beyond the optional
+            // `AND condition` already handled above.
+        }
+        _ => {
+            return Err(AnalyzeError::Unsupported(format!(
+                "MERGE WHEN command type {:?} is not supported",
+                cmd
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1553,51 +1845,92 @@ fn process_range_function(
         }
     };
 
-    let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, false)?;
-
-    // Build the scope columns.
-    let mut cols: Vec<ScopeColumn> = if !resolved.out_args.is_empty() {
-        resolved
-            .out_args
-            .iter()
-            .map(|f| ScopeColumn {
-                name: f.name.clone(),
-                type_oid: f.type_oid,
-                base_not_null: f.not_null,
+    // `unnest(arr1, arr2, …)` in FROM is a special PG-only multi-array form
+    // (parsed as a regular FuncCall but transformed by PG into ROWS FROM
+    // (unnest(arr1), unnest(arr2), …)). Each argument contributes one column
+    // of its element type, aligned row-wise (zip with NULL-padding).
+    let is_pg_unnest = (schema.is_none() || schema == Some("pg_catalog")) && name == "unnest";
+    let mut cols: Vec<ScopeColumn> = if is_pg_unnest && arg_types.len() > 1 {
+        let mut col_specs = Vec::with_capacity(arg_types.len());
+        for (i, (&type_oid, &nullable)) in arg_types.iter().zip(arg_nullable.iter()).enumerate() {
+            let type_entry =
+                snapshot
+                    .get_type(type_oid)
+                    .ok_or_else(|| AnalyzeError::UndefinedType {
+                        oid: type_oid.get(),
+                        context: format!("unnest argument {}", i + 1),
+                    })?;
+            let elem = (type_entry.typcategory == TypCategory::Array)
+                .then_some(type_entry.typelem)
+                .flatten()
+                .ok_or_else(|| AnalyzeError::TypeMismatch {
+                    actual: type_entry.typname.clone(),
+                    expected: "array".into(),
+                    context: format!("unnest argument {} must be an array", i + 1),
+                })?;
+            // Multi-arg unnest is strict: each output column is NOT NULL iff
+            // the corresponding input array is NOT NULL (a NULL array yields
+            // a single NULL row, not zero rows). Out-of-bounds positions are
+            // padded with NULLs because the arrays may have different
+            // lengths, so each column is conservatively nullable when any
+            // *other* arg is shorter — but we can only see that at runtime.
+            // Match PG's behavior: NOT NULL only when the array itself is.
+            col_specs.push(ScopeColumn {
+                name: "unnest".to_owned(),
+                type_oid: elem,
+                base_not_null: !nullable,
                 table_alias: alias.to_owned(),
                 record_fields: None,
-            })
-            .collect()
-    } else if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
-        (t.typtype == TypType::Composite)
-            .then_some(t.typrelid)
-            .flatten()
-    }) {
-        snapshot
-            .attributes_of(typrelid)
-            .iter()
-            .map(|f| ScopeColumn {
-                name: f.attname.clone(),
-                type_oid: f.atttypid,
-                base_not_null: f.attnotnull,
-                table_alias: alias.to_owned(),
-                record_fields: None,
-            })
-            .collect()
+            });
+        }
+        col_specs
     } else {
-        // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from
-        // their arguments — `FROM unnest(int4[] NOT NULL)` produces
-        // NOT NULL int4 elements, just like `SELECT unnest(arr)` in
-        // the projection.
-        let strict_not_null =
-            resolved.is_strict && resolved.schema == "pg_catalog" && !any_arg_nullable;
-        vec![ScopeColumn {
-            name: name.to_owned(),
-            type_oid: resolved.return_type_oid,
-            base_not_null: strict_not_null,
-            table_alias: alias.to_owned(),
-            record_fields: None,
-        }]
+        let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, false)?;
+
+        // Build the scope columns.
+        if !resolved.out_args.is_empty() {
+            resolved
+                .out_args
+                .iter()
+                .map(|f| ScopeColumn {
+                    name: f.name.clone(),
+                    type_oid: f.type_oid,
+                    base_not_null: f.not_null,
+                    table_alias: alias.to_owned(),
+                    record_fields: None,
+                })
+                .collect()
+        } else if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
+            (t.typtype == TypType::Composite)
+                .then_some(t.typrelid)
+                .flatten()
+        }) {
+            snapshot
+                .attributes_of(typrelid)
+                .iter()
+                .map(|f| ScopeColumn {
+                    name: f.attname.clone(),
+                    type_oid: f.atttypid,
+                    base_not_null: f.attnotnull,
+                    table_alias: alias.to_owned(),
+                    record_fields: None,
+                })
+                .collect()
+        } else {
+            // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from
+            // their arguments — `FROM unnest(int4[] NOT NULL)` produces
+            // NOT NULL int4 elements, just like `SELECT unnest(arr)` in
+            // the projection.
+            let strict_not_null =
+                resolved.is_strict && resolved.schema == "pg_catalog" && !any_arg_nullable;
+            vec![ScopeColumn {
+                name: name.to_owned(),
+                type_oid: resolved.return_type_oid,
+                base_not_null: strict_not_null,
+                table_alias: alias.to_owned(),
+                record_fields: None,
+            }]
+        }
     };
 
     // WITH ORDINALITY appends a trailing BIGINT NOT NULL row number. Do this
@@ -1673,7 +2006,7 @@ fn resolve_target_list(
             };
 
             for col in star_cols {
-                let nullable = null_ctx.is_nullable(&col.table_alias, col.base_not_null);
+                let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
                 columns.push(RawColumn {
                     name: col.name.clone(),
                     type_oid: col.type_oid,
