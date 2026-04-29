@@ -48,6 +48,7 @@ mod resolve;
 mod scope;
 mod seed;
 mod types;
+mod typmod;
 
 /// Re-exports of types defined in `cubos_sql_core` but used pervasively by
 /// the analyzer. Kept here so downstream crates (and tests) can depend only

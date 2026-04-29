@@ -1,8 +1,8 @@
 //! CREATE TYPE / CREATE DOMAIN / ALTER TYPE DDL handlers.
 
 use pg_query::protobuf::{
-    AlterEnumStmt, CoercionContext, CompositeTypeStmt, CreateCastStmt, CreateDomainStmt,
-    CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, node,
+    AlterEnumStmt, CoercionContext, CompositeTypeStmt, ConstrType, CreateCastStmt,
+    CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, node,
 };
 
 use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgTypeOid};
@@ -29,11 +29,13 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         )));
     }
 
-    let base_type_oid = stmt
+    let base_type_name = stmt
         .type_name
         .as_ref()
-        .and_then(|tn| resolve_type_name(tn, interp))
         .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
+    let base_type_oid = resolve_type_name(base_type_name, interp)
+        .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
+    let typtypmod = crate::typmod::encode(interp, base_type_oid, &base_type_name.typmods)?;
 
     // Domains inherit category/preferred from their base type.
     let (typcategory, typispreferred) = interp
@@ -41,6 +43,16 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .get(&base_type_oid)
         .map(|t| (t.typcategory, t.typispreferred))
         .unwrap_or((TypCategory::UserDefined, false));
+
+    // `CREATE DOMAIN d AS T NOT NULL` lands in `stmt.constraints` as a
+    // `Constraint { contype = CONSTR_NOTNULL }`. PG also forbids null defaults
+    // on a NOT NULL domain, but the analyzer doesn't model defaults yet.
+    let typnotnull = stmt.constraints.iter().any(|n| {
+        matches!(
+            n.node.as_ref(),
+            Some(node::Node::Constraint(c)) if c.contype == ConstrType::ConstrNotnull as i32
+        )
+    });
 
     let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
     interp.insert_pg_type(PgType {
@@ -54,6 +66,8 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typelem: None,
         typarray: None,
         typbasetype: Some(base_type_oid),
+        typnotnull,
+        typtypmod,
     });
 
     register_array_type(interp, nsoid, &name, oid);
@@ -89,6 +103,8 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         typelem: None,
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
     for (i, label) in labels.into_iter().enumerate() {
         let enum_oid = PgEnumOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
@@ -132,15 +148,14 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 
     // Collect column definitions before mutating, so we can resolve type
     // names against the catalog without holding a mutable borrow.
-    let mut field_defs: Vec<(String, PgTypeOid, bool)> = Vec::new();
+    let mut field_defs: Vec<(String, PgTypeOid, Option<i32>, bool)> = Vec::new();
     for col_node in &stmt.coldeflist {
         if let Some(node::Node::ColumnDef(cd)) = col_node.node.as_ref()
-            && let Some(type_oid) = cd
-                .type_name
-                .as_ref()
-                .and_then(|tn| resolve_type_name(tn, interp))
+            && let Some(tn) = cd.type_name.as_ref()
+            && let Some(type_oid) = resolve_type_name(tn, interp)
         {
-            field_defs.push((cd.colname.clone(), type_oid, cd.is_not_null));
+            let typmod = crate::typmod::encode(interp, type_oid, &tn.typmods)?;
+            field_defs.push((cd.colname.clone(), type_oid, typmod, cd.is_not_null));
         }
     }
 
@@ -156,7 +171,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         relviewdef: Vec::new(),
         viewbindings: Vec::new(),
     });
-    for (i, (fname, ftype, fnotnull)) in field_defs.into_iter().enumerate() {
+    for (i, (fname, ftype, ftypmod, fnotnull)) in field_defs.into_iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
             attrelid: class_oid,
             attname: fname,
@@ -165,6 +180,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             attnotnull: fnotnull,
             atthasdef: false,
             attgenerated: None,
+            atttypmod: ftypmod,
         });
     }
     interp.insert_pg_type(PgType {
@@ -178,6 +194,8 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         typelem: None,
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
 
     register_array_type(interp, nsoid, &name, type_oid);
@@ -224,6 +242,8 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typelem: None,
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
     interp.insert_pg_range(PgRange {
         rngtypid: oid,
@@ -348,6 +368,8 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         typelem: None,
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
     register_array_type(interp, nsoid, &name, oid);
     Ok(())
@@ -425,6 +447,8 @@ pub(crate) fn register_array_type(
         typelem: Some(element_oid),
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);

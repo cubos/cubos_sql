@@ -257,6 +257,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
             schema,
             name,
             extension,
+            ..
         } => {
             let qn = QualifiedName::new(schema.clone(), name.clone());
             // 1. User override in [types].

@@ -12,6 +12,10 @@ pub(crate) struct ScopeColumn {
     pub type_oid: PgTypeOid,
     /// NOT NULL from the table definition (before JOIN effects).
     pub base_not_null: bool,
+    /// `pg_attribute.atttypmod`-shaped modifier (`varchar(n)` length, etc.),
+    /// optionally inherited from the column's type chain (e.g. a domain over
+    /// `varchar(20)`). `None` matches PG's `-1`.
+    pub typmod: Option<i32>,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
     /// Named-field structure when the column holds a record value: SRF /
@@ -62,7 +66,8 @@ impl Scope {
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                base_not_null: c.attnotnull,
+                base_not_null: c.attnotnull || snapshot.type_is_not_null(c.atttypid),
+                typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
@@ -86,13 +91,20 @@ impl Scope {
     }
 
     /// Add columns from a DML target table (for RETURNING).
-    pub fn add_dml_target(&mut self, alias: &str, qn: QualifiedName, columns: &[PgAttribute]) {
+    pub fn add_dml_target(
+        &mut self,
+        snapshot: &PgCatalog,
+        alias: &str,
+        qn: QualifiedName,
+        columns: &[PgAttribute],
+    ) {
         let cols = columns
             .iter()
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                base_not_null: c.attnotnull,
+                base_not_null: c.attnotnull || snapshot.type_is_not_null(c.atttypid),
+                typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })

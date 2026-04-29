@@ -166,7 +166,7 @@ fn export_namespaces(client: &mut postgres::Client) -> Result<Vec<PgNamespace>, 
 fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::Error> {
     let rows = client.query(
         "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
-                typrelid, typelem, typarray, typbasetype \
+                typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod \
          FROM pg_catalog.pg_type ORDER BY oid",
         &[],
     )?;
@@ -181,6 +181,7 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
             let typelem: u32 = r.get(7);
             let typarray: u32 = r.get(8);
             let typbasetype: u32 = r.get(9);
+            let typtypmod_raw: i32 = r.get(11);
             PgType {
                 oid: PgTypeOid::new(oid).expect("pg_type.oid is non-zero"),
                 typname: r.get(1),
@@ -192,6 +193,8 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
                 typelem: PgTypeOid::new(typelem),
                 typarray: PgTypeOid::new(typarray),
                 typbasetype: PgTypeOid::new(typbasetype),
+                typnotnull: r.get(10),
+                typtypmod: (typtypmod_raw >= 0).then_some(typtypmod_raw),
             }
         })
         .collect())
@@ -268,7 +271,7 @@ fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgre
 fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, postgres::Error> {
     let rows = client.query(
         "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
-                a.attgenerated \
+                a.attgenerated, a.atttypmod \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
          WHERE a.attnum > 0 \
@@ -283,6 +286,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
             let attgenerated: i8 = r.get(6);
             let attrelid: u32 = r.get(0);
             let atttypid: u32 = r.get(2);
+            let atttypmod_raw: i32 = r.get(7);
             PgAttribute {
                 attrelid: PgClassOid::new(attrelid).expect("attrelid is non-zero"),
                 attname: r.get(1),
@@ -291,6 +295,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
                 attnotnull: r.get(4),
                 atthasdef: r.get(5),
                 attgenerated: char_to_attgenerated(attgenerated as u8 as char),
+                atttypmod: (atttypmod_raw >= 0).then_some(atttypmod_raw),
             }
         })
         .collect())

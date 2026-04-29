@@ -46,12 +46,25 @@ pub enum Type {
         schema: String,
         name: String,
         extension: Option<String>,
+        /// `pg_attribute.atttypmod`-style modifier. `Some(n + 4)` for
+        /// `varchar(n)`, `Some(p)` for `timestamp(p)`, `Some(N)` for
+        /// pgvector's `vector(N)`, etc. `None` matches PG's `-1` ("no
+        /// typmod"). Use [`crate::typmod::decode`] to interpret the value
+        /// per type.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typmod: Option<i32>,
     },
     Domain {
         schema: String,
         name: String,
         base: Box<Type>,
         extension: Option<String>,
+        /// Effective typmod observed at the domain level. Mirrors
+        /// `pg_type.typtypmod` if the column inherited it from the domain,
+        /// or carries the column's own `atttypmod` when the column locally
+        /// pinned a length / precision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typmod: Option<i32>,
     },
     Array {
         element: Box<Type>,
@@ -67,6 +80,11 @@ pub enum Type {
         name: String,
         subtype: Box<Type>,
         extension: Option<String>,
+        /// Range subtypes don't carry typmod themselves but inherit through
+        /// `subtype` — kept for symmetry with `Basic`/`Domain` and forward
+        /// compatibility with custom range types.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typmod: Option<i32>,
     },
     AnonymousRecord {
         fields: Vec<RecordField>,

@@ -95,6 +95,7 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
             schema: "public".into(),
             name: "vector".into(),
             extension: Some("vector".into()),
+            typmod: None,
         }
     );
     assert!(!embedding.nullable);
@@ -111,7 +112,8 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
         Type::Basic {
             schema: "pg_catalog".into(),
             name: "float8".into(),
-            extension: None
+            extension: None,
+            typmod: None,
         },
         "cosine_distance returns float8"
     );
@@ -122,6 +124,7 @@ fn analyze_vector_query_maps_to_pgvector_rust_type() {
             schema: "public".into(),
             name: "vector".into(),
             extension: Some("vector".into()),
+            typmod: None,
         }
     );
     assert_eq!(
@@ -299,6 +302,7 @@ fn param_only_in_order_by_is_inferred() {
             schema: "public".into(),
             name: "vector".into(),
             extension: Some("vector".into()),
+            typmod: None,
         }
     );
 }

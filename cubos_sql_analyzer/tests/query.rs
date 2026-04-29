@@ -36,6 +36,8 @@ mod set_operations;
 mod special;
 #[path = "query/subqueries.rs"]
 mod subqueries;
+#[path = "query/typmod.rs"]
+mod typmod;
 #[path = "query/user_types.rs"]
 mod user_types;
 #[path = "query/where_clause.rs"]

@@ -99,6 +99,16 @@ pub fn basic(schema: &str, name: &str) -> Type {
         schema: schema.into(),
         name: name.into(),
         extension: None,
+        typmod: None,
+    }
+}
+
+pub fn basic_with_typmod(schema: &str, name: &str, typmod: i32) -> Type {
+    Type::Basic {
+        schema: schema.into(),
+        name: name.into(),
+        extension: None,
+        typmod: Some(typmod),
     }
 }
 
@@ -107,6 +117,7 @@ pub fn basic_ext(schema: &str, name: &str, extension: &str) -> Type {
         schema: schema.into(),
         name: name.into(),
         extension: Some(extension.into()),
+        typmod: None,
     }
 }
 
@@ -122,6 +133,7 @@ pub fn domain(schema: &str, name: &str, base: Type) -> Type {
         name: name.into(),
         base: Box::new(base),
         extension: None,
+        typmod: None,
     }
 }
 
@@ -140,6 +152,7 @@ pub fn range_of(schema: &str, name: &str, subtype: Type) -> Type {
         name: name.into(),
         subtype: Box::new(subtype),
         extension: None,
+        typmod: None,
     }
 }
 
@@ -193,11 +206,23 @@ pub fn float8() -> Type {
 pub fn numeric() -> Type {
     basic("pg_catalog", "numeric")
 }
+/// Build a `numeric(p, s)` type with the matching typmod.
+pub fn numeric_ps(precision: i32, scale: i32) -> Type {
+    basic_with_typmod(
+        "pg_catalog",
+        "numeric",
+        ((precision << 16) | (scale & 0xFFFF)) + 4,
+    )
+}
 pub fn text() -> Type {
     basic("pg_catalog", "text")
 }
 pub fn varchar() -> Type {
     basic("pg_catalog", "varchar")
+}
+/// Build a `varchar(n)` type with the matching typmod.
+pub fn varchar_n(length: i32) -> Type {
+    basic_with_typmod("pg_catalog", "varchar", length + 4)
 }
 pub fn bpchar() -> Type {
     basic("pg_catalog", "bpchar")

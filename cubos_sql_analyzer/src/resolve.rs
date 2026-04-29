@@ -303,6 +303,35 @@ fn is_set_to_default(node: &protobuf::Node) -> bool {
     matches!(node.node.as_ref(), Some(node::Node::SetToDefault(_)))
 }
 
+/// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
+/// (either column-level `attnotnull`, or a domain in the type chain whose
+/// `typnotnull` is set), return the matching `AnalyzeError`. `op` selects
+/// the wording — `"insert"` mirrors PG's INSERT message, `"assign"` covers
+/// UPDATE / MERGE UPDATE.
+fn null_assignment_error(
+    tc: &crate::pg_catalog::PgAttribute,
+    snapshot: &PgCatalog,
+    table_relname: &str,
+    op: &'static str,
+) -> Option<AnalyzeError> {
+    if let Some(domain) = snapshot.domain_not_null_name(tc.atttypid) {
+        return Some(AnalyzeError::Invalid(format!(
+            "domain {domain} does not allow null values"
+        )));
+    }
+    if tc.attnotnull {
+        let verb = match op {
+            "insert" => "insert NULL into",
+            _ => "assign NULL to",
+        };
+        return Some(AnalyzeError::Invalid(format!(
+            "cannot {verb} NOT NULL column `{}.{}`",
+            table_relname, tc.attname,
+        )));
+    }
+    None
+}
+
 /// Reject aggregate / window function calls in a context where PG forbids
 /// them. Matches PG's `aggregate functions are not allowed in WHERE` /
 /// `window functions are not allowed in WHERE` errors. `context` goes into
@@ -355,6 +384,9 @@ pub(crate) struct RawColumn {
     pub name: String,
     pub type_oid: PgTypeOid,
     pub nullable: bool,
+    /// Optional `pg_attribute.atttypmod`-shaped modifier (`varchar(n)` length,
+    /// `numeric(p,s)`, pgvector dimension, …). `None` matches PG's `-1`.
+    pub typmod: Option<i32>,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and
@@ -680,13 +712,21 @@ fn analyze_insert(
                             .get(i)
                             .and_then(|cn| table_attrs.iter().find(|c| &c.attname == cn));
                         if let Some(tc) = target_col
-                            && tc.attnotnull
                             && is_sql_null_literal(val)
+                            && let Some(err) =
+                                null_assignment_error(tc, snapshot, &table_relname, "insert")
                         {
-                            return Err(AnalyzeError::Invalid(format!(
-                                "cannot insert NULL into NOT NULL column `{}.{}`",
-                                table_relname, tc.attname,
-                            )));
+                            return Err(err);
+                        }
+                        if let Some(tc) = target_col
+                            && let Some(err) = crate::typmod::check_literal_assignment(
+                                snapshot,
+                                tc.atttypid,
+                                snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                                val,
+                            )
+                        {
+                            return Err(err);
                         }
                         if let Some(tc) = target_col
                             && tc.attgenerated.is_some()
@@ -755,8 +795,8 @@ fn analyze_insert(
     if let Some(on_conflict) = &ins.on_conflict_clause {
         let mut conflict_scope = Scope::default();
         let target_qn = crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname);
-        conflict_scope.add_dml_target(&relation.relname, target_qn.clone(), &table_attrs);
-        conflict_scope.add_dml_target("excluded", target_qn, &table_attrs);
+        conflict_scope.add_dml_target(snapshot, &relation.relname, target_qn.clone(), &table_attrs);
+        conflict_scope.add_dml_target(snapshot, "excluded", target_qn, &table_attrs);
         let conflict_null_ctx = NullabilityContext::default();
         for set_item in &on_conflict.target_list {
             if let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref()
@@ -793,6 +833,7 @@ fn analyze_insert(
     let mut ret_scope = Scope::default();
     let ret_null_ctx = NullabilityContext::default();
     ret_scope.add_dml_target(
+        snapshot,
         &relation.relname,
         crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
         &table_attrs,
@@ -852,6 +893,7 @@ fn analyze_update(
         .map(|a| a.aliasname.as_str())
         .unwrap_or(&relation.relname);
     scope.add_dml_target(
+        snapshot,
         alias,
         crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
         &table_attrs,
@@ -889,11 +931,18 @@ fn analyze_update(
             // raises a runtime `null value in column … violates not-null
             // constraint` error, and we can do better by failing the macro
             // at compile time.
-            if tc.attnotnull && is_sql_null_literal(val) {
-                return Err(AnalyzeError::Invalid(format!(
-                    "cannot assign NULL to NOT NULL column `{}.{}`",
-                    table_relname, tc.attname,
-                )));
+            if is_sql_null_literal(val)
+                && let Some(err) = null_assignment_error(tc, snapshot, &table_relname, "assign")
+            {
+                return Err(err);
+            }
+            if let Some(err) = crate::typmod::check_literal_assignment(
+                snapshot,
+                tc.atttypid,
+                snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                val,
+            ) {
+                return Err(err);
             }
             if tc.attgenerated.is_some() && !is_set_to_default(val) {
                 return Err(AnalyzeError::Invalid(format!(
@@ -964,6 +1013,7 @@ fn analyze_delete(
     let mut scope = Scope::default();
     let null_ctx = NullabilityContext::default();
     scope.add_dml_target(
+        snapshot,
         &relation.relname,
         crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
         &table_attrs,
@@ -1048,7 +1098,7 @@ fn analyze_merge(
     // `WHEN NOT MATCHED` rows, but PG handles that NULL semantically — we
     // just need both visible for type/parameter inference).
     let mut scope = Scope::default();
-    scope.add_dml_target(&target_alias, target_qn.clone(), &table_attrs);
+    scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
 
     let mut null_ctx = NullabilityContext::default();
     if let Some(source_relation) = &merge.source_relation {
@@ -1092,7 +1142,7 @@ fn analyze_merge(
     // on which branch fired. Following the existing UPDATE/DELETE style,
     // we project against the target with its base nullability.
     let mut ret_scope = Scope::default();
-    ret_scope.add_dml_target(&target_alias, target_qn, &table_attrs);
+    ret_scope.add_dml_target(snapshot, &target_alias, target_qn, &table_attrs);
     let ret_null_ctx = NullabilityContext::default();
     let columns = resolve_target_list(
         &merge.returning_list,
@@ -1144,11 +1194,18 @@ fn walk_merge_when_clause(
                             rt.name, table_relname,
                         ))
                     })?;
-                if tc.attnotnull && is_sql_null_literal(val) {
-                    return Err(AnalyzeError::Invalid(format!(
-                        "cannot assign NULL to NOT NULL column `{}.{}`",
-                        table_relname, tc.attname,
-                    )));
+                if is_sql_null_literal(val)
+                    && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "assign")
+                {
+                    return Err(err);
+                }
+                if let Some(err) = crate::typmod::check_literal_assignment(
+                    snapshot,
+                    tc.atttypid,
+                    snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                    val,
+                ) {
+                    return Err(err);
                 }
                 if tc.attgenerated.is_some() && !is_set_to_default(val) {
                     return Err(AnalyzeError::Invalid(format!(
@@ -1205,11 +1262,19 @@ fn walk_merge_when_clause(
             for (i, val) in when.values.iter().enumerate() {
                 let target_col = target_attrs.get(i).copied();
                 if let Some(tc) = target_col {
-                    if tc.attnotnull && is_sql_null_literal(val) {
-                        return Err(AnalyzeError::Invalid(format!(
-                            "cannot insert NULL into NOT NULL column `{}.{}`",
-                            table_relname, tc.attname,
-                        )));
+                    if is_sql_null_literal(val)
+                        && let Some(err) =
+                            null_assignment_error(tc, snapshot, table_relname, "insert")
+                    {
+                        return Err(err);
+                    }
+                    if let Some(err) = crate::typmod::check_literal_assignment(
+                        snapshot,
+                        tc.atttypid,
+                        snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                        val,
+                    ) {
+                        return Err(err);
                     }
                     if tc.attgenerated.is_some() && !is_set_to_default(val) {
                         return Err(AnalyzeError::Invalid(format!(
@@ -1290,10 +1355,12 @@ fn analyze_set_operation(
             }
             (None, false) => l.type_oid,
         };
+        let typmod = if l.typmod == r.typmod { l.typmod } else { None };
         columns.push(RawColumn {
             name: l.name,
             type_oid,
             nullable: l.nullable || r.nullable,
+            typmod,
             record_fields: None,
         });
     }
@@ -1357,6 +1424,7 @@ fn analyze_cte(
                 type_oid: rc.type_oid,
                 base_not_null: !rc.nullable,
                 table_alias: cte.ctename.clone(),
+                typmod: rc.typmod,
                 record_fields: rc.record_fields,
             })
             .collect();
@@ -1375,11 +1443,13 @@ fn analyze_cte(
             .map(|(s, r)| {
                 let type_oid = crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
                     .unwrap_or(s.type_oid);
+                let typmod = if s.typmod == r.typmod { s.typmod } else { None };
                 ScopeColumn {
                     name: s.name,
                     type_oid,
                     // Either arm producing NULL makes the column nullable.
                     base_not_null: !(s.nullable || r.nullable),
+                    typmod,
                     table_alias: cte.ctename.clone(),
                     record_fields: s.record_fields,
                 }
@@ -1400,6 +1470,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    typmod: rc.typmod,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1413,6 +1484,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    typmod: rc.typmod,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1426,6 +1498,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    typmod: rc.typmod,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1439,6 +1512,7 @@ fn analyze_cte(
                     type_oid: rc.type_oid,
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
+                    typmod: rc.typmod,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1475,6 +1549,7 @@ fn append_search_cycle_columns(
             type_oid: oid::RECORD,
             base_not_null: true,
             table_alias: cte.ctename.clone(),
+            typmod: None,
             record_fields: None,
         });
     }
@@ -1488,6 +1563,7 @@ fn append_search_cycle_columns(
                 type_oid: mark_oid,
                 base_not_null: true,
                 table_alias: cte.ctename.clone(),
+                typmod: None,
                 record_fields: None,
             });
         }
@@ -1502,6 +1578,7 @@ fn append_search_cycle_columns(
                 type_oid: path_oid,
                 base_not_null: true,
                 table_alias: cte.ctename.clone(),
+                typmod: None,
                 record_fields: None,
             });
         }
@@ -1528,6 +1605,7 @@ fn apply_cte_column_aliases(cols: Vec<RawColumn>, aliases: &[protobuf::Node]) ->
             name: names.get(i).cloned().unwrap_or(c.name),
             type_oid: c.type_oid,
             nullable: c.nullable,
+            typmod: c.typmod,
             record_fields: c.record_fields,
         })
         .collect()
@@ -1685,6 +1763,7 @@ fn process_from_item(
                         type_oid: rc.type_oid,
                         base_not_null: !rc.nullable,
                         table_alias: alias.to_owned(),
+                        typmod: rc.typmod,
                         record_fields: rc.record_fields,
                     })
                     .collect();
@@ -1880,6 +1959,7 @@ fn process_range_function(
                 type_oid: elem,
                 base_not_null: !nullable,
                 table_alias: alias.to_owned(),
+                typmod: None,
                 record_fields: None,
             });
         }
@@ -1896,6 +1976,7 @@ fn process_range_function(
                     name: f.name.clone(),
                     type_oid: f.type_oid,
                     base_not_null: f.not_null,
+                    typmod: None,
                     table_alias: alias.to_owned(),
                     record_fields: None,
                 })
@@ -1911,7 +1992,8 @@ fn process_range_function(
                 .map(|f| ScopeColumn {
                     name: f.attname.clone(),
                     type_oid: f.atttypid,
-                    base_not_null: f.attnotnull,
+                    base_not_null: f.attnotnull || snapshot.type_is_not_null(f.atttypid),
+                    typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
                     table_alias: alias.to_owned(),
                     record_fields: None,
                 })
@@ -1928,6 +2010,7 @@ fn process_range_function(
                 type_oid: resolved.return_type_oid,
                 base_not_null: strict_not_null,
                 table_alias: alias.to_owned(),
+                typmod: None,
                 record_fields: None,
             }]
         }
@@ -1942,6 +2025,7 @@ fn process_range_function(
             type_oid: oid::INT8,
             base_not_null: true,
             table_alias: alias.to_owned(),
+            typmod: None,
             record_fields: None,
         });
     }
@@ -2011,6 +2095,7 @@ fn resolve_target_list(
                     name: col.name.clone(),
                     type_oid: col.type_oid,
                     nullable,
+                    typmod: col.typmod,
                     record_fields: col.record_fields.clone(),
                 });
             }
@@ -2051,6 +2136,7 @@ fn resolve_target_list(
             name,
             type_oid,
             nullable: expr_type.nullable,
+            typmod: expr_type.typmod,
             record_fields,
         });
     }
@@ -2111,6 +2197,7 @@ fn analyze_values_lists(
             type_oid: crate::coerce::find_common_type(&column_types[i], snapshot)
                 .unwrap_or(oid::UNKNOWN),
             nullable: column_nullable[i],
+            typmod: None,
             record_fields: None,
         })
         .collect();
@@ -2178,7 +2265,12 @@ fn infer_column_name(node: &protobuf::Node) -> Option<String> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn build_column(rc: RawColumn, snapshot: &PgCatalog) -> Result<AnalyzedColumn, AnalyzeError> {
-    let pg_type = resolve_type_with_shape(rc.type_oid, rc.record_fields.as_deref(), snapshot)?;
+    let pg_type = resolve_type_with_shape(
+        rc.type_oid,
+        rc.typmod,
+        rc.record_fields.as_deref(),
+        snapshot,
+    )?;
 
     // Handle nullability annotations (! and ?).
     let (name, nullable) = parse_nullability_annotation(&rc.name, rc.nullable);
@@ -2196,6 +2288,7 @@ fn build_column(rc: RawColumn, snapshot: &PgCatalog) -> Result<AnalyzedColumn, A
 /// from the shape recursively. Otherwise falls through to the OID-only path.
 fn resolve_type_with_shape(
     type_oid: PgTypeOid,
+    typmod: Option<i32>,
     shape: Option<&[crate::expr::RecordField]>,
     snapshot: &PgCatalog,
 ) -> Result<Type, AnalyzeError> {
@@ -2208,6 +2301,7 @@ fn resolve_type_with_shape(
                 name: f.name.clone(),
                 ty: resolve_type_with_shape(
                     f.ty.type_oid,
+                    f.ty.typmod,
                     f.ty.record_fields.as_deref(),
                     snapshot,
                 )?,
@@ -2216,7 +2310,7 @@ fn resolve_type_with_shape(
         }
         return Ok(Type::AnonymousRecord { fields: out });
     }
-    resolve_type(type_oid, snapshot)
+    resolve_type(type_oid, typmod, snapshot)
 }
 
 fn build_param_info(
@@ -2224,7 +2318,11 @@ fn build_param_info(
     nullable: bool,
     snapshot: &PgCatalog,
 ) -> Result<ParamInfo, AnalyzeError> {
-    let pg_type = resolve_type(type_oid, snapshot)?;
+    // Params have no analyzer-visible typmod (they're typeless until
+    // bound, and the cast-introduced typmod is consumed at the cast site
+    // itself). Match PG's `pg_param_collator`/`exec_describe_params` which
+    // does not include atttypmod for parameters.
+    let pg_type = resolve_type(type_oid, None, snapshot)?;
     Ok(ParamInfo { pg_type, nullable })
 }
 
@@ -2232,7 +2330,17 @@ fn build_param_info(
 /// wrappers. Unknown OIDs (pseudo `UNKNOWN` included) are surfaced as
 /// [`Type::Basic`] named `pg_catalog.unknown` so consumers can fall back to
 /// `String` without the analyzer having to know about Rust.
-fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, AnalyzeError> {
+///
+/// `typmod` is the column / expression-level modifier observed in the
+/// outer scope; resolve_type will surface it on the matching variant. The
+/// inner recursion clears `typmod` for nested types (e.g. domain's base
+/// type, array's element) since the seed-level `typtypmod` already tracks
+/// per-type defaults.
+fn resolve_type(
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    snapshot: &PgCatalog,
+) -> Result<Type, AnalyzeError> {
     if let Some(te) = snapshot.get_type(type_oid) {
         let schema = snapshot
             .namespace_name(te.typnamespace)
@@ -2246,7 +2354,9 @@ fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, Analy
         if te.typcategory == TypCategory::Array
             && let Some(elem) = te.typelem
         {
-            let element = resolve_type(elem, snapshot)?;
+            // Array columns store the modifier on the element type
+            // (`varchar(20)[]` → element typmod = 24, array typmod = -1).
+            let element = resolve_type(elem, typmod, snapshot)?;
             return Ok(Type::Array {
                 element: Box::new(element),
             });
@@ -2258,12 +2368,17 @@ fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, Analy
                     oid: type_oid.get(),
                     context: "domain base type".into(),
                 })?;
-                let base = resolve_type(base_oid, snapshot)?;
+                // Domains inherit their base typmod when the column didn't
+                // pin one. Recurse without re-applying so the base sees its
+                // own seed-level value (or `None`).
+                let base = resolve_type(base_oid, None, snapshot)?;
+                let effective_typmod = typmod.or(te.typtypmod);
                 return Ok(Type::Domain {
                     schema,
                     name,
                     base: Box::new(base),
                     extension,
+                    typmod: effective_typmod,
                 });
             }
             TypType::Enum => {
@@ -2285,12 +2400,13 @@ fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, Analy
                     .get(&type_oid)
                     .map(|r| r.rngsubtype)
                     .unwrap_or(oid::UNKNOWN);
-                let subtype = resolve_type(subtype_oid, snapshot)?;
+                let subtype = resolve_type(subtype_oid, None, snapshot)?;
                 return Ok(Type::Range {
                     schema,
                     name,
                     subtype: Box::new(subtype),
                     extension,
+                    typmod,
                 });
             }
             TypType::Composite => {
@@ -2303,7 +2419,7 @@ fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, Analy
                 for f in &attrs {
                     out.push(crate::types::RecordField {
                         name: f.attname.clone(),
-                        ty: resolve_type(f.atttypid, snapshot)?,
+                        ty: resolve_type(f.atttypid, f.atttypmod, snapshot)?,
                         nullable: !f.attnotnull,
                     });
                 }
@@ -2314,6 +2430,7 @@ fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, Analy
                     schema,
                     name,
                     extension,
+                    typmod,
                 });
             }
         }
@@ -2325,6 +2442,7 @@ fn resolve_type(type_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<Type, Analy
             schema: "pg_catalog".to_owned(),
             name: "unknown".to_owned(),
             extension: None,
+            typmod: None,
         });
     }
 

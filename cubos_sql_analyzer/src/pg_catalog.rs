@@ -268,6 +268,16 @@ pub struct PgType {
     /// FK `pg_type.oid` of the domain's base type. `None` if not a domain.
     #[serde(with = "crate::oid::oid_or_zero")]
     pub typbasetype: Option<PgTypeOid>,
+    /// Domain-level `NOT NULL`. `false` for every non-domain type. Mirrors
+    /// `pg_type.typnotnull` so a column declared `colname mydomain` inherits
+    /// non-nullness without an explicit column constraint.
+    pub typnotnull: bool,
+    /// Domain-level type modifier, mirroring `pg_type.typtypmod`. `Some`
+    /// only for domains over a parametric base (`CREATE DOMAIN d AS
+    /// varchar(20)`); `None` for everything else (PG's `-1`). Use
+    /// [`crate::typmod`] to encode/decode.
+    #[serde(with = "crate::oid::option_i32_neg_one")]
+    pub typtypmod: Option<i32>,
 }
 
 /// `pg_enum`: one row per enum label.
@@ -369,6 +379,13 @@ pub struct PgAttribute {
     pub attnotnull: bool,
     pub atthasdef: bool,
     pub attgenerated: Option<AttGenerated>,
+    /// Type modifier: the `n` in `varchar(n)`, the packed `(p,s)` of
+    /// `numeric(p,s)`, the dimension count of pgvector's `vector(N)`, etc.
+    /// `None` matches PG's `-1` sentinel ("no typmod"); `Some` carries the
+    /// packed `int32` exactly as PG would store it. Use [`crate::typmod`]
+    /// to encode/decode.
+    #[serde(with = "crate::oid::option_i32_neg_one")]
+    pub atttypmod: Option<i32>,
 }
 
 /// `pg_proc`: a function, aggregate, window function, or procedure.

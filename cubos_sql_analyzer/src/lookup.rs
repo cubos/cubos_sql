@@ -126,6 +126,57 @@ impl PgCatalog {
         current
     }
 
+    /// Walk the domain chain looking for a `typnotnull` row. Returns the
+    /// `typname` of the first domain that forbids NULLs, or `None` if no
+    /// domain in the chain has the constraint. Capped at 32 hops, same as
+    /// [`unwrap_domain`], to stay safe against malformed catalogs.
+    pub fn domain_not_null_name(&self, oid: PgTypeOid) -> Option<&str> {
+        let mut current = oid;
+        for _ in 0..32 {
+            let t = self.pg_type.get(&current)?;
+            if t.typtype == TypType::Domain && t.typnotnull {
+                return Some(&t.typname);
+            }
+            if t.typtype == TypType::Domain {
+                current = t.typbasetype?;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    /// True when the type chain forces non-nullable semantics on the column,
+    /// independent of `pg_attribute.attnotnull`.
+    pub fn type_is_not_null(&self, oid: PgTypeOid) -> bool {
+        self.domain_not_null_name(oid).is_some()
+    }
+
+    /// Resolve the modifier that should apply to a column, given its
+    /// `pg_attribute.atttypmod` and the column's type. PG semantics:
+    /// `atttypmod` wins when present; otherwise we walk the domain chain
+    /// looking for a `typtypmod` to inherit. This way `CREATE DOMAIN d AS
+    /// varchar(20); CREATE TABLE t (x d)` produces a column with the right
+    /// length even though `parse_column_def` left `atttypmod = None`.
+    pub fn effective_typmod(&self, oid: PgTypeOid, atttypmod: Option<i32>) -> Option<i32> {
+        if atttypmod.is_some() {
+            return atttypmod;
+        }
+        let mut current = oid;
+        for _ in 0..32 {
+            let t = self.pg_type.get(&current)?;
+            if let Some(v) = t.typtypmod {
+                return Some(v);
+            }
+            if t.typtype == TypType::Domain {
+                current = t.typbasetype?;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     /// The preferred type of a given `pg_type.typcategory`. Used when the
     /// analyzer needs to pick a concrete type for an expression whose inputs
     /// are all UNKNOWN (string-category literals default to `text`, numeric

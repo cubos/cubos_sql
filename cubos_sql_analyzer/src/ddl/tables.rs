@@ -106,6 +106,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attnotnull: col.not_null,
             atthasdef: col.has_default,
             attgenerated: col.is_generated.then_some(AttGenerated::Stored),
+            atttypmod: col.typmod,
         });
     }
     interp.insert_pg_type(PgType {
@@ -119,6 +120,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typelem: None,
         typarray: Some(array_oid),
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
     register_composite_to_record_cast(interp, composite_oid);
 
@@ -134,6 +137,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typelem: Some(composite_oid),
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
 
     Ok(())
@@ -144,6 +149,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
 struct ParsedColumn {
     name: String,
     type_oid: PgTypeOid,
+    typmod: Option<i32>,
     not_null: bool,
     has_default: bool,
     is_generated: bool,
@@ -170,6 +176,13 @@ fn parse_column_def(
         .as_ref()
         .and_then(|tn| resolve_type_name(tn, interp))
         .unwrap_or(crate::pg_catalog::oid::UNKNOWN);
+
+    // Encode any `(n)` / `(p,s)` modifier sitting next to the type name.
+    // Empty `typmods` (`varchar` plain) yields `None`.
+    let typmod = match cd.type_name.as_ref() {
+        Some(tn) => crate::typmod::encode(interp, type_oid, &tn.typmods)?,
+        None => None,
+    };
 
     let mut not_null = cd.is_not_null;
     let mut has_default = cd.raw_default.is_some() || cd.cooked_default.is_some();
@@ -219,6 +232,7 @@ fn parse_column_def(
     Ok(ParsedColumn {
         name: cd.colname.clone(),
         type_oid,
+        typmod,
         not_null,
         has_default,
         is_generated,
@@ -324,6 +338,7 @@ fn add_column(
         attnotnull: col.not_null,
         atthasdef: col.has_default,
         attgenerated: col.is_generated.then_some(AttGenerated::Stored),
+        atttypmod: col.typmod,
     });
     Ok(())
 }
@@ -439,6 +454,11 @@ fn alter_column_type(
         .and_then(|tn| resolve_type_name(tn, interp))
         .unwrap_or(crate::pg_catalog::oid::UNKNOWN);
 
+    let new_typmod = match cd.type_name.as_ref() {
+        Some(tn) => crate::typmod::encode(interp, new_type_oid, &tn.typmods)?,
+        None => None,
+    };
+
     let old_type_oid = interp
         .attributes_of(relid)
         .iter()
@@ -479,6 +499,7 @@ fn alter_column_type(
         && let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name)
     {
         col.atttypid = new_type_oid;
+        col.atttypmod = new_typmod;
     }
 
     let _ = old_type_oid;

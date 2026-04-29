@@ -206,6 +206,25 @@ pub mod vec_oid {
     }
 }
 
+/// Serde adapter for `Option<i32>` fields that PG models with the sentinel
+/// `-1` ("no value"). `None` round-trips as `-1`; `Some(v)` as `v`. Used for
+/// `pg_attribute.atttypmod` / `pg_type.typtypmod` so the in-memory shape can
+/// stay `Option<i32>` while the seed JSON keeps PG-faithful integers.
+#[allow(dead_code)]
+pub mod option_i32_neg_one {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<i32>, ser: S) -> Result<S::Ok, S::Error> {
+        let raw = value.unwrap_or(-1);
+        serde::Serialize::serialize(&raw, ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<i32>, D::Error> {
+        let raw = i32::deserialize(de)?;
+        Ok(if raw < 0 { None } else { Some(raw) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

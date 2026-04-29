@@ -84,6 +84,11 @@ impl TypeGoal {
 pub(crate) struct ExprType {
     pub type_oid: PgTypeOid,
     pub nullable: bool,
+    /// `pg_attribute.atttypmod`-shaped type modifier carried through the
+    /// inference. `None` (PG's `-1`) is the default; only column refs, direct
+    /// casts, and uniform CASE/UNION branches actually propagate a value.
+    /// Functions, operators, and aggregates strip it (PG matching).
+    pub typmod: Option<i32>,
     pub record_fields: Option<Vec<RecordField>>,
 }
 
@@ -123,6 +128,19 @@ impl ExprType {
         Self {
             type_oid,
             nullable,
+            typmod: None,
+            record_fields: None,
+        }
+    }
+
+    /// Construct a scalar with a known `pg_attribute.atttypmod` value. Used
+    /// by `infer_column_ref` and `infer_type_cast` to thread the modifier
+    /// through the inference chain.
+    pub fn scalar_with_typmod(type_oid: PgTypeOid, nullable: bool, typmod: Option<i32>) -> Self {
+        Self {
+            type_oid,
+            nullable,
+            typmod,
             record_fields: None,
         }
     }
@@ -419,6 +437,7 @@ pub(crate) fn infer_expr(
             Ok(ExprType {
                 type_oid: oid::RECORD,
                 nullable: false,
+                typmod: None,
                 record_fields: Some(fields),
             })
         }
@@ -594,6 +613,7 @@ fn infer_column_ref(
             Ok(ExprType {
                 type_oid: col.type_oid,
                 nullable,
+                typmod: col.typmod,
                 // Carry the column's record shape forward so downstream
                 // `(col).field` indirection and ROW-vs-shape coercion can
                 // see through to the field types.
@@ -902,6 +922,7 @@ fn resolve_composite_field(
         return Ok(ExprType {
             type_oid: field.ty.type_oid,
             nullable: current.nullable || field.ty.nullable,
+            typmod: field.ty.typmod,
             record_fields: field.ty.record_fields.clone(),
         });
     }
@@ -1098,7 +1119,23 @@ fn infer_type_cast(
         params.record(p.number, target_oid);
     }
 
-    Ok(ExprType::scalar(target_oid, inner_type.nullable))
+    // PG: an explicit cast `x::T(n)` carries the target's typmod through.
+    // When the cast omits typmods (`x::T`), keep the operand's typmod only
+    // when the type OID is unchanged — coercing across types strips it.
+    let target_typmod = match cast.type_name.as_ref() {
+        Some(tn) if !tn.typmods.is_empty() => {
+            crate::typmod::encode(snapshot, target_oid, &tn.typmods)
+                .map_err(|e| AnalyzeError::Invalid(e.to_string()))?
+        }
+        _ if target_oid == inner_type.type_oid => inner_type.typmod,
+        _ => None,
+    };
+
+    Ok(ExprType::scalar_with_typmod(
+        target_oid,
+        inner_type.nullable,
+        target_typmod,
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1342,6 +1379,10 @@ fn infer_func_call(
     Ok(ExprType {
         type_oid: resolved.return_type_oid,
         nullable,
+        // Functions / aggregates / window calls never propagate the
+        // argument's typmod (PG matching: `lower(varchar(20))` returns
+        // varchar, not varchar(20)).
+        typmod: None,
         record_fields,
     })
 }

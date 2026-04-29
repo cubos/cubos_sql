@@ -154,6 +154,7 @@ fn install_relation(
             attnotnull: col.not_null,
             atthasdef: false,
             attgenerated: None,
+            atttypmod: col.typmod,
         });
     }
     interp.insert_pg_type(PgType {
@@ -167,6 +168,8 @@ fn install_relation(
         typelem: None,
         typarray: Some(array_oid),
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
     interp.insert_pg_type(PgType {
         oid: array_oid,
@@ -179,6 +182,8 @@ fn install_relation(
         typelem: Some(composite_oid),
         typarray: None,
         typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
     });
 
     // Record dependencies in pg_depend.
@@ -207,6 +212,7 @@ fn install_relation(
 struct ResolvedColumn {
     name: String,
     type_oid: PgTypeOid,
+    typmod: Option<i32>,
     not_null: bool,
 }
 
@@ -250,6 +256,7 @@ fn resolve_view_now(
             ResolvedColumn {
                 name,
                 type_oid: col.type_oid,
+                typmod: col.typmod,
                 not_null: !col.nullable,
             }
         })
