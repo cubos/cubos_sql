@@ -305,9 +305,9 @@ pub(crate) fn analyze_raw_node(
         // standard form (no expressions / parameters); for parameterized
         // notifications callers use `SELECT pg_notify($1, $2)` which goes
         // through the regular function-call path.
-        node::Node::NotifyStmt(_)
-        | node::Node::ListenStmt(_)
-        | node::Node::UnlistenStmt(_) => (Vec::new(), None),
+        node::Node::NotifyStmt(_) | node::Node::ListenStmt(_) | node::Node::UnlistenStmt(_) => {
+            (Vec::new(), None)
+        }
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
                 "statement type: {:?}",
