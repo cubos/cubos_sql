@@ -690,6 +690,13 @@ impl PgCatalog {
         &self.pg_inherits
     }
 
+    /// Iterate over every `pg_index` row. Tests use this to assert the
+    /// shape of indexes the DDL emitted; runtime callers don't need it.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn pg_index_values(&self) -> impl Iterator<Item = &crate::pg_catalog::PgIndex> {
+        self.pg_index.values()
+    }
+
     /// Iterate over every `pg_constraint` row. Used by the `ON CONFLICT`
     /// validator to find PK/UNIQUE constraints for a relation.
     pub(crate) fn pg_constraint_values(

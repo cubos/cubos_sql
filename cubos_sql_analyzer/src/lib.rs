@@ -65,7 +65,7 @@ pub use oid::{
 pub use pg_catalog::{
     ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
     PgAggregate, PgAttribute, PgCast, PgCatalogSeed, PgClass, PgConstraint, PgDepend, PgEnum,
-    PgExtension, PgInherits, PgNamespace, PgOperator, PgProc, PgRange, PgType, ProKind,
+    PgExtension, PgIndex, PgInherits, PgNamespace, PgOperator, PgProc, PgRange, PgType, ProKind,
     ProVolatile, RelKind, SerializedAst, TypCategory, TypType,
 };
 

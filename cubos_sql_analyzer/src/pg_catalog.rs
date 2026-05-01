@@ -128,21 +128,33 @@ pub enum TypCategory {
     Internal,
 }
 
-/// `pg_class.relkind`. PG chars used here: `r` table, `v` view, `m` matview,
-/// `p` partitioned table, `c` composite type. Sequences/indexes/foreign tables
-/// are not tracked by the analyzer.
+/// `pg_class.relkind`. Carries every variant PG emits, even the ones the
+/// analyzer doesn't consult — keeping them lets the seed mirror `pg_class`
+/// 1:1 without dropping rows. PG chars: `r` table, `i` index, `S` sequence,
+/// `t` TOAST table, `v` view, `m` matview, `c` composite type, `f` foreign
+/// table, `p` partitioned table, `I` partitioned index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelKind {
     #[serde(rename = "r")]
     Table,
+    #[serde(rename = "i")]
+    Index,
+    #[serde(rename = "S")]
+    Sequence,
+    #[serde(rename = "t")]
+    ToastTable,
     #[serde(rename = "v")]
     View,
     #[serde(rename = "m")]
     MaterializedView,
-    #[serde(rename = "p")]
-    Partitioned,
     #[serde(rename = "c")]
     CompositeType,
+    #[serde(rename = "f")]
+    ForeignTable,
+    #[serde(rename = "p")]
+    Partitioned,
+    #[serde(rename = "I")]
+    PartitionedIndex,
 }
 
 /// `pg_proc.prokind`. PG chars: `f` normal function, `a` aggregate, `w`
@@ -379,6 +391,46 @@ pub struct PgConstraint {
     /// Attnums (1-based) of the columns on the target relation that the
     /// FK references. Empty for non-FK constraints.
     pub confkey: Vec<i16>,
+}
+
+/// `pg_index`: one row per index. Keyed by `indexrelid` — PG models the index
+/// itself as a row in `pg_class` (`relkind = 'i'`) and the metadata about
+/// what it's indexing here.
+///
+/// `indkey` mirrors PG: a list of attnums, one per indexed element. A `0`
+/// means "this slot is an expression"; the expressions are walked from
+/// `indexprs` in order. `indpred` carries the partial-index predicate.
+/// Both expression and predicate share the [`SerializedAst`] shape so
+/// dependency rewrites (RENAME / SET SCHEMA on an indexed column) flow
+/// through the same applier the views use.
+///
+/// We don't model `indisvalid`, `indisready`, `indisclustered`, etc. — the
+/// analyzer doesn't consult them and they would only inflate the seed.
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgIndex {
+    /// FK `pg_class.oid` of the index relation itself.
+    pub indexrelid: PgClassOid,
+    /// FK `pg_class.oid` of the indexed table.
+    pub indrelid: PgClassOid,
+    /// Total number of index columns + included columns.
+    pub indnatts: i16,
+    /// Number of *key* columns (excludes `INCLUDE (cols)` columns).
+    pub indnkeyatts: i16,
+    pub indisunique: bool,
+    pub indisprimary: bool,
+    /// Attnums of the indexed columns. `0` means the slot is an expression
+    /// (consumed in order from `indexprs`).
+    pub indkey: Vec<i16>,
+    /// Per-expression ASTs for slots where `indkey[i] == 0`, in the same
+    /// order. `Vec::new()` when no slot is an expression.
+    ///
+    /// Diverges from PG's literal shape (PG packs the whole list into one
+    /// `pg_node_tree`); splitting per expression keeps each entry's
+    /// bindings stream local to its own AST and makes per-expression
+    /// reanalysis trivial.
+    pub indexprs: Vec<SerializedAst>,
+    /// Partial-index predicate. `None` for non-partial indexes.
+    pub indpred: Option<SerializedAst>,
 }
 
 /// `pg_inherits`: one row per (child, parent) edge in the inheritance graph.
@@ -664,6 +716,8 @@ pub struct PgCatalogSeed {
     pub pg_inherits: Vec<PgInherits>,
     #[serde(default)]
     pub pg_constraint: Vec<PgConstraint>,
+    #[serde(default)]
+    pub pg_index: Vec<PgIndex>,
     /// Namespace OIDs in search order. Non-PG (PG keeps this in a GUC).
     #[serde(default, with = "crate::oid::vec_oid")]
     pub search_path: Vec<PgNamespaceOid>,
@@ -699,6 +753,8 @@ pub struct PgCatalog {
     pub(crate) pg_depend: Vec<PgDepend>,
     pub(crate) pg_inherits: Vec<PgInherits>,
     pub(crate) pg_constraint: HashMap<PgConstraintOid, PgConstraint>,
+    /// Keyed by `indexrelid` (the index's `pg_class.oid`).
+    pub(crate) pg_index: HashMap<PgClassOid, PgIndex>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
@@ -839,6 +895,9 @@ impl PgCatalog {
         for c in seed.pg_constraint {
             cat.pg_constraint.insert(c.oid, c);
         }
+        for i in seed.pg_index {
+            cat.pg_index.insert(i.indexrelid, i);
+        }
         cat.search_path = seed.search_path;
         cat
     }
@@ -862,6 +921,7 @@ impl PgCatalog {
             pg_depend: Vec::new(),
             pg_inherits: Vec::new(),
             pg_constraint: HashMap::new(),
+            pg_index: HashMap::new(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),
@@ -934,6 +994,9 @@ impl PgCatalog {
         let mut pg_constraint: Vec<_> = self.pg_constraint.values().cloned().collect();
         pg_constraint.sort_by_key(|c| c.oid);
 
+        let mut pg_index: Vec<_> = self.pg_index.values().cloned().collect();
+        pg_index.sort_by_key(|i| i.indexrelid);
+
         PgCatalogSeed {
             pg_namespace,
             pg_type,
@@ -949,6 +1012,7 @@ impl PgCatalog {
             pg_depend,
             pg_inherits,
             pg_constraint,
+            pg_index,
             search_path: self.search_path.clone(),
         }
     }
@@ -956,6 +1020,25 @@ impl PgCatalog {
     /// Parse and apply all DDL statements in `sql`, mutating the catalog.
     pub fn apply_sql(&mut self, sql: &str) -> Result<(), DdlError> {
         apply_sql_to(self, sql)
+    }
+
+    /// Parse `expr_sql` as a SELECT-list expression (`SELECT <expr>`),
+    /// resolve every name slot to a catalog OID against `self`, and return
+    /// the serialized AST + bindings. Used by the seed exporter to capture
+    /// `pg_index.indexprs` from `pg_get_indexdef` output without requiring
+    /// the seed crate to depend on the binding walker directly.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn serialize_expression(&self, expr_sql: &str) -> Result<SerializedAst, DdlError> {
+        let select = format!("SELECT {expr_sql}");
+        crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_first_target)
+    }
+
+    /// Like [`Self::serialize_expression`] but for partial-index predicates
+    /// — parses `SELECT 1 WHERE <pred>` and serializes the WHERE node.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn serialize_predicate(&self, pred_sql: &str) -> Result<SerializedAst, DdlError> {
+        let select = format!("SELECT 1 WHERE {pred_sql}");
+        crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_where)
     }
 
     /// Analyze a SQL query template against this catalog.
@@ -1237,6 +1320,30 @@ impl PgCatalog {
 
     pub(crate) fn remove_pg_constraints_of(&mut self, relid: PgClassOid) {
         self.pg_constraint.retain(|_, c| c.conrelid != relid);
+    }
+
+    pub(crate) fn insert_pg_index(&mut self, row: PgIndex) {
+        self.pg_index.insert(row.indexrelid, row);
+    }
+
+    pub(crate) fn remove_pg_index(&mut self, indexrelid: PgClassOid) -> Option<PgIndex> {
+        self.pg_index.remove(&indexrelid)
+    }
+
+    /// Drop every `pg_index` row whose `indrelid` is `relid` and return the
+    /// indexrelids — callers tear down the matching `pg_class` rows
+    /// afterwards.
+    pub(crate) fn remove_pg_indexes_of(&mut self, relid: PgClassOid) -> Vec<PgClassOid> {
+        let to_drop: Vec<PgClassOid> = self
+            .pg_index
+            .values()
+            .filter(|i| i.indrelid == relid)
+            .map(|i| i.indexrelid)
+            .collect();
+        for oid in &to_drop {
+            self.pg_index.remove(oid);
+        }
+        to_drop
     }
 
     /// Add a `pg_depend` row by directly inserting the `PgDepend` value the

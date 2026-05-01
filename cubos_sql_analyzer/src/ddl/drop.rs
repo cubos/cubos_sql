@@ -8,7 +8,7 @@ use super::views;
 use crate::oid::{PgCastOid, PgClassOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
     PG_CAST_RELID, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_NAMESPACE_RELID, PG_OPERATOR_RELID,
-    PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, PgProc, ProKind,
+    PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, PgProc, ProKind, RelKind,
 };
 
 pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlError> {
@@ -47,8 +47,10 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             ObjectType::ObjectSchema => {
                 drop_schema(interp, obj_node, stmt.missing_ok, cascade)?;
             }
-            ObjectType::ObjectIndex
-            | ObjectType::ObjectTrigger
+            ObjectType::ObjectIndex => {
+                drop_index(interp, obj_node, stmt.missing_ok)?;
+            }
+            ObjectType::ObjectTrigger
             | ObjectType::ObjectRule
             | ObjectType::ObjectPolicy
             | ObjectType::ObjectForeignTable => {}
@@ -156,6 +158,22 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
         .pg_inherits
         .retain(|i| i.inhrelid != class_oid && i.inhparent != class_oid);
 
+    // Tear down indexes whose `indrelid` is this relation, and the matching
+    // pg_class rows for each index. PG cascades indexes with the table they
+    // sit on; the analyzer mirrors that without an extra DROP CASCADE.
+    if matches!(
+        class.relkind,
+        RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+    ) {
+        let index_oids = interp.remove_pg_indexes_of(class_oid);
+        for idx_oid in index_oids {
+            interp.remove_pg_class(idx_oid);
+            let idx_obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+            interp.remove_dependencies_of(PG_CLASS_RELID, idx_obj);
+            interp.remove_dependencies_on(PG_CLASS_RELID, idx_obj);
+        }
+    }
+
     if let Some(reltype) = class.reltype {
         // Find and drop the array type whose typelem points at the composite.
         if let Some(arr_oid) = interp.array_type_of(reltype) {
@@ -163,6 +181,69 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
         }
         interp.remove_pg_type(reltype);
     }
+}
+
+/// `DROP INDEX [IF EXISTS] name [, …]`. Resolves the index by `pg_class.oid`
+/// (relkind = 'i'), tears down both the `pg_class` row and the matching
+/// `pg_index` row. Also removes the `pg_constraint` row that
+/// `CREATE UNIQUE INDEX` may have synthesized for ON CONFLICT matching.
+fn drop_index(
+    interp: &mut PgCatalog,
+    obj_node: &pg_query::protobuf::Node,
+    missing_ok: bool,
+) -> Result<(), DdlError> {
+    let names = match obj_node.node.as_ref() {
+        Some(node::Node::List(list)) => &list.items,
+        _ => return Ok(()),
+    };
+    let (schema, name) = extract_names(names, interp);
+    let Some(nsoid) = interp.namespace_oid(&schema) else {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::DependencyError(format!(
+            "index \"{schema}.{name}\" does not exist"
+        )));
+    };
+    let Some(class_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied() else {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::DependencyError(format!(
+            "index \"{schema}.{name}\" does not exist"
+        )));
+    };
+
+    // Reject if the resolved relation isn't an index — PG: "X is not an index".
+    if !matches!(
+        interp.pg_class.get(&class_oid).map(|c| c.relkind),
+        Some(RelKind::Index)
+    ) {
+        return Err(DdlError::DependencyError(format!(
+            "\"{schema}.{name}\" is not an index"
+        )));
+    }
+
+    interp.remove_pg_index(class_oid);
+    // Drop the synthesized UNIQUE pg_constraint row that ON CONFLICT
+    // matching consults — its `conname` mirrors the index name and
+    // `conrelid` points at the indexed table.
+    let synth_oids: Vec<_> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            matches!(c.contype, crate::pg_catalog::ConType::Unique) && c.conname == name
+        })
+        .map(|c| c.oid)
+        .collect();
+    for oid in synth_oids {
+        interp.pg_constraint.remove(&oid);
+    }
+    interp.remove_pg_class(class_oid);
+    let obj = crate::oid::PgGenericOid::new(class_oid.get()).unwrap();
+    interp.remove_dependencies_of(PG_CLASS_RELID, obj);
+    interp.remove_dependencies_on(PG_CLASS_RELID, obj);
+    Ok(())
 }
 
 fn drop_type(

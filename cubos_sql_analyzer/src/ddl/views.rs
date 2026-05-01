@@ -301,6 +301,61 @@ pub(crate) fn decode_ast(bytes: &[u8]) -> Option<protobuf::Node> {
     protobuf::Node::decode(bytes).ok()
 }
 
+/// Parse `sql` (typically a synthetic `SELECT …`), pluck out a subnode
+/// via `pick`, walk it through the [`BindingWalker`] against `snapshot`, and
+/// return a [`SerializedAst`] of the picked node + bindings. Powers
+/// [`crate::pg_catalog::PgCatalog::serialize_expression`] and friends so
+/// the seed exporter can capture index expressions and predicates with
+/// fully resolved bindings, without re-implementing the walker.
+#[cfg(any(test, feature = "internal"))]
+pub(crate) fn serialize_subnode(
+    snapshot: &PgCatalog,
+    sql: &str,
+    pick: impl Fn(&protobuf::Node) -> Option<&protobuf::Node>,
+) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
+    let parsed = pg_query::parse(sql)
+        .map_err(|e| super::DdlError::Parse(format!("failed to parse `{sql}`: {e}")))?;
+    let proto = parsed.protobuf;
+    let stmt = proto
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .ok_or_else(|| super::DdlError::Parse(format!("`{sql}` produced no statement")))?;
+    let target = pick(stmt)
+        .ok_or_else(|| super::DdlError::Parse(format!("`{sql}` has no expression to extract")))?;
+    let mut walker = BindingWalker::default();
+    walker.walk(target, snapshot);
+    Ok(crate::pg_catalog::SerializedAst {
+        ast: encode_ast(target),
+        bindings: walker.bindings,
+    })
+}
+
+/// `pick` for `serialize_expression`: pulls the value of the first target
+/// in `SELECT <expr>`. Returns `None` if the input wasn't a `SelectStmt`
+/// or has no targets.
+#[cfg(any(test, feature = "internal"))]
+pub(crate) fn extract_first_target(stmt: &protobuf::Node) -> Option<&protobuf::Node> {
+    let node::Node::SelectStmt(sel) = stmt.node.as_ref()? else {
+        return None;
+    };
+    let target = sel.target_list.first()?;
+    let node::Node::ResTarget(rt) = target.node.as_ref()? else {
+        return None;
+    };
+    rt.val.as_deref()
+}
+
+/// `pick` for `serialize_predicate`: extracts the WHERE clause of
+/// `SELECT 1 WHERE <pred>`. Returns `None` if there is no WHERE.
+#[cfg(any(test, feature = "internal"))]
+pub(crate) fn extract_where(stmt: &protobuf::Node) -> Option<&protobuf::Node> {
+    let node::Node::SelectStmt(sel) = stmt.node.as_ref()? else {
+        return None;
+    };
+    sel.where_clause.as_deref()
+}
+
 /// Re-run the static analyzer against a view's stored AST and refresh the
 /// stored column types. The AST is rewritten in-memory via the bindings
 /// side-table before analysis, so any RENAME / SET SCHEMA on a dependency
@@ -379,15 +434,23 @@ struct FromSource {
 /// propagate without ever editing the stored AST: at deparse time the
 /// applier rewrites name slots from the OID's *current* catalog name.
 #[derive(Default)]
-struct ViewWalker {
-    bindings: Vec<AstBinding>,
+pub(crate) struct BindingWalker {
+    pub(crate) bindings: Vec<AstBinding>,
+}
+
+impl BindingWalker {
+    #[cfg(any(test, feature = "internal"))]
+    pub(crate) fn walk(&mut self, node: &protobuf::Node, snapshot: &PgCatalog) {
+        let scope_stack: Vec<Vec<FromSource>> = Vec::new();
+        self.walk_node(node, snapshot, &scope_stack);
+    }
 }
 
 fn collect_view_bindings_and_deps(
     query_node: &protobuf::Node,
     snapshot: &PgCatalog,
 ) -> (Vec<AstBinding>, ViewDeps) {
-    let mut walker = ViewWalker::default();
+    let mut walker = BindingWalker::default();
     let scope_stack: Vec<Vec<FromSource>> = Vec::new();
     walker.walk_node(query_node, snapshot, &scope_stack);
     let deps = derive_deps_from_bindings(&walker.bindings);
@@ -429,7 +492,7 @@ fn derive_deps_from_bindings(bindings: &[AstBinding]) -> ViewDeps {
     }
 }
 
-impl ViewWalker {
+impl BindingWalker {
     fn walk_node(
         &mut self,
         node: &protobuf::Node,
@@ -901,7 +964,7 @@ fn resolve_column_qualified(
 
 // ─── Binding applier (rewrites AST in-place using bindings) ─────────────────
 //
-// Walks the AST in the same pre-order as `ViewWalker`, popping one binding
+// Walks the AST in the same pre-order as `BindingWalker`, popping one binding
 // per name slot and substituting the literal AST text with the OID's
 // *current* catalog name. Called right before deparse / reanalysis so RENAME
 // and SET SCHEMA never need to touch the stored AST.
@@ -917,7 +980,7 @@ struct ViewApplier<'a> {
 }
 
 /// Walk `ast` mutably, applying `bindings` in the same pre-order
-/// [`ViewWalker`] used to emit them. Each name slot is rewritten from the
+/// [`BindingWalker`] used to emit them. Each name slot is rewritten from the
 /// OID stored in its binding to the catalog's current name.
 fn apply_view_bindings(ast: &mut protobuf::Node, bindings: &[AstBinding], snapshot: &PgCatalog) {
     let mut applier = ViewApplier {

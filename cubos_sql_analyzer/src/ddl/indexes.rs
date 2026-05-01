@@ -1,8 +1,9 @@
-//! `CREATE INDEX` handler.
+//! `CREATE INDEX` / `DROP INDEX` handlers.
 //!
 //! Indexes don't change query result types — they're invisible to the
-//! analyzer's type/nullability inference. We still parse the statement
-//! for two reasons:
+//! analyzer's type/nullability inference. We still mirror them in the
+//! catalog because three things downstream consult `pg_index` (and a
+//! matching `pg_class` row of `relkind = 'i'`):
 //!
 //! 1. **Volatility check** — PG forbids VOLATILE callees in expression
 //!    indexes, since the index would otherwise never agree with itself.
@@ -11,14 +12,20 @@
 //!    for the purposes of `ON CONFLICT (cols)` matching, so we mirror
 //!    that here. Partial unique indexes (with a `WHERE`) are *not*
 //!    valid `ON CONFLICT` targets and so we deliberately skip them.
+//! 3. **DROP INDEX / DROP TABLE cascade** — index rows live as their own
+//!    pg_class entries; dropping the underlying table tears down the
+//!    indexes via `pg_index.indrelid`.
 
 use pg_query::protobuf::{IndexStmt, node};
+use prost::Message;
 
 use super::DdlError;
 use super::util::range_var_names;
 use super::volatile::{ExprLocation, check_no_volatile};
-use crate::oid::PgConstraintOid;
-use crate::pg_catalog::{ConType, PgCatalog, PgConstraint};
+use crate::oid::{PgClassOid, PgConstraintOid};
+use crate::pg_catalog::{
+    AstBinding, ConType, PgCatalog, PgClass, PgConstraint, PgIndex, RelKind, SerializedAst,
+};
 
 pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError> {
     // ── Volatility check on expression indexes ──
@@ -31,6 +38,114 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         }
     }
 
+    let Some(rv) = stmt.relation.as_ref() else {
+        return Ok(());
+    };
+    let (schema, table_name) = range_var_names(rv, db);
+    let Some(nsoid) = db.namespace_oid(&schema) else {
+        return Ok(());
+    };
+    let Some(indrelid) = db.class_by_qname.get(&(nsoid, table_name.clone())).copied() else {
+        return Ok(());
+    };
+
+    // ── Resolve indkey + indexprs (one ast per expression slot) ──
+    //
+    // Mirror PG: each index element is either a column reference (yields
+    // an attnum, indexprs slot is empty) or an arbitrary expression
+    // (indkey gets `0`, indexprs gets the next AST). The split keeps
+    // expressions iterable per slot.
+    let attnum_by_name: std::collections::HashMap<String, i16> = db
+        .attributes_of(indrelid)
+        .iter()
+        .map(|a| (a.attname.clone(), a.attnum))
+        .collect();
+    let mut indkey: Vec<i16> = Vec::with_capacity(stmt.index_params.len());
+    let mut indexprs: Vec<SerializedAst> = Vec::new();
+    for param in &stmt.index_params {
+        let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
+            continue;
+        };
+        if !elem.name.is_empty() {
+            let an = *attnum_by_name.get(&elem.name).ok_or_else(|| {
+                DdlError::Parse(format!(
+                    "column \"{}\" named in index does not exist",
+                    elem.name
+                ))
+            })?;
+            indkey.push(an);
+        } else if let Some(expr) = elem.expr.as_deref() {
+            indkey.push(0);
+            indexprs.push(serialize_node(expr));
+        }
+    }
+    let indpred = stmt
+        .where_clause
+        .as_deref()
+        .map(serialize_node);
+
+    // ── Pick a name for the index ──
+    //
+    // PG generates `<table>_<col1>_<col2>_..._<key|idx>` when the user
+    // omits the name. Unique indexes get `_key`, plain indexes get `_idx`.
+    let suffix = if stmt.unique { "key" } else { "idx" };
+    let conname = if stmt.idxname.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        for param in &stmt.index_params {
+            if let Some(node::Node::IndexElem(elem)) = param.node.as_ref()
+                && !elem.name.is_empty()
+            {
+                parts.push(elem.name.clone());
+            }
+        }
+        if parts.is_empty() {
+            format!("{table_name}_{suffix}")
+        } else {
+            format!("{table_name}_{}_{}", parts.join("_"), suffix)
+        }
+    } else {
+        stmt.idxname.clone()
+    };
+
+    // ── Reject duplicate index names in the same schema ──
+    //
+    // PG: `relation "<idxname>" already exists`. Indexes share the
+    // namespace with tables/views/etc. via `pg_class`.
+    if db.class_by_qname.contains_key(&(nsoid, conname.clone())) {
+        if stmt.if_not_exists {
+            return Ok(());
+        }
+        return Err(DdlError::DuplicateObject(format!(
+            "relation \"{conname}\" already exists"
+        )));
+    }
+
+    // ── Allocate the index's pg_class oid + insert pg_index ──
+    let indexrelid = PgClassOid::new(db.alloc_oid()).expect("alloc_oid is non-zero");
+    db.insert_pg_class(PgClass {
+        oid: indexrelid,
+        relname: conname.clone(),
+        relnamespace: nsoid,
+        relkind: RelKind::Index,
+        reltype: None,
+        relviewdef: None,
+    });
+
+    let indnatts = indkey.len() as i16;
+    db.insert_pg_index(PgIndex {
+        indexrelid,
+        indrelid,
+        indnatts,
+        // PG distinguishes key cols from `INCLUDE (cols)`. We don't model
+        // INCLUDE today — every column counts as a key column.
+        indnkeyatts: indnatts,
+        indisunique: stmt.unique,
+        indisprimary: stmt.primary,
+        indkey,
+        indexprs,
+        indpred,
+    });
+
     // ── pg_constraint emission for non-partial UNIQUE INDEX ──
     //
     // PG only treats a unique index as a valid `ON CONFLICT` target when
@@ -40,72 +155,35 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // make `ON CONFLICT (slug)` correctly fail to find a match for a
     // partial-unique-only schema.
     if stmt.unique && stmt.where_clause.is_none() {
-        let Some(rv) = stmt.relation.as_ref() else {
-            return Ok(());
-        };
-        let (schema, table_name) = range_var_names(rv, db);
-        let Some(nsoid) = db.namespace_oid(&schema) else {
-            return Ok(());
-        };
-        let Some(class_oid) = db.class_by_qname.get(&(nsoid, table_name.clone())).copied() else {
-            return Ok(());
-        };
-
-        // `index_params` lists either column names (`name` set) or
-        // expressions. For ON CONFLICT (cols) matching we need the
-        // attnum list — expression-based UNIQUE INDEXes never line up
-        // with a column-list ON CONFLICT, so we skip them.
-        let mut conkey: Vec<i16> = Vec::new();
-        let mut all_columns = true;
-        for param in &stmt.index_params {
-            let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
-                continue;
-            };
-            if elem.name.is_empty() {
-                all_columns = false;
-                break;
-            }
-            let Some(an) = db
-                .attributes_of(class_oid)
-                .iter()
-                .find(|a| a.attname == elem.name)
-                .map(|a| a.attnum)
-            else {
-                all_columns = false;
-                break;
-            };
-            conkey.push(an);
+        let idx = db.pg_index.get(&indexrelid).expect("just inserted");
+        // Expression-based UNIQUE INDEXes never line up with a
+        // column-list ON CONFLICT, so skip those.
+        if idx.indexprs.is_empty() && !idx.indkey.is_empty() {
+            let conkey: Vec<i16> = idx.indkey.clone();
+            let oid = PgConstraintOid::new(db.alloc_oid()).expect("alloc_oid is non-zero");
+            db.insert_pg_constraint(PgConstraint {
+                oid,
+                conname: conname.clone(),
+                conrelid: indrelid,
+                contype: ConType::Unique,
+                conkey,
+                confrelid: None,
+                confkey: Vec::new(),
+            });
         }
-        if !all_columns || conkey.is_empty() {
-            return Ok(());
-        }
-
-        let conname = if stmt.idxname.is_empty() {
-            format!(
-                "{table_name}_{}_key",
-                stmt.index_params
-                    .iter()
-                    .filter_map(|p| match p.node.as_ref()? {
-                        node::Node::IndexElem(e) if !e.name.is_empty() => Some(e.name.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("_")
-            )
-        } else {
-            stmt.idxname.clone()
-        };
-        let oid = PgConstraintOid::new(db.alloc_oid()).expect("alloc_oid is non-zero");
-        db.insert_pg_constraint(PgConstraint {
-            oid,
-            conname,
-            conrelid: class_oid,
-            contype: ConType::Unique,
-            conkey,
-            confrelid: None,
-            confkey: Vec::new(),
-        });
     }
 
     Ok(())
+}
+
+/// Encode a `pg_query::Node` as a `SerializedAst` (protobuf bytes + an
+/// empty bindings stream — index expressions don't yet flow through the
+/// view-binding walker; that's a separate piece of work).
+fn serialize_node(node: &pg_query::protobuf::Node) -> SerializedAst {
+    let mut buf = Vec::with_capacity(64);
+    node.encode(&mut buf).ok();
+    SerializedAst {
+        ast: buf,
+        bindings: Vec::<AstBinding>::new(),
+    }
 }

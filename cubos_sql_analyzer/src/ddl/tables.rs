@@ -6,8 +6,8 @@ use pg_query::protobuf::{
 
 use crate::oid::{PgClassOid, PgConstraintOid, PgTypeOid};
 use crate::pg_catalog::{
-    AttGenerated, AttIdentity, ConType, PgAttribute, PgClass, PgConstraint, PgInherits, PgType,
-    RelKind, TypCategory, TypType,
+    AttGenerated, AttIdentity, ConType, PgAttribute, PgClass, PgConstraint, PgIndex, PgInherits,
+    PgType, RelKind, TypCategory, TypType,
 };
 
 use super::DdlError;
@@ -324,18 +324,67 @@ fn emit_constraints(
     }
 
     for (conname, contype, conkey, confrelid, confkey) in to_emit {
-        let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-        interp.insert_pg_constraint(PgConstraint {
-            oid,
-            conname,
-            conrelid: relid,
-            contype,
-            conkey,
-            confrelid,
-            confkey,
-        });
+        emit_constraint_with_backing_index(
+            interp, relid, conname, contype, conkey, confrelid, confkey,
+        );
     }
     Ok(())
+}
+
+/// Insert a `pg_constraint` row and, for PK/UNIQUE, the backing
+/// `pg_class` (relkind = 'i') + `pg_index` rows that PG auto-creates.
+///
+/// PG conflates the constraint and its backing index — `<table>_pkey` is
+/// both a constraint and an index, sharing one name. Mirror that so DROP
+/// COLUMN / DROP TABLE cascade through `pg_index` and `ON CONFLICT ON
+/// CONSTRAINT name` finds the index by its conname.
+fn emit_constraint_with_backing_index(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    conname: String,
+    contype: ConType,
+    conkey: Vec<i16>,
+    confrelid: Option<PgClassOid>,
+    confkey: Vec<i16>,
+) {
+    let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    interp.insert_pg_constraint(PgConstraint {
+        oid,
+        conname: conname.clone(),
+        conrelid: relid,
+        contype,
+        conkey: conkey.clone(),
+        confrelid,
+        confkey,
+    });
+    if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
+        let table_ns = interp
+            .pg_class
+            .get(&relid)
+            .map(|c| c.relnamespace)
+            .expect("relid is registered");
+        let indexrelid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        interp.insert_pg_class(PgClass {
+            oid: indexrelid,
+            relname: conname,
+            relnamespace: table_ns,
+            relkind: RelKind::Index,
+            reltype: None,
+            relviewdef: None,
+        });
+        let indnatts = conkey.len() as i16;
+        interp.insert_pg_index(PgIndex {
+            indexrelid,
+            indrelid: relid,
+            indnatts,
+            indnkeyatts: indnatts,
+            indisunique: true,
+            indisprimary: matches!(contype, ConType::PrimaryKey),
+            indkey: conkey,
+            indexprs: Vec::new(),
+            indpred: None,
+        });
+    }
 }
 
 /// Resolve a `FOREIGN KEY` target: returns `(target_class_oid, target_attnums)`.
@@ -958,6 +1007,28 @@ fn drop_constraint(
         }
     }
 
+    // Drop the backing index (`<conname>` shares the relname with the
+    // constraint for PK/UNIQUE) before dropping the constraint itself.
+    if is_pkey_or_unique {
+        let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
+        if let Some(nsoid) = nsoid
+            && let Some(idx_oid) = interp
+                .class_by_qname
+                .get(&(nsoid, conname.clone()))
+                .copied()
+            && matches!(
+                interp.pg_class.get(&idx_oid).map(|c| c.relkind),
+                Some(RelKind::Index)
+            )
+        {
+            interp.remove_pg_index(idx_oid);
+            interp.remove_pg_class(idx_oid);
+            let obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+            interp.remove_dependencies_of(crate::pg_catalog::PG_CLASS_RELID, obj);
+            interp.remove_dependencies_on(crate::pg_catalog::PG_CLASS_RELID, obj);
+        }
+    }
+
     interp.pg_constraint.remove(&oid);
     Ok(())
 }
@@ -1146,8 +1217,9 @@ fn drop_column(
 
     // PG also blocks DROP COLUMN when a `pg_constraint` row references
     // it (PK/UNIQUE/CHECK on this relation, or an FK on another relation
-    // whose target column matches). Without CASCADE we surface the same
-    // error PG does.
+    // whose target column matches), or when a `pg_index` row's `indkey`
+    // contains the attnum. Without CASCADE we surface the same error PG
+    // does.
     if let Some(an) = target_attnum {
         let mut blockers: Vec<String> = Vec::new();
         for c in interp.pg_constraint.values() {
@@ -1159,6 +1231,25 @@ fn drop_column(
                 && c.confkey.contains(&an)
             {
                 blockers.push(c.conname.clone());
+            }
+        }
+        // Indexes whose indkey references this attnum block too. Skip
+        // indexes that are *already* covered by a constraint above (their
+        // pg_class name matches a pg_constraint we'll drop anyway) so the
+        // error message doesn't double-up.
+        let constraint_names: std::collections::HashSet<String> =
+            blockers.iter().cloned().collect();
+        let dependent_indexes: Vec<PgClassOid> = interp
+            .pg_index
+            .values()
+            .filter(|i| i.indrelid == relid && i.indkey.contains(&an))
+            .map(|i| i.indexrelid)
+            .collect();
+        for idx_oid in &dependent_indexes {
+            if let Some(c) = interp.pg_class.get(idx_oid)
+                && !constraint_names.contains(&c.relname)
+            {
+                blockers.push(c.relname.clone());
             }
         }
         if !blockers.is_empty() && !cascade {
@@ -1174,8 +1265,10 @@ fn drop_column(
             )));
         }
         if cascade && !blockers.is_empty() {
-            // CASCADE: drop the dependent constraints too.
-            let to_drop: Vec<_> = interp
+            // CASCADE: drop the dependent constraints + their backing
+            // indexes + any non-constraint indexes that reference this
+            // column.
+            let to_drop_constraints: Vec<_> = interp
                 .pg_constraint
                 .values()
                 .filter(|c| {
@@ -1186,8 +1279,15 @@ fn drop_column(
                 })
                 .map(|c| c.oid)
                 .collect();
-            for oid in to_drop {
+            for oid in to_drop_constraints {
                 interp.pg_constraint.remove(&oid);
+            }
+            for idx_oid in dependent_indexes {
+                interp.remove_pg_index(idx_oid);
+                interp.remove_pg_class(idx_oid);
+                let obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+                interp.remove_dependencies_of(crate::pg_catalog::PG_CLASS_RELID, obj);
+                interp.remove_dependencies_on(crate::pg_catalog::PG_CLASS_RELID, obj);
             }
         }
     }
@@ -1397,16 +1497,15 @@ fn add_constraint(
             } else {
                 c.conname.clone()
             };
-            let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-            interp.insert_pg_constraint(PgConstraint {
-                oid,
+            emit_constraint_with_backing_index(
+                interp,
+                relid,
                 conname,
-                conrelid: relid,
-                contype: ConType::PrimaryKey,
-                conkey: attnums,
-                confrelid: None,
-                confkey: Vec::new(),
-            });
+                ConType::PrimaryKey,
+                attnums,
+                None,
+                Vec::new(),
+            );
         }
     }
 
@@ -1440,16 +1539,15 @@ fn add_constraint(
             } else {
                 c.conname.clone()
             };
-            let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-            interp.insert_pg_constraint(PgConstraint {
-                oid,
+            emit_constraint_with_backing_index(
+                interp,
+                relid,
                 conname,
-                conrelid: relid,
-                contype: ConType::Unique,
-                conkey: attnums,
-                confrelid: None,
-                confkey: Vec::new(),
-            });
+                ConType::Unique,
+                attnums,
+                None,
+                Vec::new(),
+            );
         }
     }
 

@@ -18,6 +18,9 @@ pub mod util;
 pub mod views;
 mod volatile;
 
+#[cfg(any(test, feature = "internal"))]
+pub(crate) use views::serialize_subnode;
+
 use pg_query::protobuf::node;
 
 use crate::pg_catalog::PgCatalog;

@@ -75,8 +75,25 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
         )));
     };
 
+    let old_name = stmt.subname.clone();
+    let is_pkey_or_unique = matches!(
+        interp.pg_constraint.get(&target_oid).map(|c| c.contype),
+        Some(crate::pg_catalog::ConType::PrimaryKey | crate::pg_catalog::ConType::Unique)
+    );
     if let Some(row) = interp.pg_constraint.get_mut(&target_oid) {
         row.conname = stmt.newname.clone();
+    }
+    // The backing index for PK/UNIQUE shares its name with the constraint
+    // (PG conflates them). Rename the pg_class entry so subsequent DROP
+    // INDEX / SQL references find the index under its new name too.
+    if is_pkey_or_unique
+        && let Some(idx_oid) = interp.class_by_qname.get(&(nsoid, old_name)).copied()
+        && matches!(
+            interp.pg_class.get(&idx_oid).map(|c| c.relkind),
+            Some(crate::pg_catalog::RelKind::Index)
+        )
+    {
+        interp.rename_pg_class(idx_oid, stmt.newname.clone(), nsoid);
     }
     Ok(())
 }

@@ -15,8 +15,8 @@ use cubos_sql_analyzer::{
     ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType, PgAggregate,
     PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgConstraint,
     PgConstraintOid, PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid,
-    PgInherits, PgNamespace, PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange,
-    PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory, TypType,
+    PgIndex, PgInherits, PgNamespace, PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid,
+    PgRange, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory, TypType,
 };
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
@@ -77,6 +77,7 @@ fn main() {
     eprintln!("  pg_depend:    {}", snapshot.pg_depend.len());
     eprintln!("  pg_inherits:  {}", snapshot.pg_inherits.len());
     eprintln!("  pg_constraint:{}", snapshot.pg_constraint.len());
+    eprintln!("  pg_index:     {}", snapshot.pg_index.len());
 }
 
 // ─── Schema export ─────────────────────────────────────────────────────────────
@@ -105,7 +106,10 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
 
     let _ = nsname_by_oid;
 
-    Ok(PgCatalogSeed {
+    // Build a seed without pg_index first: we need a working PgCatalog so
+    // analyzer::serialize_expression / serialize_predicate can resolve OIDs
+    // for the AstBindings of each indexed expression / WHERE predicate.
+    let mut seed = PgCatalogSeed {
         pg_namespace,
         pg_type,
         pg_enum,
@@ -120,8 +124,12 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_depend,
         pg_inherits,
         pg_constraint,
+        pg_index: Vec::new(),
         search_path,
-    })
+    };
+    let scratch = PgCatalog::from_seed(seed.clone());
+    seed.pg_index = export_indexes(client, &scratch)?;
+    Ok(seed)
 }
 
 fn export_search_path(
@@ -246,10 +254,12 @@ fn export_ranges(client: &mut postgres::Client) -> Result<Vec<PgRange>, postgres
 }
 
 fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgres::Error> {
+    // No relkind filter — `RelKind` covers every variant PG emits, so the
+    // mirror is 1:1. Rows we don't recognize are silently dropped by
+    // `char_to_relkind`, but in practice that never fires.
     let rows = client.query(
         "SELECT oid, relname, relnamespace, relkind, reltype \
          FROM pg_catalog.pg_class \
-         WHERE relkind IN ('r', 'v', 'm', 'p', 'c') \
          ORDER BY oid",
         &[],
     )?;
@@ -274,14 +284,16 @@ fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgre
 }
 
 fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, postgres::Error> {
+    // `attnum > 0` filters PG's system columns (`ctid`, `xmin`, …) which the
+    // analyzer never inspects. `NOT attisdropped` skips columns that
+    // ALTER TABLE DROP COLUMN tombstoned — PG keeps the row so attnum gaps
+    // stay stable. No relkind filter: we mirror every relation's columns.
     let rows = client.query(
         "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
                 a.attgenerated, a.atttypmod, a.attidentity \
          FROM pg_catalog.pg_attribute a \
-         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
          WHERE a.attnum > 0 \
            AND NOT a.attisdropped \
-           AND c.relkind IN ('r', 'v', 'm', 'p', 'c') \
          ORDER BY a.attrelid, a.attnum",
         &[],
     )?;
@@ -524,6 +536,120 @@ fn char_to_contype(c: char) -> ConType {
     }
 }
 
+/// Export every `pg_index` row whose `indrelid` is a relation we already
+/// snapshotted. For each row we also need to recover `indexprs` and
+/// `indpred` as analyzer ASTs — PG stores them as `pg_node_tree` (its own
+/// serialization, not the protobuf shape we use), so we reach back through
+/// `pg_get_indexdef(idx, slot, false)` and `pg_get_expr(indpred, indrelid)`
+/// to get the SQL text and feed it to the analyzer's `serialize_expression`
+/// / `serialize_predicate`. Indexes whose expressions don't round-trip
+/// (rare; usually catalog-internal collation/typename quirks) are skipped
+/// with a warning.
+fn export_indexes(
+    client: &mut postgres::Client,
+    snapshot: &PgCatalog,
+) -> Result<Vec<PgIndex>, postgres::Error> {
+    let rows = client.query(
+        "SELECT i.indexrelid, i.indrelid, i.indnatts, i.indnkeyatts, \
+                i.indisunique, i.indisprimary, \
+                i.indkey::int2[]::int4[] AS indkey, \
+                i.indexprs IS NOT NULL AS has_exprs, \
+                CASE WHEN i.indpred IS NOT NULL \
+                     THEN pg_get_expr(i.indpred, i.indrelid) \
+                     ELSE NULL END AS pred_sql \
+         FROM pg_catalog.pg_index i \
+         ORDER BY i.indexrelid",
+        &[],
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut skipped: Vec<u32> = Vec::new();
+    for r in rows.iter() {
+        let indexrelid: u32 = r.get(0);
+        let indrelid: u32 = r.get(1);
+        let indnatts: i16 = r.get(2);
+        let indnkeyatts: i16 = r.get(3);
+        let indisunique: bool = r.get(4);
+        let indisprimary: bool = r.get(5);
+        let indkey_raw: Vec<i32> = r.get(6);
+        let has_exprs: bool = r.get(7);
+        let pred_sql: Option<String> = r.get(8);
+        let indkey: Vec<i16> = indkey_raw.into_iter().map(|n| n as i16).collect();
+
+        // Pull each expression slot's SQL via pg_get_indexdef(idx, slot, false).
+        // PG numbers slots from 1 up; slots whose indkey is 0 are expressions.
+        let mut indexprs = Vec::new();
+        let mut skip_row = false;
+        if has_exprs {
+            for (slot_idx, &attnum) in indkey.iter().enumerate() {
+                if attnum != 0 {
+                    continue;
+                }
+                let slot_no = (slot_idx + 1) as i32;
+                let expr_sql: String = client
+                    .query_one(
+                        "SELECT pg_get_indexdef($1::oid, $2, false)",
+                        &[&indexrelid, &slot_no],
+                    )?
+                    .get(0);
+                match snapshot.serialize_expression(&expr_sql) {
+                    Ok(s) => indexprs.push(s),
+                    Err(e) => {
+                        eprintln!(
+                            "  skipping pg_index oid={indexrelid}: serialize_expression on `{expr_sql}` failed: {e}"
+                        );
+                        skip_row = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if skip_row {
+            skipped.push(indexrelid);
+            continue;
+        }
+
+        let indpred = if let Some(sql) = pred_sql {
+            match snapshot.serialize_predicate(&sql) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "  skipping pg_index oid={indexrelid}: serialize_predicate on `{sql}` failed: {e}"
+                    );
+                    skipped.push(indexrelid);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let Some(indexrelid) = PgClassOid::new(indexrelid) else {
+            continue;
+        };
+        let Some(indrelid) = PgClassOid::new(indrelid) else {
+            continue;
+        };
+        out.push(PgIndex {
+            indexrelid,
+            indrelid,
+            indnatts,
+            indnkeyatts,
+            indisunique,
+            indisprimary,
+            indkey,
+            indexprs,
+            indpred,
+        });
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "Skipped {} pg_index row(s) whose expressions/predicate didn't round-trip.",
+            skipped.len(),
+        );
+    }
+    Ok(out)
+}
+
 fn export_inherits(client: &mut postgres::Client) -> Result<Vec<PgInherits>, postgres::Error> {
     let rows = client.query(
         "SELECT inhrelid, inhparent, inhseqno \
@@ -736,10 +862,15 @@ fn char_to_typcategory(c: char) -> TypCategory {
 fn char_to_relkind(c: char) -> Option<RelKind> {
     Some(match c {
         'r' => RelKind::Table,
+        'i' => RelKind::Index,
+        'S' => RelKind::Sequence,
+        't' => RelKind::ToastTable,
         'v' => RelKind::View,
         'm' => RelKind::MaterializedView,
-        'p' => RelKind::Partitioned,
         'c' => RelKind::CompositeType,
+        'f' => RelKind::ForeignTable,
+        'p' => RelKind::Partitioned,
+        'I' => RelKind::PartitionedIndex,
         _ => return None,
     })
 }
