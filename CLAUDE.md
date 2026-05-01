@@ -4,18 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Test Commands
 
-Always use `cargo nextest run` instead of `cargo test` — it aggregates results across test binaries into a single summary with total count and elapsed time, which `cargo test` does not provide natively.
+Always use `cargo nextest run --release` instead of `cargo test` — nextest
+aggregates results across test binaries into a single summary, and `--release`
+runs *much* faster end-to-end on this workspace (the analyzer's DDL/query test
+suite is heavy on parsing + interpretation; the optimized binary saves more
+than the extra build time costs).
 
 ```bash
-cargo build                                  # build all crates
-cargo build -p cubos_sql                     # build specific crate
-cargo nextest run                            # all tests (no Docker needed)
-cargo nextest run -p cubos_sql_core          # core crate only
-cargo nextest run -p cubos_sql_macros        # macro crate only
-cargo nextest run -p cubos_sql_analyzer      # analyzer crate only
-cargo nextest run -p cubos_sql               # runtime crate only
-cargo nextest run --test migrate_integration # integration tests (requires Docker)
-cargo nextest run test_name                  # run a single test by name
+cargo build                                          # build all crates
+cargo build -p cubos_sql                             # build specific crate
+cargo nextest run --release                          # all tests (no Docker needed)
+cargo nextest run --release -p cubos_sql_core        # core crate only
+cargo nextest run --release -p cubos_sql_macros      # macro crate only
+cargo nextest run --release -p cubos_sql_analyzer    # analyzer crate only
+cargo nextest run --release -p cubos_sql             # runtime crate only
+cargo nextest run --release --test migrate_integration  # integration tests (requires Docker)
+cargo nextest run --release test_name                # run a single test by name
 ```
 
 All compile-time tests run without Docker. Integration tests for the runtime migration runner use `testcontainers-modules` and require a running Docker daemon.

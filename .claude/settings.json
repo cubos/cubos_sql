@@ -15,8 +15,8 @@
           },
           {
             "type": "command",
-            "command": "out=$(RUSTFLAGS=\"-D warnings\" cargo test 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
-            "statusMessage": "Running cargo test..."
+            "command": "out=$(RUSTFLAGS=\"-D warnings\" cargo nextest run --release 2>&1); e=$?; [ $e -ne 0 ] && echo \"$out\" >&2 && exit 2; exit 0",
+            "statusMessage": "Running cargo nextest run --release..."
           },
           {
             "type": "command",
