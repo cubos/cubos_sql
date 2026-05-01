@@ -79,10 +79,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             indexprs.push(serialize_node(expr));
         }
     }
-    let indpred = stmt
-        .where_clause
-        .as_deref()
-        .map(serialize_node);
+    let indpred = stmt.where_clause.as_deref().map(serialize_node);
 
     // ── Pick a name for the index ──
     //

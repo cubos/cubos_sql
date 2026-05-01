@@ -480,11 +480,18 @@ fn build_out_args(p: &PgProc) -> Vec<OutArg> {
     out
 }
 
+/// Effective return type for an aggregate: when `pg_aggregate.aggfinalfn`
+/// points at a real proc, use *that* proc's `prorettype`; otherwise the
+/// caller falls back to the aggregate's own `prorettype`. PG derives this
+/// the same way at lookup time — we don't cache the type on `pg_aggregate`.
+fn aggregate_final_return(f: &PgProc, snapshot: &PgCatalog) -> Option<PgTypeOid> {
+    let agg = snapshot.pg_aggregate.get(&f.oid)?;
+    let final_oid = agg.aggfinalfn?;
+    snapshot.pg_proc.get(&final_oid).map(|p| p.prorettype)
+}
+
 fn make_resolved(f: &PgProc, snapshot: &PgCatalog) -> ResolvedFunction {
-    let agg_final = snapshot
-        .pg_aggregate
-        .get(&f.oid)
-        .and_then(|a| a.aggfinaltype);
+    let agg_final = aggregate_final_return(f, snapshot);
     ResolvedFunction {
         return_type_oid: agg_final.unwrap_or(f.prorettype),
         arg_types: f.proargtypes.clone(),
@@ -516,10 +523,7 @@ fn make_resolved_polymorphic(
         );
     }
 
-    let agg_final = snapshot
-        .pg_aggregate
-        .get(&f.oid)
-        .and_then(|a| a.aggfinaltype);
+    let agg_final = aggregate_final_return(f, snapshot);
     let return_type_oid = substitute_polymorphic(
         agg_final.unwrap_or(f.prorettype),
         bound_element,

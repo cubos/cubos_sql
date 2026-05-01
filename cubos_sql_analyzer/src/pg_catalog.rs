@@ -587,16 +587,24 @@ pub struct PgProc {
 /// `pg_aggregate`: extra metadata for aggregate `pg_proc` rows.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgAggregate {
-    /// FK `pg_proc.oid`.
+    /// FK `pg_proc.oid` — the aggregate's own pg_proc entry.
     pub aggfnoid: PgProcOid,
-    /// FK `pg_type.oid` of the aggregate's effective return type when a
-    /// finalfn is present. `None` when there is no finalfn (return type
-    /// comes from `pg_proc.prorettype`).
+    /// FK `pg_proc.oid` of the final function. `None` (PG: `0`) when the
+    /// aggregate has no finalfn, in which case its effective return type
+    /// is `aggfnoid.prorettype`. Callers walk the FK to derive the
+    /// effective return type instead of caching it on the row.
     #[serde(with = "crate::oid::oid_or_zero")]
-    pub aggfinaltype: Option<PgTypeOid>,
+    pub aggfinalfn: Option<PgProcOid>,
 }
 
 /// `pg_operator`: a registered operator.
+///
+/// `oprresult` is `Option<PgTypeOid>` — PG `0` is a "shell operator" placed
+/// by `CREATE OPERATOR` before the implementation function exists. Such
+/// operators can't be used in queries; the operator-resolution path skips
+/// them when their result type is `None`. We still keep the row so the
+/// catalog mirror is faithful and a follow-up CREATE OPERATOR can finish
+/// it.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgOperator {
     pub oid: PgOperatorOid,
@@ -608,8 +616,9 @@ pub struct PgOperator {
     pub oprleft: Option<PgTypeOid>,
     /// FK `pg_type.oid`.
     pub oprright: PgTypeOid,
-    /// FK `pg_type.oid`.
-    pub oprresult: PgTypeOid,
+    /// FK `pg_type.oid`. `None` for shell operators (PG: `0`).
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub oprresult: Option<PgTypeOid>,
 }
 
 /// `pg_cast`: a cast rule between two types.

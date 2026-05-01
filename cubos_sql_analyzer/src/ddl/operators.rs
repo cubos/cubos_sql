@@ -79,7 +79,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         oprnamespace: nsoid,
         oprleft: left_type,
         oprright: right_oid,
-        oprresult: result_oid,
+        oprresult: Some(result_oid),
     });
 
     Ok(())

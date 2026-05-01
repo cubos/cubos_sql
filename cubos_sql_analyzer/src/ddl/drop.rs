@@ -231,9 +231,7 @@ fn drop_index(
     let synth_oids: Vec<_> = interp
         .pg_constraint
         .values()
-        .filter(|c| {
-            matches!(c.contype, crate::pg_catalog::ConType::Unique) && c.conname == name
-        })
+        .filter(|c| matches!(c.contype, crate::pg_catalog::ConType::Unique) && c.conname == name)
         .map(|c| c.oid)
         .collect();
     for oid in synth_oids {

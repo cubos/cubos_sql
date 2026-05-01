@@ -7,6 +7,20 @@
 
 use crate::common::*;
 
+/// Filter pg_index rows down to those targeting user-defined relations
+/// (everything in the seed lives in `pg_catalog` / `pg_toast` /
+/// `information_schema`, so anything in `public` is from the test).
+fn user_indexes(db: &PgCatalog) -> Vec<&PgIndex> {
+    let public_oid = db.namespace_oid("public").unwrap();
+    db.pg_index_values()
+        .filter(|i| {
+            db.pg_class()
+                .get(&i.indrelid)
+                .is_some_and(|c| c.relnamespace == public_oid)
+        })
+        .collect()
+}
+
 // ── VOLATILE function rejection in index expressions ────────────────────────
 
 #[test]
@@ -296,9 +310,10 @@ fn drop_index_removes_pg_class_and_pg_index_rows() {
     ]);
 
     assert!(db.resolve_table(None, "t_name_idx").is_none());
+    // Filter to user-relations: pg_catalog ships with its own indexes.
     assert!(
-        db.pg_index_values().next().is_none(),
-        "no pg_index rows should remain after DROP INDEX"
+        user_indexes(&db).is_empty(),
+        "no user pg_index rows should remain after DROP INDEX"
     );
 }
 
@@ -316,7 +331,7 @@ fn drop_table_cascades_to_indexes() {
     ]);
 
     assert!(db.resolve_table(None, "t_name_idx").is_none());
-    assert!(db.pg_index_values().next().is_none());
+    assert!(user_indexes(&db).is_empty());
 }
 
 #[test]
@@ -358,10 +373,15 @@ fn alter_table_drop_constraint_removes_backing_index() {
     ]);
 
     assert!(db.resolve_table(None, "t_slug_key").is_none());
-    // pg_index entries: only the pkey one should remain.
-    let remaining: Vec<_> = db.pg_index_values().collect();
-    assert_eq!(remaining.len(), 1);
-    assert!(remaining[0].indisprimary);
+    // Only the pkey index should remain on `t`. Filter by `indrelid` so
+    // built-in pg_catalog indexes don't pollute the assertion.
+    let table_oid = db.resolve_table(None, "t").unwrap().oid;
+    let on_t: Vec<_> = db
+        .pg_index_values()
+        .filter(|i| i.indrelid == table_oid)
+        .collect();
+    assert_eq!(on_t.len(), 1);
+    assert!(on_t[0].indisprimary);
 }
 
 #[test]
@@ -395,7 +415,52 @@ fn drop_column_cascade_removes_dependent_index() {
     ]);
 
     assert!(db.resolve_table(None, "t_slug_idx").is_none());
-    assert!(db.pg_index_values().next().is_none());
+    assert!(user_indexes(&db).is_empty());
+}
+
+// ── Catalog noise must not leak into ON CONFLICT lookups ───────────────────
+//
+// The seed ships with ~163 pg_index rows (every catalog table has its own
+// indexes). ON CONFLICT (cols) matches pg_constraint by relation OID +
+// conkey set, so if a pg_catalog index named like a user column were
+// reachable, the validator could return a false positive. These tests
+// pin the property by exercising column names that show up frequently
+// across pg_catalog (`oid`, `name`).
+
+#[test]
+fn on_conflict_user_column_not_polluted_by_catalog_indexes() {
+    // `oid` is indexed across pg_catalog (`pg_class_oid_index`,
+    // `pg_proc_oid_index`, …). A user table with an `oid` column should
+    // still need its OWN unique constraint to participate in ON CONFLICT.
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE my_objs (oid BIGINT NOT NULL, name TEXT NOT NULL);")
+        .unwrap();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO my_objs (oid, name) VALUES ($p1, $p2) \
+             ON CONFLICT (oid) DO NOTHING"
+        ),
+        AnalyzeError::Invalid(_),
+        "no unique or exclusion constraint",
+    );
+}
+
+#[test]
+fn user_unique_index_still_resolves_on_conflict() {
+    // Sanity: with the noisy catalog still loaded, a user-created UNIQUE
+    // INDEX on a column whose name collides with a catalog column must
+    // still resolve.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE my_objs (oid BIGINT NOT NULL, name TEXT NOT NULL);
+         CREATE UNIQUE INDEX my_objs_oid_uniq ON my_objs (oid);",
+    )
+    .unwrap();
+    db.analyze(
+        "INSERT INTO my_objs (oid, name) VALUES ($p1, $p2) \
+         ON CONFLICT (oid) DO NOTHING",
+    )
+    .unwrap();
 }
 
 #[test]

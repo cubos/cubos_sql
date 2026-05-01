@@ -275,7 +275,12 @@ impl PgCatalog {
             if let Some(oids) = self.operator_by_qname.get(&(nsoid, name.to_owned())) {
                 for &oid in oids {
                     if let Some(op) = self.pg_operator.get(&oid) {
-                        candidate_buf.push(op);
+                        // Skip shell operators — `oprresult = None` means
+                        // the implementation hasn't been linked yet and
+                        // the operator can't appear in queries.
+                        if op.oprresult.is_some() {
+                            candidate_buf.push(op);
+                        }
                     }
                 }
             }
@@ -807,8 +812,11 @@ fn concretize_operator(
             bound_array,
             db,
         ),
+        // Shell operators (oprresult = None) can't be resolved — find_operator
+        // already filters them out of the candidate list, so this unwrap is
+        // safe: any PgOperator that reaches here has a result type.
         result_type_oid: crate::functions::substitute_polymorphic(
-            op.oprresult,
+            op.oprresult.expect("non-shell operator"),
             bound_element,
             bound_array,
             db,

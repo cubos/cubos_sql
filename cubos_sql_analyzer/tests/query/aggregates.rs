@@ -147,6 +147,55 @@ fn agg_count_without_group_by() {
     assert_cols(&info, vec![c("cnt", int8())]);
 }
 
+// ── aggfinalfn-driven return types ──────────────────────────────────────────
+//
+// These exercise the codepath that walks pg_aggregate.aggfinalfn → pg_proc
+// → prorettype. Without a properly populated `aggfinalfn` in the seed,
+// the returned type would silently fall back to the aggregate's transition
+// type (e.g., AVG(int) would return its internal accumulator instead of
+// numeric). Each variant of AVG we test below has its own finalfn.
+
+#[test]
+fn avg_int4_returns_numeric_via_finalfn() {
+    let db = setup();
+    // PG: avg(int4) → numeric. Driven by `int8_avg` finalfn — `aggfinalfn`
+    // points at it; the analyzer walks that to recover the type.
+    let sql = "SELECT AVG(rating) AS avg_rating FROM comments";
+    let info = db.analyze(sql).unwrap();
+    assert_cols(&info, vec![cn("avg_rating", numeric())]);
+}
+
+#[test]
+fn avg_int8_returns_numeric_via_finalfn() {
+    let db = setup();
+    let sql = "SELECT AVG(id) AS avg_id FROM posts";
+    let info = db.analyze(sql).unwrap();
+    assert_cols(&info, vec![cn("avg_id", numeric())]);
+}
+
+#[test]
+fn avg_numeric_returns_numeric_via_finalfn() {
+    // Cover NUMERIC explicitly — its accumulator is `_numeric` (an array)
+    // but the finalfn collapses to numeric. If `aggfinalfn` weren't
+    // resolved, we'd surface the array intermediate.
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE t (price NUMERIC NOT NULL);")
+        .unwrap();
+    let info = db.analyze("SELECT AVG(price) AS avg_price FROM t").unwrap();
+    assert_cols(&info, vec![cn("avg_price", numeric())]);
+}
+
+#[test]
+fn variance_int4_returns_numeric_via_finalfn() {
+    // VARIANCE / STDDEV also have finalfns. Different finalfn than AVG —
+    // makes sure we're not just lucky on one binding.
+    let db = setup();
+    let info = db
+        .analyze("SELECT VARIANCE(rating) AS v FROM comments")
+        .unwrap();
+    assert_cols(&info, vec![cn("v", numeric())]);
+}
+
 #[test]
 fn agg_sum_without_group_by_always_nullable() {
     let db = setup();

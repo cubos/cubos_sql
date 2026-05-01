@@ -391,34 +391,37 @@ fn char_to_provolatile(c: char) -> ProVolatile {
 }
 
 fn export_aggregates(client: &mut postgres::Client) -> Result<Vec<PgAggregate>, postgres::Error> {
+    // aggfnoid identifies the aggregate (FK pg_proc.oid). aggfinalfn (also
+    // FK pg_proc.oid, or 0 for none) drives the effective return type
+    // resolution: callers walk to that proc's prorettype, otherwise fall
+    // back to aggfnoid.prorettype. Don't pre-compute the type — PG doesn't
+    // and we shouldn't desync from it.
     let rows = client.query(
-        "SELECT a.aggfnoid::int4 as oid, \
-                CASE WHEN a.aggfinalfn != 0 \
-                     THEN (SELECT prorettype FROM pg_proc WHERE oid = a.aggfinalfn) \
-                     ELSE 0::oid \
-                END as final_type \
-         FROM pg_aggregate a \
-         ORDER BY a.aggfnoid",
+        "SELECT aggfnoid::int4 AS aggfnoid, \
+                aggfinalfn::int4 AS aggfinalfn \
+         FROM pg_catalog.pg_aggregate \
+         ORDER BY aggfnoid",
         &[],
     )?;
     Ok(rows
         .iter()
         .map(|r| {
-            let oid: i32 = r.get(0);
-            let final_type: u32 = r.get(1);
+            let aggfnoid: i32 = r.get(0);
+            let aggfinalfn: i32 = r.get(1);
             PgAggregate {
-                aggfnoid: PgProcOid::new(oid as u32).expect("aggfnoid is non-zero"),
-                aggfinaltype: PgTypeOid::new(final_type),
+                aggfnoid: PgProcOid::new(aggfnoid as u32).expect("aggfnoid is non-zero"),
+                aggfinalfn: PgProcOid::new(aggfinalfn as u32),
             }
         })
         .collect())
 }
 
 fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, postgres::Error> {
+    // No filter — shell operators (oprresult = 0) round-trip too. Operator
+    // resolution skips them at lookup time.
     let rows = client.query(
         "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult \
          FROM pg_catalog.pg_operator \
-         WHERE oprresult != 0 \
          ORDER BY oid",
         &[],
     )?;
@@ -436,7 +439,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
                 oprnamespace: PgNamespaceOid::new(oprnamespace).expect("oprnamespace is non-zero"),
                 oprleft: PgTypeOid::new(oprleft),
                 oprright: PgTypeOid::new(oprright).expect("oprright is non-zero"),
-                oprresult: PgTypeOid::new(oprresult).expect("oprresult is non-zero"),
+                oprresult: PgTypeOid::new(oprresult),
             }
         })
         .collect())
@@ -491,14 +494,11 @@ fn export_extensions(client: &mut postgres::Client) -> Result<Vec<PgExtension>, 
 }
 
 fn export_constraints(client: &mut postgres::Client) -> Result<Vec<PgConstraint>, postgres::Error> {
-    // Only export PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK / EXCLUSION
-    // constraints — the analyzer does not consult anything else (e.g.
-    // PG18 NOT NULL constraints land in pg_constraint too, but `attnotnull`
-    // already records them).
+    // No contype filter — `ConType::Other` is a catch-all so unknown chars
+    // round-trip without panicking.
     let rows = client.query(
         "SELECT oid, conname, conrelid, contype, conkey, confrelid, confkey \
          FROM pg_catalog.pg_constraint \
-         WHERE contype IN ('p','u','f','c','x') \
          ORDER BY oid",
         &[],
     )?;
@@ -672,14 +672,12 @@ fn export_inherits(client: &mut postgres::Client) -> Result<Vec<PgInherits>, pos
 }
 
 fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgres::Error> {
-    // Only export deptype = 'e' (extension) — the only type the analyzer
-    // tracks in the seed. Normal/auto deps from the DDL pipeline are
-    // re-derived when `apply_sql` runs against a clean catalog.
+    // No deptype filter — every dependency edge round-trips. Mirrors
+    // `pg_depend` 1:1 so cascading drops behave identically to PG.
     let rows = client.query(
         "SELECT classid::int4, objid::int4, objsubid, refclassid::int4, refobjid::int4, \
                 refobjsubid, deptype \
          FROM pg_catalog.pg_depend \
-         WHERE deptype = 'e' \
          ORDER BY classid, objid, objsubid, refclassid, refobjid",
         &[],
     )?;

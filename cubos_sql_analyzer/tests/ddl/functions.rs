@@ -84,10 +84,13 @@ fn create_aggregate_with_finalfunc_uses_final_return_type() {
         .into_iter()
         .find(|f| matches!(f.prokind, ProKind::Aggregate))
         .expect("my_avg aggregate should exist");
-    // The aggregate's effective return type is the finalfn's prorettype,
-    // which is recorded in pg_aggregate.aggfinaltype.
+    // The aggregate's effective return type is its finalfn's prorettype.
+    // pg_aggregate stores the finalfn FK; the analyzer walks to pg_proc
+    // for the type at lookup time.
     let agg_row = snap.pg_aggregate().get(&agg.oid).expect("pg_aggregate row");
-    assert_eq!(agg_row.aggfinaltype, Some(float8_oid));
+    let finalfn_oid = agg_row.aggfinalfn.expect("aggfinalfn must be set");
+    let finalfn_proc = snap.pg_proc().get(&finalfn_oid).expect("finalfn pg_proc");
+    assert_eq!(finalfn_proc.prorettype, float8_oid);
 }
 
 #[test]

@@ -5,7 +5,7 @@
 pub use cubos_sql_analyzer::{
     AnalyzeError, AnalyzedColumn, AnalyzedQuery, AttGenerated, CastContext, CastMethod, DdlError,
     PgAggregate, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid,
-    PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgNamespace,
+    PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgNamespace,
     PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid,
     ProKind, QualifiedName, RecordField, RelKind, TypCategory, TypType, Type,
 };

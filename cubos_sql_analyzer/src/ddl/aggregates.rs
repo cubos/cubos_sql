@@ -82,13 +82,19 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         }
     }
 
-    // Determine the aggregate's effective return type.
-    //   1. FINALFUNC return type, if a final function is declared.
-    //   2. Otherwise the state type.
-    let final_return = finalfunc.as_ref().and_then(|(schema, name)| {
-        let candidates = interp.find_functions(schema.as_deref(), name);
-        candidates.into_iter().next().map(|f| f.prorettype)
+    // Resolve the FINALFUNC's pg_proc oid (if declared) — the analyzer
+    // walks `aggfinalfn -> pg_proc -> prorettype` at lookup time, so we
+    // store the FK rather than the derived type. Also derive the
+    // aggregate's own `prorettype` for the pg_proc row: PG sets it to the
+    // finalfn's return type when one is declared, otherwise the state
+    // type (which is what queries see for things like SUM(int) → bigint).
+    let finalfn = finalfunc.as_ref().and_then(|(schema, name)| {
+        interp
+            .find_functions(schema.as_deref(), name)
+            .first()
+            .map(|f| f.oid)
     });
+    let final_return = finalfn.and_then(|oid| interp.pg_proc.get(&oid).map(|p| p.prorettype));
     let Some(prorettype) = final_return.or(state_type) else {
         return Ok(());
     };
@@ -115,7 +121,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     });
     interp.insert_pg_aggregate(PgAggregate {
         aggfnoid: proc_oid,
-        aggfinaltype: final_return,
+        aggfinalfn: finalfn,
     });
 
     Ok(())
