@@ -6,6 +6,7 @@
 
 pub mod aggregates;
 pub mod alter;
+pub mod collations;
 pub mod drop;
 pub mod extensions;
 pub mod functions;
@@ -133,8 +134,9 @@ pub(crate) fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(
                 ObjectType::ObjectType => types::define_type(db, s),
                 ObjectType::ObjectOperator => operators::define_operator(db, s),
                 ObjectType::ObjectAggregate => aggregates::define_aggregate(db, s),
-                // Other DefineStmt kinds (collation, text search, etc.)
-                // are irrelevant for static type analysis.
+                ObjectType::ObjectCollation => collations::define_collation(db, s),
+                // Other DefineStmt kinds (text search, etc.) are irrelevant
+                // for static type analysis.
                 _ => Ok(()),
             }
         }

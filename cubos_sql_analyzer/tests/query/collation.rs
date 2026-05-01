@@ -160,6 +160,69 @@ fn collate_unknown_collation_should_error() {
 }
 
 #[test]
+fn create_collation_then_use_it() {
+    // PG: `CREATE COLLATION my_coll (LOCALE = 'C')` registers a new
+    // collation in pg_collation. Subsequent `COLLATE "my_coll"` resolves.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE COLLATION my_coll (LOCALE = 'C');
+         CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT NOT NULL);",
+    )
+    .unwrap();
+    db.analyze("SELECT name COLLATE \"my_coll\" AS n FROM t")
+        .unwrap();
+}
+
+#[test]
+fn create_collation_from_existing() {
+    // PG: `CREATE COLLATION new FROM existing` clones an existing entry.
+    // The new row resolves with the same encoding semantics as its source.
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE COLLATION my_c FROM \"C\";").unwrap();
+    let resolved = db
+        .resolve_collation(None, "my_c")
+        .expect("clone should be registered");
+    let source = db.resolve_collation(None, "C").unwrap();
+    assert_eq!(resolved.collencoding, source.collencoding);
+}
+
+#[test]
+fn create_collation_from_unknown_errors() {
+    let mut db = PgCatalog::new();
+    let err = db
+        .apply_sql("CREATE COLLATION my_c FROM \"definitely_not_a_real_one\";")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("does not exist"),
+        "expected source-not-found error, got: {err}"
+    );
+}
+
+#[test]
+fn create_collation_duplicate_name_errors() {
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE COLLATION my_c (LOCALE = 'C');")
+        .unwrap();
+    let err = db
+        .apply_sql("CREATE COLLATION my_c (LOCALE = 'C');")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("already exists"),
+        "expected duplicate error, got: {err}"
+    );
+}
+
+#[test]
+fn create_collation_if_not_exists_swallows_duplicate() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE COLLATION my_c (LOCALE = 'C');
+         CREATE COLLATION IF NOT EXISTS my_c (LOCALE = 'C');",
+    )
+    .unwrap();
+}
+
+#[test]
 fn column_level_collate_in_create_table_is_preserved() {
     // PG: `name TEXT COLLATE "C"` pins the column's default collation in
     // pg_attribute.attcollation. The analyzer now records it, so two
