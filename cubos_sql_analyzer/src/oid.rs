@@ -150,6 +150,11 @@ define_oid!(
     /// KEY / EXCLUSION constraint.
     PgConstraintOid
 );
+define_oid!(
+    /// `pg_rewrite.oid` — one per rule. Views' SELECT bodies live here
+    /// under `rulename = '_RETURN'`.
+    PgRewriteOid
+);
 
 // Generic OID for `pg_depend.objid` / `refobjid`. Their concrete catalog
 // table varies with `classid`/`refclassid`, so we can't pin them to one of

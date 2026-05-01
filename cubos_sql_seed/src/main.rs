@@ -49,7 +49,10 @@ fn main() {
     eprintln!("Exporting view definitions...");
     let view_defs =
         export_view_definitions(&mut client).expect("failed to export view definitions");
-    eprintln!("Populating relviewdef for {} view(s)...", view_defs.len());
+    eprintln!(
+        "Populating pg_rewrite._RETURN for {} view(s)...",
+        view_defs.len()
+    );
     let snapshot = populate_view_defs(snapshot, view_defs);
 
     let json = serde_json::to_string(&snapshot).expect("failed to serialize snapshot");
@@ -78,6 +81,7 @@ fn main() {
     eprintln!("  pg_inherits:  {}", snapshot.pg_inherits.len());
     eprintln!("  pg_constraint:{}", snapshot.pg_constraint.len());
     eprintln!("  pg_index:     {}", snapshot.pg_index.len());
+    eprintln!("  pg_rewrite:   {}", snapshot.pg_rewrite.len());
 }
 
 // ─── Schema export ─────────────────────────────────────────────────────────────
@@ -125,6 +129,10 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_inherits,
         pg_constraint,
         pg_index: Vec::new(),
+        // pg_rewrite (view bodies) is populated downstream by
+        // populate_view_defs, which re-runs each CREATE VIEW through the
+        // analyzer DDL pipeline against this seed.
+        pg_rewrite: Vec::new(),
         search_path,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
@@ -277,7 +285,6 @@ fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgre
                 relnamespace: PgNamespaceOid::new(relnamespace).expect("relnamespace is non-zero"),
                 relkind,
                 reltype: PgTypeOid::new(reltype),
-                relviewdef: None,
             })
         })
         .collect())
@@ -728,11 +735,11 @@ fn export_view_definitions(
 }
 
 /// Re-apply each view's `CREATE VIEW` through the analyzer's DDL pipeline so
-/// `PgClass.relviewdef` is populated with the resolved AST. Continues to use
+/// the matching `pg_rewrite._RETURN` row gets emitted. Continues to use
 /// `to_seed()`/`from_seed()` for round-trip.
 ///
-/// Views that the analyzer can't yet handle (typically polymorphic /
-/// information_schema oddities) are logged and skipped — `relviewdef` stays
+/// Views the analyzer can't yet handle (typically polymorphic /
+/// information_schema oddities) are logged and skipped — pg_rewrite stays
 /// empty for those, but the rest of the seed is still produced.
 fn populate_view_defs(seed: PgCatalogSeed, defs: Vec<(String, String, String)>) -> PgCatalogSeed {
     let mut db = PgCatalog::from_seed(seed);

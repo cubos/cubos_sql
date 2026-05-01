@@ -154,6 +154,7 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
     interp.remove_dependencies_of(PG_CLASS_RELID, class_obj);
     interp.remove_dependencies_on(PG_CLASS_RELID, class_obj);
     interp.remove_pg_constraints_of(class_oid);
+    interp.remove_pg_rewrites_of(class_oid);
     interp
         .pg_inherits
         .retain(|i| i.inhrelid != class_oid && i.inhparent != class_oid);

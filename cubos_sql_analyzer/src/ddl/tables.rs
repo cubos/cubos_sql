@@ -97,7 +97,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         relnamespace: nsoid,
         relkind: RelKind::Table,
         reltype: Some(composite_oid),
-        relviewdef: None,
     });
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
@@ -370,7 +369,6 @@ fn emit_constraint_with_backing_index(
             relnamespace: table_ns,
             relkind: RelKind::Index,
             reltype: None,
-            relviewdef: None,
         });
         let indnatts = conkey.len() as i16;
         interp.insert_pg_index(PgIndex {

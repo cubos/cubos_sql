@@ -125,7 +125,6 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         relnamespace: nsoid,
         relkind: RelKind::Index,
         reltype: None,
-        relviewdef: None,
     });
 
     let indnatts = indkey.len() as i16;

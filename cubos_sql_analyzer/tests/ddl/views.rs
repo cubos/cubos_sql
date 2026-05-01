@@ -538,8 +538,64 @@ fn view_def_stores_resolved_ast() {
 
     let view = snap.resolve_table(None, "v").unwrap();
     assert!(
-        view.relviewdef.is_some(),
-        "relviewdef should be populated for freshly-created views",
+        snap.view_body(view.oid).is_some(),
+        "pg_rewrite._RETURN should be populated for freshly-created views",
+    );
+}
+
+#[test]
+fn drop_view_removes_pg_rewrite_return_rule() {
+    // PG: dropping a view tears its `_RETURN` rule down with it.
+    let mut db = build(&[(
+        "0001.sql",
+        "CREATE TABLE t (id INT NOT NULL);
+         CREATE VIEW v AS SELECT id FROM t;",
+    )]);
+
+    let view_oid = db.resolve_table(None, "v").unwrap().oid;
+    assert!(db.view_body(view_oid).is_some());
+
+    db.apply_sql("DROP VIEW v;").unwrap();
+    assert!(db.view_body(view_oid).is_none());
+}
+
+#[test]
+fn create_or_replace_view_replaces_pg_rewrite_body() {
+    // CREATE OR REPLACE drops the old pg_class + pg_rewrite rows and emits
+    // fresh ones. The new body must round-trip the new column shape.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, slug TEXT NOT NULL);
+             CREATE VIEW v AS SELECT id FROM t;",
+        ),
+        (
+            "0002.sql",
+            "CREATE OR REPLACE VIEW v AS SELECT id, slug FROM t;",
+        ),
+    ]);
+
+    let view = snap.resolve_table(None, "v").unwrap();
+    let body = snap.view_body(view.oid).expect("rule must exist");
+    // The rebuilt body's protobuf bytes must end up referencing both
+    // attnums (1 = id, 2 = slug). Cheapest cross-check: attribute count.
+    assert_eq!(snap.attributes_of(view.oid).len(), 2);
+    assert!(!body.ast.is_empty());
+}
+
+#[test]
+fn matview_also_stores_select_in_pg_rewrite() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TABLE t (id INT NOT NULL);
+         CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+    )]);
+
+    let mv = snap.resolve_table(None, "mv").unwrap();
+    assert!(matches!(mv.relkind, RelKind::MaterializedView));
+    assert!(
+        snap.view_body(mv.oid).is_some(),
+        "matviews keep their SELECT in pg_rewrite._RETURN, same as views",
     );
 }
 
@@ -556,7 +612,7 @@ fn view_def_serde_roundtrip_preserves_ast() {
 
     let original = snap.resolve_table(None, "v").unwrap();
     let restored = back.resolve_table(None, "v").unwrap();
-    assert_eq!(original.relviewdef, restored.relviewdef);
+    assert_eq!(snap.view_body(original.oid), back.view_body(restored.oid));
 
     let original_table_deps = view_table_deps(&snap, original.oid);
     let restored_table_deps = view_table_deps(&back, restored.oid);

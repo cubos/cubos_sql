@@ -14,10 +14,11 @@
 
 use pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
 
-use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgTypeOid};
+use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgRewriteOid, PgTypeOid};
 use crate::pg_catalog::{
-    AstBinding, DepType, PG_CLASS_RELID, PG_PROC_RELID, PG_TYPE_RELID, PgAttribute, PgClass,
-    PgDepend, PgType, RelKind, SerializedAst, TypCategory, TypType,
+    AstBinding, DepType, EvEnabled, EvType, PG_CLASS_RELID, PG_PROC_RELID, PG_TYPE_RELID,
+    PgAttribute, PgClass, PgDepend, PgRewrite, PgType, RelKind, SerializedAst, TypCategory,
+    TypType,
 };
 
 use super::DdlError;
@@ -142,8 +143,22 @@ fn install_relation(
         relnamespace: nsoid,
         relkind,
         reltype: Some(composite_oid),
-        relviewdef: Some(SerializedAst { ast, bindings }),
     });
+    // PG stores the SELECT body as a `_RETURN` rule in pg_rewrite — only
+    // for views/matviews; CTAS-as-table doesn't get one.
+    if matches!(relkind, RelKind::View | RelKind::MaterializedView) {
+        let rewrite_oid = PgRewriteOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        interp.insert_pg_rewrite(PgRewrite {
+            oid: rewrite_oid,
+            rulename: "_RETURN".to_owned(),
+            ev_class: class_oid,
+            ev_type: EvType::Select,
+            ev_enabled: EvEnabled::Origin,
+            is_instead: true,
+            ev_qual: None,
+            ev_action: SerializedAst { ast, bindings },
+        });
+    }
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
             attrelid: class_oid,
@@ -365,11 +380,7 @@ pub(crate) fn reanalyze_view(
     snapshot: &mut PgCatalog,
     view_oid: PgClassOid,
 ) -> Result<(), DdlError> {
-    let Some(serialized) = snapshot
-        .pg_class
-        .get(&view_oid)
-        .and_then(|c| c.relviewdef.clone())
-    else {
+    let Some(serialized) = snapshot.view_body(view_oid).cloned() else {
         return Ok(());
     };
     let Some(mut ast) = decode_ast(&serialized.ast) else {

@@ -22,7 +22,7 @@ use crate::error::AnalyzeError;
 use crate::lexer::lex;
 use crate::oid::{
     PgCastOid, PgClassOid, PgConstraintOid, PgEnumOid, PgExtensionOid, PgGenericOid,
-    PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid,
+    PgNamespaceOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
 };
 use crate::resolve::{AnalyzedQuery, analyze_static, build_spread_sample_sql, fuse};
 use crate::seed::load_seed;
@@ -253,6 +253,35 @@ pub enum CastMethod {
     InOut,
 }
 
+/// `pg_rewrite.ev_type`. PG stores this as a single char: `'1'` SELECT
+/// (used for views' implicit `_RETURN` rule), `'2'` UPDATE, `'3'` INSERT,
+/// `'4'` DELETE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvType {
+    #[serde(rename = "1")]
+    Select,
+    #[serde(rename = "2")]
+    Update,
+    #[serde(rename = "3")]
+    Insert,
+    #[serde(rename = "4")]
+    Delete,
+}
+
+/// `pg_rewrite.ev_enabled`. PG chars: `O` origin (default), `R` replica,
+/// `A` always, `D` disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvEnabled {
+    #[serde(rename = "O")]
+    Origin,
+    #[serde(rename = "R")]
+    Replica,
+    #[serde(rename = "A")]
+    Always,
+    #[serde(rename = "D")]
+    Disabled,
+}
+
 /// `pg_depend.deptype`. PG chars used here: `n` normal, `a` auto, `i`
 /// internal, `e` extension, `x` auto-extension, `p` pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,14 +480,11 @@ pub struct PgInherits {
 }
 
 /// `pg_class`: a relation (table, view, matview, partitioned table, composite
-/// type's row type).
+/// type's row type, sequence, index, …).
 ///
-/// `relviewdef` is non-PG: it stores the protobuf-encoded `pg_query::Node` of
-/// the view's SELECT plus a side-table of OID-resolved name bindings. Carried
-/// together as [`SerializedAst`] so re-analysis after `ALTER COLUMN TYPE` /
-/// `RENAME` / `SET SCHEMA` works without round-tripping through SQL text.
-/// `None` for non-view relations. View-to-table dependencies live in
-/// `pg_depend`.
+/// Views/matviews keep their SELECT body in `pg_rewrite` under `rulename =
+/// '_RETURN'`, exactly the way PG does. Look up via [`PgCatalog::view_body`]
+/// — there's no `relviewdef` shortcut on this row.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgClass {
     pub oid: PgClassOid,
@@ -470,9 +496,34 @@ pub struct PgClass {
     /// that don't get one (rare in our scope).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub reltype: Option<PgTypeOid>,
-    /// Non-PG: serialized SELECT AST + binding side-table for views/matviews.
-    /// `None` for non-view relations.
-    pub relviewdef: Option<SerializedAst>,
+}
+
+/// `pg_rewrite`: rules attached to a relation. Views are modeled as a
+/// table with relkind = 'v' plus a single rule of type SELECT named
+/// `_RETURN` that carries the body of the view in `ev_action`. PG also
+/// stores user-defined `CREATE RULE INSTEAD INSERT/UPDATE/DELETE` rules
+/// here; the analyzer doesn't currently emit those but the row shape is
+/// the same.
+///
+/// `ev_action` is the SELECT (or DML) AST. PG stores it as `pg_node_tree`;
+/// we keep it as [`SerializedAst`] (protobuf bytes + AstBindings) so
+/// dependency renames flow through the same applier the views always
+/// used. `ev_qual` is the rule's WHERE — `None` for views' `_RETURN`
+/// rule.
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgRewrite {
+    pub oid: PgRewriteOid,
+    pub rulename: String,
+    /// FK `pg_class.oid` — the relation the rule is attached to.
+    pub ev_class: PgClassOid,
+    pub ev_type: EvType,
+    pub ev_enabled: EvEnabled,
+    pub is_instead: bool,
+    /// Optional WHERE clause attached to the rule. Always `None` for
+    /// views' `_RETURN`.
+    pub ev_qual: Option<SerializedAst>,
+    /// The rule body. For views/matviews this is the SELECT AST.
+    pub ev_action: SerializedAst,
 }
 
 /// Bundle of a protobuf-encoded `pg_query::Node` plus the per-name-slot
@@ -727,6 +778,8 @@ pub struct PgCatalogSeed {
     pub pg_constraint: Vec<PgConstraint>,
     #[serde(default)]
     pub pg_index: Vec<PgIndex>,
+    #[serde(default)]
+    pub pg_rewrite: Vec<PgRewrite>,
     /// Namespace OIDs in search order. Non-PG (PG keeps this in a GUC).
     #[serde(default, with = "crate::oid::vec_oid")]
     pub search_path: Vec<PgNamespaceOid>,
@@ -764,6 +817,7 @@ pub struct PgCatalog {
     pub(crate) pg_constraint: HashMap<PgConstraintOid, PgConstraint>,
     /// Keyed by `indexrelid` (the index's `pg_class.oid`).
     pub(crate) pg_index: HashMap<PgClassOid, PgIndex>,
+    pub(crate) pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
@@ -907,6 +961,9 @@ impl PgCatalog {
         for i in seed.pg_index {
             cat.pg_index.insert(i.indexrelid, i);
         }
+        for r in seed.pg_rewrite {
+            cat.pg_rewrite.insert(r.oid, r);
+        }
         cat.search_path = seed.search_path;
         cat
     }
@@ -931,6 +988,7 @@ impl PgCatalog {
             pg_inherits: Vec::new(),
             pg_constraint: HashMap::new(),
             pg_index: HashMap::new(),
+            pg_rewrite: HashMap::new(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),
@@ -1006,6 +1064,9 @@ impl PgCatalog {
         let mut pg_index: Vec<_> = self.pg_index.values().cloned().collect();
         pg_index.sort_by_key(|i| i.indexrelid);
 
+        let mut pg_rewrite: Vec<_> = self.pg_rewrite.values().cloned().collect();
+        pg_rewrite.sort_by_key(|r| r.oid);
+
         PgCatalogSeed {
             pg_namespace,
             pg_type,
@@ -1022,6 +1083,7 @@ impl PgCatalog {
             pg_inherits,
             pg_constraint,
             pg_index,
+            pg_rewrite,
             search_path: self.search_path.clone(),
         }
     }
@@ -1337,6 +1399,34 @@ impl PgCatalog {
 
     pub(crate) fn remove_pg_index(&mut self, indexrelid: PgClassOid) -> Option<PgIndex> {
         self.pg_index.remove(&indexrelid)
+    }
+
+    pub(crate) fn insert_pg_rewrite(&mut self, row: PgRewrite) {
+        self.pg_rewrite.insert(row.oid, row);
+    }
+
+    /// Drop every `pg_rewrite` row attached to `relid`. Used by
+    /// DROP TABLE / DROP VIEW so the rule body doesn't leak past the
+    /// relation.
+    pub(crate) fn remove_pg_rewrites_of(&mut self, relid: PgClassOid) {
+        self.pg_rewrite.retain(|_, r| r.ev_class != relid);
+    }
+
+    /// Look up the SELECT body for a view (the `_RETURN` rule). Returns
+    /// `None` for non-views or if the rule was never installed.
+    pub fn view_body(&self, view_oid: PgClassOid) -> Option<&SerializedAst> {
+        self.pg_rewrite.values().find_map(|r| {
+            (r.ev_class == view_oid && r.rulename == "_RETURN").then_some(&r.ev_action)
+        })
+    }
+
+    /// Replace the SELECT body for a view (the `_RETURN` rule). Tests use
+    /// this to simulate a legacy snapshot whose `_RETURN` rule was never
+    /// populated.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn clear_view_body(&mut self, view_oid: PgClassOid) {
+        self.pg_rewrite
+            .retain(|_, r| !(r.ev_class == view_oid && r.rulename == "_RETURN"));
     }
 
     /// Drop every `pg_index` row whose `indrelid` is `relid` and return the

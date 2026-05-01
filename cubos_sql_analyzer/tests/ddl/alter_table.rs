@@ -311,8 +311,9 @@ fn alter_column_type_on_nonexistent_column_errors() {
 
 #[test]
 fn alter_column_type_reanalyze_is_noop_for_legacy_view() {
-    // Simulate a legacy snapshot where relviewdef was never populated:
-    // the ALTER path must still succeed (best-effort), not blow up.
+    // Simulate a legacy snapshot where the `_RETURN` rule was never
+    // populated: the ALTER path must still succeed (best-effort), not
+    // blow up.
     let mut db = build_db(&[(
         "0001.sql",
         "CREATE DOMAIN user_id AS INT;
@@ -320,9 +321,9 @@ fn alter_column_type_reanalyze_is_noop_for_legacy_view() {
          CREATE VIEW v AS SELECT id FROM t;",
     )]);
 
-    // Clear the view's relviewdef to mimic a legacy snapshot.
+    // Clear the view's pg_rewrite._RETURN row to mimic a legacy snapshot.
     let view_oid = db.resolve_table(None, "v").map(|c| c.oid).unwrap();
-    db.pg_class_mut().get_mut(&view_oid).unwrap().relviewdef = None;
+    db.clear_view_body(view_oid);
 
     db.apply_sql("ALTER TABLE t ALTER COLUMN id TYPE INT;")
         .unwrap();
