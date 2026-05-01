@@ -29,8 +29,56 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectType | ObjectType::ObjectDomain => rename_type_obj(interp, stmt),
         ObjectType::ObjectSchema => rename_schema(interp, stmt),
         ObjectType::ObjectColumn => rename_column(interp, stmt),
+        ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint => {
+            rename_constraint(interp, stmt)
+        }
         _ => Ok(()),
     }
+}
+
+fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
+    let Some(rv) = stmt.relation.as_ref() else {
+        return Ok(());
+    };
+    let (schema_name, relname) = crate::ddl::util::range_var_names(rv, interp);
+    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TableNotFound(format!("{schema_name}.{relname}")));
+    };
+    let Some(class_oid) = interp
+        .class_by_qname
+        .get(&(nsoid, relname.clone()))
+        .copied()
+    else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::TableNotFound(format!("{schema_name}.{relname}")));
+    };
+
+    // PG: `constraint "x" of relation "t" does not exist` when the name
+    // doesn't match anything attached to the relation.
+    let target_oid = interp
+        .pg_constraint
+        .values()
+        .find(|c| c.conrelid == class_oid && c.conname == stmt.subname)
+        .map(|c| c.oid);
+    let Some(target_oid) = target_oid else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::DependencyError(format!(
+            "constraint \"{}\" of relation \"{relname}\" does not exist",
+            stmt.subname,
+        )));
+    };
+
+    if let Some(row) = interp.pg_constraint.get_mut(&target_oid) {
+        row.conname = stmt.newname.clone();
+    }
+    Ok(())
 }
 
 fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {

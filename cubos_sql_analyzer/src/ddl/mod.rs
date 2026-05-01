@@ -9,12 +9,14 @@ pub mod alter;
 pub mod drop;
 pub mod extensions;
 pub mod functions;
+pub mod indexes;
 pub mod operators;
 pub mod schema_stmt;
 pub mod tables;
 pub mod types;
 pub mod util;
 pub mod views;
+mod volatile;
 
 use pg_query::protobuf::node;
 
@@ -139,9 +141,14 @@ pub(crate) fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(
         node::Node::RenameStmt(s) => alter::rename(db, s),
         node::Node::AlterObjectSchemaStmt(s) => alter::set_schema(db, s),
 
+        // ── Indexes ─────────────────────────────────────────────────
+        // Indexes don't change query result types, but expression indexes
+        // forbid VOLATILE functions (CREATE INDEX walks the expression
+        // tree to detect them).
+        node::Node::IndexStmt(s) => indexes::create_index(db, s),
+
         // ── No-ops (irrelevant for type analysis) ───────────────────
-        node::Node::IndexStmt(_)
-        | node::Node::CreateSeqStmt(_)
+        node::Node::CreateSeqStmt(_)
         | node::Node::AlterSeqStmt(_)
         | node::Node::GrantStmt(_)
         | node::Node::CommentStmt(_)

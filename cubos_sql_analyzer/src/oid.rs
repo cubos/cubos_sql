@@ -145,6 +145,11 @@ define_oid!(
     /// `pg_enum.oid` — one per enum label.
     PgEnumOid
 );
+define_oid!(
+    /// `pg_constraint.oid` — one per CHECK / UNIQUE / PRIMARY KEY / FOREIGN
+    /// KEY / EXCLUSION constraint.
+    PgConstraintOid
+);
 
 // Generic OID for `pg_depend.objid` / `refobjid`. Their concrete catalog
 // table varies with `classid`/`refclassid`, so we can't pin them to one of

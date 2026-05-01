@@ -108,6 +108,10 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         proallargtypes: Vec::new(),
         proargmodes: Vec::new(),
         proargnames: Vec::new(),
+        // PG aggregates are conventionally IMMUTABLE w.r.t. their input —
+        // the analyzer never traverses an aggregate body in a CHECK /
+        // GENERATED / index context anyway.
+        provolatile: crate::pg_catalog::ProVolatile::Immutable,
     });
     interp.insert_pg_aggregate(PgAggregate {
         aggfnoid: proc_oid,

@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 
 use cubos_sql_analyzer::{
-    ArgMode, AttGenerated, CastContext, CastMethod, DepType, PgAggregate, PgAttribute, PgCast,
-    PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgDepend, PgEnum, PgEnumOid,
-    PgExtension, PgExtensionOid, PgGenericOid, PgNamespace, PgNamespaceOid, PgOperator,
-    PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, QualifiedName, RelKind,
-    TypCategory, TypType,
+    ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType, PgAggregate,
+    PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgConstraint,
+    PgConstraintOid, PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid,
+    PgInherits, PgNamespace, PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange,
+    PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory, TypType,
 };
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
@@ -75,6 +75,8 @@ fn main() {
     eprintln!("  pg_cast:      {}", snapshot.pg_cast.len());
     eprintln!("  pg_extension: {}", snapshot.pg_extension.len());
     eprintln!("  pg_depend:    {}", snapshot.pg_depend.len());
+    eprintln!("  pg_inherits:  {}", snapshot.pg_inherits.len());
+    eprintln!("  pg_constraint:{}", snapshot.pg_constraint.len());
 }
 
 // ─── Schema export ─────────────────────────────────────────────────────────────
@@ -97,6 +99,8 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_cast = export_casts(client)?;
     let pg_extension = export_extensions(client)?;
     let pg_depend = export_depends(client)?;
+    let pg_inherits = export_inherits(client)?;
+    let pg_constraint = export_constraints(client)?;
     let search_path = export_search_path(client, &pg_namespace)?;
 
     let _ = nsname_by_oid;
@@ -114,6 +118,8 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_cast,
         pg_extension,
         pg_depend,
+        pg_inherits,
+        pg_constraint,
         search_path,
     })
 }
@@ -271,7 +277,7 @@ fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgre
 fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, postgres::Error> {
     let rows = client.query(
         "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
-                a.attgenerated, a.atttypmod \
+                a.attgenerated, a.atttypmod, a.attidentity \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
          WHERE a.attnum > 0 \
@@ -284,6 +290,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
         .iter()
         .map(|r| {
             let attgenerated: i8 = r.get(6);
+            let attidentity: i8 = r.get(8);
             let attrelid: u32 = r.get(0);
             let atttypid: u32 = r.get(2);
             let atttypmod_raw: i32 = r.get(7);
@@ -296,6 +303,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
                 atthasdef: r.get(5),
                 attgenerated: char_to_attgenerated(attgenerated as u8 as char),
                 atttypmod: (atttypmod_raw >= 0).then_some(atttypmod_raw),
+                attidentity: char_to_attidentity(attidentity as u8 as char),
             }
         })
         .collect())
@@ -306,7 +314,8 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
         "SELECT p.oid, p.proname, p.pronamespace, p.prokind, \
                 p.proargtypes::int4[]::int4[], p.prorettype, \
                 p.proretset, p.provariadic, p.proisstrict, p.pronargdefaults, \
-                p.proallargtypes::int4[], p.proargmodes, p.proargnames \
+                p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
+                p.provolatile \
          FROM pg_catalog.pg_proc p \
          ORDER BY p.oid",
         &[],
@@ -337,6 +346,7 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 })
                 .unwrap_or_default();
             let arg_names: Option<Vec<String>> = r.get(12);
+            let provolatile: i8 = r.get(13);
             let oid: u32 = r.get(0);
             let pronamespace: u32 = r.get(2);
             let prorettype: u32 = r.get(5);
@@ -355,9 +365,18 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 proallargtypes,
                 proargmodes,
                 proargnames: arg_names.unwrap_or_default(),
+                provolatile: char_to_provolatile(provolatile as u8 as char),
             }
         })
         .collect())
+}
+
+fn char_to_provolatile(c: char) -> ProVolatile {
+    match c {
+        'i' => ProVolatile::Immutable,
+        's' => ProVolatile::Stable,
+        _ => ProVolatile::Volatile,
+    }
 }
 
 fn export_aggregates(client: &mut postgres::Client) -> Result<Vec<PgAggregate>, postgres::Error> {
@@ -456,6 +475,73 @@ fn export_extensions(client: &mut postgres::Client) -> Result<Vec<PgExtension>, 
                 extnamespace: PgNamespaceOid::new(extnamespace).expect("extnamespace is non-zero"),
                 extversion: r.get(3),
             }
+        })
+        .collect())
+}
+
+fn export_constraints(client: &mut postgres::Client) -> Result<Vec<PgConstraint>, postgres::Error> {
+    // Only export PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK / EXCLUSION
+    // constraints — the analyzer does not consult anything else (e.g.
+    // PG18 NOT NULL constraints land in pg_constraint too, but `attnotnull`
+    // already records them).
+    let rows = client.query(
+        "SELECT oid, conname, conrelid, contype, conkey, confrelid, confkey \
+         FROM pg_catalog.pg_constraint \
+         WHERE contype IN ('p','u','f','c','x') \
+         ORDER BY oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oid: u32 = r.get(0);
+            let conname: String = r.get(1);
+            let conrelid: u32 = r.get(2);
+            let contype: i8 = r.get(3);
+            let conkey: Option<Vec<i16>> = r.get(4);
+            let confrelid: u32 = r.get(5);
+            let confkey: Option<Vec<i16>> = r.get(6);
+            Some(PgConstraint {
+                oid: PgConstraintOid::new(oid)?,
+                conname,
+                conrelid: PgClassOid::new(conrelid)?,
+                contype: char_to_contype(contype as u8 as char),
+                conkey: conkey.unwrap_or_default(),
+                confrelid: PgClassOid::new(confrelid),
+                confkey: confkey.unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+fn char_to_contype(c: char) -> ConType {
+    match c {
+        'p' => ConType::PrimaryKey,
+        'u' => ConType::Unique,
+        'f' => ConType::ForeignKey,
+        'c' => ConType::Check,
+        'x' => ConType::Exclusion,
+        _ => ConType::Other,
+    }
+}
+
+fn export_inherits(client: &mut postgres::Client) -> Result<Vec<PgInherits>, postgres::Error> {
+    let rows = client.query(
+        "SELECT inhrelid, inhparent, inhseqno \
+         FROM pg_catalog.pg_inherits \
+         ORDER BY inhrelid, inhseqno",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let inhrelid: u32 = r.get(0);
+            let inhparent: u32 = r.get(1);
+            Some(PgInherits {
+                inhrelid: PgClassOid::new(inhrelid)?,
+                inhparent: PgClassOid::new(inhparent)?,
+                inhseqno: r.get(2),
+            })
         })
         .collect())
 }
@@ -682,6 +768,14 @@ fn char_to_attgenerated(c: char) -> Option<AttGenerated> {
     match c {
         's' => Some(AttGenerated::Stored),
         'v' => Some(AttGenerated::Virtual),
+        _ => None,
+    }
+}
+
+fn char_to_attidentity(c: char) -> Option<AttIdentity> {
+    match c {
+        'a' => Some(AttIdentity::Always),
+        'd' => Some(AttIdentity::ByDefault),
         _ => None,
     }
 }

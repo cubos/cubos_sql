@@ -686,6 +686,36 @@ impl PgCatalog {
     }
 
     #[cfg(any(test, feature = "internal"))]
+    pub fn pg_inherits(&self) -> &[crate::pg_catalog::PgInherits] {
+        &self.pg_inherits
+    }
+
+    /// Iterate over every `pg_constraint` row. Used by the `ON CONFLICT`
+    /// validator to find PK/UNIQUE constraints for a relation.
+    pub(crate) fn pg_constraint_values(
+        &self,
+    ) -> impl Iterator<Item = &crate::pg_catalog::PgConstraint> {
+        self.pg_constraint.values()
+    }
+
+    /// Names of every `pg_constraint` row attached to a relation. Returns
+    /// the empty `Vec` if the schema or table is unknown.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn pg_constraint_names_for_table(&self, schema: &str, name: &str) -> Vec<String> {
+        let Some(nsoid) = self.namespace_oid(schema) else {
+            return Vec::new();
+        };
+        let Some(class_oid) = self.class_by_qname.get(&(nsoid, name.to_owned())).copied() else {
+            return Vec::new();
+        };
+        self.pg_constraint
+            .values()
+            .filter(|c| c.conrelid == class_oid)
+            .map(|c| c.conname.clone())
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "internal"))]
     pub fn pg_proc(&self) -> &std::collections::HashMap<crate::oid::PgProcOid, PgProc> {
         &self.pg_proc
     }

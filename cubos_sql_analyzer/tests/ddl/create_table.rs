@@ -411,15 +411,18 @@ fn generated_stored_column_has_default() {
     );
 }
 
-// ── pg_proc.provolatile not modeled — VOLATILE in CHECK / generated cols ───
+// ── VOLATILE function rejection (CHECK / GENERATED / index expressions) ────
 //
-// PG forbids VOLATILE functions (random(), now() in some forms, nextval())
-// from CHECK constraints and from `GENERATED … STORED` expressions —
-// otherwise the constraint or generated value could change between rows.
-// Without `provolatile` the analyzer can't enforce this.
+// PG forbids VOLATILE functions (random(), gen_random_uuid(), nextval(), …)
+// from CHECK constraints, `GENERATED … STORED` expressions, and index
+// expressions — otherwise the constraint/index/generated value could
+// disagree with itself between rows or scans.
+//
+// We don't model `pg_proc.provolatile` (every pg_catalog function would
+// need an extra column) so the volatility check is name-based against a
+// hard-coded allow-list of well-known VOLATILE functions.
 
 #[test]
-#[ignore = "pg_proc.provolatile not modeled — VOLATILE function in CHECK constraint is not rejected"]
 fn volatile_function_in_check_constraint_should_error() {
     // PG: `cannot use volatile function "random" in check constraint`.
     assert_ddl_err!(
@@ -428,12 +431,11 @@ fn volatile_function_in_check_constraint_should_error() {
             "CREATE TABLE t (id INT NOT NULL CHECK (id < (random() * 100)::int));",
         )]),
         DdlError::UnsupportedDdl(_),
-        "volatile function",
+        "IMMUTABLE",
     );
 }
 
 #[test]
-#[ignore = "pg_proc.provolatile not modeled — VOLATILE function in generated column is not rejected"]
 fn volatile_function_in_generated_stored_column_should_error() {
     // PG: `generation expression is not immutable`. The expression must be
     // pure of the row's own columns.
@@ -447,6 +449,247 @@ fn volatile_function_in_generated_stored_column_should_error() {
         )]),
         DdlError::UnsupportedDdl(_),
         "not immutable",
+    );
+}
+
+#[test]
+fn volatile_function_in_table_level_check_constraint_should_error() {
+    // Table-level `CHECK` constraints (declared after all columns) go
+    // through the same volatility validation as column-level ones.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id INT NOT NULL,
+                CHECK (id < (random() * 100)::int)
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "IMMUTABLE",
+    );
+}
+
+#[test]
+fn alter_table_add_volatile_check_constraint_should_error() {
+    assert_ddl_err!(
+        try_apply(&[
+            ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
+            (
+                "0002.sql",
+                "ALTER TABLE t ADD CONSTRAINT chk CHECK (id > random()::int);"
+            ),
+        ]),
+        DdlError::UnsupportedDdl(_),
+        "IMMUTABLE",
+    );
+}
+
+#[test]
+fn check_constraint_calling_immutable_function_is_accepted() {
+    // The volatility check must not reject everyday IMMUTABLE functions —
+    // length, abs, lower, etc. show up routinely in CHECK constraints.
+    let _ = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+            id INT NOT NULL,
+            name TEXT NOT NULL CHECK (length(name) > 0)
+         );",
+    )])
+    .expect("length() is IMMUTABLE — must be accepted");
+}
+
+#[test]
+fn nested_volatile_call_in_check_is_detected() {
+    // The walker must descend into casts, arithmetic, and other expression
+    // nodes to find the buried VOLATILE call.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id INT NOT NULL CHECK (id > COALESCE(NULLIF((random() * 10)::int, 0), 1))
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "IMMUTABLE",
+    );
+}
+
+#[test]
+fn nextval_in_check_constraint_is_rejected() {
+    // `nextval` is VOLATILE — its result depends on sequence state.
+    assert_ddl_err!(
+        try_apply(&[
+            ("0001.sql", "CREATE SEQUENCE seq;"),
+            (
+                "0002.sql",
+                "CREATE TABLE t (id INT NOT NULL CHECK (id < nextval('seq')::int));"
+            ),
+        ]),
+        DdlError::UnsupportedDdl(_),
+        "IMMUTABLE",
+    );
+}
+
+#[test]
+fn gen_random_uuid_in_generated_column_is_rejected() {
+    // `gen_random_uuid` is VOLATILE — generated columns must be pure.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id INT NOT NULL,
+                token UUID GENERATED ALWAYS AS (gen_random_uuid()) STORED
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "not immutable",
+    );
+}
+
+// ── CHECK constraint must produce boolean (PG: argument of CHECK must be
+// type boolean, not type X). We type-check the parsed expression against
+// the freshly-built table's columns and reject anything that isn't bool.
+
+#[test]
+fn check_constraint_returning_int_is_rejected() {
+    // `CHECK (id)` — `id` is int, not boolean.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (id INT NOT NULL CHECK (id));",)]),
+        DdlError::UnsupportedDdl(_),
+        "must be type boolean",
+    );
+}
+
+#[test]
+fn check_constraint_returning_text_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL CHECK (name));",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "must be type boolean",
+    );
+}
+
+#[test]
+fn table_level_check_returning_int_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id  INT NOT NULL,
+                qty INT NOT NULL,
+                CHECK (id + qty)
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "must be type boolean",
+    );
+}
+
+#[test]
+fn check_constraint_returning_bool_expression_is_accepted() {
+    // Sanity: the type check must not reject legitimate boolean CHECKs.
+    let _ = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+            id    INT  NOT NULL CHECK (id > 0),
+            label TEXT NOT NULL CHECK (length(label) > 0),
+            qty   INT  NOT NULL,
+            CHECK (id < qty)
+         );",
+    )])
+    .expect("boolean CHECK expressions must be accepted");
+}
+
+#[test]
+fn alter_table_add_check_returning_int_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[
+            ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
+            ("0002.sql", "ALTER TABLE t ADD CONSTRAINT chk CHECK (id);"),
+        ]),
+        DdlError::UnsupportedDdl(_),
+        "must be type boolean",
+    );
+}
+
+#[test]
+fn check_constraint_referencing_unknown_column_is_rejected() {
+    // PG: `column "ghost" does not exist`. The CHECK type-checker walks
+    // the expression in the table's scope, so unknown column references
+    // are caught here too.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL CHECK (ghost > 0));",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "ghost",
+    );
+}
+
+// ── GENERATED expression must be assignable to the column's declared type ──
+
+#[test]
+fn generated_column_with_mismatched_type_is_rejected() {
+    // The expression returns text (`upper`), but the column is declared
+    // INT — assignment goal fails the check.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id    INT  NOT NULL,
+                label TEXT NOT NULL,
+                bad   INT  GENERATED ALWAYS AS (upper(label)) STORED
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "GENERATED expression",
+    );
+}
+
+#[test]
+fn generated_column_with_compatible_type_is_accepted() {
+    // `upper(label)` returns text — fits a text column. Sanity for the
+    // type check: it must not over-reject.
+    let _ = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+            id    INT  NOT NULL,
+            label TEXT NOT NULL,
+            upper_label TEXT GENERATED ALWAYS AS (upper(label)) STORED
+         );",
+    )])
+    .expect("type-matching GENERATED must be accepted");
+}
+
+#[test]
+fn generated_column_with_assignable_numeric_widening_is_accepted() {
+    // PG widens int → bigint via assignment cast — the analyzer mirrors that.
+    let _ = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+            id INT NOT NULL,
+            big_id BIGINT GENERATED ALWAYS AS (id) STORED
+         );",
+    )])
+    .expect("int → bigint assignment must be accepted in a generated column");
+}
+
+#[test]
+fn generated_column_referencing_unknown_column_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (
+                id INT NOT NULL,
+                bad INT GENERATED ALWAYS AS (ghost + 1) STORED
+            );",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "ghost",
     );
 }
 

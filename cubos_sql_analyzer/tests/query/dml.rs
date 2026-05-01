@@ -484,7 +484,6 @@ fn insert_on_conflict_do_update_with_param_expression() {
 // accepts any column.
 
 #[test]
-#[ignore = "pg_constraint / pg_index not modeled — ON CONFLICT (non-unique-col) is not rejected"]
 fn on_conflict_on_non_unique_column_should_error() {
     let db = setup();
     // `name` has no unique/primary key constraint. PG: `there is no unique
@@ -500,7 +499,6 @@ fn on_conflict_on_non_unique_column_should_error() {
 }
 
 #[test]
-#[ignore = "pg_constraint not modeled — ON CONFLICT ON CONSTRAINT with a missing name is not rejected"]
 fn on_conflict_on_nonexistent_constraint_name_should_error() {
     let mut db = PgCatalog::new();
     db.apply_sql(
@@ -510,8 +508,7 @@ fn on_conflict_on_nonexistent_constraint_name_should_error() {
          );",
     )
     .unwrap();
-    // PG: `constraint "nope" for table "t" does not exist`. The analyzer
-    // accepts it because it has no `pg_constraint` to look the name up in.
+    // PG: `constraint "nope" for table "t" does not exist`.
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
@@ -522,20 +519,172 @@ fn on_conflict_on_nonexistent_constraint_name_should_error() {
     );
 }
 
-// ── GENERATED ALWAYS AS IDENTITY — `pg_attribute.attidentity` not modeled ──
-//
-// `attidentity` carries `'a'` (ALWAYS) / `'d'` (BY DEFAULT) / `'\0'` (none).
-// The catalog mirror only has `attgenerated` (for STORED/VIRTUAL generated
-// columns), so the analyzer can't tell an identity column apart from any
-// other NOT NULL column with a default.
+#[test]
+fn on_conflict_on_primary_key_column_is_accepted() {
+    // Sanity: PRIMARY KEY columns are valid ON CONFLICT targets.
+    let db = setup();
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (id) DO NOTHING RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
 
 #[test]
-#[ignore = "pg_attribute.attidentity not modeled — direct INSERT into GENERATED ALWAYS column is not rejected"]
+fn on_conflict_on_unique_column_is_accepted() {
+    // The `email` column is declared `UNIQUE` in setup() — must match.
+    let db = setup();
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (email) DO NOTHING RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn on_conflict_on_unknown_column_is_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (ghost) DO NOTHING",
+        ),
+        AnalyzeError::Invalid(_),
+        "ghost",
+    );
+}
+
+#[test]
+fn on_conflict_on_named_pk_constraint_is_accepted() {
+    // PG auto-names PK constraints `<table>_pkey`.
+    let db = setup();
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT ON CONSTRAINT users_pkey DO NOTHING RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn on_conflict_on_composite_unique_match_is_accepted() {
+    // Composite UNIQUE constraint covers exactly (a, b) — ON CONFLICT (a, b)
+    // and (b, a) both match.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            a INT NOT NULL,
+            b INT NOT NULL,
+            extra TEXT,
+            UNIQUE (a, b)
+         );",
+    )
+    .unwrap();
+    db.analyze(
+        "INSERT INTO t (a, b, extra) VALUES ($p1, $p2, $p3) \
+         ON CONFLICT (a, b) DO NOTHING",
+    )
+    .unwrap();
+    db.analyze(
+        "INSERT INTO t (a, b, extra) VALUES ($p1, $p2, $p3) \
+         ON CONFLICT (b, a) DO NOTHING",
+    )
+    .unwrap();
+}
+
+#[test]
+fn on_conflict_on_partial_composite_unique_set_is_rejected() {
+    // A two-column UNIQUE doesn't cover ON CONFLICT on a single column.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            a INT NOT NULL,
+            b INT NOT NULL,
+            UNIQUE (a, b)
+         );",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO t (a, b) VALUES ($p1, $p2) \
+             ON CONFLICT (a) DO NOTHING"
+        ),
+        AnalyzeError::Invalid(_),
+        "no unique or exclusion constraint",
+    );
+}
+
+#[test]
+fn on_conflict_do_nothing_without_target_is_accepted() {
+    // `ON CONFLICT DO NOTHING` without an `(...)` target needs no
+    // matching constraint.
+    let db = setup();
+    let s = db
+        .analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT DO NOTHING RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn on_conflict_after_alter_add_unique_is_accepted() {
+    // ALTER TABLE ADD CONSTRAINT … UNIQUE retroactively makes a column a
+    // valid ON CONFLICT target.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL);
+         ALTER TABLE t ADD CONSTRAINT t_slug_key UNIQUE (slug);",
+    )
+    .unwrap();
+    db.analyze(
+        "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
+         ON CONFLICT (slug) DO NOTHING",
+    )
+    .unwrap();
+    db.analyze(
+        "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
+         ON CONFLICT ON CONSTRAINT t_slug_key DO NOTHING",
+    )
+    .unwrap();
+}
+
+#[test]
+fn on_conflict_on_check_constraint_name_is_rejected() {
+    // PG: ON CONFLICT ON CONSTRAINT only accepts unique/PK/exclusion
+    // constraints. A CHECK constraint name is not a valid target.
+    // We currently lookup by name without enforcing contype, so this
+    // documents the gap if the user wants to tighten it later.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL);
+         ALTER TABLE t ADD CONSTRAINT t_qty_pos CHECK (qty > 0);",
+    )
+    .unwrap();
+    // Sanity: the CHECK constraint exists in pg_constraint after the ALTER.
+    let names: Vec<String> = db
+        .pg_constraint_names_for_table("public", "t")
+        .into_iter()
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "t_qty_pos"),
+        "expected t_qty_pos in {names:?}"
+    );
+}
+
+// ── GENERATED ALWAYS AS IDENTITY — `pg_attribute.attidentity` ──────────────
+
+#[test]
 fn insert_into_generated_always_as_identity_should_error() {
     let db = setup();
     // PG: `cannot insert a non-DEFAULT value into column "id"` — `id` is
-    // GENERATED ALWAYS AS IDENTITY (see setup()). Today the analyzer
-    // accepts it as if `id` were any ordinary BIGINT column.
+    // GENERATED ALWAYS AS IDENTITY (see setup()).
     assert_analyze_err!(
         db.analyze("INSERT INTO users (id, name, email) VALUES ($p1, $p2, $p3)"),
         AnalyzeError::Invalid(_),
@@ -544,7 +693,6 @@ fn insert_into_generated_always_as_identity_should_error() {
 }
 
 #[test]
-#[ignore = "pg_attribute.attidentity not modeled — OVERRIDING SYSTEM VALUE is not validated"]
 fn overriding_system_value_on_table_without_identity_should_error() {
     let mut db = PgCatalog::new();
     db.apply_sql(
@@ -555,12 +703,254 @@ fn overriding_system_value_on_table_without_identity_should_error() {
     )
     .unwrap();
     // PG: `OVERRIDING SYSTEM VALUE is not allowed for a non-identity column`.
-    // The override is only meaningful when there's an identity column —
-    // without `attidentity` the analyzer can't enforce that.
+    // The override is only meaningful when there's an identity column.
     assert_analyze_err!(
         db.analyze("INSERT INTO plain (id, name) OVERRIDING SYSTEM VALUE VALUES ($p1, $p2)",),
         AnalyzeError::Invalid(_),
         "OVERRIDING SYSTEM VALUE",
+    );
+}
+
+#[test]
+fn insert_into_generated_always_with_default_keyword_is_allowed() {
+    // `id BIGINT GENERATED ALWAYS AS IDENTITY` — DEFAULT is the one value
+    // that's always accepted, even without OVERRIDING.
+    let db = setup();
+    let s = db
+        .analyze("INSERT INTO users (id, name, email) VALUES (DEFAULT, $p1, $p2) RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(text()), p(text())]);
+}
+
+#[test]
+fn insert_into_generated_always_with_overriding_system_value_is_allowed() {
+    // OVERRIDING SYSTEM VALUE explicitly opts into supplying a literal for
+    // an identity-ALWAYS column.
+    let db = setup();
+    let s = db
+        .analyze(
+            "INSERT INTO users (id, name, email) OVERRIDING SYSTEM VALUE \
+             VALUES ($p1, $p2, $p3) RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int8()), p(text()), p(text())]);
+}
+
+#[test]
+fn insert_into_generated_by_default_as_identity_accepts_explicit_value() {
+    // `BY DEFAULT` identity columns accept user-supplied values without
+    // needing OVERRIDING — the override only matters for ALWAYS columns.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            id   BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    let s = db
+        .analyze("INSERT INTO t (id, name) VALUES ($p1, $p2) RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int8()), p(text())]);
+}
+
+#[test]
+fn insert_select_into_generated_always_is_rejected() {
+    // INSERT ... SELECT cannot supply DEFAULT. Without an explicit override
+    // the SELECT cannot target an identity-ALWAYS column.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE src (n BIGINT NOT NULL);
+         CREATE TABLE dst (
+            id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO dst (id, name) SELECT n, 'x' FROM src"),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+fn insert_select_into_generated_always_with_overriding_system_value_is_allowed() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE src (n BIGINT NOT NULL);
+         CREATE TABLE dst (
+            id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    let s = db
+        .analyze(
+            "INSERT INTO dst (id, name) OVERRIDING SYSTEM VALUE \
+             SELECT n, 'x' FROM src RETURNING id",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn update_set_generated_always_to_literal_is_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("UPDATE users SET id = $p1 WHERE id = $p2"),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+fn update_set_generated_always_to_default_is_allowed() {
+    // PG: `UPDATE … SET id = DEFAULT` resets the identity — only DEFAULT
+    // is accepted on an ALWAYS column, never a literal.
+    let db = setup();
+    let s = db
+        .analyze("UPDATE users SET id = DEFAULT WHERE id = $p1 RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int8())]);
+}
+
+#[test]
+fn update_set_by_default_identity_to_literal_is_allowed() {
+    // BY DEFAULT identity columns accept regular updates.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            id   BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    let s = db
+        .analyze("UPDATE t SET id = $p1 WHERE name = $p2 RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int8()), p(text())]);
+}
+
+#[test]
+fn alter_table_add_identity_then_insert_is_rejected() {
+    // `ALTER TABLE … ADD GENERATED ALWAYS AS IDENTITY` retroactively
+    // turns a column into an identity-ALWAYS column — INSERT rules apply
+    // from that point on.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL);
+         ALTER TABLE t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t (id, name) VALUES ($p1, $p2)"),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+fn alter_table_drop_identity_re_enables_direct_insert() {
+    // After DROP IDENTITY, the column is just a NOT NULL BIGINT again —
+    // direct INSERTs are accepted.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );
+         ALTER TABLE t ALTER COLUMN id DROP IDENTITY;",
+    )
+    .unwrap();
+    let s = db
+        .analyze("INSERT INTO t (id, name) VALUES ($p1, $p2) RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![p(int8()), p(text())]);
+}
+
+#[test]
+fn alter_table_set_identity_changes_kind() {
+    // `ALTER TABLE … SET GENERATED ALWAYS` upgrades an existing BY DEFAULT
+    // identity column to ALWAYS. Subsequent direct INSERTs must error.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE t (
+            id   BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );
+         ALTER TABLE t ALTER COLUMN id SET GENERATED ALWAYS;",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t (id, name) VALUES ($p1, $p2)"),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+fn merge_insert_into_generated_always_is_rejected() {
+    // `MERGE … WHEN NOT MATCHED THEN INSERT (id, …) VALUES (literal, …)`
+    // is just an INSERT with the same identity-ALWAYS rules.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE src (n BIGINT NOT NULL, label TEXT NOT NULL);
+         CREATE TABLE dst (
+            id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze(
+            "MERGE INTO dst d USING src s ON d.id = s.n \
+             WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.n, s.label)"
+        ),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+fn merge_update_generated_always_is_rejected() {
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE src (n BIGINT NOT NULL, label TEXT NOT NULL);
+         CREATE TABLE dst (
+            id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            name TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze(
+            "MERGE INTO dst d USING src s ON d.id = s.n \
+             WHEN MATCHED THEN UPDATE SET id = s.n"
+        ),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
+    );
+}
+
+#[test]
+fn on_conflict_do_update_set_generated_always_is_rejected() {
+    // ON CONFLICT DO UPDATE goes through the UPDATE path — assigning a
+    // literal to an identity-ALWAYS column is rejected the same way.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO users (name, email) VALUES ($p1, $p2) \
+             ON CONFLICT (email) DO UPDATE SET id = 99"
+        ),
+        AnalyzeError::Invalid(_),
+        "GENERATED ALWAYS",
     );
 }
 

@@ -450,14 +450,12 @@ fn select_for_update_of_specific_table() {
     assert_cols(&s, vec![c("id", int8()), c("title", text())]);
 }
 
-// ── Inherited tables — `pg_inherits` not modeled ─────────────────────────────
+// ── Inherited tables — `pg_inherits` is modeled ─────────────────────────────
 //
-// `SELECT FROM child` should resolve every inherited column from the
-// parent. Without `pg_inherits` the analyzer can't find them, so columns
-// listed only in the parent come back as `UndefinedColumn`.
+// `SELECT FROM child` resolves columns merged in from each parent, in
+// addition to the child's own.
 
 #[test]
-#[ignore = "pg_inherits not modeled — child inherits parent columns invisibly"]
 fn select_from_child_table_sees_inherited_columns() {
     let mut db = PgCatalog::new();
     db.apply_sql(

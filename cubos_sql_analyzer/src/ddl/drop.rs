@@ -100,8 +100,41 @@ fn drop_relation(
         )));
     }
 
+    // PG also blocks DROP TABLE when an FK on another table targets us
+    // (without CASCADE). Walk pg_constraint for FK rows whose
+    // `confrelid` is this relation.
+    let dependent_fks: Vec<(crate::pg_catalog::PgConstraint, String)> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            matches!(c.contype, crate::pg_catalog::ConType::ForeignKey)
+                && c.confrelid == Some(class_oid)
+        })
+        .filter_map(|c| {
+            let owner = interp.pg_class.get(&c.conrelid)?;
+            let nsname = interp.namespace_name(owner.relnamespace)?;
+            Some((c.clone(), format!("{nsname}.{}", owner.relname)))
+        })
+        .collect();
+    if !dependent_fks.is_empty() && !cascade {
+        let labels: Vec<String> = dependent_fks
+            .iter()
+            .map(|(c, owner)| format!("{} on {}", c.conname, owner))
+            .collect();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop {schema}.{name} because foreign key constraint(s) {} depend on it",
+            labels.join(", "),
+        )));
+    }
+
     if !dependent_views.is_empty() {
         views::drop_views(interp, &dependent_views);
+    }
+    if cascade && !dependent_fks.is_empty() {
+        let fk_oids: Vec<_> = dependent_fks.iter().map(|(c, _)| c.oid).collect();
+        for oid in fk_oids {
+            interp.pg_constraint.remove(&oid);
+        }
     }
 
     drop_relation_by_oid(interp, class_oid);
@@ -118,6 +151,10 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
     let class_obj = crate::oid::PgGenericOid::new(class_oid.get()).unwrap();
     interp.remove_dependencies_of(PG_CLASS_RELID, class_obj);
     interp.remove_dependencies_on(PG_CLASS_RELID, class_obj);
+    interp.remove_pg_constraints_of(class_oid);
+    interp
+        .pg_inherits
+        .retain(|i| i.inhrelid != class_oid && i.inhparent != class_oid);
 
     if let Some(reltype) = class.reltype {
         // Find and drop the array type whose typelem points at the composite.

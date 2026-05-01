@@ -118,6 +118,31 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         ProKind::Function
     };
 
+    // Volatility — `IMMUTABLE` / `STABLE` / `VOLATILE` show up in
+    // `stmt.options` as DefElems with defname="volatility". PG's default
+    // is `VOLATILE` when the option is absent.
+    let provolatile = stmt
+        .options
+        .iter()
+        .find_map(|n| {
+            let node::Node::DefElem(de) = n.node.as_ref()? else {
+                return None;
+            };
+            if de.defname != "volatility" {
+                return None;
+            }
+            let arg = de.arg.as_deref()?;
+            let node::Node::String(s) = arg.node.as_ref()? else {
+                return None;
+            };
+            match s.sval.as_str() {
+                "immutable" => Some(crate::pg_catalog::ProVolatile::Immutable),
+                "stable" => Some(crate::pg_catalog::ProVolatile::Stable),
+                _ => Some(crate::pg_catalog::ProVolatile::Volatile),
+            }
+        })
+        .unwrap_or(crate::pg_catalog::ProVolatile::Volatile);
+
     // Check for an existing entry with the same (signature, kind).
     let key = (nsoid, name.clone());
     if let Some(oids) = interp.proc_by_qname.get(&key).cloned() {
@@ -158,6 +183,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         proallargtypes,
         proargmodes,
         proargnames,
+        provolatile,
     });
 
     Ok(())

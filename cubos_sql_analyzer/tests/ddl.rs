@@ -16,6 +16,8 @@ mod common;
 mod alter_table;
 #[path = "ddl/casts.rs"]
 mod casts;
+#[path = "ddl/constraints.rs"]
+mod constraints;
 #[path = "ddl/create_table.rs"]
 mod create_table;
 #[path = "ddl/drop.rs"]

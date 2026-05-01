@@ -14,7 +14,7 @@ use crate::nullability::{self, NullabilityContext};
 use crate::oid::PgTypeOid;
 use crate::param::LexOutput;
 use crate::param_collector::ParamCollector;
-use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
+use crate::pg_catalog::{AttIdentity, ConType, PgCatalog, TypCategory, TypType, oid};
 use crate::scope::{Scope, ScopeColumn};
 use crate::types::Type;
 
@@ -301,6 +301,82 @@ fn is_sql_null_literal(node: &protobuf::Node) -> bool {
 /// UPDATE SET. Mirrors PG's `SetToDefault` AST node.
 fn is_set_to_default(node: &protobuf::Node) -> bool {
     matches!(node.node.as_ref(), Some(node::Node::SetToDefault(_)))
+}
+
+/// Walk an `ON CONFLICT` clause's `infer` target and verify it matches a
+/// real `PRIMARY KEY` / `UNIQUE` constraint on the target relation. PG
+/// rejects an unmatched target with `there is no unique or exclusion
+/// constraint matching the ON CONFLICT specification` (column-list form)
+/// or `constraint "name" for table "rel" does not exist` (named form).
+fn validate_on_conflict_target(
+    on_conflict: &protobuf::OnConflictClause,
+    snapshot: &PgCatalog,
+    table_oid: crate::oid::PgClassOid,
+    table_relname: &str,
+) -> Result<(), AnalyzeError> {
+    // No `infer` clause → `ON CONFLICT DO NOTHING` without target. PG
+    // accepts this — it matches any conflict.
+    let Some(infer) = on_conflict.infer.as_deref() else {
+        return Ok(());
+    };
+
+    // `ON CONFLICT ON CONSTRAINT <name>` — look up by name on the table.
+    if !infer.conname.is_empty() {
+        let found = snapshot
+            .pg_constraint_values()
+            .any(|c| c.conrelid == table_oid && c.conname == infer.conname);
+        if !found {
+            return Err(AnalyzeError::Invalid(format!(
+                "constraint \"{}\" for table \"{}\" does not exist",
+                infer.conname, table_relname,
+            )));
+        }
+        return Ok(());
+    }
+
+    // `ON CONFLICT (col1, col2, …)` — collect target attnums.
+    let mut targets: Vec<i16> = Vec::new();
+    for elem in &infer.index_elems {
+        let Some(node::Node::IndexElem(ie)) = elem.node.as_ref() else {
+            continue;
+        };
+        if !ie.name.is_empty() {
+            let attnum = snapshot
+                .attributes_of(table_oid)
+                .iter()
+                .find(|a| a.attname == ie.name)
+                .map(|a| a.attnum);
+            match attnum {
+                Some(an) => targets.push(an),
+                None => {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "column \"{}\" referenced in ON CONFLICT does not exist",
+                        ie.name
+                    )));
+                }
+            }
+        }
+    }
+
+    // PG matches the target set against constraints whose conkey is
+    // exactly the same set (ordering doesn't matter).
+    let target_set: std::collections::BTreeSet<i16> = targets.iter().copied().collect();
+    let any_match = snapshot.pg_constraint_values().any(|c| {
+        c.conrelid == table_oid
+            && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
+            && c.conkey
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                == target_set
+    });
+    if !any_match {
+        return Err(AnalyzeError::Invalid(format!(
+            "there is no unique or exclusion constraint matching the ON CONFLICT \
+             specification on table \"{table_relname}\""
+        )));
+    }
+    Ok(())
 }
 
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
@@ -678,6 +754,18 @@ fn analyze_insert(
         }
     }
 
+    // OVERRIDING SYSTEM VALUE is only valid on tables that have at least one
+    // identity column; otherwise PG rejects with a clear message. PG enum:
+    // 1 = OVERRIDING_NOT_SET, 2 = USER_VALUE, 3 = SYSTEM_VALUE.
+    let overriding_system = ins.r#override == 3;
+    if overriding_system && !table_attrs.iter().any(|a| a.attidentity.is_some()) {
+        return Err(AnalyzeError::Invalid(format!(
+            "OVERRIDING SYSTEM VALUE is not allowed for a non-identity column \
+             in INSERT on `{}`",
+            table_relname,
+        )));
+    }
+
     // Build a minimal scope for expressions within VALUES (no table in scope
     // for VALUES, but we need scope for possible subqueries/functions).
     let scope = Scope::default();
@@ -708,9 +796,13 @@ fn analyze_insert(
                         )));
                     }
                     for (i, val) in list.items.iter().enumerate() {
-                        let target_col = col_names
-                            .get(i)
-                            .and_then(|cn| table_attrs.iter().find(|c| &c.attname == cn));
+                        let target_col = if col_names.is_empty() {
+                            table_attrs.get(i)
+                        } else {
+                            col_names
+                                .get(i)
+                                .and_then(|cn| table_attrs.iter().find(|c| &c.attname == cn))
+                        };
                         if let Some(tc) = target_col
                             && is_sql_null_literal(val)
                             && let Some(err) =
@@ -735,6 +827,19 @@ fn analyze_insert(
                             return Err(AnalyzeError::Invalid(format!(
                                 "cannot insert a non-DEFAULT value into generated column `{}.{}`",
                                 table_relname, tc.attname,
+                            )));
+                        }
+                        if let Some(tc) = target_col
+                            && tc.attidentity == Some(AttIdentity::Always)
+                            && !is_set_to_default(val)
+                            && !overriding_system
+                        {
+                            return Err(AnalyzeError::Invalid(format!(
+                                "cannot insert a non-DEFAULT value into column \"{}\" \
+                                 of relation \"{}\" — column is an identity column \
+                                 defined as GENERATED ALWAYS \
+                                 (hint: use OVERRIDING SYSTEM VALUE to override)",
+                                tc.attname, table_relname,
                             )));
                         }
                         let goal = target_col
@@ -765,6 +870,31 @@ fn analyze_insert(
                     val_sel.target_list.len(),
                 )));
             }
+            // INSERT ... SELECT cannot supply `DEFAULT`, so any target
+            // column that is `GENERATED ALWAYS AS IDENTITY` is rejected
+            // unless the user requested OVERRIDING SYSTEM VALUE.
+            if !overriding_system {
+                for (i, _) in val_sel.target_list.iter().enumerate() {
+                    let target_col = if col_names.is_empty() {
+                        table_attrs.get(i)
+                    } else {
+                        col_names
+                            .get(i)
+                            .and_then(|cn| table_attrs.iter().find(|c| &c.attname == cn))
+                    };
+                    if let Some(tc) = target_col
+                        && tc.attidentity == Some(AttIdentity::Always)
+                    {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "cannot insert a non-DEFAULT value into column \"{}\" \
+                             of relation \"{}\" — column is an identity column \
+                             defined as GENERATED ALWAYS \
+                             (hint: use OVERRIDING SYSTEM VALUE to override)",
+                            tc.attname, table_relname,
+                        )));
+                    }
+                }
+            }
             let _ = analyze_select(val_sel, snapshot, params);
 
             for (i, target) in val_sel.target_list.iter().enumerate() {
@@ -793,6 +923,12 @@ fn analyze_insert(
     // columns because PG rejects an INSERT that violates NOT NULL before
     // the conflict handler runs.
     if let Some(on_conflict) = &ins.on_conflict_clause {
+        // Validate the conflict target (`ON CONFLICT (cols)` /
+        // `ON CONFLICT ON CONSTRAINT name`) against pg_constraint. PG
+        // rejects targets that don't match a unique/primary-key index;
+        // without this check the analyzer accepts any column.
+        validate_on_conflict_target(on_conflict, snapshot, table_oid, &table_relname)?;
+
         let mut conflict_scope = Scope::default();
         let target_qn = crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname);
         conflict_scope.add_dml_target(snapshot, &relation.relname, target_qn.clone(), &table_attrs);
@@ -802,6 +938,21 @@ fn analyze_insert(
             if let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref()
                 && let Some(val) = &rt.val
             {
+                if let Some(tc) = table_attrs.iter().find(|c| c.attname == rt.name) {
+                    if tc.attgenerated.is_some() && !is_set_to_default(val) {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "generated column `{}.{}` can only be updated to DEFAULT",
+                            table_relname, tc.attname,
+                        )));
+                    }
+                    if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "column \"{}\" of relation \"{}\" can only be updated to DEFAULT \
+                             — column is an identity column defined as GENERATED ALWAYS",
+                            tc.attname, table_relname,
+                        )));
+                    }
+                }
                 let goal = table_attrs
                     .iter()
                     .find(|c| c.attname == rt.name)
@@ -948,6 +1099,13 @@ fn analyze_update(
                 return Err(AnalyzeError::Invalid(format!(
                     "generated column `{}.{}` can only be updated to DEFAULT",
                     table_relname, tc.attname,
+                )));
+            }
+            if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
+                return Err(AnalyzeError::Invalid(format!(
+                    "column \"{}\" of relation \"{}\" can only be updated to DEFAULT \
+                     — column is an identity column defined as GENERATED ALWAYS",
+                    tc.attname, table_relname,
                 )));
             }
             let goal = TypeGoal::assignment(tc.atttypid);
@@ -1213,6 +1371,13 @@ fn walk_merge_when_clause(
                         table_relname, tc.attname,
                     )));
                 }
+                if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "column \"{}\" of relation \"{}\" can only be updated to DEFAULT \
+                         — column is an identity column defined as GENERATED ALWAYS",
+                        tc.attname, table_relname,
+                    )));
+                }
                 expr::infer_expr(
                     val,
                     scope,
@@ -1280,6 +1445,14 @@ fn walk_merge_when_clause(
                         return Err(AnalyzeError::Invalid(format!(
                             "cannot insert a non-DEFAULT value into generated column `{}.{}`",
                             table_relname, tc.attname,
+                        )));
+                    }
+                    if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "cannot insert a non-DEFAULT value into column \"{}\" \
+                             of relation \"{}\" — column is an identity column \
+                             defined as GENERATED ALWAYS",
+                            tc.attname, table_relname,
                         )));
                     }
                 }

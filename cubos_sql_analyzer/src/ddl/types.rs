@@ -181,6 +181,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             atthasdef: false,
             attgenerated: None,
             atttypmod: ftypmod,
+            attidentity: None,
         });
     }
     interp.insert_pg_type(PgType {

@@ -58,14 +58,15 @@ pub(crate) mod qualified_name {
 }
 
 pub use oid::{
-    PgCastOid, PgClassOid, PgEnumOid, PgExtensionOid, PgGenericOid, PgNamespaceOid, PgOperatorOid,
-    PgProcOid, PgTypeOid,
+    PgCastOid, PgClassOid, PgConstraintOid, PgEnumOid, PgExtensionOid, PgGenericOid,
+    PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid,
 };
 #[cfg(any(test, feature = "internal"))]
 pub use pg_catalog::{
-    ArgMode, AttGenerated, CastContext, CastMethod, DepType, PgAggregate, PgAttribute, PgCast,
-    PgCatalogSeed, PgClass, PgDepend, PgEnum, PgExtension, PgNamespace, PgOperator, PgProc,
-    PgRange, PgType, ProKind, RelKind, TypCategory, TypType, ViewBinding,
+    ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType, PgAggregate,
+    PgAttribute, PgCast, PgCatalogSeed, PgClass, PgConstraint, PgDepend, PgEnum, PgExtension,
+    PgInherits, PgNamespace, PgOperator, PgProc, PgRange, PgType, ProKind, ProVolatile, RelKind,
+    TypCategory, TypType, ViewBinding,
 };
 
 pub use cubos_sql_core::{ParseQualifiedNameError, QualifiedName};
