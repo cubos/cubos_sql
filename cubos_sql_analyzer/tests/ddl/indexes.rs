@@ -47,7 +47,7 @@ fn nextval_in_index_expression_is_rejected() {
 fn plain_column_index_is_accepted() {
     // Plain column indexes have no expression — the volatility walker
     // must not over-reject them.
-    let _ = try_apply(&[
+    try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);",
@@ -59,7 +59,7 @@ fn plain_column_index_is_accepted() {
 
 #[test]
 fn immutable_function_in_index_expression_is_accepted() {
-    let _ = try_apply(&[
+    try_apply(&[
         (
             "0001.sql",
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);",

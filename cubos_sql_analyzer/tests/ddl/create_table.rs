@@ -488,7 +488,7 @@ fn alter_table_add_volatile_check_constraint_should_error() {
 fn check_constraint_calling_immutable_function_is_accepted() {
     // The volatility check must not reject everyday IMMUTABLE functions —
     // length, abs, lower, etc. show up routinely in CHECK constraints.
-    let _ = try_apply(&[(
+    try_apply(&[(
         "0001.sql",
         "CREATE TABLE t (
             id INT NOT NULL,
@@ -591,7 +591,7 @@ fn table_level_check_returning_int_is_rejected() {
 #[test]
 fn check_constraint_returning_bool_expression_is_accepted() {
     // Sanity: the type check must not reject legitimate boolean CHECKs.
-    let _ = try_apply(&[(
+    try_apply(&[(
         "0001.sql",
         "CREATE TABLE t (
             id    INT  NOT NULL CHECK (id > 0),
@@ -654,7 +654,7 @@ fn generated_column_with_mismatched_type_is_rejected() {
 fn generated_column_with_compatible_type_is_accepted() {
     // `upper(label)` returns text — fits a text column. Sanity for the
     // type check: it must not over-reject.
-    let _ = try_apply(&[(
+    try_apply(&[(
         "0001.sql",
         "CREATE TABLE t (
             id    INT  NOT NULL,
@@ -668,7 +668,7 @@ fn generated_column_with_compatible_type_is_accepted() {
 #[test]
 fn generated_column_with_assignable_numeric_widening_is_accepted() {
     // PG widens int → bigint via assignment cast — the analyzer mirrors that.
-    let _ = try_apply(&[(
+    try_apply(&[(
         "0001.sql",
         "CREATE TABLE t (
             id INT NOT NULL,

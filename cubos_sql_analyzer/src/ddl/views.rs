@@ -16,8 +16,8 @@ use pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
 
 use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
-    AstBinding, DepType, PG_CLASS_RELID, PgAttribute, PgClass, PgDepend, PgType, RelKind,
-    SerializedAst, TypCategory, TypType,
+    AstBinding, DepType, PG_CLASS_RELID, PG_PROC_RELID, PG_TYPE_RELID, PgAttribute, PgClass,
+    PgDepend, PgType, RelKind, SerializedAst, TypCategory, TypType,
 };
 
 use super::DdlError;
@@ -188,23 +188,29 @@ fn install_relation(
 
     // Record dependencies in pg_depend.
     let class_obj = PgGenericOid::new(class_oid.get()).unwrap();
-    let view_dep = |refobjid: PgClassOid, refobjsubid: i16| PgDepend {
+    let dep = |refclassid: PgClassOid, refobjid: u32, refobjsubid: i16| PgDepend {
         classid: PG_CLASS_RELID,
         objid: class_obj,
         objsubid: 0,
-        refclassid: PG_CLASS_RELID,
-        refobjid: PgGenericOid::new(refobjid.get()).unwrap(),
+        refclassid,
+        refobjid: PgGenericOid::new(refobjid).unwrap(),
         refobjsubid,
         deptype: DepType::Normal,
     };
     let mut whole_recorded = std::collections::HashSet::new();
     for (refrelid, refattnum) in &deps.column_refs {
-        interp.add_dependency(view_dep(*refrelid, *refattnum));
+        interp.add_dependency(dep(PG_CLASS_RELID, refrelid.get(), *refattnum));
     }
     for refrelid in &deps.relation_refs {
         if whole_recorded.insert(*refrelid) {
-            interp.add_dependency(view_dep(*refrelid, 0));
+            interp.add_dependency(dep(PG_CLASS_RELID, refrelid.get(), 0));
         }
+    }
+    for proc_oid in &deps.function_refs {
+        interp.add_dependency(dep(PG_PROC_RELID, proc_oid.get(), 0));
+    }
+    for type_oid in &deps.type_refs {
+        interp.add_dependency(dep(PG_TYPE_RELID, type_oid.get(), 0));
     }
 }
 
@@ -222,6 +228,10 @@ struct ViewDeps {
     column_refs: Vec<(PgClassOid, i16)>,
     /// `refrelid` values — relations the view reads from (whole-row deps).
     relation_refs: Vec<PgClassOid>,
+    /// `pg_proc.oid` values — functions/operators called from the view.
+    function_refs: Vec<PgProcOid>,
+    /// `pg_type.oid` values — types named explicitly (e.g. as CAST targets).
+    type_refs: Vec<PgTypeOid>,
 }
 
 /// Resolve view columns at creation time, walk the AST to emit a binding
@@ -384,25 +394,38 @@ fn collect_view_bindings_and_deps(
     (walker.bindings, deps)
 }
 
-/// Derive `(relation_refs, column_refs)` from emitted bindings — the pieces
-/// `install_relation` writes into `pg_depend`.
+/// Derive distinct dep lists from emitted bindings — the pieces
+/// `install_relation` writes into `pg_depend`. Mirrors PG: a view depends on
+/// every relation/column it reads, every function it calls, and every named
+/// type (cast target / typed literal). DROP of any of these without CASCADE
+/// must reject when a view is reachable through these edges.
 fn derive_deps_from_bindings(bindings: &[AstBinding]) -> ViewDeps {
     let mut relation_refs: Vec<PgClassOid> = Vec::new();
     let mut column_refs: Vec<(PgClassOid, i16)> = Vec::new();
+    let mut function_refs: Vec<PgProcOid> = Vec::new();
+    let mut type_refs: Vec<PgTypeOid> = Vec::new();
     for b in bindings {
         match b {
             AstBinding::Relation(oid) => relation_refs.push(*oid),
             AstBinding::Column(rel, attnum) => column_refs.push((*rel, *attnum)),
-            _ => {}
+            AstBinding::Function(oid) => function_refs.push(*oid),
+            AstBinding::Type(oid) => type_refs.push(*oid),
+            AstBinding::Unresolved => {}
         }
     }
     relation_refs.sort();
     relation_refs.dedup();
     column_refs.sort();
     column_refs.dedup();
+    function_refs.sort();
+    function_refs.dedup();
+    type_refs.sort();
+    type_refs.dedup();
     ViewDeps {
         column_refs,
         relation_refs,
+        function_refs,
+        type_refs,
     }
 }
 
@@ -1239,15 +1262,22 @@ impl<'a> ViewApplier<'a> {
 
 // ─── Dependency checking ────────────────────────────────────────────────────
 
-/// Find all view OIDs that depend on the given table or view OID.
-pub fn find_dependent_views(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
+/// Find all view OIDs whose `pg_depend` row points at `(refclassid, refobjid)`.
+/// Specialized callers below funnel into this — `find_dependent_views` for
+/// table/view OIDs, plus the proc/type variants used by DROP FUNCTION /
+/// DROP TYPE.
+fn find_views_depending_on(
+    snapshot: &PgCatalog,
+    refclassid: PgClassOid,
+    refobjid: u32,
+) -> Vec<PgClassOid> {
     let mut out: Vec<PgClassOid> = snapshot
         .iter_pg_depend()
         .filter(|d| {
             matches!(d.deptype, DepType::Normal)
                 && d.classid == PG_CLASS_RELID
-                && d.refclassid == PG_CLASS_RELID
-                && d.refobjid.get() == relid.get()
+                && d.refclassid == refclassid
+                && d.refobjid.get() == refobjid
         })
         .filter_map(|d| {
             let obj = PgClassOid::new(d.objid.get())?;
@@ -1258,6 +1288,24 @@ pub fn find_dependent_views(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<PgCl
     out.sort();
     out.dedup();
     out
+}
+
+/// Find all view OIDs that depend on the given table or view OID.
+pub fn find_dependent_views(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
+    find_views_depending_on(snapshot, PG_CLASS_RELID, relid.get())
+}
+
+/// Find all view OIDs that depend on the given function/aggregate/window OID.
+pub fn find_views_depending_on_function(
+    snapshot: &PgCatalog,
+    proc_oid: PgProcOid,
+) -> Vec<PgClassOid> {
+    find_views_depending_on(snapshot, PG_PROC_RELID, proc_oid.get())
+}
+
+/// Find all view OIDs that depend on the given type OID.
+pub fn find_views_depending_on_type(snapshot: &PgCatalog, type_oid: PgTypeOid) -> Vec<PgClassOid> {
+    find_views_depending_on(snapshot, PG_TYPE_RELID, type_oid.get())
 }
 
 /// Find all view OIDs that depend on a specific column of a relation.

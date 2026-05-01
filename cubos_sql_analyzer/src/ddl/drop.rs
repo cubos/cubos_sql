@@ -219,6 +219,18 @@ fn drop_type(
         )));
     }
 
+    // Views can also reach a type through `AstBinding::Type` (CAST targets,
+    // typed literals). Those entries live in pg_depend with refclassid =
+    // PG_TYPE_RELID, so a separate lookup catches them — block without
+    // CASCADE and drop them transitively otherwise.
+    let dependent_views = views::find_views_depending_on_type(interp, type_oid);
+    if !dependent_views.is_empty() && !cascade {
+        let view_names = format_view_list(interp, &dependent_views);
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop type {schema}.{name} because view(s) {view_names} depend on it",
+        )));
+    }
+
     if cascade {
         for relid in &dependent_relations {
             if let Some(attrs) = interp.pg_attribute.get_mut(relid) {
@@ -226,6 +238,9 @@ fn drop_type(
                     a.atttypid != type_oid && array_oid.is_none_or(|arr| a.atttypid != arr)
                 });
             }
+        }
+        if !dependent_views.is_empty() {
+            views::drop_views(interp, &dependent_views);
         }
     }
 
@@ -315,7 +330,7 @@ fn drop_function(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
-    _cascade: bool,
+    cascade: bool,
     expected_kind: ObjectType,
 ) -> Result<(), DdlError> {
     let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
@@ -377,12 +392,41 @@ fn drop_function(
     }
 
     if let Some(oid) = target {
+        let dependent_views = views::find_views_depending_on_function(interp, oid);
+        if !dependent_views.is_empty() && !cascade {
+            let view_names = format_view_list(interp, &dependent_views);
+            let kind = if want_procedure {
+                "procedure"
+            } else {
+                "function"
+            };
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {kind} {name} because view(s) {view_names} depend on it",
+            )));
+        }
+        if !dependent_views.is_empty() {
+            views::drop_views(interp, &dependent_views);
+        }
         interp.remove_pg_proc(oid);
         let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
         interp.remove_dependencies_of(PG_PROC_RELID, obj);
         interp.remove_dependencies_on(PG_PROC_RELID, obj);
     }
     Ok(())
+}
+
+/// Comma-join schema-qualified names of the given view OIDs, for error
+/// messages.
+fn format_view_list(snapshot: &PgCatalog, view_oids: &[PgClassOid]) -> String {
+    view_oids
+        .iter()
+        .filter_map(|&v| {
+            let c = snapshot.pg_class.get(&v)?;
+            let nsname = snapshot.namespace_name(c.relnamespace).unwrap_or("?");
+            Some(format!("{nsname}.{}", c.relname))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Find the first `pg_proc` OID matching the predicate, walking the search
@@ -425,7 +469,7 @@ fn drop_aggregate(
     interp: &mut PgCatalog,
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
-    _cascade: bool,
+    cascade: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
         return Ok(());
@@ -466,6 +510,16 @@ fn drop_aggregate(
     }
 
     if let Some(oid) = target {
+        let dependent_views = views::find_views_depending_on_function(interp, oid);
+        if !dependent_views.is_empty() && !cascade {
+            let view_names = format_view_list(interp, &dependent_views);
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop aggregate {name} because view(s) {view_names} depend on it",
+            )));
+        }
+        if !dependent_views.is_empty() {
+            views::drop_views(interp, &dependent_views);
+        }
         interp.remove_pg_proc(oid);
         let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
         interp.remove_dependencies_of(PG_PROC_RELID, obj);

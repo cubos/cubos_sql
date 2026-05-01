@@ -744,3 +744,115 @@ fn drop_view_cascade_removes_dependent_views() {
     assert!(snap.resolve_table(None, "v2").is_none());
     assert!(snap.resolve_table(None, "t").is_some());
 }
+
+// ── Function/type bindings flow through pg_depend ───────────────────────────
+//
+// Views that name a function (`lower(x)`) or a type (`x::my_domain`) record
+// pg_depend rows so DROP FUNCTION / DROP TYPE without CASCADE fails. Mirrors
+// PG: every name slot in a view's query becomes a dep.
+
+#[test]
+fn drop_function_referenced_by_view_fails_without_cascade() {
+    // PG: `cannot drop function ... because other objects depend on it`
+    assert_ddl_err!(
+        try_apply(&[
+            (
+                "0001.sql",
+                "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
+                 CREATE FUNCTION shout(s TEXT) RETURNS TEXT \
+                   LANGUAGE SQL IMMUTABLE AS $$ SELECT upper(s) $$;
+                 CREATE VIEW v AS SELECT id, shout(name) AS yelled FROM t;",
+            ),
+            ("0002.sql", "DROP FUNCTION shout(text);"),
+        ]),
+        DdlError::DependencyError(_),
+        "depend",
+    );
+}
+
+#[test]
+fn drop_function_cascade_removes_dependent_view() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL);
+             CREATE FUNCTION shout(s TEXT) RETURNS TEXT \
+               LANGUAGE SQL IMMUTABLE AS $$ SELECT upper(s) $$;
+             CREATE VIEW v AS SELECT id, shout(name) AS yelled FROM t;",
+        ),
+        ("0002.sql", "DROP FUNCTION shout(text) CASCADE;"),
+    ]);
+
+    assert!(snap.resolve_table(None, "v").is_none());
+    assert!(snap.resolve_table(None, "t").is_some());
+}
+
+#[test]
+fn drop_aggregate_referenced_by_view_fails_without_cascade() {
+    // Aggregates share pg_proc + the same function-binding edge, so the
+    // same protection must apply.
+    assert_ddl_err!(
+        try_apply(&[
+            (
+                "0001.sql",
+                "CREATE TABLE t (id INT NOT NULL, score INT NOT NULL);
+                 CREATE AGGREGATE custom_sum(int) (sfunc = int4pl, stype = int);
+                 CREATE VIEW v AS SELECT custom_sum(score) AS total FROM t;",
+            ),
+            ("0002.sql", "DROP AGGREGATE custom_sum(int);"),
+        ]),
+        DdlError::DependencyError(_),
+        "depend",
+    );
+}
+
+#[test]
+fn drop_type_referenced_by_view_cast_fails_without_cascade() {
+    // PG: a view that casts to a domain registers a pg_depend row to the
+    // domain — DROP DOMAIN without CASCADE has to surface that.
+    assert_ddl_err!(
+        try_apply(&[
+            (
+                "0001.sql",
+                "CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0);
+                 CREATE TABLE t (id INT NOT NULL);
+                 CREATE VIEW v AS SELECT id::positive_int AS pos FROM t;",
+            ),
+            ("0002.sql", "DROP DOMAIN positive_int;"),
+        ]),
+        DdlError::DependencyError(_),
+        "depend",
+    );
+}
+
+#[test]
+fn drop_type_cascade_removes_dependent_view() {
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0);
+             CREATE TABLE t (id INT NOT NULL);
+             CREATE VIEW v AS SELECT id::positive_int AS pos FROM t;",
+        ),
+        ("0002.sql", "DROP DOMAIN positive_int CASCADE;"),
+    ]);
+
+    assert!(snap.resolve_table(None, "v").is_none());
+    assert!(snap.resolve_table(None, "t").is_some());
+}
+
+#[test]
+fn drop_function_unused_by_view_succeeds() {
+    // Sanity: dropping a function that no view depends on must still go
+    // through. The new pg_depend edges only block when a view references
+    // the callee.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE FUNCTION shout(s TEXT) RETURNS TEXT \
+               LANGUAGE SQL IMMUTABLE AS $$ SELECT upper(s) $$;",
+        ),
+        ("0002.sql", "DROP FUNCTION shout(text);"),
+    ]);
+    assert!(snap.find_functions(None, "shout").is_empty());
+}
