@@ -170,6 +170,7 @@ fn install_relation(
             attgenerated: None,
             atttypmod: col.typmod,
             attidentity: None,
+            attcollation: None,
         });
     }
     interp.insert_pg_type(PgType {

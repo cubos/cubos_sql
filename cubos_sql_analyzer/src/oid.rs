@@ -155,6 +155,11 @@ define_oid!(
     /// under `rulename = '_RETURN'`.
     PgRewriteOid
 );
+define_oid!(
+    /// `pg_collation.oid` — one per registered collation
+    /// (`"C"`, `"POSIX"`, `"en_US.UTF-8"`, …).
+    PgCollationOid
+);
 
 // Generic OID for `pg_depend.objid` / `refobjid`. Their concrete catalog
 // table varies with `classid`/`refclassid`, so we can't pin them to one of

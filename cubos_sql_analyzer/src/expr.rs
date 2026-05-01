@@ -465,6 +465,31 @@ pub(crate) fn infer_expr(
                 .arg
                 .as_ref()
                 .ok_or_else(|| AnalyzeError::Internal("CollateClause without arg".into()))?;
+            // PG rejects unknown collation names up front; mirror that.
+            // `collname` is a list of identifier nodes (`["pg_catalog", "C"]`
+            // when fully qualified, just `["C"]` otherwise).
+            let parts: Vec<&str> = c
+                .collname
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let (schema, name) = match parts.as_slice() {
+                [n] => (None, *n),
+                [s, n] => (Some(*s), *n),
+                _ => {
+                    return Err(AnalyzeError::Invalid(
+                        "malformed COLLATE clause".into(),
+                    ));
+                }
+            };
+            if !parts.is_empty() && snapshot.resolve_collation(schema, name).is_none() {
+                return Err(AnalyzeError::Invalid(format!(
+                    "collation \"{name}\" does not exist",
+                )));
+            }
             let result = infer_expr(arg, scope, null_ctx, snapshot, params, goal)?;
             // PG rejects `COLLATE` on non-string-category types with
             // `collations are not supported by type X`. Accept UNKNOWN

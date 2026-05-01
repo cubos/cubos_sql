@@ -13,10 +13,11 @@ use std::collections::HashMap;
 
 use cubos_sql_analyzer::{
     ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType, PgAggregate,
-    PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgConstraint,
-    PgConstraintOid, PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid,
-    PgIndex, PgInherits, PgNamespace, PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid,
-    PgRange, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory, TypType,
+    PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgCollation,
+    PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum, PgEnumOid, PgExtension,
+    PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace, PgNamespaceOid, PgOperator,
+    PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, ProVolatile,
+    QualifiedName, RelKind, TypCategory, TypType,
 };
 use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
@@ -106,6 +107,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_depend = export_depends(client)?;
     let pg_inherits = export_inherits(client)?;
     let pg_constraint = export_constraints(client)?;
+    let pg_collation = export_collations(client)?;
     let search_path = export_search_path(client, &pg_namespace)?;
 
     let _ = nsname_by_oid;
@@ -133,6 +135,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         // populate_view_defs, which re-runs each CREATE VIEW through the
         // analyzer DDL pipeline against this seed.
         pg_rewrite: Vec::new(),
+        pg_collation,
         search_path,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
@@ -297,7 +300,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
     // stay stable. No relkind filter: we mirror every relation's columns.
     let rows = client.query(
         "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
-                a.attgenerated, a.atttypmod, a.attidentity \
+                a.attgenerated, a.atttypmod, a.attidentity, a.attcollation \
          FROM pg_catalog.pg_attribute a \
          WHERE a.attnum > 0 \
            AND NOT a.attisdropped \
@@ -312,6 +315,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
             let attrelid: u32 = r.get(0);
             let atttypid: u32 = r.get(2);
             let atttypmod_raw: i32 = r.get(7);
+            let attcollation: u32 = r.get(9);
             PgAttribute {
                 attrelid: PgClassOid::new(attrelid).expect("attrelid is non-zero"),
                 attname: r.get(1),
@@ -322,6 +326,7 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
                 attgenerated: char_to_attgenerated(attgenerated as u8 as char),
                 atttypmod: (atttypmod_raw >= 0).then_some(atttypmod_raw),
                 attidentity: char_to_attidentity(attidentity as u8 as char),
+                attcollation: PgCollationOid::new(attcollation),
             }
         })
         .collect())
@@ -655,6 +660,32 @@ fn export_indexes(
         );
     }
     Ok(out)
+}
+
+fn export_collations(client: &mut postgres::Client) -> Result<Vec<PgCollation>, postgres::Error> {
+    // Collations vary by host OS — `en_US.UTF-8` may exist on one machine
+    // and not another. The seed snapshots whatever the container shipped
+    // with; users that build against a different libc will need to
+    // regenerate.
+    let rows = client.query(
+        "SELECT oid, collname, collnamespace, collencoding \
+         FROM pg_catalog.pg_collation \
+         ORDER BY oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oid: u32 = r.get(0);
+            let collnamespace: u32 = r.get(2);
+            Some(PgCollation {
+                oid: PgCollationOid::new(oid)?,
+                collname: r.get(1),
+                collnamespace: PgNamespaceOid::new(collnamespace)?,
+                collencoding: r.get(3),
+            })
+        })
+        .collect())
 }
 
 fn export_inherits(client: &mut postgres::Client) -> Result<Vec<PgInherits>, postgres::Error> {

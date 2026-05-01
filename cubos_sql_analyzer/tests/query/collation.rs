@@ -136,25 +136,34 @@ fn collate_in_case_branch() {
 // up front and propagates a column's collation through expressions.
 
 #[test]
-#[ignore = "pg_collation not modeled — unknown collation name is not rejected"]
 fn collate_unknown_collation_should_error() {
-    let db = setup();
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);",
+    )
+    .unwrap();
     // PG: `collation "definitely_not_a_real_collation" for encoding "UTF8"
-    // does not exist`. The analyzer accepts the decoration silently.
-    assert_analyze_err!(
-        db.analyze("SELECT name COLLATE \"definitely_not_a_real_collation\" AS n FROM users"),
-        AnalyzeError::Invalid(_),
-        "collation \"definitely_not_a_real_collation\" does not exist",
+    // does not exist`. CREATE TABLE with a bogus column-level COLLATE
+    // raises this at apply time; we mirror it.
+    let err = db
+        .apply_sql(
+            "CREATE TABLE t (
+                id BIGINT PRIMARY KEY,
+                name TEXT COLLATE \"definitely_not_a_real_collation\" NOT NULL
+             );",
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("does not exist"),
+        "expected collation-not-found error, got: {err}"
     );
 }
 
 #[test]
-#[ignore = "pg_attribute.attcollation not modeled — column-level COLLATE is dropped"]
 fn column_level_collate_in_create_table_is_preserved() {
-    // PG: `name TEXT COLLATE "C"` pins the column's default collation, and
-    // `ORDER BY name` uses it. The analyzer drops the column-level COLLATE
-    // entirely, so two tables with different declared collations look
-    // identical to anything that consults the catalog.
+    // PG: `name TEXT COLLATE "C"` pins the column's default collation in
+    // pg_attribute.attcollation. The analyzer now records it, so two
+    // tables with different declared collations no longer look identical.
     let mut db = PgCatalog::new();
     db.apply_sql(
         "CREATE TABLE t (
@@ -166,9 +175,9 @@ fn column_level_collate_in_create_table_is_preserved() {
     let table = db.resolve_table(None, "t").unwrap();
     let attrs = db.attributes_of(table.oid);
     let name = attrs.iter().find(|a| a.attname == "name").unwrap();
-    // No public API to read attcollation today — once it lands the
-    // assertion should look up the "C" collation OID and compare.
-    let _ = name; // placeholder; this test fails at the apply_sql boundary
-    // anyway because COLLATE on a column is not parsed.
-    panic!("attcollation not modeled — see comment above");
+    let c_oid = db
+        .resolve_collation(None, "C")
+        .expect("\"C\" collation must be in the seed")
+        .oid;
+    assert_eq!(name.attcollation, Some(c_oid));
 }

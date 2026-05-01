@@ -109,6 +109,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attgenerated: col.is_generated.then_some(AttGenerated::Stored),
             atttypmod: col.typmod,
             attidentity: col.identity,
+            attcollation: col.collation,
         });
     }
     interp.insert_pg_type(PgType {
@@ -732,6 +733,7 @@ fn apply_inherits(
                 attgenerated: pa.attgenerated,
                 atttypmod: pa.atttypmod,
                 attidentity: pa.attidentity,
+                attcollation: pa.attcollation,
             });
         }
 
@@ -755,6 +757,7 @@ struct ParsedColumn {
     has_default: bool,
     is_generated: bool,
     identity: Option<AttIdentity>,
+    collation: Option<crate::oid::PgCollationOid>,
 }
 
 /// Parse a `ColumnDef` AST node into a `ParsedColumn` (shared between
@@ -866,6 +869,30 @@ fn parse_column_def(
         not_null = true;
     }
 
+    // `COLLATE "name"` decoration on the column. PG rejects unknown names
+    // up front; we mirror that. Collation oid lands on pg_attribute.
+    let collation = if let Some(coll) = cd.coll_clause.as_deref() {
+        let parts: Vec<&str> = coll
+            .collname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                node::Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (schema, name) = match parts.as_slice() {
+            [name] => (None, *name),
+            [schema, name] => (Some(*schema), *name),
+            _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
+        };
+        let resolved = interp.resolve_collation(schema, name).ok_or_else(|| {
+            DdlError::Parse(format!("collation \"{name}\" does not exist"))
+        })?;
+        Some(resolved.oid)
+    } else {
+        None
+    };
+
     Ok(ParsedColumn {
         name: cd.colname.clone(),
         type_oid,
@@ -874,6 +901,7 @@ fn parse_column_def(
         has_default,
         is_generated,
         identity,
+        collation,
     })
 }
 
@@ -1154,6 +1182,7 @@ fn add_column(
         attgenerated: col.is_generated.then_some(AttGenerated::Stored),
         atttypmod: col.typmod,
         attidentity: col.identity,
+        attcollation: col.collation,
     });
     Ok(())
 }

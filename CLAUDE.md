@@ -26,6 +26,21 @@ All compile-time tests run without Docker. Integration tests for the runtime mig
 
 Note: doctests are not supported by nextest — for those, fall back to `cargo test --doc`.
 
+## Regenerating `seed.json`
+
+Never hand-migrate `cubos_sql_analyzer/src/seed.json` (e.g. with a Python
+script) when changing catalog struct shapes. The seed loader tolerates empty
+or stale seeds — `cubos_sql_seed` exports the catalog from a live PG via
+testcontainers and overwrites the file. Always regenerate by running:
+
+```bash
+cargo run -p cubos_sql_seed   # requires Docker; takes ~10 seconds
+```
+
+Hand-rewriting the seed risks subtle FK drift (e.g. an old aggfinaltype
+field repurposed as aggfinalfn would store pg_type oids where pg_proc oids
+are expected).
+
 ## Architecture
 
 Workspace with crates:
