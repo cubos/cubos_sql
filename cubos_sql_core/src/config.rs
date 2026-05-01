@@ -17,6 +17,7 @@
 //! table = "public._migrations"   # tracking table name (default: "public._migrations")
 //! lock_id = 713705               # advisory lock ID (default: 713705)
 //! use_transaction = true         # wrap each migration in a transaction (default: true)
+//! fail_on_drift = true           # abort if an applied migration's file changed (default: true)
 //!
 //! [package.metadata.cubos_sql.domains]
 //! user_preferences = "crate::domains::UserPreferences"
@@ -150,6 +151,13 @@ pub struct MigrationsConfig {
     /// Default: true
     #[serde(default = "MigrationsConfig::default_use_transaction")]
     pub use_transaction: bool,
+
+    /// Whether drift (an applied migration's file changing on disk after
+    /// it ran) is treated as a fatal error. With `true` the migration
+    /// runner aborts before applying anything new; with `false` it only
+    /// logs a warning and continues. Default: true.
+    #[serde(default = "MigrationsConfig::default_fail_on_drift")]
+    pub fail_on_drift: bool,
 }
 
 impl Default for MigrationsConfig {
@@ -158,6 +166,7 @@ impl Default for MigrationsConfig {
             table: Self::default_table(),
             lock_id: Self::default_lock_id(),
             use_transaction: Self::default_use_transaction(),
+            fail_on_drift: Self::default_fail_on_drift(),
         }
     }
 }
@@ -172,6 +181,10 @@ impl MigrationsConfig {
     }
 
     fn default_use_transaction() -> bool {
+        true
+    }
+
+    fn default_fail_on_drift() -> bool {
         true
     }
 

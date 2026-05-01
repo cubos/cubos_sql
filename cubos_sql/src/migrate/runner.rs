@@ -145,6 +145,14 @@ async fn run_inner(
             if let Some(h) = stored_hash {
                 let current = sql_hash(&migration.sql);
                 if *h != current {
+                    if config.fail_on_drift {
+                        return Err(crate::Error::Migration(format!(
+                            "migration '{}' has been modified since it was applied; \
+                             set [package.metadata.cubos_sql.migrations] fail_on_drift = false \
+                             to downgrade to a warning",
+                            migration.name
+                        )));
+                    }
                     eprintln!(
                         "warning: migration '{}' has been modified since it was applied",
                         migration.name

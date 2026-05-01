@@ -8,6 +8,7 @@
 extern crate proc_macro;
 
 mod codegen;
+mod embed_migrations;
 mod from_row;
 mod migrations_hash;
 mod pg_type_map;
@@ -280,6 +281,32 @@ pub fn sql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 ///     email: Option<String>,
 /// }
 /// ```
+/// Bake a `cubos_sql::migrate::MigrationSource` from a directory of
+/// `NNNN_description.sql` files into the binary at compile time.
+///
+/// The path is resolved relative to the invoking crate's `CARGO_MANIFEST_DIR`,
+/// the same way `include_str!` does. Each migration's contents land in the
+/// final binary as a `&'static str` — no filesystem I/O at runtime, and
+/// changes to the SQL files re-trigger a rebuild via `include_str!`'s
+/// dependency tracking.
+///
+/// ```rust,ignore
+/// let source = cubos_sql::embed_migrations!("./migrations");
+/// let applied = cubos_sql::migrate::run(&mut client, &source, &config).await?;
+/// ```
+///
+/// Errors at expansion time when:
+/// - The path doesn't resolve to a directory.
+/// - A `.sql` filename doesn't match `NNNN_description.sql`.
+#[proc_macro]
+pub fn embed_migrations(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(input as embed_migrations::EmbedInput);
+    match embed_migrations::expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 #[proc_macro_derive(FromRow)]
 pub fn derive_from_row(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);

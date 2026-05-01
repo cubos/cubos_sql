@@ -136,6 +136,60 @@ impl MigrationSource {
         Ok(Self { migrations })
     }
 
+    /// Build a `MigrationSource` from migration contents already in memory.
+    /// Lets a binary embed migrations via `include_str!` (or any other
+    /// source), without round-tripping through the filesystem at runtime.
+    ///
+    /// Each entry is `(file_stem, up_sql, down_sql)` where `file_stem`
+    /// matches `NNNN_description` — same naming rules as
+    /// [`from_dir`](Self::from_dir). Migrations are sorted by their
+    /// numeric prefix.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Migration`](crate::Error::Migration) if a `file_stem`
+    ///   doesn't follow the `NNNN_description` format.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use cubos_sql::migrate::MigrationSource;
+    ///
+    /// let source = MigrationSource::from_embedded([
+    ///     ("0001_create_users", include_str!("../migrations/0001_create_users.sql"), None),
+    ///     (
+    ///         "0002_add_email",
+    ///         include_str!("../migrations/0002_add_email.sql"),
+    ///         Some(include_str!("../migrations/0002_add_email.down.sql")),
+    ///     ),
+    /// ]).unwrap();
+    /// ```
+    pub fn from_embedded<'a, I>(entries: I) -> Result<Self, crate::Error>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+    {
+        let mut migrations = Vec::new();
+        for (stem, up, down) in entries {
+            // Reuse from_dir's parser so the format error wording stays
+            // identical — pass the stem as the file path for nice errors.
+            let synthetic_path = std::path::PathBuf::from(format!("{stem}.sql"));
+            let (version, _description) = parse_migration_name(stem, &synthetic_path)?;
+            let no_transaction = up
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim() == "-- no-transaction");
+            migrations.push(Migration {
+                version,
+                name: stem.to_owned(),
+                sql: up.to_owned(),
+                down_sql: down.map(str::to_owned),
+                no_transaction,
+            });
+        }
+        migrations.sort_by(|a, b| a.version.cmp(&b.version));
+        Ok(Self { migrations })
+    }
+
     /// Returns all migrations in version order.
     pub fn migrations(&self) -> &[Migration] {
         &self.migrations
@@ -370,6 +424,40 @@ mod tests {
 
         let source = MigrationSource::from_dir(dir.path()).unwrap();
         assert!(source.migrations()[0].no_transaction);
+    }
+
+    #[test]
+    fn from_embedded_orders_by_version() {
+        let source = MigrationSource::from_embedded([
+            ("0002_b", "SELECT 2;", None),
+            ("0001_a", "SELECT 1;", Some("DROP TABLE a;")),
+            ("0003_c", "SELECT 3;", None),
+        ])
+        .unwrap();
+        let m = source.migrations();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].name, "0001_a");
+        assert_eq!(m[0].down_sql.as_deref(), Some("DROP TABLE a;"));
+        assert_eq!(m[1].name, "0002_b");
+        assert_eq!(m[2].name, "0003_c");
+    }
+
+    #[test]
+    fn from_embedded_detects_no_transaction_directive() {
+        let source = MigrationSource::from_embedded([(
+            "0001_idx",
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY idx ON t(col);",
+            None,
+        )])
+        .unwrap();
+        assert!(source.migrations()[0].no_transaction);
+    }
+
+    #[test]
+    fn from_embedded_rejects_invalid_stem() {
+        let err = MigrationSource::from_embedded([("not_numeric_prefix", "SELECT 1;", None)])
+            .unwrap_err();
+        assert!(format!("{err}").contains("numeric prefix"));
     }
 
     #[test]

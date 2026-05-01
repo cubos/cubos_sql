@@ -333,6 +333,10 @@ pub use executor::Executor;
 pub use from_row::FromRow;
 
 pub use cubos_sql_macros::FromRow;
+/// Re-export the `embed_migrations!` macro from `cubos_sql_macros`.
+///
+/// See the [`macro@embed_migrations`] documentation for usage details.
+pub use cubos_sql_macros::embed_migrations;
 /// Re-export the `sql!` macro from `cubos_sql_macros`.
 ///
 /// See the [`macro@sql`] documentation for full syntax, examples, and
