@@ -38,6 +38,8 @@ mod special;
 mod subqueries;
 #[path = "query/typmod.rs"]
 mod typmod;
+#[path = "query/utility_stmts.rs"]
+mod utility_stmts;
 #[path = "query/user_types.rs"]
 mod user_types;
 #[path = "query/where_clause.rs"]

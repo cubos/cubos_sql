@@ -260,6 +260,54 @@ pub(crate) fn analyze_raw_node(
         node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
         node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
         node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
+        // `EXPLAIN <query>` — recurse into the wrapped statement so its
+        // parameters are harvested into the outer `ParamCollector`, then
+        // replace the column list with PG's fixed `QUERY PLAN` row
+        // description (single text column, never NULL — even an empty
+        // plan emits at least one row).
+        node::Node::ExplainStmt(es) => {
+            let inner = es
+                .query
+                .as_deref()
+                .and_then(|q| q.node.as_ref())
+                .ok_or_else(|| AnalyzeError::Unsupported("EXPLAIN with no inner query".into()))?;
+            // Dispatch into the same per-stmt analyzers we use at the top
+            // level so the params collector stays shared (calling
+            // `analyze_raw_node` recursively would allocate a fresh
+            // collector and the outer call would see zero params).
+            let _ = match inner {
+                node::Node::SelectStmt(sel) => analyze_select(sel, snapshot, &mut params)?,
+                node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
+                node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
+                node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
+                node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
+                _ => {
+                    return Err(AnalyzeError::Unsupported(format!(
+                        "EXPLAIN with statement type: {:?}",
+                        std::mem::discriminant(inner)
+                    )));
+                }
+            };
+            (
+                vec![RawColumn {
+                    name: "QUERY PLAN".to_owned(),
+                    type_oid: oid::TEXT,
+                    nullable: false,
+                    typmod: None,
+                    collation: None,
+                    record_fields: None,
+                }],
+                None,
+            )
+        }
+        // `NOTIFY channel [, 'payload']` and `LISTEN/UNLISTEN channel`
+        // produce no result rows. PG's payload is a string literal in the
+        // standard form (no expressions / parameters); for parameterized
+        // notifications callers use `SELECT pg_notify($1, $2)` which goes
+        // through the regular function-call path.
+        node::Node::NotifyStmt(_)
+        | node::Node::ListenStmt(_)
+        | node::Node::UnlistenStmt(_) => (Vec::new(), None),
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
                 "statement type: {:?}",

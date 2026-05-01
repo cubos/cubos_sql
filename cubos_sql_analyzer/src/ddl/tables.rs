@@ -887,9 +887,9 @@ fn parse_column_def(
             [schema, name] => (Some(*schema), *name),
             _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
         };
-        let resolved = interp.resolve_collation(schema, name).ok_or_else(|| {
-            DdlError::Parse(format!("collation \"{name}\" does not exist"))
-        })?;
+        let resolved = interp
+            .resolve_collation(schema, name)
+            .ok_or_else(|| DdlError::Parse(format!("collation \"{name}\" does not exist")))?;
         Some(resolved.oid)
     } else {
         None

@@ -62,9 +62,7 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
                 [n] => (None, *n),
                 [s, n] => (Some(*s), *n),
                 _ => {
-                    return Err(DdlError::Parse(
-                        "malformed collation source name".into(),
-                    ));
+                    return Err(DdlError::Parse("malformed collation source name".into()));
                 }
             };
             let source = interp.resolve_collation(schema, src_name).ok_or_else(|| {
@@ -83,4 +81,3 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     });
     Ok(())
 }
-

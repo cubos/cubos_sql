@@ -72,13 +72,16 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
             [s, n] => (Some(*s), *n),
             _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
         };
-        let resolved = interp.resolve_collation(schema, cname).ok_or_else(|| {
-            DdlError::Parse(format!("collation \"{cname}\" does not exist"))
-        })?;
+        let resolved = interp
+            .resolve_collation(schema, cname)
+            .ok_or_else(|| DdlError::Parse(format!("collation \"{cname}\" does not exist")))?;
         Some(resolved.oid)
     } else {
         // Inherit the base type's typcollation.
-        interp.pg_type.get(&base_type_oid).and_then(|t| t.typcollation)
+        interp
+            .pg_type
+            .get(&base_type_oid)
+            .and_then(|t| t.typcollation)
     };
 
     let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");

@@ -30,7 +30,10 @@ fn collate_in_select_preserves_text_type_and_nullability() {
     let s = db
         .analyze("SELECT name COLLATE \"C\" AS n FROM users")
         .unwrap();
-    assert_cols(&s, vec![c("n", basic_with_collation("pg_catalog", "text", "C"))]);
+    assert_cols(
+        &s,
+        vec![c("n", basic_with_collation("pg_catalog", "text", "C"))],
+    );
 }
 
 #[test]
@@ -146,10 +149,8 @@ fn collate_in_case_branch() {
 #[test]
 fn collate_unknown_collation_should_error() {
     let mut db = PgCatalog::new();
-    db.apply_sql(
-        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);",
-    )
-    .unwrap();
+    db.apply_sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);")
+        .unwrap();
     // PG: `collation "definitely_not_a_real_collation" for encoding "UTF8"
     // does not exist`. CREATE TABLE with a bogus column-level COLLATE
     // raises this at apply time; we mirror it.

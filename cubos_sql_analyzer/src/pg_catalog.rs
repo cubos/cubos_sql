@@ -1468,11 +1468,7 @@ impl PgCatalog {
     /// Walks the search path when `schema` is `None`. Returns `None` for
     /// names that don't match any registered collation — callers surface
     /// this as PG's `collation "x" does not exist` error.
-    pub fn resolve_collation(
-        &self,
-        schema: Option<&str>,
-        name: &str,
-    ) -> Option<&PgCollation> {
+    pub fn resolve_collation(&self, schema: Option<&str>, name: &str) -> Option<&PgCollation> {
         let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
             self.namespace_oid(s).into_iter().collect()
         } else {

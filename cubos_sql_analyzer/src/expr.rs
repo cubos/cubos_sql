@@ -510,9 +510,7 @@ pub(crate) fn infer_expr(
                 [n] => (None, *n),
                 [s, n] => (Some(*s), *n),
                 _ => {
-                    return Err(AnalyzeError::Invalid(
-                        "malformed COLLATE clause".into(),
-                    ));
+                    return Err(AnalyzeError::Invalid("malformed COLLATE clause".into()));
                 }
             };
             let resolved_collation = if parts.is_empty() {
