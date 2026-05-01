@@ -463,6 +463,10 @@ pub(crate) struct RawColumn {
     /// Optional `pg_attribute.atttypmod`-shaped modifier (`varchar(n)` length,
     /// `numeric(p,s)`, pgvector dimension, …). `None` matches PG's `-1`.
     pub typmod: Option<i32>,
+    /// Effective `pg_collation.oid` derived for the column / expression.
+    /// Threaded straight from the inner [`ExprType::collation`] so the
+    /// final `Type` can render the non-default name.
+    pub collation: Option<crate::oid::PgCollationOid>,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and
@@ -1529,11 +1533,21 @@ fn analyze_set_operation(
             (None, false) => l.type_oid,
         };
         let typmod = if l.typmod == r.typmod { l.typmod } else { None };
+        // UNION arms only carry collation forward when both sides agree
+        // — same shape as the typmod merge above. Mirrors PG's collation
+        // derivation rule that conflicting branches produce an
+        // indeterminate (None) collation.
+        let collation = if l.collation == r.collation {
+            l.collation
+        } else {
+            None
+        };
         columns.push(RawColumn {
             name: l.name,
             type_oid,
             nullable: l.nullable || r.nullable,
             typmod,
+            collation,
             record_fields: None,
         });
     }
@@ -1598,6 +1612,7 @@ fn analyze_cte(
                 base_not_null: !rc.nullable,
                 table_alias: cte.ctename.clone(),
                 typmod: rc.typmod,
+                collation: rc.collation,
                 record_fields: rc.record_fields,
             })
             .collect();
@@ -1617,12 +1632,21 @@ fn analyze_cte(
                 let type_oid = crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
                     .unwrap_or(s.type_oid);
                 let typmod = if s.typmod == r.typmod { s.typmod } else { None };
+                // Recursive CTE arms only keep the collation when both
+                // arms agree — otherwise PG drops it (same shape as the
+                // typmod merge above).
+                let collation = if s.collation == r.collation {
+                    s.collation
+                } else {
+                    None
+                };
                 ScopeColumn {
                     name: s.name,
                     type_oid,
                     // Either arm producing NULL makes the column nullable.
                     base_not_null: !(s.nullable || r.nullable),
                     typmod,
+                    collation,
                     table_alias: cte.ctename.clone(),
                     record_fields: s.record_fields,
                 }
@@ -1644,6 +1668,7 @@ fn analyze_cte(
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
                     typmod: rc.typmod,
+                    collation: rc.collation,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1658,6 +1683,7 @@ fn analyze_cte(
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
                     typmod: rc.typmod,
+                    collation: rc.collation,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1672,6 +1698,7 @@ fn analyze_cte(
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
                     typmod: rc.typmod,
+                    collation: rc.collation,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1686,6 +1713,7 @@ fn analyze_cte(
                     base_not_null: !rc.nullable,
                     table_alias: cte.ctename.clone(),
                     typmod: rc.typmod,
+                    collation: rc.collation,
                     record_fields: rc.record_fields,
                 })
                 .collect())
@@ -1723,6 +1751,7 @@ fn append_search_cycle_columns(
             base_not_null: true,
             table_alias: cte.ctename.clone(),
             typmod: None,
+            collation: None,
             record_fields: None,
         });
     }
@@ -1737,6 +1766,7 @@ fn append_search_cycle_columns(
                 base_not_null: true,
                 table_alias: cte.ctename.clone(),
                 typmod: None,
+                collation: None,
                 record_fields: None,
             });
         }
@@ -1752,6 +1782,7 @@ fn append_search_cycle_columns(
                 base_not_null: true,
                 table_alias: cte.ctename.clone(),
                 typmod: None,
+                collation: None,
                 record_fields: None,
             });
         }
@@ -1779,6 +1810,7 @@ fn apply_cte_column_aliases(cols: Vec<RawColumn>, aliases: &[protobuf::Node]) ->
             type_oid: c.type_oid,
             nullable: c.nullable,
             typmod: c.typmod,
+            collation: c.collation,
             record_fields: c.record_fields,
         })
         .collect()
@@ -1937,6 +1969,7 @@ fn process_from_item(
                         base_not_null: !rc.nullable,
                         table_alias: alias.to_owned(),
                         typmod: rc.typmod,
+                        collation: rc.collation,
                         record_fields: rc.record_fields,
                     })
                     .collect();
@@ -2133,6 +2166,7 @@ fn process_range_function(
                 base_not_null: !nullable,
                 table_alias: alias.to_owned(),
                 typmod: None,
+                collation: None,
                 record_fields: None,
             });
         }
@@ -2150,6 +2184,7 @@ fn process_range_function(
                     type_oid: f.type_oid,
                     base_not_null: f.not_null,
                     typmod: None,
+                    collation: None,
                     table_alias: alias.to_owned(),
                     record_fields: None,
                 })
@@ -2167,6 +2202,7 @@ fn process_range_function(
                     type_oid: f.atttypid,
                     base_not_null: f.attnotnull || snapshot.type_is_not_null(f.atttypid),
                     typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
+                    collation: f.attcollation,
                     table_alias: alias.to_owned(),
                     record_fields: None,
                 })
@@ -2184,6 +2220,7 @@ fn process_range_function(
                 base_not_null: strict_not_null,
                 table_alias: alias.to_owned(),
                 typmod: None,
+                collation: None,
                 record_fields: None,
             }]
         }
@@ -2199,6 +2236,7 @@ fn process_range_function(
             base_not_null: true,
             table_alias: alias.to_owned(),
             typmod: None,
+            collation: None,
             record_fields: None,
         });
     }
@@ -2269,6 +2307,7 @@ fn resolve_target_list(
                     type_oid: col.type_oid,
                     nullable,
                     typmod: col.typmod,
+                    collation: col.collation,
                     record_fields: col.record_fields.clone(),
                 });
             }
@@ -2310,6 +2349,7 @@ fn resolve_target_list(
             type_oid,
             nullable: expr_type.nullable,
             typmod: expr_type.typmod,
+            collation: expr_type.collation,
             record_fields,
         });
     }
@@ -2371,6 +2411,10 @@ fn analyze_values_lists(
                 .unwrap_or(oid::UNKNOWN),
             nullable: column_nullable[i],
             typmod: None,
+            // VALUES literals don't carry a column-level collation — PG
+            // leaves it indeterminate and lets a surrounding `INSERT INTO
+            // table (cols)` re-attach the target column's attcollation.
+            collation: None,
             record_fields: None,
         })
         .collect();
@@ -2441,6 +2485,7 @@ fn build_column(rc: RawColumn, snapshot: &PgCatalog) -> Result<AnalyzedColumn, A
     let pg_type = resolve_type_with_shape(
         rc.type_oid,
         rc.typmod,
+        rc.collation,
         rc.record_fields.as_deref(),
         snapshot,
     )?;
@@ -2462,6 +2507,7 @@ fn build_column(rc: RawColumn, snapshot: &PgCatalog) -> Result<AnalyzedColumn, A
 fn resolve_type_with_shape(
     type_oid: PgTypeOid,
     typmod: Option<i32>,
+    collation: Option<crate::oid::PgCollationOid>,
     shape: Option<&[crate::expr::RecordField]>,
     snapshot: &PgCatalog,
 ) -> Result<Type, AnalyzeError> {
@@ -2475,6 +2521,7 @@ fn resolve_type_with_shape(
                 ty: resolve_type_with_shape(
                     f.ty.type_oid,
                     f.ty.typmod,
+                    f.ty.collation,
                     f.ty.record_fields.as_deref(),
                     snapshot,
                 )?,
@@ -2483,7 +2530,7 @@ fn resolve_type_with_shape(
         }
         return Ok(Type::AnonymousRecord { fields: out });
     }
-    resolve_type(type_oid, typmod, snapshot)
+    resolve_type(type_oid, typmod, collation, snapshot)
 }
 
 fn build_param_info(
@@ -2495,8 +2542,24 @@ fn build_param_info(
     // bound, and the cast-introduced typmod is consumed at the cast site
     // itself). Match PG's `pg_param_collator`/`exec_describe_params` which
     // does not include atttypmod for parameters.
-    let pg_type = resolve_type(type_oid, None, snapshot)?;
+    let pg_type = resolve_type(type_oid, None, None, snapshot)?;
     Ok(ParamInfo { pg_type, nullable })
+}
+
+/// Resolve a [`PgCollationOid`] to a printable name, suppressing the
+/// database default ("default", oid 100). Used when materializing
+/// `Type::Basic` / `Type::Domain` from a column or expression site.
+fn collation_name(
+    collation: Option<crate::oid::PgCollationOid>,
+    snapshot: &PgCatalog,
+) -> Option<String> {
+    let oid = collation?;
+    let row = snapshot.pg_collation.get(&oid)?;
+    if row.collname == "default" {
+        None
+    } else {
+        Some(row.collname.clone())
+    }
 }
 
 /// Build the PG-facing [`Type`] for an OID, recursing through Domain/Array
@@ -2509,11 +2572,18 @@ fn build_param_info(
 /// inner recursion clears `typmod` for nested types (e.g. domain's base
 /// type, array's element) since the seed-level `typtypmod` already tracks
 /// per-type defaults.
+///
+/// `collation` is the `pg_collation.oid` resolved on the column /
+/// expression site. When present, the database default ("default", oid
+/// 100) is suppressed and any other collation is rendered as its name on
+/// `Type::Basic` / `Type::Domain`.
 fn resolve_type(
     type_oid: PgTypeOid,
     typmod: Option<i32>,
+    collation: Option<crate::oid::PgCollationOid>,
     snapshot: &PgCatalog,
 ) -> Result<Type, AnalyzeError> {
+    let coll_name = collation_name(collation, snapshot);
     if let Some(te) = snapshot.get_type(type_oid) {
         let schema = snapshot
             .namespace_name(te.typnamespace)
@@ -2529,7 +2599,9 @@ fn resolve_type(
         {
             // Array columns store the modifier on the element type
             // (`varchar(20)[]` → element typmod = 24, array typmod = -1).
-            let element = resolve_type(elem, typmod, snapshot)?;
+            // Collation propagates through to the element — PG attaches it
+            // to the element type, not the array wrapper.
+            let element = resolve_type(elem, typmod, collation, snapshot)?;
             return Ok(Type::Array {
                 element: Box::new(element),
             });
@@ -2544,7 +2616,7 @@ fn resolve_type(
                 // Domains inherit their base typmod when the column didn't
                 // pin one. Recurse without re-applying so the base sees its
                 // own seed-level value (or `None`).
-                let base = resolve_type(base_oid, None, snapshot)?;
+                let base = resolve_type(base_oid, None, None, snapshot)?;
                 let effective_typmod = typmod.or(te.typtypmod);
                 return Ok(Type::Domain {
                     schema,
@@ -2552,6 +2624,7 @@ fn resolve_type(
                     base: Box::new(base),
                     extension,
                     typmod: effective_typmod,
+                    collation: coll_name,
                 });
             }
             TypType::Enum => {
@@ -2573,7 +2646,7 @@ fn resolve_type(
                     .get(&type_oid)
                     .map(|r| r.rngsubtype)
                     .unwrap_or(oid::UNKNOWN);
-                let subtype = resolve_type(subtype_oid, None, snapshot)?;
+                let subtype = resolve_type(subtype_oid, None, None, snapshot)?;
                 return Ok(Type::Range {
                     schema,
                     name,
@@ -2592,7 +2665,7 @@ fn resolve_type(
                 for f in &attrs {
                     out.push(crate::types::RecordField {
                         name: f.attname.clone(),
-                        ty: resolve_type(f.atttypid, f.atttypmod, snapshot)?,
+                        ty: resolve_type(f.atttypid, f.atttypmod, f.attcollation, snapshot)?,
                         nullable: !f.attnotnull,
                     });
                 }
@@ -2604,6 +2677,7 @@ fn resolve_type(
                     name,
                     extension,
                     typmod,
+                    collation: coll_name,
                 });
             }
         }
@@ -2616,6 +2690,7 @@ fn resolve_type(
             name: "unknown".to_owned(),
             extension: None,
             typmod: None,
+            collation: None,
         });
     }
 

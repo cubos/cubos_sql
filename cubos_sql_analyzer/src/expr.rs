@@ -89,6 +89,14 @@ pub(crate) struct ExprType {
     /// casts, and uniform CASE/UNION branches actually propagate a value.
     /// Functions, operators, and aggregates strip it (PG matching).
     pub typmod: Option<i32>,
+    /// `pg_collation.oid` carried through the inference. `None` for non-
+    /// collatable types and untagged sites; `Some` only when a real
+    /// collation is pinned (column attcollation, explicit `COLLATE "x"`,
+    /// or propagation through a binary op / case branch). Operator and
+    /// function outputs typically clear this — PG's full collation
+    /// derivation rules ("explicit > implicit > none") are approximated
+    /// here as "left-or-right wins" in binary contexts.
+    pub collation: Option<crate::oid::PgCollationOid>,
     pub record_fields: Option<Vec<RecordField>>,
 }
 
@@ -129,6 +137,7 @@ impl ExprType {
             type_oid,
             nullable,
             typmod: None,
+            collation: None,
             record_fields: None,
         }
     }
@@ -141,6 +150,26 @@ impl ExprType {
             type_oid,
             nullable,
             typmod,
+            collation: None,
+            record_fields: None,
+        }
+    }
+
+    /// Construct a scalar with a known typmod *and* collation. Used by
+    /// `infer_column_ref` (column attcollation) and the `CollateClause`
+    /// arm of `infer_expr` (explicit decoration overrides the inferred
+    /// collation regardless of source).
+    pub fn scalar_with_collation(
+        type_oid: PgTypeOid,
+        nullable: bool,
+        typmod: Option<i32>,
+        collation: Option<crate::oid::PgCollationOid>,
+    ) -> Self {
+        Self {
+            type_oid,
+            nullable,
+            typmod,
+            collation,
             record_fields: None,
         }
     }
@@ -438,6 +467,7 @@ pub(crate) fn infer_expr(
                 type_oid: oid::RECORD,
                 nullable: false,
                 typmod: None,
+                collation: None,
                 record_fields: Some(fields),
             })
         }
@@ -485,11 +515,14 @@ pub(crate) fn infer_expr(
                     ));
                 }
             };
-            if !parts.is_empty() && snapshot.resolve_collation(schema, name).is_none() {
-                return Err(AnalyzeError::Invalid(format!(
-                    "collation \"{name}\" does not exist",
-                )));
-            }
+            let resolved_collation = if parts.is_empty() {
+                None
+            } else {
+                let r = snapshot.resolve_collation(schema, name).ok_or_else(|| {
+                    AnalyzeError::Invalid(format!("collation \"{name}\" does not exist"))
+                })?;
+                Some(r.oid)
+            };
             let result = infer_expr(arg, scope, null_ctx, snapshot, params, goal)?;
             // PG rejects `COLLATE` on non-string-category types with
             // `collations are not supported by type X`. Accept UNKNOWN
@@ -511,7 +544,14 @@ pub(crate) fn infer_expr(
                     )));
                 }
             }
-            return Ok(result);
+            // Explicit COLLATE overrides whatever collation was inherited
+            // from the inner expression (PG's "explicit" derivation tier).
+            return Ok(ExprType::scalar_with_collation(
+                result.type_oid,
+                result.nullable,
+                result.typmod,
+                resolved_collation,
+            ));
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
@@ -639,6 +679,11 @@ fn infer_column_ref(
                 type_oid: col.type_oid,
                 nullable,
                 typmod: col.typmod,
+                // The column's `attcollation` (if any) flows out as-is. PG
+                // never overrides it implicitly — only an explicit
+                // `COLLATE "x"` decoration on the surrounding expression
+                // does.
+                collation: col.collation,
                 // Carry the column's record shape forward so downstream
                 // `(col).field` indirection and ROW-vs-shape coercion can
                 // see through to the field types.
@@ -948,6 +993,7 @@ fn resolve_composite_field(
             type_oid: field.ty.type_oid,
             nullable: current.nullable || field.ty.nullable,
             typmod: field.ty.typmod,
+            collation: field.ty.collation,
             record_fields: field.ty.record_fields.clone(),
         });
     }
@@ -1408,6 +1454,15 @@ fn infer_func_call(
         // argument's typmod (PG matching: `lower(varchar(20))` returns
         // varchar, not varchar(20)).
         typmod: None,
+        // Collation derivation through function calls is PG's most
+        // intricate area (see "collation derivation" in the docs). For
+        // the common case of `lower(text_col)` / `upper(text_col)` the
+        // input collation flows through, but exhaustive support
+        // requires the per-function `proargcollation`/`procollation`
+        // we don't model. Conservatively drop collation through
+        // calls — the compiler still propagates COLLATE-decorated
+        // column refs for the surrounding context.
+        collation: None,
         record_fields,
     })
 }

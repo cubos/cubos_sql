@@ -54,6 +54,33 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         )
     });
 
+    // `CREATE DOMAIN d AS T COLLATE "x"` pins the domain's default
+    // collation. PG validates the name and stores the resolved oid in
+    // `pg_type.typcollation`; columns of type `d` later inherit this
+    // unless they declare their own `COLLATE`.
+    let domain_collation = if let Some(coll) = stmt.coll_clause.as_deref() {
+        let parts: Vec<&str> = coll
+            .collname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                node::Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (schema, cname) = match parts.as_slice() {
+            [n] => (None, *n),
+            [s, n] => (Some(*s), *n),
+            _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
+        };
+        let resolved = interp.resolve_collation(schema, cname).ok_or_else(|| {
+            DdlError::Parse(format!("collation \"{cname}\" does not exist"))
+        })?;
+        Some(resolved.oid)
+    } else {
+        // Inherit the base type's typcollation.
+        interp.pg_type.get(&base_type_oid).and_then(|t| t.typcollation)
+    };
+
     let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
     interp.insert_pg_type(PgType {
         oid,
@@ -68,6 +95,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typbasetype: Some(base_type_oid),
         typnotnull,
         typtypmod,
+        typcollation: domain_collation,
     });
 
     register_array_type(interp, nsoid, &name, oid);
@@ -105,6 +133,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
     for (i, label) in labels.into_iter().enumerate() {
         let enum_oid = PgEnumOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
@@ -196,6 +225,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
 
     register_array_type(interp, nsoid, &name, type_oid);
@@ -244,6 +274,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
     interp.insert_pg_range(PgRange {
         rngtypid: oid,
@@ -370,6 +401,7 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
     register_array_type(interp, nsoid, &name, oid);
     Ok(())
@@ -449,6 +481,7 @@ pub(crate) fn register_array_type(
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);

@@ -350,6 +350,14 @@ pub struct PgType {
     /// [`crate::typmod`] to encode/decode.
     #[serde(with = "crate::oid::option_i32_neg_one")]
     pub typtypmod: Option<i32>,
+    /// FK `pg_collation.oid` — the type's default collation. `None`
+    /// (PG's `0`) for non-collatable types and base text types that
+    /// inherit the database default. Set explicitly for `citext` and
+    /// for domains created with an explicit `COLLATE` decoration. PG
+    /// uses this to derive `attcollation` when a column doesn't pin its
+    /// own collation.
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub typcollation: Option<PgCollationOid>,
 }
 
 /// `pg_enum`: one row per enum label.

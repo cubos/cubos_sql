@@ -100,6 +100,7 @@ pub fn basic(schema: &str, name: &str) -> Type {
         name: name.into(),
         extension: None,
         typmod: None,
+        collation: None,
     }
 }
 
@@ -109,6 +110,7 @@ pub fn basic_with_typmod(schema: &str, name: &str, typmod: i32) -> Type {
         name: name.into(),
         extension: None,
         typmod: Some(typmod),
+        collation: None,
     }
 }
 
@@ -118,6 +120,17 @@ pub fn basic_ext(schema: &str, name: &str, extension: &str) -> Type {
         name: name.into(),
         extension: Some(extension.into()),
         typmod: None,
+        collation: None,
+    }
+}
+
+pub fn basic_with_collation(schema: &str, name: &str, collation: &str) -> Type {
+    Type::Basic {
+        schema: schema.into(),
+        name: name.into(),
+        extension: None,
+        typmod: None,
+        collation: Some(collation.into()),
     }
 }
 
@@ -134,6 +147,18 @@ pub fn domain(schema: &str, name: &str, base: Type) -> Type {
         base: Box::new(base),
         extension: None,
         typmod: None,
+        collation: None,
+    }
+}
+
+pub fn domain_with_collation(schema: &str, name: &str, base: Type, collation: &str) -> Type {
+    Type::Domain {
+        schema: schema.into(),
+        name: name.into(),
+        base: Box::new(base),
+        extension: None,
+        typmod: None,
+        collation: Some(collation.into()),
     }
 }
 

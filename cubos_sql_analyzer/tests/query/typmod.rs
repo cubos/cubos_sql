@@ -65,6 +65,7 @@ fn vector_dimension_propagates_to_select() {
                 name: "vector".into(),
                 extension: Some("vector".into()),
                 typmod: Some(384),
+                collation: None,
             },
         )],
     );
@@ -127,6 +128,7 @@ fn domain_inherits_typmod_to_column() {
                 base: Box::new(varchar()),
                 extension: None,
                 typmod: Some(24),
+                collation: None,
             },
         )],
     );
@@ -208,6 +210,7 @@ fn alter_column_type_to_vector_with_dim() {
                 name: "vector".into(),
                 extension: Some("vector".into()),
                 typmod: Some(768),
+                collation: None,
             },
         )],
     );

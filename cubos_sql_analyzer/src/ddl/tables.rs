@@ -125,6 +125,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
     register_composite_to_record_cast(interp, composite_oid);
 
@@ -142,6 +143,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
 
     // `CREATE TABLE child () INHERITS (p1, p2, …)` (NOT `PARTITION OF`).

@@ -24,11 +24,13 @@ fn setup() -> PgCatalog {
 #[test]
 fn collate_in_select_preserves_text_type_and_nullability() {
     let db = setup();
-    // `name COLLATE "C"` is still text, NOT NULL — collation is metadata.
+    // `name COLLATE "C"` is still text, NOT NULL, with the collation
+    // surfaced on the output column (PG does the same in the row
+    // description).
     let s = db
         .analyze("SELECT name COLLATE \"C\" AS n FROM users")
         .unwrap();
-    assert_cols(&s, vec![c("n", text())]);
+    assert_cols(&s, vec![c("n", basic_with_collation("pg_catalog", "text", "C"))]);
 }
 
 #[test]
@@ -37,7 +39,10 @@ fn collate_in_select_keeps_nullable() {
     let s = db
         .analyze("SELECT nick COLLATE \"C\" AS n FROM users")
         .unwrap();
-    assert_cols(&s, vec![cn("n", text())]);
+    assert_cols(
+        &s,
+        vec![cn("n", basic_with_collation("pg_catalog", "text", "C"))],
+    );
 }
 
 // ── COLLATE in ORDER BY ─────────────────────────────────────────────────────
@@ -103,7 +108,10 @@ fn collate_on_text_domain_accepted() {
     )
     .unwrap();
     let s = db.analyze("SELECT name COLLATE \"C\" AS n FROM t").unwrap();
-    assert_cols(&s, vec![c("n", domain("public", "slug", text()))]);
+    assert_cols(
+        &s,
+        vec![c("n", domain_with_collation("public", "slug", text(), "C"))],
+    );
 }
 
 // ── Stacked / nested COLLATE ────────────────────────────────────────────────

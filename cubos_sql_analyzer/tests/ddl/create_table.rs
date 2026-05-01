@@ -718,6 +718,7 @@ fn param_in_group_by_and_having_is_inferred() {
             name: "int8".into(),
             extension: None,
             typmod: None,
+            collation: None,
         }
     );
 }

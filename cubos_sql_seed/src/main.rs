@@ -191,7 +191,7 @@ fn export_namespaces(client: &mut postgres::Client) -> Result<Vec<PgNamespace>, 
 fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::Error> {
     let rows = client.query(
         "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
-                typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod \
+                typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod, typcollation \
          FROM pg_catalog.pg_type ORDER BY oid",
         &[],
     )?;
@@ -207,6 +207,7 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
             let typarray: u32 = r.get(8);
             let typbasetype: u32 = r.get(9);
             let typtypmod_raw: i32 = r.get(11);
+            let typcollation: u32 = r.get(12);
             PgType {
                 oid: PgTypeOid::new(oid).expect("pg_type.oid is non-zero"),
                 typname: r.get(1),
@@ -220,6 +221,7 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
                 typbasetype: PgTypeOid::new(typbasetype),
                 typnotnull: r.get(10),
                 typtypmod: (typtypmod_raw >= 0).then_some(typtypmod_raw),
+                typcollation: PgCollationOid::new(typcollation),
             }
         })
         .collect())

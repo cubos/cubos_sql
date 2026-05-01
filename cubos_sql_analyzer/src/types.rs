@@ -12,11 +12,10 @@
 //! has one nullable element and one not).
 
 use cubos_sql_core::QualifiedName;
-use serde::{Deserialize, Serialize};
 
 /// One field of an [`Type::AnonymousRecord`]. Carries the field's name, its
 /// resolved [`Type`], and whether the value at that position can be NULL.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordField {
     pub name: String,
     pub ty: Type,
@@ -40,7 +39,7 @@ pub struct RecordField {
 /// - `AnonymousRecord` — the unnamed row type produced by a subquery or a
 ///   composite-returning function, carrying its named field list with
 ///   per-field nullability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Basic {
         schema: String,
@@ -51,8 +50,12 @@ pub enum Type {
         /// pgvector's `vector(N)`, etc. `None` matches PG's `-1` ("no
         /// typmod"). Use [`crate::typmod::decode`] to interpret the value
         /// per type.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         typmod: Option<i32>,
+        /// Collation name attached to this column/expression — only
+        /// surfaced for text-like types whose collation isn't the
+        /// database default. Mirrors the way PG decorates a column with
+        /// a non-default collation in the row description.
+        collation: Option<String>,
     },
     Domain {
         schema: String,
@@ -63,8 +66,10 @@ pub enum Type {
         /// `pg_type.typtypmod` if the column inherited it from the domain,
         /// or carries the column's own `atttypmod` when the column locally
         /// pinned a length / precision.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         typmod: Option<i32>,
+        /// Same shape as on `Basic`: non-default collation pinned on the
+        /// column / expression.
+        collation: Option<String>,
     },
     Array {
         element: Box<Type>,
@@ -83,7 +88,6 @@ pub enum Type {
         /// Range subtypes don't carry typmod themselves but inherit through
         /// `subtype` — kept for symmetry with `Basic`/`Domain` and forward
         /// compatibility with custom range types.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         typmod: Option<i32>,
     },
     AnonymousRecord {

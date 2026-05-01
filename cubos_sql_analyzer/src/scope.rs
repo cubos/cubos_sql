@@ -16,6 +16,9 @@ pub(crate) struct ScopeColumn {
     /// optionally inherited from the column's type chain (e.g. a domain over
     /// `varchar(20)`). `None` matches PG's `-1`.
     pub typmod: Option<i32>,
+    /// `pg_attribute.attcollation` of the source column, if any. Threaded
+    /// through `infer_column_ref` into `ExprType.collation`.
+    pub collation: Option<crate::oid::PgCollationOid>,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
     /// Named-field structure when the column holds a record value: SRF /
@@ -68,6 +71,7 @@ impl Scope {
                 type_oid: c.atttypid,
                 base_not_null: c.attnotnull || snapshot.type_is_not_null(c.atttypid),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
+                collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
@@ -105,6 +109,7 @@ impl Scope {
                 type_oid: c.atttypid,
                 base_not_null: c.attnotnull || snapshot.type_is_not_null(c.atttypid),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
+                collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })

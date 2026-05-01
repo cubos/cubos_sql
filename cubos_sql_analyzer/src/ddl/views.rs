@@ -186,6 +186,7 @@ fn install_relation(
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
     interp.insert_pg_type(PgType {
         oid: array_oid,
@@ -200,6 +201,7 @@ fn install_relation(
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
+        typcollation: None,
     });
 
     // Record dependencies in pg_depend.
