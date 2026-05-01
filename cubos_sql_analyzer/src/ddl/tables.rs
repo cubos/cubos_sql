@@ -97,8 +97,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         relnamespace: nsoid,
         relkind: RelKind::Table,
         reltype: Some(composite_oid),
-        relviewdef: Vec::new(),
-        viewbindings: Vec::new(),
+        relviewdef: None,
     });
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {

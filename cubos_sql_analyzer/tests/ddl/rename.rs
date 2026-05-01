@@ -53,7 +53,7 @@ fn rename_table_rewrites_view_ast() {
     ]);
 
     let view = snap.resolve_table(None, "v").unwrap();
-    assert!(!view.relviewdef.is_empty());
+    assert!(view.relviewdef.is_some());
 
     let table_deps = view_table_deps(&snap, view.oid);
     assert!(

@@ -267,8 +267,7 @@ fn export_classes(client: &mut postgres::Client) -> Result<Vec<PgClass>, postgre
                 relnamespace: PgNamespaceOid::new(relnamespace).expect("relnamespace is non-zero"),
                 relkind,
                 reltype: PgTypeOid::new(reltype),
-                relviewdef: Vec::new(),
-                viewbindings: Vec::new(),
+                relviewdef: None,
             })
         })
         .collect())

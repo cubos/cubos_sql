@@ -16,8 +16,8 @@ use pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
 
 use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
-    DepType, PG_CLASS_RELID, PgAttribute, PgClass, PgDepend, PgType, RelKind, TypCategory, TypType,
-    ViewBinding,
+    AstBinding, DepType, PG_CLASS_RELID, PgAttribute, PgClass, PgDepend, PgType, RelKind,
+    SerializedAst, TypCategory, TypType,
 };
 
 use super::DdlError;
@@ -112,7 +112,7 @@ pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Resu
 #[derive(Default)]
 struct ResolvedView {
     columns: Vec<ResolvedColumn>,
-    bindings: Vec<ViewBinding>,
+    bindings: Vec<AstBinding>,
     ast: Vec<u8>,
     deps: ViewDeps,
 }
@@ -128,8 +128,8 @@ fn install_relation(
 ) {
     let ResolvedView {
         columns,
-        bindings: viewbindings,
-        ast: relviewdef,
+        bindings,
+        ast,
         deps,
     } = resolved;
     let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
@@ -142,8 +142,7 @@ fn install_relation(
         relnamespace: nsoid,
         relkind,
         reltype: Some(composite_oid),
-        relviewdef,
-        viewbindings,
+        relviewdef: Some(SerializedAst { ast, bindings }),
     });
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
@@ -301,18 +300,17 @@ pub(crate) fn reanalyze_view(
     snapshot: &mut PgCatalog,
     view_oid: PgClassOid,
 ) -> Result<(), DdlError> {
-    let Some((ast_bytes, bindings)) = snapshot
+    let Some(serialized) = snapshot
         .pg_class
         .get(&view_oid)
-        .map(|c| (c.relviewdef.clone(), c.viewbindings.clone()))
-        .filter(|(b, _)| !b.is_empty())
+        .and_then(|c| c.relviewdef.clone())
     else {
         return Ok(());
     };
-    let Some(mut ast) = decode_ast(&ast_bytes) else {
+    let Some(mut ast) = decode_ast(&serialized.ast) else {
         return Ok(());
     };
-    apply_view_bindings(&mut ast, &bindings, snapshot);
+    apply_view_bindings(&mut ast, &serialized.bindings, snapshot);
 
     let Some(stmt) = ast.node.as_ref() else {
         return Ok(());
@@ -363,7 +361,7 @@ struct FromSource {
 }
 
 /// Walks a view's parsed AST and emits a deterministic stream of
-/// [`ViewBinding`]s — one per name slot, in pre-order. Deps for `pg_depend`
+/// [`AstBinding`]s — one per name slot, in pre-order. Deps for `pg_depend`
 /// are derived from the bindings as a side-effect.
 ///
 /// The applier ([`apply_view_bindings`]) walks the same AST in the same order
@@ -372,13 +370,13 @@ struct FromSource {
 /// applier rewrites name slots from the OID's *current* catalog name.
 #[derive(Default)]
 struct ViewWalker {
-    bindings: Vec<ViewBinding>,
+    bindings: Vec<AstBinding>,
 }
 
 fn collect_view_bindings_and_deps(
     query_node: &protobuf::Node,
     snapshot: &PgCatalog,
-) -> (Vec<ViewBinding>, ViewDeps) {
+) -> (Vec<AstBinding>, ViewDeps) {
     let mut walker = ViewWalker::default();
     let scope_stack: Vec<Vec<FromSource>> = Vec::new();
     walker.walk_node(query_node, snapshot, &scope_stack);
@@ -388,13 +386,13 @@ fn collect_view_bindings_and_deps(
 
 /// Derive `(relation_refs, column_refs)` from emitted bindings — the pieces
 /// `install_relation` writes into `pg_depend`.
-fn derive_deps_from_bindings(bindings: &[ViewBinding]) -> ViewDeps {
+fn derive_deps_from_bindings(bindings: &[AstBinding]) -> ViewDeps {
     let mut relation_refs: Vec<PgClassOid> = Vec::new();
     let mut column_refs: Vec<(PgClassOid, i16)> = Vec::new();
     for b in bindings {
         match b {
-            ViewBinding::Relation(oid) => relation_refs.push(*oid),
-            ViewBinding::Column(rel, attnum) => column_refs.push((*rel, *attnum)),
+            AstBinding::Relation(oid) => relation_refs.push(*oid),
+            AstBinding::Column(rel, attnum) => column_refs.push((*rel, *attnum)),
             _ => {}
         }
     }
@@ -636,7 +634,7 @@ impl ViewWalker {
                         .any(|f| f.iter().any(|s| s.relid.is_none() && s.alias == rv.relname))
                 {
                     // CTE / subquery alias shadowing: keep literal AST text.
-                    self.bindings.push(ViewBinding::Unresolved);
+                    self.bindings.push(AstBinding::Unresolved);
                     frame.push(FromSource {
                         alias,
                         relid: None,
@@ -653,7 +651,7 @@ impl ViewWalker {
 
                 if let Some(table) = snapshot.resolve_table(schema, &rv.relname) {
                     let relid = table.oid;
-                    self.bindings.push(ViewBinding::Relation(relid));
+                    self.bindings.push(AstBinding::Relation(relid));
                     let columns = snapshot
                         .attributes_of(relid)
                         .iter()
@@ -665,7 +663,7 @@ impl ViewWalker {
                         columns,
                     });
                 } else {
-                    self.bindings.push(ViewBinding::Unresolved);
+                    self.bindings.push(AstBinding::Unresolved);
                     frame.push(FromSource {
                         alias,
                         relid: None,
@@ -744,8 +742,8 @@ impl ViewWalker {
             _ => None,
         };
         match resolved {
-            Some((relid, attnum)) => self.bindings.push(ViewBinding::Column(relid, attnum)),
-            None => self.bindings.push(ViewBinding::Unresolved),
+            Some((relid, attnum)) => self.bindings.push(AstBinding::Column(relid, attnum)),
+            None => self.bindings.push(AstBinding::Unresolved),
         }
     }
 
@@ -765,7 +763,7 @@ impl ViewWalker {
             [n] => (None, *n),
             [s, n] => (Some(*s), *n),
             _ => {
-                self.bindings.push(ViewBinding::Unresolved);
+                self.bindings.push(AstBinding::Unresolved);
                 return;
             }
         };
@@ -775,8 +773,8 @@ impl ViewWalker {
             .next()
             .map(|p| p.oid);
         match resolved {
-            Some(oid) => self.bindings.push(ViewBinding::Function(oid)),
-            None => self.bindings.push(ViewBinding::Unresolved),
+            Some(oid) => self.bindings.push(AstBinding::Function(oid)),
+            None => self.bindings.push(AstBinding::Unresolved),
         }
     }
 
@@ -795,14 +793,14 @@ impl ViewWalker {
             [n] => (None, *n),
             [s, n] => (Some(*s), *n),
             _ => {
-                self.bindings.push(ViewBinding::Unresolved);
+                self.bindings.push(AstBinding::Unresolved);
                 return;
             }
         };
         let resolved = snapshot.resolve_type_by_name(schema, name).map(|t| t.oid);
         match resolved {
-            Some(oid) => self.bindings.push(ViewBinding::Type(oid)),
-            None => self.bindings.push(ViewBinding::Unresolved),
+            Some(oid) => self.bindings.push(AstBinding::Type(oid)),
+            None => self.bindings.push(AstBinding::Unresolved),
         }
     }
 }
@@ -890,7 +888,7 @@ fn resolve_column_qualified(
 // `Unresolved`. That can't happen with the matched walker pair below, but
 // keeps things robust against future divergence.
 struct ViewApplier<'a> {
-    bindings: &'a [ViewBinding],
+    bindings: &'a [AstBinding],
     cursor: usize,
     snapshot: &'a PgCatalog,
 }
@@ -898,7 +896,7 @@ struct ViewApplier<'a> {
 /// Walk `ast` mutably, applying `bindings` in the same pre-order
 /// [`ViewWalker`] used to emit them. Each name slot is rewritten from the
 /// OID stored in its binding to the catalog's current name.
-fn apply_view_bindings(ast: &mut protobuf::Node, bindings: &[ViewBinding], snapshot: &PgCatalog) {
+fn apply_view_bindings(ast: &mut protobuf::Node, bindings: &[AstBinding], snapshot: &PgCatalog) {
     let mut applier = ViewApplier {
         bindings,
         cursor: 0,
@@ -908,12 +906,12 @@ fn apply_view_bindings(ast: &mut protobuf::Node, bindings: &[ViewBinding], snaps
 }
 
 impl<'a> ViewApplier<'a> {
-    fn pop(&mut self) -> ViewBinding {
+    fn pop(&mut self) -> AstBinding {
         let b = self
             .bindings
             .get(self.cursor)
             .copied()
-            .unwrap_or(ViewBinding::Unresolved);
+            .unwrap_or(AstBinding::Unresolved);
         self.cursor += 1;
         b
     }
@@ -926,7 +924,7 @@ impl<'a> ViewApplier<'a> {
             node::Node::SelectStmt(sel) => self.walk_select(sel),
             node::Node::ColumnRef(cr) => {
                 let b = self.pop();
-                if let ViewBinding::Column(rel, attnum) = b {
+                if let AstBinding::Column(rel, attnum) = b {
                     self.apply_column_ref(cr, rel, attnum);
                 }
             }
@@ -945,7 +943,7 @@ impl<'a> ViewApplier<'a> {
             }
             node::Node::FuncCall(fc) => {
                 let b = self.pop();
-                if let ViewBinding::Function(proc_oid) = b {
+                if let AstBinding::Function(proc_oid) = b {
                     self.apply_func_name(&mut fc.funcname, proc_oid);
                 }
                 for arg in fc.args.iter_mut() {
@@ -969,7 +967,7 @@ impl<'a> ViewApplier<'a> {
                 }
                 if let Some(tn) = tc.type_name.as_mut() {
                     let b = self.pop();
-                    if let ViewBinding::Type(type_oid) = b {
+                    if let AstBinding::Type(type_oid) = b {
                         self.apply_type_name(tn, type_oid);
                     }
                 }
@@ -1106,7 +1104,7 @@ impl<'a> ViewApplier<'a> {
         match inner {
             node::Node::RangeVar(rv) => {
                 let b = self.pop();
-                if let ViewBinding::Relation(relid) = b {
+                if let AstBinding::Relation(relid) = b {
                     self.apply_range_var(rv, relid);
                 }
             }

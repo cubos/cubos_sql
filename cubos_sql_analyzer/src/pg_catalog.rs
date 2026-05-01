@@ -402,14 +402,11 @@ pub struct PgInherits {
 /// type's row type).
 ///
 /// `relviewdef` is non-PG: it stores the protobuf-encoded `pg_query::Node` of
-/// the view's SELECT (resolved against the catalog at creation time) so we
-/// can re-analyze the view after `ALTER COLUMN TYPE` without the original
-/// SQL. View-to-table dependencies live in `pg_depend`.
-///
-/// `viewbindings` is the side-table that resolves every name slot in the AST
-/// to a catalog OID at view creation time. RENAME / SET SCHEMA become no-ops
-/// on the AST: the OIDs in the bindings remain valid and the deparser uses
-/// them to look up *current* names. See [`ViewBinding`] for details.
+/// the view's SELECT plus a side-table of OID-resolved name bindings. Carried
+/// together as [`SerializedAst`] so re-analysis after `ALTER COLUMN TYPE` /
+/// `RENAME` / `SET SCHEMA` works without round-tripping through SQL text.
+/// `None` for non-view relations. View-to-table dependencies live in
+/// `pg_depend`.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgClass {
     pub oid: PgClassOid,
@@ -421,16 +418,30 @@ pub struct PgClass {
     /// that don't get one (rare in our scope).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub reltype: Option<PgTypeOid>,
-    /// Non-PG: serialized AST of the SELECT for views/matviews. Empty for
-    /// other relkinds. (Tuple-positional now, so always emitted; empty
-    /// rows still serialize as the empty base64 string.)
+    /// Non-PG: serialized SELECT AST + binding side-table for views/matviews.
+    /// `None` for non-view relations.
+    pub relviewdef: Option<SerializedAst>,
+}
+
+/// Bundle of a protobuf-encoded `pg_query::Node` plus the per-name-slot
+/// binding side-table that resolves every `RangeVar` / `ColumnRef` /
+/// `FuncCall` / `TypeName` in the AST to a catalog OID.
+///
+/// Used by [`PgClass::relviewdef`] (the SELECT AST of a view) and — once
+/// `pg_index` lands — by index expressions / predicates, where we also need
+/// the AST + bindings to reanalyze after dependency renames.
+///
+/// The emitter and the rewrite pass walk the AST in identical pre-order:
+/// each name-bearing node consumes exactly one [`AstBinding`] entry. RENAME
+/// / SET SCHEMA become no-ops on the AST itself — the OIDs in the bindings
+/// remain valid and the deparser looks up *current* names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct SerializedAst {
+    /// Protobuf-encoded `pg_query::Node`. Base64 in JSON.
     #[serde(with = "serde_base64")]
-    pub relviewdef: Vec<u8>,
-    /// Non-PG: per-view side-table mapping each name slot in `relviewdef` to
-    /// the catalog OID it resolved to at creation time. Walked in the same
-    /// pre-order as the binding emitter; consumed in lockstep by the rewrite
-    /// pass before deparse / reanalysis. Empty for non-view relations.
-    pub viewbindings: Vec<ViewBinding>,
+    pub ast: Vec<u8>,
+    /// One entry per name slot, walked in lockstep with the AST.
+    pub bindings: Vec<AstBinding>,
 }
 
 /// One resolved name slot in a stored view AST.
@@ -442,8 +453,8 @@ pub struct PgClass {
 /// sentinel for slots that referred to a CTE / subquery alias /
 /// unrecognized function — those keep the literal AST text through
 /// round-trip.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ViewBinding {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AstBinding {
     /// A `RangeVar` or the relation-qualifier of a `ColumnRef`. JSON: `{"r":1234}`.
     #[serde(rename = "r")]
     Relation(PgClassOid),

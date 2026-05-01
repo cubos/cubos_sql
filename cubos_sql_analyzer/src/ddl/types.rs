@@ -168,8 +168,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         relnamespace: nsoid,
         relkind: RelKind::CompositeType,
         reltype: Some(type_oid),
-        relviewdef: Vec::new(),
-        viewbindings: Vec::new(),
+        relviewdef: None,
     });
     for (i, (fname, ftype, ftypmod, fnotnull)) in field_defs.into_iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {

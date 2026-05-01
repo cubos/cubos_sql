@@ -538,7 +538,7 @@ fn view_def_stores_resolved_ast() {
 
     let view = snap.resolve_table(None, "v").unwrap();
     assert!(
-        !view.relviewdef.is_empty(),
+        view.relviewdef.is_some(),
         "relviewdef should be populated for freshly-created views",
     );
 }

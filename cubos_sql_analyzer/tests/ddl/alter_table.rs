@@ -322,11 +322,7 @@ fn alter_column_type_reanalyze_is_noop_for_legacy_view() {
 
     // Clear the view's relviewdef to mimic a legacy snapshot.
     let view_oid = db.resolve_table(None, "v").map(|c| c.oid).unwrap();
-    db.pg_class_mut()
-        .get_mut(&view_oid)
-        .unwrap()
-        .relviewdef
-        .clear();
+    db.pg_class_mut().get_mut(&view_oid).unwrap().relviewdef = None;
 
     db.apply_sql("ALTER TABLE t ALTER COLUMN id TYPE INT;")
         .unwrap();
