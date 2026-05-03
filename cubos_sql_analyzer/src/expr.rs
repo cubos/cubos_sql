@@ -2002,6 +2002,15 @@ fn infer_coalesce(
         }
     }
 
+    // A `$param` directly inside COALESCE is, by construction, expected to be
+    // nullable — otherwise the COALESCE would be pointless. Override with
+    // `$param!` to force non-null.
+    for arg in &expr.args {
+        if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+            params.infer_nullable(p.number, true);
+        }
+    }
+
     Ok(ExprType::scalar(type_oid, all_nullable))
 }
 
