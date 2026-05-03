@@ -818,6 +818,22 @@ fn analyze_insert(
         )));
     }
 
+    // Walk the optional `WITH` clause so parameters used only inside the
+    // CTE are registered with the collector — without this, `$N` numbers
+    // referenced exclusively in the CTE would be missing from `seen` and
+    // `into_sorted` would report a spurious "parameter gap". The resolved
+    // CTE columns are also threaded into the inner SELECT's scope so
+    // `INSERT … SELECT … FROM cte` resolves the CTE alias.
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    if let Some(with) = &ins.with_clause {
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
+
     // Build a minimal scope for expressions within VALUES (no table in scope
     // for VALUES, but we need scope for possible subqueries/functions).
     let scope = Scope::default();
@@ -947,7 +963,7 @@ fn analyze_insert(
                     }
                 }
             }
-            let _ = analyze_select(val_sel, snapshot, params);
+            let _ = analyze_select_with_ctes(val_sel, snapshot, params, &cte_scopes);
 
             for (i, target) in val_sel.target_list.iter().enumerate() {
                 if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
@@ -1087,6 +1103,19 @@ fn analyze_update(
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
 
+    // Walk `UPDATE … WITH (cte) …` so parameters inside the CTE are seen by
+    // the collector and the CTE alias is visible to the FROM clause. Same
+    // reasoning as the corresponding block in `analyze_insert`.
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    if let Some(with) = &upd.with_clause {
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
+
     // Build scope with target table + FROM clause tables.
     let mut scope = Scope::default();
     let mut null_ctx = NullabilityContext::default();
@@ -1103,13 +1132,12 @@ fn analyze_update(
     );
 
     // Process FROM clause (UPDATE ... FROM ... WHERE ...).
-    let empty_ctes = HashMap::new();
     process_from_clause(
         &upd.from_clause,
         &mut scope,
         &mut null_ctx,
         snapshot,
-        &empty_ctes,
+        &cte_scopes,
         params,
     )?;
 
@@ -1219,6 +1247,20 @@ fn analyze_delete(
         .map(str::to_owned)
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table.oid).to_vec();
+
+    // Walk `DELETE … WITH (cte) …` so parameters inside the CTE register
+    // with the collector. CTE visibility inside WHERE sublinks is a
+    // separate concern (subselects don't currently inherit outer CTEs);
+    // this fix is scoped to closing the param-tracking gap.
+    if let Some(with) = &del.with_clause {
+        let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
 
     let mut scope = Scope::default();
     let null_ctx = NullabilityContext::default();
