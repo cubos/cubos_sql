@@ -568,7 +568,7 @@ pub(crate) fn analyze_select(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &[], &[])
 }
 
 /// Like [`analyze_select`] but seeds the initial scope with `outer_sources`
@@ -589,6 +589,7 @@ pub(crate) fn analyze_correlated_select(
         &HashMap::new(),
         &[],
         &outer_scope.sources,
+        &[],
     )
 }
 
@@ -598,12 +599,12 @@ fn analyze_select_with_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[], &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[], &[], &[])
 }
 
 /// Core SELECT analyzer.
 ///
-/// Two flavours of outer scope, mirroring PG's distinction:
+/// Three flavours of outer scope, mirroring PG's distinction:
 /// - `lateral_sources`: pre-visible aliases for `LATERAL` subqueries —
 ///   merged into the local FROM scope so the inner query sees them as if
 ///   they were declared locally.
@@ -611,6 +612,11 @@ fn analyze_select_with_ctes(
 ///   (`EXISTS`, scalar, `IN`, `ANY`/`ALL`) — only consulted as a fallback
 ///   when local resolution fails, so an inner alias of the same name
 ///   shadows the outer one.
+/// - `shadowed_sources`: aliases visible in the enclosing FROM but
+///   *unreachable* from inside this query (non-LATERAL FROM subquery). Not
+///   used for resolution — only to upgrade the diagnostic from a generic
+///   missing-column to PG's `invalid reference to FROM-clause entry for
+///   table "x"` when the SQL tries to reach across the boundary.
 fn analyze_select_with_ctes_and_outer(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
@@ -618,6 +624,7 @@ fn analyze_select_with_ctes_and_outer(
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
     lateral_sources: &[crate::scope::TableSource],
     correlated_sources: &[crate::scope::TableSource],
+    shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
@@ -653,11 +660,15 @@ fn analyze_select_with_ctes_and_outer(
     // LATERAL: outer aliases live as if locally declared (visible to `*`,
     // can be referenced unqualified, etc.). Correlated sublinks: outer
     // aliases are only a fallback so an inner alias of the same name
-    // shadows correctly.
+    // shadows correctly. Shadowed: aliases live only as a hint for the
+    // diagnostic when the SQL reaches across the boundary.
     scope.sources.extend(lateral_sources.iter().cloned());
     scope
         .outer_sources
         .extend(correlated_sources.iter().cloned());
+    scope
+        .shadowed_sources
+        .extend(shadowed_sources.iter().cloned());
     let mut null_ctx = NullabilityContext::default();
     null_ctx.has_group_by = !sel.group_clause.is_empty();
 
@@ -2133,11 +2144,15 @@ fn process_from_item(
                 // A LATERAL subquery inherits the visible FROM items to its
                 // left — including the enclosing SELECT's scope we already
                 // built — so column refs like `s.oid` inside
-                // `JOIN LATERAL (… s.oid …)` resolve properly.
-                let lateral_sources: Vec<_> = if sub.lateral {
-                    scope.sources.clone()
+                // `JOIN LATERAL (… s.oid …)` resolve properly. Without
+                // LATERAL the same aliases are *shadowed*: not resolvable,
+                // but tracked so a stray reference produces PG's exact
+                // `invalid reference to FROM-clause entry for table "x"`
+                // diagnostic instead of a generic missing-column message.
+                let (lateral_sources, shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
+                    (scope.sources.clone(), Vec::new())
                 } else {
-                    Vec::new()
+                    (Vec::new(), scope.sources.clone())
                 };
                 let (cols, _) = analyze_select_with_ctes_and_outer(
                     sel,
@@ -2146,6 +2161,7 @@ fn process_from_item(
                     cte_scopes,
                     &lateral_sources,
                     &[],
+                    &shadowed_sources,
                 )?;
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()

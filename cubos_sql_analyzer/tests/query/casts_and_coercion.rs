@@ -250,14 +250,15 @@ fn array_literal_bool_and_int_rejected() {
 }
 
 #[test]
-fn array_literal_unknown_and_int_accepted_like_pg() {
-    // `'x'` is an *unknown* literal; real PG defers the cast to runtime and
-    // happily lands the array on `int4[]`. The analyzer mirrors that.
-    //
-    // PG sanity-socket evaluates the literal at Describe time and trips the
-    // `invalid input syntax for type integer` runtime error real PG would
-    // only raise on actual execution — opt out of the mirror so the
-    // analyzer's compile-time behavior is what's checked.
+fn array_literal_unknown_and_int_accepted_by_analyzer() {
+    // Analyzer-only acceptance: `'x'` is an unknown literal coerced toward
+    // the int4 branch, and our analyzer takes the lenient path (lands the
+    // array on `int4[]`). Real PG runs `int4in('x')` during constant
+    // folding at parse_analyze and raises `invalid input syntax for type
+    // integer: "x"`. Replicating PG's per-type input parsers is outside
+    // the analyzer's scope (see NULLIF/CASE/COALESCE peers), so we accept
+    // the divergence and skip the mirror — the query would still fail at
+    // runtime in real PG.
     let mut db = setup();
     db.skip_pg_sanity();
     let s = db.analyze("SELECT ARRAY['x', 1] AS xs").unwrap();

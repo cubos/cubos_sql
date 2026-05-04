@@ -42,6 +42,12 @@ pub(crate) struct TableSource {
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
     pub outer_sources: Vec<TableSource>,
+    /// Aliases that exist in the enclosing scope but are *not* visible here
+    /// — same shape PG uses for non-LATERAL subqueries: a reference like
+    /// `t.col` against a `t` in this list produces the diagnostic `invalid
+    /// reference to FROM-clause entry for table "t"` instead of the generic
+    /// `column "t.col" does not exist`. Never consulted for resolution.
+    pub shadowed_sources: Vec<TableSource>,
 }
 
 impl Scope {
@@ -140,6 +146,15 @@ impl Scope {
                 {
                     return Ok(col);
                 }
+            }
+            // Match PG's wording for the non-LATERAL outer-reference case:
+            // when `t` is visible in the enclosing FROM but not here, point
+            // at the FROM-clause-entry visibility rule rather than the
+            // generic missing-column message. The hint mirrors PG's HINT.
+            if self.shadowed_sources.iter().any(|s| s.alias == t) {
+                return Err(AnalyzeError::UndefinedColumn(format!(
+                    "invalid reference to FROM-clause entry for table \"{t}\""
+                )));
             }
             return Err(AnalyzeError::UndefinedColumn(format!(
                 "column \"{t}.{column}\" does not exist"

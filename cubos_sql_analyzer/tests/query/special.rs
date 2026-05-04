@@ -158,17 +158,17 @@ fn indirection_field_nullability_honors_field_not_null() {
 
 #[test]
 fn indirection_field_unknown_errors() {
-    // PG (SQLSTATE 42703) says `column u.nao_existe does not exist`,
-    // surfacing the *alias* rather than the composite type's name; the
-    // analyzer goes through the composite-type path and quotes the
-    // typname, so the wording diverges. Opt out of the pglite mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // PG (SQLSTATE 42703) reports `column u.nao_existe does not exist` for
+    // the bare-relation-alias indirection shape `(alias).field` — distinct
+    // from the chained / composite-column wording (`column "f" not found
+    // in data type T`). The analyzer mirrors PG's exact message, so no
+    // mirror skip is needed.
+    let db = setup();
     let sql = "SELECT (u).nao_existe FROM users u";
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nao_existe\" of composite type \"users\" does not exist",
+        "column u.nao_existe does not exist",
     );
 }
 
@@ -476,19 +476,17 @@ fn function_in_from_can_see_outer_scope_implicitly() {
 
 #[test]
 fn non_lateral_subquery_cannot_see_outer_scope() {
-    // Without LATERAL the inner subquery can't reference `u.id`. PG
-    // diagnoses this as `invalid reference to FROM-clause entry for
-    // table "u"` (SQLSTATE 42P01); the analyzer raises a generic
-    // `UndefinedColumn` because we don't track the same FROM-clause
-    // visibility distinction PG does. Opt out of the pglite mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // Without LATERAL the inner subquery can't reference `u.id`. PG emits
+    // `invalid reference to FROM-clause entry for table "u"`. The analyzer
+    // mirrors that wording via the `shadowed_sources` channel populated
+    // when descending into a non-LATERAL FROM subquery — no skip needed.
+    let db = setup();
     let sql = "SELECT u.name, s.double_id \
                FROM users u, (SELECT u.id * 2 AS double_id) s";
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "column \"u.id\" does not exist",
+        "invalid reference to FROM-clause entry for table \"u\"",
     );
 }
 

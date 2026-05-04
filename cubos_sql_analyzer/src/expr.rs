@@ -817,10 +817,37 @@ fn infer_indirection(
         None => infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?,
     };
 
+    // Detect the `(alias).field` shape: arg is a single-identifier ColumnRef
+    // whose identifier is a relation alias in scope (not a column). PG emits
+    // `column alias.field does not exist` for this case (whereas
+    // `(c.col).field` produces `column "field" not found in data type T`).
+    // The alias hint only applies to the first indirection step — chained
+    // accesses past that point are no longer at the relation boundary.
+    let arg_is_bare_alias: Option<&str> = if let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref()
+    {
+        let parts = extract_string_fields(&cr.fields);
+        match parts.as_slice() {
+            [single] if scope.find_source(single).is_some() => {
+                cr.fields.iter().find_map(|f| match f.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     for (idx, step) in ind.indirection.iter().enumerate().skip(start_step) {
         match step.node.as_ref() {
             Some(node::Node::String(s)) => {
-                current = resolve_composite_field(&current, &s.sval, snapshot)?;
+                let alias_hint = if idx == start_step {
+                    arg_is_bare_alias
+                } else {
+                    None
+                };
+                current = resolve_composite_field(&current, &s.sval, snapshot, alias_hint)?;
             }
             Some(node::Node::AIndices(ai)) => {
                 // Walk both bounds with an int4 goal so params and column
@@ -959,10 +986,19 @@ fn resolve_funccall_out_args(
 /// When the enclosing value carries an inline `record_fields` shape (e.g.
 /// `(ROW(1, 'x'::text)).f2`), we use that directly — no snapshot lookup,
 /// since pseudo `record` has no `TypeKind::Composite` to consult.
+///
+/// `relation_alias` is `Some(alias)` when the indirection's argument was a
+/// bare relation reference (`(alias).field` form). PG emits a different
+/// error wording in that case — `column alias.field does not exist` — so
+/// the analyzer mirrors it to keep `pg_sanity` aligned. For chained or
+/// composite-column accesses (`(c.col).field`, `((c).x).field`), pass
+/// `None` and the wording switches to PG's `column "f" not found in data
+/// type T`.
 fn resolve_composite_field(
     current: &ExprType,
     field_name: &str,
     snapshot: &PgCatalog,
+    relation_alias: Option<&str>,
 ) -> Result<ExprType, AnalyzeError> {
     if let Some(shape) = current.record_fields.as_deref() {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
@@ -1007,10 +1043,15 @@ fn resolve_composite_field(
         .iter()
         .find(|f| f.attname == field_name)
         .ok_or_else(|| {
-            AnalyzeError::UndefinedColumn(format!(
-                "column \"{field_name}\" of composite type \"{}\" does not exist",
-                type_entry.typname
-            ))
+            let msg = if let Some(alias) = relation_alias {
+                format!("column {alias}.{field_name} does not exist")
+            } else {
+                format!(
+                    "column \"{field_name}\" not found in data type {}",
+                    type_entry.typname
+                )
+            };
+            AnalyzeError::UndefinedColumn(msg)
         })?;
 
     Ok(ExprType::scalar(

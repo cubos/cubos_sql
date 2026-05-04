@@ -275,7 +275,7 @@ fn indirection_unknown_field_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (u.work).inexistente FROM users u"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"inexistente\" of composite type \"address\" does not exist",
+        "column \"inexistente\" not found in data type address",
     );
 }
 
@@ -1322,7 +1322,7 @@ fn record_field_unknown_on_indirection_chain() {
     assert_analyze_err!(
         db.analyze("SELECT ((c.info).hq).nope FROM companies c"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nope\" of composite type \"address\" does not exist",
+        "column \"nope\" not found in data type address",
     );
 }
 
@@ -1691,7 +1691,7 @@ fn unknown_field_on_composite_column_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (u.work).inexistente FROM users u"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"inexistente\" of composite type \"address\" does not exist",
+        "column \"inexistente\" not found in data type address",
     );
 }
 
