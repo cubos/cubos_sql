@@ -8,7 +8,8 @@ use quote::{format_ident, quote};
 use syn::parse_str;
 
 use cubos_sql_analyzer::{
-    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, Type,
+    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, TopLevelKind,
+    Type,
 };
 use cubos_sql_core::config::ResolvedConfig;
 
@@ -51,16 +52,18 @@ fn make_field_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
-/// If the SQL is a SELECT-like query, wrap it in a subquery with `LIMIT 2`
-/// so that `fetch_one` / `fetch_optional` can detect more-than-one-row without
-/// fetching the entire result set.
-fn wrap_with_limit(sql: &str) -> Option<String> {
-    let upper = sql.trim_start().to_uppercase();
-    if upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("VALUES")
-        || upper.starts_with("TABLE")
-    {
+/// If the SQL is a row-producing `SELECT`, wrap it in a subquery with
+/// `LIMIT 2` so that `fetch_one` / `fetch_optional` can detect
+/// more-than-one-row without fetching the entire result set.
+///
+/// Wrapping is only legal for top-level `SELECT` (which in `pg_query` covers
+/// `SELECT`, `VALUES`, `TABLE foo`, and `WITH … SELECT`). Top-level
+/// `INSERT`/`UPDATE`/`DELETE`/`MERGE` — even with `RETURNING` and even when
+/// preceded by a `WITH` clause — cannot appear as the body of a subquery, so
+/// for those we leave the SQL unwrapped and let the runtime materialize all
+/// returned rows before the row-count check.
+fn wrap_with_limit(sql: &str, kind: TopLevelKind) -> Option<String> {
+    if matches!(kind, TopLevelKind::Select) {
         Some(format!(
             "SELECT * FROM ({sql}) AS __cubos_sql_limit LIMIT 2"
         ))
@@ -345,7 +348,8 @@ fn generate_regular(
     let row_mapping = build_row_mapping(&analyzed.columns, config)?;
 
     let sql_str = cast_params(analyzed);
-    let sql_limited = wrap_with_limit(&sql_str).unwrap_or_else(|| sql_str.clone());
+    let sql_limited =
+        wrap_with_limit(&sql_str, analyzed.top_level_kind).unwrap_or_else(|| sql_str.clone());
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config)?;
 

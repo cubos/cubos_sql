@@ -71,6 +71,29 @@ pub struct AnalyzedSpread {
     pub fields: Vec<AnalyzedSpreadField>,
 }
 
+/// Top-level command kind, after stripping any leading `WITH` clause. Useful
+/// for code generators that need to know whether a query is row-producing
+/// (`SELECT`) or a data-modifying statement (`INSERT`/`UPDATE`/`DELETE`/
+/// `MERGE`) — e.g. to decide whether wrapping it in a `SELECT * FROM (…)`
+/// subquery is even legal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopLevelKind {
+    /// Plain `SELECT`, `VALUES`, `TABLE foo`, or `WITH … SELECT/VALUES`. All
+    /// of these parse as `SelectStmt` in `pg_query`.
+    Select,
+    /// `INSERT … [RETURNING …]`, possibly preceded by `WITH …`.
+    Insert,
+    /// `UPDATE … [RETURNING …]`, possibly preceded by `WITH …`.
+    Update,
+    /// `DELETE … [RETURNING …]`, possibly preceded by `WITH …`.
+    Delete,
+    /// `MERGE …`, possibly preceded by `WITH …`.
+    Merge,
+    /// Anything else the analyzer accepts (e.g. `EXPLAIN`, `NOTIFY`,
+    /// `LISTEN`, `UNLISTEN`).
+    Other,
+}
+
 /// The full result of analyzing a SQL query template.
 #[derive(Debug, Clone)]
 pub struct AnalyzedQuery {
@@ -81,6 +104,11 @@ pub struct AnalyzedQuery {
     pub params: Vec<AnalyzedParam>,
     pub spreads: Vec<AnalyzedSpread>,
     pub columns: Vec<AnalyzedColumn>,
+    /// Kind of the top-level statement. Used by code generators that wrap the
+    /// query in a subquery — only `Select` is safe to wrap; CTE-DML statements
+    /// like `WITH x AS (UPDATE … RETURNING) INSERT …` are invalid as a
+    /// subquery body and must be sent to PG as-is.
+    pub top_level_kind: TopLevelKind,
 }
 
 /// Build a "sample" SQL for analysis when the query contains spreads.
@@ -119,6 +147,7 @@ pub(crate) fn fuse(
     lex_output: LexOutput,
     columns: Vec<AnalyzedColumn>,
     info_params: Vec<ParamInfo>,
+    top_level_kind: TopLevelKind,
 ) -> AnalyzedQuery {
     let LexOutput {
         sql,
@@ -169,6 +198,7 @@ pub(crate) fn fuse(
         params,
         spreads,
         columns,
+        top_level_kind,
     }
 }
 
@@ -177,7 +207,7 @@ pub(crate) fn fuse(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Parse `sql` with `pg_query`, walk the AST, and produce the resolved output
-/// columns and parameter type information.
+/// columns, parameter type information, and the top-level statement kind.
 ///
 /// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
 /// 1-based positional parameter index minus one.
@@ -185,17 +215,28 @@ pub(crate) fn analyze_static(
     snapshot: &PgCatalog,
     sql: &str,
     param_nullability: &[Option<bool>],
-) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>), AnalyzeError> {
-    let (raw_columns, raw_params) = analyze_raw(snapshot, sql, param_nullability)?;
+) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, TopLevelKind), AnalyzeError> {
+    let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(e.to_string()))?;
+
+    let stmt = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
+
+    let kind = top_level_kind_of(stmt);
+    let (raw_columns, raw_params) = analyze_raw_node(snapshot, stmt, param_nullability)?;
 
     let columns = raw_columns
         .into_iter()
         .map(|mut rc| {
             // PG resolves any `unknown`-typed top-level output column (bare
             // string literal, NULL, untyped param that stayed unresolved) to
-            // `text` before sending it to the client. `analyze_raw` is also
-            // used for view-column analysis, which needs the raw OID, so apply
-            // the coercion only here at the statement boundary.
+            // `text` before sending it to the client. `analyze_raw_node` is
+            // also used for view-column analysis, which needs the raw OID,
+            // so apply the coercion only here at the statement boundary.
             if rc.type_oid == oid::UNKNOWN {
                 rc.type_oid = oid::TEXT;
             }
@@ -208,7 +249,19 @@ pub(crate) fn analyze_static(
         .map(|(_, type_oid, nullable)| build_param_info(type_oid, nullable, snapshot))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok((columns, params_info))
+    Ok((columns, params_info, kind))
+}
+
+/// Map a parsed top-level AST node to the public [`TopLevelKind`] enum.
+fn top_level_kind_of(stmt: &node::Node) -> TopLevelKind {
+    match stmt {
+        node::Node::SelectStmt(_) => TopLevelKind::Select,
+        node::Node::InsertStmt(_) => TopLevelKind::Insert,
+        node::Node::UpdateStmt(_) => TopLevelKind::Update,
+        node::Node::DeleteStmt(_) => TopLevelKind::Delete,
+        node::Node::MergeStmt(_) => TopLevelKind::Merge,
+        _ => TopLevelKind::Other,
+    }
 }
 
 /// A positional parameter slot: `(position, type_oid, nullable)`. Shared by
@@ -216,30 +269,11 @@ pub(crate) fn analyze_static(
 /// before they are merged with lexer-side info.
 pub(crate) type RawParam = (i32, PgTypeOid, bool);
 
-/// Lower-level analyzer entry point: returns the raw columns (keyed by OID)
-/// and sorted param list without converting to [`Type`]. Used by the DDL
-/// view handling, which only needs OIDs to rebuild catalog entries.
-pub(crate) fn analyze_raw(
-    snapshot: &PgCatalog,
-    sql: &str,
-    param_nullability: &[Option<bool>],
-) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
-    let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(e.to_string()))?;
-
-    let stmt = parsed
-        .protobuf
-        .stmts
-        .first()
-        .and_then(|s| s.stmt.as_ref())
-        .and_then(|n| n.node.as_ref())
-        .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
-
-    analyze_raw_node(snapshot, stmt, param_nullability)
-}
-
-/// Same as [`analyze_raw`] but consumes a pre-parsed AST node directly. View
-/// reanalysis uses this to skip the deparse → reparse round-trip: the stored
-/// AST + binding side-table already gives us the post-RENAME tree.
+/// Lower-level analyzer entry point: walks a pre-parsed AST node and returns
+/// the raw columns (keyed by OID) and sorted param list without converting to
+/// [`Type`]. Used by [`analyze_static`] (after parsing) and by the DDL view
+/// handling, which only needs OIDs to rebuild catalog entries and reuses a
+/// stored AST to skip the deparse → reparse round-trip.
 pub(crate) fn analyze_raw_node(
     snapshot: &PgCatalog,
     stmt: &node::Node,

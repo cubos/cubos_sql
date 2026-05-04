@@ -75,6 +75,56 @@ async fn update_and_delete_return_affected_rows() {
 }
 
 #[tokio::test]
+async fn cte_dml_insert_with_fetch_one() {
+    // Regression: a top-level `WITH … (UPDATE … RETURNING) INSERT … RETURNING`
+    // is valid PostgreSQL but cannot legally appear as the body of a
+    // `SELECT * FROM (…)` subquery. `fetch_one`/`fetch_optional` used to wrap
+    // every query starting with `WITH` in such a subquery, producing a syntax
+    // error at the inner `INSERT`. The codegen now consults the analyzed
+    // top-level kind and only wraps real `SELECT`s.
+    let pool = common::setup().await;
+
+    let owner_email = "ellie-crud@example.com";
+    let owner = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES ('Ellie', $owner_email) RETURNING id"
+    )
+    .fetch_one()
+    .await
+    .expect("insert user");
+
+    let owner_id = owner.id;
+    let post = sql!(
+        &pool,
+        "INSERT INTO posts (user_id, title, body) VALUES ($owner_id, 'Hello', 'old body') RETURNING id"
+    )
+    .fetch_one()
+    .await
+    .expect("insert post");
+
+    let post_id = post.id;
+    let new_body = "fresh body";
+    let comment_body = "first comment";
+    let inserted = sql!(
+        &pool,
+        "WITH bump AS ( \
+             UPDATE posts SET body = $new_body WHERE id = $post_id RETURNING id, user_id \
+         ) \
+         INSERT INTO comments (post_id, user_id, body) \
+         SELECT bump.id, bump.user_id, $comment_body FROM bump \
+         RETURNING id, post_id, user_id, body"
+    )
+    .fetch_one()
+    .await
+    .expect("cte-dml insert");
+
+    assert!(inserted.id > 0);
+    assert_eq!(inserted.post_id, post_id);
+    assert_eq!(inserted.user_id, owner_id);
+    assert_eq!(inserted.body, "first comment");
+}
+
+#[tokio::test]
 async fn fetch_all_returns_multiple_rows() {
     let pool = common::setup().await;
 

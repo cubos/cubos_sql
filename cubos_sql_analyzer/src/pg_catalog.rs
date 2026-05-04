@@ -1270,7 +1270,7 @@ impl PgCatalog {
             build_spread_sample_sql(&lex_output)
         };
 
-        let (columns, mut info_params) =
+        let (columns, mut info_params, top_level_kind) =
             match analyze_static(self, &analysis_sql, &param_nullability) {
                 Ok(p) => p,
                 Err(e) => return (analysis_sql, Err(e)),
@@ -1305,7 +1305,10 @@ impl PgCatalog {
             }
         }
 
-        (analysis_sql, Ok(fuse(lex_output, columns, info_params)))
+        (
+            analysis_sql,
+            Ok(fuse(lex_output, columns, info_params, top_level_kind)),
+        )
     }
 
     pub(crate) fn alloc_oid(&mut self) -> u32 {
