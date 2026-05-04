@@ -516,7 +516,17 @@ pub(crate) fn infer_expr(
                     .map(|t| t.typcategory)
                     .unwrap_or(TypCategory::UserDefined);
                 if category != TypCategory::String {
-                    let type_name = crate::ddl::util::format_type_for_message(snapshot, base);
+                    // PG renders the bare type name here (search-path
+                    // aware) — keep the SQL-standard aliases for built-ins
+                    // (`int4` → `integer`) but drop the schema prefix for
+                    // user types so a `public.address` column reads the
+                    // same way PG would: `... by type address`.
+                    let formatted =
+                        crate::ddl::util::format_type_for_message(snapshot, base);
+                    let type_name = match formatted.rsplit_once('.') {
+                        Some((_, bare)) => bare.to_owned(),
+                        None => formatted,
+                    };
                     return Err(AnalyzeError::Invalid(format!(
                         "collations are not supported by type {type_name}"
                     )));

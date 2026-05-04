@@ -1886,3 +1886,195 @@ fn row_to_json_with_no_args_errors() {
     let r = db.analyze("SELECT row_to_json()");
     assert!(r.is_err(), "expected arity error, got: {r:?}");
 }
+
+// ── Type::Composite — focused coverage ───────────────────────────────────────
+//
+// The tests below pin behavior the F1 refactor enabled: every site that
+// surfaces a *named* composite (table row, CREATE TYPE, function return)
+// must produce `Type::Composite { schema, name, fields, .. }` so the
+// `pg_sanity` mirror's qualified-name compare passes and the macro's
+// `[types]` override has a key to match against.
+
+#[test]
+fn cast_row_to_composite_lands_on_named_composite() {
+    let db = setup();
+    // `ROW(...)::address` carries the cast intent through inference and
+    // surfaces the result as the named composite — not the anonymous
+    // record from the bare ROW.
+    let s = db
+        .analyze("SELECT ROW('s'::text, 'c'::text, '0'::text)::address AS a")
+        .unwrap();
+    assert_eq!(
+        col(&s, "a").pg_type,
+        composite(
+            "public",
+            "address",
+            vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+        ),
+    );
+}
+
+#[test]
+fn composite_param_cast_name_is_schema_qualified() {
+    let db = setup();
+    // The macro layer uses `cast_name()` to spell `::pg_catalog.foo` /
+    // `::public.address` for the runtime parameter cast. A composite
+    // parameter must produce a schema-qualified name (not None like
+    // AnonymousRecord did, which broke `cast_name` for composite param
+    // sites before the F1 split).
+    let s = db
+        .analyze("INSERT INTO users (name, work) VALUES ($p1, $p2) RETURNING id")
+        .unwrap();
+    assert_eq!(
+        s.params[1].pg_type.cast_name().as_deref(),
+        Some("public.address"),
+    );
+}
+
+#[test]
+fn composite_array_column_is_array_of_composite() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE locations (
+             id    BIGINT PRIMARY KEY,
+             addrs address[] NOT NULL
+         );",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT addrs FROM locations").unwrap();
+    let addrs = &col(&s, "addrs").pg_type;
+    match addrs {
+        Type::Array { element } => assert_eq!(
+            **element,
+            composite(
+                "public",
+                "address",
+                vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+            ),
+        ),
+        other => panic!("expected Array<Composite>, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_join_preserves_named_identity_on_each_side() {
+    let db = setup();
+    // Joining two tables that each carry a composite column — both sides
+    // must retain their named identity (not collapse to `record`).
+    let s = db
+        .analyze(
+            "SELECT u.work, c.info \
+             FROM users u INNER JOIN companies c ON u.id = c.id",
+        )
+        .unwrap();
+    assert_eq!(
+        col(&s, "work").pg_type,
+        composite(
+            "public",
+            "address",
+            vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+        ),
+    );
+    match &col(&s, "info").pg_type {
+        Type::Composite { schema, name, .. } => {
+            assert_eq!(schema, "public");
+            assert_eq!(name, "company");
+        }
+        other => panic!("expected Composite public.company, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_is_not_null_resolves_to_bool() {
+    let db = setup();
+    // Composite columns participate in IS NULL / IS NOT NULL just like
+    // scalars; the predicate types as bool with no surprise about the
+    // composite shape.
+    let s = db
+        .analyze("SELECT u.id FROM users u WHERE u.home IS NOT NULL")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn composite_coalesce_unifies_to_named_composite() {
+    let db = setup();
+    // `COALESCE(home, work)` — both arms are `address`, the result keeps
+    // the composite identity. `home` is nullable, `work` is NOT NULL →
+    // COALESCE result is NOT NULL.
+    let s = db
+        .analyze("SELECT COALESCE(u.home, u.work) AS addr FROM users u")
+        .unwrap();
+    let addr_col = col(&s, "addr");
+    match &addr_col.pg_type {
+        Type::Composite { schema, name, .. } => {
+            assert_eq!(schema, "public");
+            assert_eq!(name, "address");
+        }
+        other => panic!("expected Composite public.address, got {other:?}"),
+    }
+    assert!(!addr_col.nullable);
+}
+
+#[test]
+fn composite_distinct_preserves_named_identity() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT DISTINCT u.work AS addr FROM users u")
+        .unwrap();
+    match &col(&s, "addr").pg_type {
+        Type::Composite { schema, name, .. } => {
+            assert_eq!(schema, "public");
+            assert_eq!(name, "address");
+        }
+        other => panic!("expected Composite, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_function_return_lands_as_named_composite() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION default_address() RETURNS address AS $$
+             SELECT ROW('main', 'sp', '00000')::address
+         $$ LANGUAGE SQL;",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT default_address() AS a").unwrap();
+    match &col(&s, "a").pg_type {
+        Type::Composite { schema, name, .. } => {
+            assert_eq!(schema, "public");
+            assert_eq!(name, "address");
+        }
+        other => panic!("expected Composite public.address, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_propagated_through_subquery_keeps_identity() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT t.work AS addr FROM (SELECT id, work FROM users) t",
+        )
+        .unwrap();
+    match &col(&s, "addr").pg_type {
+        Type::Composite { schema, name, .. } => {
+            assert_eq!(schema, "public");
+            assert_eq!(name, "address");
+        }
+        other => panic!("expected Composite public.address, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_on_collate_is_rejected() {
+    // Composite types are non-collatable; PG: `collations are not
+    // supported by type address`. The analyzer mirrors the wording.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT u.work COLLATE \"C\" FROM users u"),
+        AnalyzeError::Invalid(_),
+        "collations are not supported by type address",
+    );
+}
