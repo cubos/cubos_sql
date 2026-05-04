@@ -730,26 +730,28 @@ fn insert_into_generated_always_as_identity_should_error() {
 }
 
 #[test]
-fn overriding_system_value_on_table_without_identity_should_error() {
-    // The analyzer rejects this at compile time with a targeted message.
-    // Real PG accepts at parse and only reports a NOT-NULL violation at
-    // execute (since `id INT NOT NULL` happens to be NOT NULL but isn't
-    // an identity column, so `OVERRIDING SYSTEM VALUE` is silently
-    // allowed). Two genuinely different errors, so keep the skip.
+fn overriding_system_value_on_table_without_identity_is_a_noop() {
+    // PG silently accepts `OVERRIDING SYSTEM VALUE` against a table with
+    // no identity columns (it's a no-op rather than a parser error). The
+    // analyzer mirrors that behavior to keep `pg_sanity` aligned, even
+    // though writing the clause on a non-identity table is almost always
+    // a caller mistake.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE plain (
-            id   INT NOT NULL,
-            name TEXT NOT NULL
+            id   INT,
+            name TEXT
          );",
     )
     .unwrap();
-    assert_analyze_err!(
-        db.analyze("INSERT INTO plain (id, name) OVERRIDING SYSTEM VALUE VALUES ($p1, $p2)",),
-        AnalyzeError::Invalid(_),
-        "OVERRIDING SYSTEM VALUE is not allowed for a non-identity column in INSERT on `plain`",
-    );
+    let s = db
+        .analyze(
+            "INSERT INTO plain (id, name) OVERRIDING SYSTEM VALUE \
+             VALUES ($p1, $p2) RETURNING id, name",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("id", int4()), cn("name", text())]);
+    assert_params(&s, vec![pn(int4()), pn(text())]);
 }
 
 #[test]

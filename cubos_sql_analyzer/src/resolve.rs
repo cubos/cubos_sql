@@ -917,17 +917,13 @@ fn analyze_insert(
         }
     }
 
-    // OVERRIDING SYSTEM VALUE is only valid on tables that have at least one
-    // identity column; otherwise PG rejects with a clear message. PG enum:
-    // 1 = OVERRIDING_NOT_SET, 2 = USER_VALUE, 3 = SYSTEM_VALUE.
+    // PG enum for `Insert.override`:
+    //   1 = OVERRIDING_NOT_SET, 2 = USER_VALUE, 3 = SYSTEM_VALUE.
+    // `OVERRIDING SYSTEM VALUE` on a table without any identity column is a
+    // no-op for PG (silently accepted), so we don't reject the construct
+    // here even though it's almost always a caller mistake — keeping
+    // `pg_sanity` honest matters more than catching the typo statically.
     let overriding_system = ins.r#override == 3;
-    if overriding_system && !table_attrs.iter().any(|a| a.attidentity.is_some()) {
-        return Err(AnalyzeError::Invalid(format!(
-            "OVERRIDING SYSTEM VALUE is not allowed for a non-identity column \
-             in INSERT on `{}`",
-            table_relname,
-        )));
-    }
 
     // Walk the optional `WITH` clause so parameters used only inside the
     // CTE are registered with the collector — without this, `$N` numbers
