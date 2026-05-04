@@ -1707,18 +1707,18 @@ fn star_on_unknown_alias_errors() {
 }
 
 #[test]
-fn star_on_cte_is_unsupported() {
+fn star_on_cte_resolves_to_anonymous_record() {
     let db = setup();
-    // CTE-derived sources don't have an OID-backed composite — `t.*` in
-    // expression context isn't supported.
-    assert_analyze_err!(
-        db.analyze(
+    // CTE-derived sources have no OID-backed composite type; `t.*` is
+    // resolved as `pg_catalog.record` carrying the CTE's columns as the
+    // inline record shape, mirroring PG's planning-time row composition.
+    let s = db
+        .analyze(
             "WITH t AS (SELECT id, name FROM users) \
-             SELECT row_to_json(t.*) FROM t"
-        ),
-        AnalyzeError::Unsupported(_),
-        "cannot use t.* here: t is a CTE or subquery, not a real relation",
-    );
+             SELECT row_to_json(t.*) AS payload FROM t",
+        )
+        .unwrap();
+    assert_eq!(col(&s, "payload").pg_type, json_ty());
 }
 
 #[test]

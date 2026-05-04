@@ -716,29 +716,50 @@ fn infer_star_ref(
         AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
     })?;
 
-    let qn = source.source_qn.as_ref().ok_or_else(|| {
-        AnalyzeError::Unsupported(format!(
-            "cannot use {alias}.* here: {alias} is a CTE or subquery, not a real relation"
-        ))
-    })?;
+    // Real tables / views resolve to their backing composite type so calls
+    // like `row_to_json(t.*)` see the registered row OID. CTE and subquery
+    // sources have no `source_qn` — PG composes an anonymous row type at
+    // planning time, so we surface `pg_catalog.record` with the source's
+    // columns threaded as the record shape. The shape lets downstream
+    // `(t.*).field` indirection still resolve, and the `record` OID lines
+    // up with what PG's wire-protocol Describe reports for these queries.
+    if let Some(qn) = source.source_qn.as_ref() {
+        let composite_oid = snapshot
+            .namespace_oid(&qn.schema)
+            .and_then(|nsoid| {
+                snapshot
+                    .type_by_qname
+                    .get(&(nsoid, qn.name.clone()))
+                    .copied()
+            })
+            .ok_or_else(|| AnalyzeError::UndefinedType {
+                oid: 0,
+                context: format!("composite type for {qn}"),
+            })?;
+        return Ok(ExprType::scalar(composite_oid, false));
+    }
 
-    let composite_oid = snapshot
-        .namespace_oid(&qn.schema)
-        .and_then(|nsoid| {
-            snapshot
-                .type_by_qname
-                .get(&(nsoid, qn.name.clone()))
-                .copied()
+    let fields: Vec<RecordField> = source
+        .columns
+        .iter()
+        .map(|c| RecordField {
+            name: c.name.clone(),
+            ty: ExprType {
+                type_oid: c.type_oid,
+                nullable: !c.base_not_null,
+                typmod: c.typmod,
+                collation: c.collation,
+                record_fields: c.record_fields.clone(),
+            },
         })
-        .ok_or_else(|| AnalyzeError::UndefinedType {
-            oid: 0,
-            context: format!("composite type for {qn}"),
-        })?;
-
-    // A row value from a real relation is never NULL (it exists as soon as
-    // the row is produced); individual fields may be null, but the composite
-    // value itself isn't.
-    Ok(ExprType::scalar(composite_oid, false))
+        .collect();
+    Ok(ExprType {
+        type_oid: oid::RECORD,
+        nullable: false,
+        typmod: None,
+        collation: None,
+        record_fields: Some(fields),
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

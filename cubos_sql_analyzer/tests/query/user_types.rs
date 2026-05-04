@@ -66,19 +66,21 @@ fn star_expr_not_null_because_row_is_always_present() {
 }
 
 #[test]
-fn star_expr_on_cte_is_unsupported() {
-    // CTE rows don't have a registered composite type — the analyzer can't
-    // resolve `u.*` to a typed shape so it errors. Real PG accepts because
-    // it composes the row type at planning time. Opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
-    let sql = "WITH u AS (SELECT id, name FROM users) \
-               SELECT row_to_json(u.*) FROM u";
-    assert_analyze_err!(
-        db.analyze(sql),
-        AnalyzeError::Unsupported(_),
-        "cannot use u.* here: u is a CTE or subquery, not a real relation",
-    );
+fn star_expr_on_cte_resolves_to_anonymous_record() {
+    // CTE rows don't have a registered composite OID — the analyzer
+    // surfaces them as `pg_catalog.record` with the CTE's columns as the
+    // inline record shape, mirroring how PG composes an anonymous row
+    // type at planning time. `row_to_json` accepts the record and lands
+    // its result on `json`.
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH u AS (SELECT id, name FROM users) \
+             SELECT row_to_json(u.*) AS payload FROM u",
+        )
+        .unwrap();
+    assert_eq!(col(&s, "payload").pg_type, json_ty());
+    assert!(!col(&s, "payload").nullable);
 }
 
 #[test]
