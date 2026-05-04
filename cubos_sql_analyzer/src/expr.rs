@@ -1470,25 +1470,26 @@ fn infer_a_expr(
         protobuf::AExprKind::try_from(expr.kind),
         Ok(protobuf::AExprKind::AexprNullif)
     ) {
+        // Both arms are inferred with NONE goal: a concrete-but-incompatible
+        // RHS would otherwise trip the generic `cannot coerce X to Y` error
+        // from the implicit goal before we get to the NULLIF-specific check
+        // below, swallowing the chance to emit PG's exact wording.
         let left = expr
             .lexpr
             .as_ref()
             .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
             .transpose()?;
         let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
-        let rhs_goal = if left_oid != oid::UNKNOWN {
-            TypeGoal::implicit(left_oid)
-        } else {
-            TypeGoal::NONE
-        };
         let right = expr
             .rexpr
             .as_ref()
-            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, rhs_goal))
+            .map(|n| infer_expr(n, scope, null_ctx, snapshot, params, TypeGoal::NONE))
             .transpose()?;
         let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
 
-        // Back-fill left if right carries the concrete type.
+        // Back-fill UNKNOWN side with the concrete side via implicit goal so
+        // params and bare unknowns get pinned. Errors here are non-fatal: a
+        // genuinely incompatible pair falls through to the operator check.
         let left_oid_final = if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
             expr.lexpr
                 .as_ref()
@@ -1508,28 +1509,48 @@ fn infer_a_expr(
         } else {
             left_oid
         };
+        let right_oid_final = if right_oid == oid::UNKNOWN && left_oid_final != oid::UNKNOWN {
+            expr.rexpr
+                .as_ref()
+                .and_then(|n| {
+                    infer_expr(
+                        n,
+                        scope,
+                        null_ctx,
+                        snapshot,
+                        params,
+                        TypeGoal::implicit(left_oid_final),
+                    )
+                    .ok()
+                    .map(|t| t.type_oid)
+                })
+                .unwrap_or(right_oid)
+        } else {
+            right_oid
+        };
 
         // Validate: `=` must be defined between the two types. For untyped
-        // string literals (`'x'`), treat them as `text` during the check —
-        // this mirrors PG's "NULLIF types <T> and text cannot be matched"
-        // error when a bare string literal is paired with a non-string type.
+        // string literals (`'x'`), treat them as `text` during the check so
+        // `NULLIF(int, 'x')` still surfaces a type clash (analyzer is more
+        // strict than PG here, which validates the literal at parse_analyze
+        // time and would emit `invalid input syntax for type integer`).
         let left_for_check = unknown_literal_as_text(expr.lexpr.as_deref(), left_oid_final);
-        let right_for_check = unknown_literal_as_text(expr.rexpr.as_deref(), right_oid);
+        let right_for_check = unknown_literal_as_text(expr.rexpr.as_deref(), right_oid_final);
         if left_for_check != oid::UNKNOWN
             && right_for_check != oid::UNKNOWN
             && snapshot
                 .find_operator("=", Some(left_for_check), right_for_check)
                 .is_none()
         {
-            return Err(AnalyzeError::TypeMismatch {
-                actual: type_display_name(right_for_check, snapshot),
-                expected: type_display_name(left_for_check, snapshot),
-                context: format!(
-                    "NULLIF types {} and {} cannot be matched",
-                    type_display_name(left_for_check, snapshot),
-                    type_display_name(right_for_check, snapshot),
-                ),
-            });
+            // PG's wording is `operator does not exist: A = B`. We append the
+            // NULLIF context as a suffix so the macro caller still sees that
+            // it was a NULLIF-shape mismatch.
+            let l = crate::ddl::util::format_type_for_message(snapshot, left_for_check);
+            let r = crate::ddl::util::format_type_for_message(snapshot, right_for_check);
+            return Err(AnalyzeError::Invalid(format!(
+                "operator does not exist: {l} = {r} \
+                 (NULLIF types {l} and {r} cannot be matched)"
+            )));
         }
 
         // Result type is the first arg's type (never bool). If the first arg
@@ -1538,7 +1559,7 @@ fn infer_a_expr(
         let result_oid = if left_oid_final != oid::UNKNOWN {
             left_oid_final
         } else {
-            right_oid
+            right_oid_final
         };
         return Ok(ExprType::scalar(result_oid, true));
     }

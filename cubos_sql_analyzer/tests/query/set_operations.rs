@@ -11,7 +11,7 @@ fn union_with_incompatible_concrete_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM t UNION SELECT s FROM t"),
         AnalyzeError::Invalid(_),
-        "UNION types bigint and text cannot be matched",
+        "UNION types bigint and text cannot be matched (column `id`)",
     );
 }
 
@@ -26,7 +26,7 @@ fn union_with_incompatible_unknown_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT 1 UNION SELECT 'text'"),
         AnalyzeError::Invalid(_),
-        "UNION types integer and text cannot be matched",
+        "UNION types integer and text cannot be matched (column `?column?`)",
     );
 }
 

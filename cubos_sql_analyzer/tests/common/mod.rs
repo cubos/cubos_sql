@@ -497,15 +497,16 @@ pub fn assert_type_mismatch(db: &PgCatalog, sql: &str, expect_actual: &str, expe
     }
 }
 
-/// Assert a query fails with a specific `AnalyzeError` variant and message substring.
+/// Assert a query fails with a specific `AnalyzeError` variant and the exact
+/// expected message.
 ///
 /// Use via the [`assert_analyze_err!`] macro for natural pattern syntax:
 /// ```ignore
-/// assert_analyze_err!(db.analyze(sql), AnalyzeError::UndefinedTable(_), "users");
+/// assert_analyze_err!(db.analyze(sql), AnalyzeError::UndefinedTable(_), "relation \"users\" does not exist");
 /// ```
 #[macro_export]
 macro_rules! assert_analyze_err {
-    ($result:expr, $variant:pat, $msg_substring:expr $(,)?) => {{
+    ($result:expr, $variant:pat, $expected_msg:expr $(,)?) => {{
         // Borrow the expression so the macro doesn't consume the caller's
         // binding — callers often inspect the error again afterwards.
         match &$result {
@@ -518,16 +519,17 @@ macro_rules! assert_analyze_err {
                     );
                 }
                 let msg = err.to_string();
-                assert!(
-                    msg.contains($msg_substring),
-                    "error message must contain {:?}\n  got: {msg}",
-                    $msg_substring,
+                let expected: &str = $expected_msg;
+                assert_eq!(
+                    msg, expected,
+                    "error message mismatch\n  expected: {:?}\n       got: {:?}",
+                    expected, msg,
                 );
             }
             Ok(info) => panic!(
-                "expected {} containing {:?}, got Ok: {:?}",
+                "expected {} with message {:?}, got Ok: {:?}",
                 stringify!($variant),
-                $msg_substring,
+                $expected_msg,
                 info,
             ),
         }

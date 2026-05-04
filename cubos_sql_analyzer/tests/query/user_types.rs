@@ -77,7 +77,7 @@ fn star_expr_on_cte_is_unsupported() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::Unsupported(_),
-        "CTE or subquery, not a real relation",
+        "cannot use u.* here: u is a CTE or subquery, not a real relation",
     );
 }
 
@@ -343,7 +343,7 @@ fn insert_into_generated_column_rejected() {
              VALUES ($p1, $p2, $p3, $p4)",
         ),
         AnalyzeError::Invalid(_),
-        "generated",
+        "cannot insert a non-DEFAULT value into column \"gross\" (generated column on `invoices`)",
     );
 }
 
@@ -354,7 +354,7 @@ fn update_generated_column_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE invoices SET gross = $p1 WHERE id = $p2"),
         AnalyzeError::Invalid(_),
-        "generated",
+        "column \"gross\" can only be updated to DEFAULT (generated column on `invoices`)",
     );
 }
 
@@ -368,7 +368,7 @@ fn insert_into_generated_column_with_literal_rejected() {
              VALUES ($p1, $p2, $p3, 42.0)",
         ),
         AnalyzeError::Invalid(_),
-        "generated",
+        "cannot insert a non-DEFAULT value into column \"gross\" (generated column on `invoices`)",
     );
 }
 
@@ -447,7 +447,7 @@ fn insert_null_into_nn_domain_column_is_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, x) VALUES ($p1, NULL)"),
         AnalyzeError::Invalid(_),
-        "domain nn_int does not allow null",
+        "domain nn_int does not allow null values",
     );
 }
 
@@ -464,7 +464,7 @@ fn update_null_into_nn_domain_column_is_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE t SET x = NULL WHERE id = $p1"),
         AnalyzeError::Invalid(_),
-        "domain nn_int does not allow null",
+        "domain nn_int does not allow null values",
     );
 }
 

@@ -275,7 +275,7 @@ fn indirection_unknown_field_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (u.work).inexistente FROM users u"),
         AnalyzeError::UndefinedColumn(_),
-        "inexistente"
+        "column \"inexistente\" of composite type \"address\" does not exist",
     );
 }
 
@@ -783,7 +783,7 @@ fn indirection_on_inline_row_unknown_field_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (ROW(1::int4, 'x'::text)).nope"),
         AnalyzeError::UndefinedColumn(_),
-        "nope"
+        "could not identify column \"nope\" in record data type",
     );
 }
 
@@ -1322,7 +1322,7 @@ fn record_field_unknown_on_indirection_chain() {
     assert_analyze_err!(
         db.analyze("SELECT ((c.info).hq).nope FROM companies c"),
         AnalyzeError::UndefinedColumn(_),
-        "nope"
+        "column \"nope\" of composite type \"address\" does not exist",
     );
 }
 
@@ -1669,7 +1669,7 @@ fn record_field_access_on_non_composite_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (u.id).f1 FROM users u"),
         AnalyzeError::Unsupported(_),
-        "non-composite",
+        "field access .f1 on non-composite type 'int8'",
     );
 }
 
@@ -1681,7 +1681,7 @@ fn unknown_field_on_inline_row_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (ROW(1, 2)).f99"),
         AnalyzeError::UndefinedColumn(_),
-        "f99",
+        "could not identify column \"f99\" in record data type",
     );
 }
 
@@ -1691,7 +1691,7 @@ fn unknown_field_on_composite_column_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (u.work).inexistente FROM users u"),
         AnalyzeError::UndefinedColumn(_),
-        "inexistente",
+        "column \"inexistente\" of composite type \"address\" does not exist",
     );
 }
 
@@ -1702,7 +1702,7 @@ fn star_on_unknown_alias_errors() {
     assert_analyze_err!(
         db.analyze("SELECT row_to_json(nope.*) FROM users u"),
         AnalyzeError::UndefinedTable(_),
-        "nope",
+        "missing FROM-clause entry for table \"nope\"",
     );
 }
 
@@ -1717,7 +1717,7 @@ fn star_on_cte_is_unsupported() {
              SELECT row_to_json(t.*) FROM t"
         ),
         AnalyzeError::Unsupported(_),
-        "CTE or subquery",
+        "cannot use t.* here: t is a CTE or subquery, not a real relation",
     );
 }
 
@@ -1797,7 +1797,7 @@ fn duplicate_field_name_in_row_errors_on_indirection() {
     assert_analyze_err!(
         db.analyze("SELECT (ROW(1::int4, 'x'::text)).f3"),
         AnalyzeError::UndefinedColumn(_),
-        "f3",
+        "could not identify column \"f3\" in record data type",
     );
 }
 

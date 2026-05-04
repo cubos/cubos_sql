@@ -49,7 +49,7 @@ fn insert_into_nonexistent_column_errors() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (nonexistent) VALUES ($p1)"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nonexistent\"",
+        "column \"nonexistent\" of relation \"users\" does not exist",
     );
 }
 
@@ -59,7 +59,7 @@ fn update_set_nonexistent_column_errors() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET nonexistent = $p1 WHERE id = $p2"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nonexistent\"",
+        "column \"nonexistent\" of relation \"users\" does not exist",
     );
 }
 
@@ -320,7 +320,7 @@ fn update_set_not_null_column_to_null_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET name = NULL WHERE id = $p1 RETURNING id"),
         AnalyzeError::Invalid(_),
-        "NOT NULL column `users.name`",
+        "cannot assign NULL to NOT NULL column `users.name`",
     );
 }
 
@@ -332,7 +332,7 @@ fn insert_null_into_not_null_column_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) VALUES (NULL, $p1)"),
         AnalyzeError::Invalid(_),
-        "NOT NULL column `users.name`",
+        "cannot insert NULL into NOT NULL column `users.name`",
     );
 }
 
@@ -344,7 +344,7 @@ fn insert_values_row_wrong_arity_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) VALUES ($p1, $p2, $p3)"),
         AnalyzeError::Invalid(_),
-        "INSERT has more expressions than target columns",
+        "INSERT has more expressions than target columns (table `users` expects 2, got 3)",
     );
 }
 
@@ -355,7 +355,7 @@ fn insert_select_column_count_mismatch_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) SELECT name FROM users"),
         AnalyzeError::Invalid(_),
-        "INSERT has more target columns than expressions",
+        "INSERT has more target columns than expressions (table `users` expects 2, SELECT produces 1)",
     );
 }
 
@@ -527,7 +527,7 @@ fn on_conflict_on_non_unique_column_should_error() {
              ON CONFLICT (name) DO NOTHING",
         ),
         AnalyzeError::Invalid(_),
-        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"users\"",
     );
 }
 
@@ -549,7 +549,7 @@ fn on_conflict_on_nonexistent_constraint_name_should_error() {
              ON CONFLICT ON CONSTRAINT nope DO NOTHING",
         ),
         AnalyzeError::Invalid(_),
-        "constraint \"nope\"",
+        "constraint \"nope\" for table \"t\" does not exist",
     );
 }
 
@@ -589,7 +589,7 @@ fn on_conflict_on_unknown_column_is_rejected() {
              ON CONFLICT (ghost) DO NOTHING",
         ),
         AnalyzeError::Invalid(_),
-        "ghost",
+        "column \"ghost\" referenced in ON CONFLICT does not exist",
     );
 }
 
@@ -651,7 +651,7 @@ fn on_conflict_on_partial_composite_unique_set_is_rejected() {
              ON CONFLICT (a) DO NOTHING"
         ),
         AnalyzeError::Invalid(_),
-        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
 
@@ -725,7 +725,7 @@ fn insert_into_generated_always_as_identity_should_error() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (id, name, email) VALUES ($p1, $p2, $p3)"),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `users` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
     );
 }
 
@@ -743,7 +743,7 @@ fn overriding_system_value_on_table_without_identity_should_error() {
     assert_analyze_err!(
         db.analyze("INSERT INTO plain (id, name) OVERRIDING SYSTEM VALUE VALUES ($p1, $p2)",),
         AnalyzeError::Invalid(_),
-        "OVERRIDING SYSTEM VALUE is not allowed for a non-identity column",
+        "OVERRIDING SYSTEM VALUE is not allowed for a non-identity column in INSERT on `plain`",
     );
 }
 
@@ -809,7 +809,7 @@ fn insert_select_into_generated_always_is_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO dst (id, name) SELECT n, 'x' FROM src"),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `dst` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
     );
 }
 
@@ -839,7 +839,7 @@ fn update_set_generated_always_to_literal_is_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET id = $p1 WHERE id = $p2"),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "column \"id\" can only be updated to DEFAULT (identity column on `users` defined as GENERATED ALWAYS)",
     );
 }
 
@@ -887,7 +887,7 @@ fn alter_table_add_identity_then_insert_is_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, name) VALUES ($p1, $p2)"),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `t` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
     );
 }
 
@@ -927,7 +927,7 @@ fn alter_table_set_identity_changes_kind() {
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, name) VALUES ($p1, $p2)"),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `t` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
     );
 }
 
@@ -950,7 +950,7 @@ fn merge_insert_into_generated_always_is_rejected() {
              WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.n, s.label)"
         ),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `dst` defined as GENERATED ALWAYS)",
     );
 }
 
@@ -975,7 +975,7 @@ fn merge_update_generated_always_is_rejected() {
              WHEN MATCHED THEN UPDATE SET id = s.n"
         ),
         AnalyzeError::Invalid(_),
-        "column \"id\" can only be updated to DEFAULT",
+        "column \"id\" can only be updated to DEFAULT (identity column on `dst` defined as GENERATED ALWAYS)",
     );
 }
 
@@ -990,7 +990,7 @@ fn on_conflict_do_update_set_generated_always_is_rejected() {
              ON CONFLICT (email) DO UPDATE SET id = 99"
         ),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "column \"id\" can only be updated to DEFAULT (identity column on `users` defined as GENERATED ALWAYS)",
     );
 }
 
@@ -1222,7 +1222,7 @@ fn merge_update_unknown_column_errors() {
              WHEN MATCHED THEN UPDATE SET ghost = 'x'"
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\"",
+        "column \"ghost\" of relation \"users\" does not exist",
     );
 }
 

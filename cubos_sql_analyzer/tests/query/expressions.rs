@@ -190,30 +190,32 @@ fn nullif_with_param_inherits_type() {
 
 #[test]
 fn nullif_incompatible_concrete_types_rejected() {
-    // `int = text` has no operator — PG dispatches to the `=` operator
-    // resolver and errors with `operator does not exist: integer = text`.
-    // The analyzer rejects via the generic coerce check first, so the
-    // wording diverges from PG. Opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // PG dispatches to the `=` operator resolver and errors with
+    // `operator does not exist: integer = text`. The analyzer mirrors the
+    // wording verbatim so the pg_sanity prefix check passes, then appends
+    // the NULLIF-specific suffix the macro caller will see.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x'::text) FROM users"),
-        AnalyzeError::TypeMismatch { .. },
-        "text",
+        AnalyzeError::Invalid(_),
+        "operator does not exist: integer = text (NULLIF types integer and text cannot be matched)",
     );
 }
 
 #[test]
 fn nullif_int_with_string_literal_rejected() {
-    // Bare string literal — PG raises a runtime cast error here
-    // (`invalid input syntax for type integer`), the analyzer catches it
-    // statically with a NULLIF-types message.
+    // PG runs the type's input function at parse_analyze time and raises
+    // `invalid input syntax for type integer: "x"`. The analyzer takes the
+    // strictly-typed path (treats the bare literal as text and reports
+    // `operator does not exist: integer = text`) — both reject, but the
+    // wording can't be aligned without re-implementing PG's input parsers,
+    // which is outside the analyzer's scope. Opt out of the mirror.
     let mut db = setup();
     db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x') FROM users"),
-        AnalyzeError::TypeMismatch { .. },
-        "NULLIF",
+        AnalyzeError::Invalid(_),
+        "operator does not exist: integer = text (NULLIF types integer and text cannot be matched)",
     );
 }
 
@@ -507,10 +509,12 @@ fn case_with_incompatible_concrete_arms_rejected() {
 
 #[test]
 fn case_with_incompatible_unknown_literal_rejected() {
-    // Bare string literal vs int — PG resolves the unknown literal toward
-    // the int4 candidate and tries a runtime cast (`invalid input syntax
-    // for type integer`), which is a different error from our compile-time
-    // CASE mismatch. Opt out of the pglite mirror.
+    // PG runs int4's input function on the literal at parse_analyze time and
+    // raises `invalid input syntax for type integer: "x"`. The analyzer
+    // promotes the bare literal to text and reports the CASE-types clash
+    // instead — both reject, but the wording can't be aligned without
+    // re-implementing PG's per-type input parsers (out of scope). Opt out
+    // of the mirror.
     let mut db = setup();
     db.skip_pg_sanity();
     assert_analyze_err!(
@@ -532,9 +536,12 @@ fn coalesce_with_incompatible_concrete_arms_rejected() {
 
 #[test]
 fn coalesce_with_incompatible_unknown_literal_rejected() {
-    // Bare string literal vs int — PG raises a runtime cast error
-    // (`invalid input syntax for integer`) rather than the analyzer's
-    // compile-time COALESCE-types mismatch. Opt out of the pglite mirror.
+    // PG runs int4's input function on the literal at parse_analyze time and
+    // raises `invalid input syntax for type integer: "x"`. The analyzer
+    // promotes the bare literal to text and reports the COALESCE-types
+    // clash instead — both reject, but the wording can't be aligned without
+    // re-implementing PG's per-type input parsers (out of scope). Opt out
+    // of the mirror.
     let mut db = setup();
     db.skip_pg_sanity();
     assert_analyze_err!(

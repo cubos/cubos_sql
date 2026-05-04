@@ -296,7 +296,7 @@ fn numeric_typmod_overflow_should_be_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, amount) VALUES ($p1, 12345.67)"),
         AnalyzeError::Invalid(_),
-        "numeric field overflow",
+        "numeric field overflow: a field with precision 4, scale 2 must round to an absolute value less than 10^2",
     );
 }
 

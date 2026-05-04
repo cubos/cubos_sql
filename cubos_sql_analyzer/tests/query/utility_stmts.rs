@@ -49,7 +49,7 @@ fn explain_propagates_inner_query_errors() {
     assert_analyze_err!(
         db.analyze("EXPLAIN SELECT bogus_col FROM t"),
         AnalyzeError::UndefinedColumn(_),
-        "bogus_col",
+        "column \"bogus_col\" does not exist",
     );
 }
 

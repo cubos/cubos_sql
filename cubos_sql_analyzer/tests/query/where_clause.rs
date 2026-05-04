@@ -287,7 +287,7 @@ fn text_eq_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name = id"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist:",
+        "operator does not exist: text = bigint",
     );
 }
 
@@ -297,7 +297,7 @@ fn text_eq_int_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name = 42"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist:",
+        "operator does not exist: text = integer",
     );
 }
 
@@ -307,7 +307,7 @@ fn timestamptz_lt_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE created_at < 42"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist:",
+        "operator does not exist: timestamp with time zone < integer",
     );
 }
 
@@ -319,7 +319,7 @@ fn int_like_text_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE id LIKE '%1%'"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist:",
+        "operator does not exist: bigint ~~ unknown",
     );
 }
 
@@ -332,7 +332,7 @@ fn same_param_with_conflicting_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE age = $p1 AND name = $p1"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist:",
+        "operator does not exist: text = integer",
     );
 }
 

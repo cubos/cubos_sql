@@ -250,7 +250,7 @@ fn indirection_on_srf_unknown_field_errors() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "nao_existe"
+        "could not identify column \"nao_existe\" in record data type",
     );
 }
 
@@ -485,7 +485,11 @@ fn non_lateral_subquery_cannot_see_outer_scope() {
     db.skip_pg_sanity();
     let sql = "SELECT u.name, s.double_id \
                FROM users u, (SELECT u.id * 2 AS double_id) s";
-    assert_analyze_err!(db.analyze(sql), AnalyzeError::UndefinedColumn(_), "u.id");
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"u.id\" does not exist",
+    );
 }
 
 // ── Subquery column alias list overrides inner names ─────────────────────────

@@ -83,7 +83,7 @@ fn vector_dimension_mismatch_in_insert_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO items (id, embedding) VALUES ($p1, '[1,2,3]'::vector)"),
         AnalyzeError::Invalid(_),
-        "expected 4 dimensions",
+        "expected 4 dimensions, not 3",
     );
 }
 
@@ -244,7 +244,7 @@ fn update_numeric_overflow_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE t SET amount = 12345.67 WHERE id = $p1"),
         AnalyzeError::Invalid(_),
-        "numeric field overflow",
+        "numeric field overflow: a field with precision 4, scale 2 must round to an absolute value less than 10^2",
     );
 }
 

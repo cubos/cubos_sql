@@ -113,7 +113,7 @@ fn on_conflict_against_partial_unique_index_should_error() {
              ON CONFLICT (slug) DO NOTHING",
         ),
         AnalyzeError::Invalid(_),
-        "no unique or exclusion constraint",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
 
@@ -151,7 +151,7 @@ fn unique_index_does_not_match_against_distinct_columns() {
              ON CONFLICT (a) DO NOTHING"
         ),
         AnalyzeError::Invalid(_),
-        "no unique or exclusion constraint",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
 
@@ -178,7 +178,7 @@ fn expression_unique_index_does_not_match_column_on_conflict() {
              ON CONFLICT (slug) DO NOTHING"
         ),
         AnalyzeError::Invalid(_),
-        "no unique or exclusion constraint",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
 
@@ -457,7 +457,7 @@ fn on_conflict_user_column_not_polluted_by_catalog_indexes() {
              ON CONFLICT (oid) DO NOTHING"
         ),
         AnalyzeError::Invalid(_),
-        "no unique or exclusion constraint",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"my_objs\"",
     );
 }
 
