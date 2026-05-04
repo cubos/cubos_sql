@@ -187,6 +187,17 @@ pub fn anon_record(fields: Vec<RecordField>) -> Type {
     Type::AnonymousRecord { fields }
 }
 
+/// Build a named [`Type::Composite`] (registered via `CREATE TYPE … AS (…)`
+/// or as the implicit row type of a table). Pair with [`rf`] / [`rfn`].
+pub fn composite(schema: &str, name: &str, fields: Vec<RecordField>) -> Type {
+    Type::Composite {
+        schema: schema.into(),
+        name: name.into(),
+        fields,
+        extension: None,
+    }
+}
+
 /// Non-null record field (mirrors [`c`] for record fields).
 pub fn rf(name: &str, ty: Type) -> RecordField {
     RecordField {

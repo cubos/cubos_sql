@@ -486,7 +486,8 @@ fn qualified_type_name_for_compare(ty: &Type) -> String {
         Type::Domain { base, .. } => qualified_type_name_for_compare(base),
         Type::Basic { schema, name, .. }
         | Type::Enum { schema, name, .. }
-        | Type::Range { schema, name, .. } => format!("{schema}.{name}"),
+        | Type::Range { schema, name, .. }
+        | Type::Composite { schema, name, .. } => format!("{schema}.{name}"),
         Type::Array { element } => format!("{}[]", qualified_type_name_for_compare(element)),
         Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),
     }

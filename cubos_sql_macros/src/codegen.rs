@@ -295,6 +295,30 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 ),
             ))
         }
+        Type::Composite { schema, name, .. } => {
+            // Named composite: defer to a `[types]` override when the user
+            // pointed it at a concrete Rust type (e.g. `public.address` →
+            // `crate::Address`). Without an override, fall back to String
+            // — same shape `AnonymousRecord` takes — since the macro can't
+            // synthesise a deserializer for an arbitrary composite.
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            if let Some(path) = config.types.get(&qn) {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: false,
+                    },
+                    accepts_iter: false,
+                });
+            }
+            Ok(RustMapping {
+                rust_type: parse_str("String")?,
+                strategy: DeserStrategy::Plain {
+                    accepts_into_string: false,
+                },
+                accepts_iter: false,
+            })
+        }
         Type::AnonymousRecord { .. } => {
             // Anonymous record without a named Rust type: fall back to String
             // so the generated struct compiles. Callers that need structured

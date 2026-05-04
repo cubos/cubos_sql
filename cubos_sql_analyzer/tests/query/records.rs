@@ -18,12 +18,6 @@ use crate::common::*;
 
 fn setup() -> PgCatalog {
     let mut db = PgCatalog::new();
-    // Records tests intentionally exercise the analyzer's composite-type
-    // decomposition into `Type::AnonymousRecord` so downstream code can
-    // read field shapes. PG's wire-protocol RowDescription reports the
-    // composite OID instead, so the `pg_sanity` mirror's type-name
-    // compare can never match here. Disable it for the whole suite.
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TYPE address AS (
              street TEXT,
@@ -206,10 +200,13 @@ fn implicit_row_in_where() {
 // ── User composite columns ───────────────────────────────────────────────────
 
 #[test]
-fn select_composite_column_surfaces_anon_record() {
+fn select_composite_column_surfaces_named_composite() {
     let db = setup();
-    // A column of composite type is surfaced as `Type::AnonymousRecord`
-    // with attributes mirroring the composite's fields.
+    // A column of composite type is surfaced as `Type::Composite` with
+    // both the schema-qualified identity *and* the decomposed field
+    // shape — the name lines up with PG's wire-protocol Describe OID
+    // while the shape lets downstream code synthesize per-field
+    // accessors without a catalog round-trip.
     let s = db.analyze("SELECT id, work FROM users").unwrap();
     assert_cols(
         &s,
@@ -217,11 +214,15 @@ fn select_composite_column_surfaces_anon_record() {
             c("id", int8()),
             c(
                 "work",
-                anon_record(vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text()),
-                ]),
+                composite(
+                    "public",
+                    "address",
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text()),
+                    ],
+                ),
             ),
         ],
     );
@@ -237,11 +238,15 @@ fn nullable_composite_column_stays_nullable() {
         &s,
         vec![cn(
             "home",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         )],
     );
 }
@@ -289,11 +294,15 @@ fn indirection_chain_through_nested_composite() {
         .unwrap();
     assert_eq!(
         col(&s, "hq").pg_type,
-        anon_record(vec![
-            rfn("street", text()),
-            rfn("city", text()),
-            rfn("zip", text()),
-        ])
+        composite(
+            "public",
+            "address",
+            vec![
+                rfn("street", text()),
+                rfn("city", text()),
+                rfn("zip", text()),
+            ],
+        )
     );
 }
 
@@ -320,11 +329,15 @@ fn insert_composite_param_surfaces_anon_record() {
         &s,
         vec![
             p(text()),
-            p(anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ])),
+            p(composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            )),
         ],
     );
 }
@@ -348,28 +361,37 @@ fn update_composite_field_via_row_ctor() {
 #[test]
 fn bare_alias_resolves_to_composite_value() {
     let db = setup();
-    // `SELECT u FROM users u` projects the entire row as a composite —
-    // PG falls back to the table's implicit composite type.
+    // `SELECT u FROM users u` projects the entire row as the table's
+    // implicit composite type (`public.users`), with the column shape
+    // populated for downstream `(u).field` resolution.
     let s = db.analyze("SELECT u FROM users u").unwrap();
-    let users_record = anon_record(vec![
+    let users_record = composite("public", "users", vec![
         rf("id", int8()),
         rf("name", text()),
         rfn("age", int4()),
         rfn(
             "home",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         ),
         rf(
             "work",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         ),
     ]);
     assert_cols(&s, vec![c("u", users_record)]);
@@ -463,8 +485,15 @@ fn srf_record_field_via_subquery_propagation() {
 fn returns_record_with_named_out_params_in_from() {
     // `CREATE FUNCTION f(OUT a int, OUT b text)` is the canonical user
     // form of declaring a record-returning function. PG exposes it as a
-    // SRF with named columns when used in FROM.
+    // SRF with named columns when used in FROM. Real PG additionally
+    // requires a column definition list when invoking a `RETURNS RECORD`
+    // function in FROM without out args (`column definition list is
+    // required for functions returning "record"`); the analyzer is more
+    // lenient and surfaces a single `pair record` column instead. Opt
+    // out of the mirror — fixing this would require modeling PG's
+    // column-list requirement at parse time.
     let mut db = setup();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE FUNCTION pair() RETURNS RECORD AS $$
              SELECT 1, 'x'::text
@@ -527,11 +556,15 @@ fn returns_composite_scalar_in_select() {
     let s = db.analyze("SELECT default_address() AS addr").unwrap();
     assert_eq!(
         col(&s, "addr").pg_type,
-        anon_record(vec![
-            rfn("street", text()),
-            rfn("city", text()),
-            rfn("zip", text()),
-        ]),
+        composite(
+            "public",
+            "address",
+            vec![
+                rfn("street", text()),
+                rfn("city", text()),
+                rfn("zip", text()),
+            ],
+        ),
     );
 }
 
@@ -593,11 +626,15 @@ fn array_of_composite_subscript_returns_composite() {
         &s,
         vec![cn(
             "first",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         )],
     );
 }
@@ -624,30 +661,39 @@ fn array_of_composite_subscript_then_field() {
 #[test]
 fn subquery_select_bare_alias_yields_composite_column() {
     // `SELECT u FROM users u` projected into a derived table — the outer
-    // query sees a single column of composite type.
+    // query still sees the row as the table's implicit composite type
+    // (`public.users`), now propagated through the subquery boundary.
     let db = setup();
     let s = db
         .analyze("SELECT t.u FROM (SELECT u FROM users u) t")
         .unwrap();
-    let users_record = anon_record(vec![
+    let users_record = composite("public", "users", vec![
         rf("id", int8()),
         rf("name", text()),
         rfn("age", int4()),
         rfn(
             "home",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         ),
         rf(
             "work",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         ),
     ]);
     assert_cols(&s, vec![c("u", users_record)]);
@@ -668,11 +714,15 @@ fn cte_propagating_composite_column() {
             c("id", int8()),
             c(
                 "work",
-                anon_record(vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text()),
-                ]),
+                composite(
+                    "public",
+                    "address",
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text()),
+                    ],
+                ),
             ),
         ],
     );
@@ -705,11 +755,11 @@ fn jsonb_build_object_from_row_fields() {
 
 #[test]
 fn row_compare_mismatched_arity_resolves_to_bool() {
-    // PG itself rejects mismatched-arity row compares at runtime, but pure
-    // static analysis only types the operator — both sides are records, so
-    // the result is bool. (We're checking the analyzer doesn't panic and
-    // produces the operator-level type.)
-    let db = setup();
+    // PG rejects mismatched-arity row compares at parse_analyze (`unequal
+    // number of entries in row expressions`); the analyzer only types the
+    // operator and surfaces bool. Documented gap — opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db.analyze("SELECT ROW(1) = ROW(1, 2) AS e").unwrap();
     assert_cols(&s, vec![c("e", bool_ty())]);
 }
@@ -881,9 +931,14 @@ fn row_with_arithmetic_inferred_per_field() {
 
 #[test]
 fn row_inside_subquery_in_where() {
-    let db = setup();
     // Equality between a ROW from outer scope and a derived ROW in the
-    // subquery — both sides should agree on field types.
+    // subquery — both sides should agree on field types. PG counts the
+    // subquery as having a single record column and rejects (`subquery has
+    // too few columns`) since the LHS unwraps to two values; the analyzer
+    // happily resolves both as records and types the comparison as bool.
+    // Documented gap — opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db
         .analyze(
             "SELECT u.id FROM users u \
@@ -1018,8 +1073,13 @@ fn row_param_against_composite_column() {
 
 #[test]
 fn deep_nested_row_indirection() {
-    let db = setup();
-    // Triple-nested ROW with field access through every level.
+    // Triple-nested ROW with field access through every level. Real PG
+    // rejects deep indirection past the first ROW level (intermediate
+    // ROWs lose their column-name typmod after the first `.fN` step), but
+    // the analyzer threads `record_fields` through every step and
+    // resolves it cleanly. Useful intentionally — opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db
         .analyze("SELECT ((ROW(1::int4, ROW('a'::text, ROW(true, NULL::int8)))).f2.f2).f1 AS deep")
         .unwrap();
@@ -1136,7 +1196,7 @@ fn row_to_json_of_composite_column() {
 }
 
 #[test]
-fn array_agg_of_composite_column_returns_array_of_record() {
+fn array_agg_of_composite_column_returns_array_of_composite() {
     let db = setup();
     let s = db
         .analyze("SELECT array_agg(u.work) AS works FROM users u")
@@ -1144,18 +1204,16 @@ fn array_agg_of_composite_column_returns_array_of_record() {
     let works = &col(&s, "works").pg_type;
     match works {
         Type::Array { element } => {
-            // The composite column's type is `address`, surfaced as
-            // AnonymousRecord with three text fields.
             assert_eq!(
                 **element,
-                anon_record(vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text())
-                ])
+                composite(
+                    "public",
+                    "address",
+                    vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+                )
             );
         }
-        other => panic!("expected Array<AnonymousRecord>, got {other:?}"),
+        other => panic!("expected Array<Composite>, got {other:?}"),
     }
 }
 
@@ -1227,11 +1285,15 @@ fn update_returning_composite_column_keeps_shape() {
         &s,
         vec![c(
             "work",
-            anon_record(vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text()),
-            ]),
+            composite(
+                "public",
+                "address",
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text()),
+                ],
+            ),
         )],
     );
 }
@@ -1295,17 +1357,17 @@ fn domain_over_composite_in_param() {
         .unwrap();
     assert_eq!(s.params.len(), 2);
     assert_eq!(s.params[0].pg_type, int8());
-    // The param surfaces as Domain(address_dom, base = AnonymousRecord(...)).
+    // The param surfaces as Domain(address_dom, base = Composite(public.address)).
     match &s.params[1].pg_type {
         Type::Domain { name, base, .. } => {
             assert_eq!(name, "address_dom");
             assert_eq!(
                 **base,
-                anon_record(vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text())
-                ])
+                composite(
+                    "public",
+                    "address",
+                    vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+                )
             );
         }
         other => panic!("expected Domain, got {other:?}"),
@@ -1339,9 +1401,14 @@ fn row_constructor_with_named_aliases_in_subquery() {
 
 #[test]
 fn nested_anonymous_records_via_subquery_pipeline() {
-    let db = setup();
     // Pipeline: build a ROW with a nested ROW inside, push it through a
     // subquery, then drill into the nested field at the outer level.
+    // Same analyzer-extension as `deep_nested_row_indirection` — PG's
+    // record typmod stops working past one indirection step, but the
+    // analyzer threads the inline record shape through the subquery
+    // boundary. Opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db
         .analyze(
             "SELECT ((t.r).f2).f1 AS x \
@@ -1577,10 +1644,13 @@ fn param_used_in_row_then_indirected_picks_up_type() {
 
 #[test]
 fn param_seeded_via_indirection_into_concrete_type() {
-    let db = setup();
     // `(ROW($p1, 1::int4)).f2` — second element is int4, so `.f2` pulls
-    // int4 out. The first element ($p1) is left UNKNOWN — surfaces as text
-    // via the analyzer's default fallback.
+    // int4 out. The first element ($p1) is left UNKNOWN; the analyzer
+    // defaults it to text. PG raises `could not determine data type of
+    // parameter $1` because the param is never positionally pinned.
+    // Skip the mirror — analyzer fallback is intentional.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db
         .analyze("SELECT (ROW($p1, 1::int4)).f2 + 1 AS n")
         .unwrap();
@@ -1592,10 +1662,14 @@ fn param_seeded_via_indirection_into_concrete_type() {
 
 #[test]
 fn param_in_nested_row_compared_inferred_per_field() {
-    let db = setup();
     // Nested ROW comparison: outer ROW arity 2, inner ROW arity 2. Each
     // position resolves independently. The pre-pass only handles a single
     // level (ROW = ROW), but element types cross over via re-inference.
+    // PG raises `could not determine data type of parameter $2` because
+    // it can't infer params nested inside an inner ROW from the LHS;
+    // analyzer is more aggressive. Skip the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db
         .analyze(
             "SELECT u.id FROM users u \
@@ -1669,7 +1743,7 @@ fn record_field_access_on_non_composite_errors() {
     assert_analyze_err!(
         db.analyze("SELECT (u.id).f1 FROM users u"),
         AnalyzeError::Unsupported(_),
-        "field access .f1 on non-composite type 'int8'",
+        "column notation .f1 applied to type bigint, which is not a composite type",
     );
 }
 
@@ -1738,8 +1812,12 @@ fn insert_composite_column_with_wrong_arity_errors() {
 
 #[test]
 fn update_composite_with_wrong_field_types_errors() {
-    let db = setup();
-    // `address.zip` is TEXT but we feed it an int4 — should fail.
+    // `address.zip` is TEXT but we feed it an int4 — analyzer rejects
+    // statically. Real PG accepts the UPDATE entirely when the WHERE
+    // matches no rows (the scratch table is empty), so the row-level
+    // composite-cast check never fires. Skip the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let r = db.analyze("UPDATE users SET work = ROW('s'::text, 'c'::text, 1::int4) WHERE id = 1");
     assert!(
         r.is_err(),

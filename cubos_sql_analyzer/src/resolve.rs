@@ -2905,6 +2905,13 @@ fn resolve_type(
                 });
             }
             TypType::Composite => {
+                // Real composite (named via `CREATE TYPE … AS (…)` or the
+                // implicit row type of a table). Surface both the
+                // schema-qualified identity and the decomposed field list so
+                // the macro layer can synthesize per-field accessors without
+                // an extra catalog round-trip, while pg_sanity / Display can
+                // render the composite by name (matching PG's wire-protocol
+                // Describe OID).
                 let attrs = if let Some(relid) = te.typrelid {
                     snapshot.attributes_of(relid).to_vec()
                 } else {
@@ -2918,7 +2925,12 @@ fn resolve_type(
                         nullable: !f.attnotnull,
                     });
                 }
-                return Ok(Type::AnonymousRecord { fields: out });
+                return Ok(Type::Composite {
+                    schema,
+                    name,
+                    fields: out,
+                    extension,
+                });
             }
             TypType::Base | TypType::Pseudo => {
                 return Ok(Type::Basic {

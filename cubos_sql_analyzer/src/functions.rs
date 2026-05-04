@@ -142,9 +142,16 @@ pub(crate) fn resolve_function(
         return Ok(make_resolved(count_matches[0], snapshot));
     }
 
+    // PG's wording: `function name(arg_types_joined) does not exist`. Match
+    // it verbatim so pg_sanity's prefix check passes; append the candidate
+    // count we computed as a suffix for the macro caller's diagnostic.
+    let arg_list = arg_types
+        .iter()
+        .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
+        .collect::<Vec<_>>()
+        .join(", ");
     Err(AnalyzeError::UndefinedFunction(format!(
-        "function {name} with {} argument(s) does not exist (found {} candidate(s))",
-        arg_types.len(),
+        "function {name}({arg_list}) does not exist (found {} candidate(s))",
         candidates.len()
     )))
 }

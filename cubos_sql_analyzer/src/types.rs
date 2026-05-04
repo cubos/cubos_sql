@@ -24,8 +24,8 @@ pub struct RecordField {
 
 /// A resolved PostgreSQL type.
 ///
-/// The six variants cover everything PG's type system expresses that a query
-/// analyzer can observe at static-analysis time:
+/// The seven variants cover everything PG's type system expresses that a
+/// query analyzer can observe at static-analysis time:
 ///
 /// - `Basic` — scalar PG types (`int4`, `text`, `uuid`, …) including pseudo
 ///   types (`void`, `record`, `anyelement`).
@@ -36,9 +36,15 @@ pub struct RecordField {
 /// - `Enum` — `CREATE TYPE ... AS ENUM (...)` with the labels in declaration
 ///   order.
 /// - `Range` — `CREATE TYPE ... AS RANGE (...)` / built-in range types.
-/// - `AnonymousRecord` — the unnamed row type produced by a subquery or a
-///   composite-returning function, carrying its named field list with
-///   per-field nullability.
+/// - `Composite` — `CREATE TYPE ... AS (...)` and the implicit row type of
+///   every table, carrying both its schema-qualified name (so it lines up
+///   with PG's wire-protocol Describe OID) *and* the decomposed field list
+///   (so the macro layer can synthesise per-field accessors without an
+///   extra catalog round-trip). PG's composite types have no top-level
+///   typmod or collation — both attributes live on the individual fields.
+/// - `AnonymousRecord` — the unnamed row type produced by `ROW(...)` or a
+///   subquery without a registered composite, carrying its named field
+///   list with per-field nullability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Basic {
@@ -90,6 +96,16 @@ pub enum Type {
         /// compatibility with custom range types.
         typmod: Option<i32>,
     },
+    Composite {
+        schema: String,
+        name: String,
+        /// Field shape decomposed for the macro layer. The column types
+        /// inside carry their own typmod / collation; the composite itself
+        /// has neither (PG sets `pg_type.typtypmod = -1` and rejects
+        /// `COLLATE` on composite types).
+        fields: Vec<RecordField>,
+        extension: Option<String>,
+    },
     AnonymousRecord {
         fields: Vec<RecordField>,
     },
@@ -107,7 +123,8 @@ impl Type {
         match self {
             Type::Basic { schema, name, .. }
             | Type::Enum { schema, name, .. }
-            | Type::Range { schema, name, .. } => {
+            | Type::Range { schema, name, .. }
+            | Type::Composite { schema, name, .. } => {
                 Some(QualifiedName::new(schema.clone(), name.clone()).to_string())
             }
             Type::Domain { base, .. } => base.cast_name(),

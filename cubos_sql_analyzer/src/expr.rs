@@ -571,6 +571,22 @@ fn check_goal_compatibility(
     if can_coerce(result.type_oid, goal.type_oid, goal.coercion, snapshot) {
         return Ok(());
     }
+    // PG uses a distinct wording when the source is the pseudo `record`
+    // type and the target is a registered composite (e.g. assigning
+    // `ROW($p1, $p2)` to an `address` column with the wrong arity). Mirror
+    // it so pg_sanity's prefix check passes — the rest of the cases keep
+    // the generic `cannot coerce` form.
+    if result.type_oid == oid::RECORD
+        && let Some(target_te) = snapshot.get_type(goal.type_oid)
+        && target_te.typtype == TypType::Composite
+    {
+        // PG renders the bare composite name (search-path aware) here, not
+        // the schema-qualified form `format_type_for_message` would produce.
+        return Err(AnalyzeError::Invalid(format!(
+            "cannot cast type record to {}",
+            target_te.typname
+        )));
+    }
     Err(AnalyzeError::TypeMismatch {
         actual: type_display_name(result.type_oid, snapshot),
         expected: type_display_name(goal.type_oid, snapshot),
@@ -1047,16 +1063,17 @@ fn resolve_composite_field(
             context: format!("composite field access .{field_name}"),
         })?;
 
+    let pg_type_name = crate::ddl::util::format_type_for_message(snapshot, base_oid);
     let Some(relid) = type_entry.typrelid else {
         return Err(AnalyzeError::Unsupported(format!(
-            "field access .{field_name} on non-composite type '{}'",
-            type_entry.typname
+            "column notation .{field_name} applied to type {pg_type_name}, \
+             which is not a composite type"
         )));
     };
     if type_entry.typtype != TypType::Composite {
         return Err(AnalyzeError::Unsupported(format!(
-            "field access .{field_name} on non-composite type '{}'",
-            type_entry.typname
+            "column notation .{field_name} applied to type {pg_type_name}, \
+             which is not a composite type"
         )));
     }
     let fields = snapshot.attributes_of(relid);
