@@ -223,7 +223,6 @@ fn update_varchar_too_long_rejected() {
     // Compile-time guard — PG only catches the overflow at runtime, so
     // pglite's `prepare` accepts. Opt out of the mirror.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -238,7 +237,6 @@ fn update_numeric_overflow_rejected() {
     // Compile-time guard: PG only catches numeric overflow at execution
     // time, so pglite's `prepare` doesn't see it. Opt out of the mirror.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
     assert_analyze_err!(

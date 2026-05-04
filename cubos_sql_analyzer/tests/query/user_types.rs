@@ -438,7 +438,6 @@ fn insert_null_into_nn_domain_column_is_rejected() {
     // analyzer catches it at compile time. PG sanity's `prepare` doesn't
     // reach runtime, so opt out of the mirror.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",
@@ -453,7 +452,10 @@ fn insert_null_into_nn_domain_column_is_rejected() {
 
 #[test]
 fn update_null_into_nn_domain_column_is_rejected() {
-    // Same compile-time-only check as the INSERT case above.
+    // The pg_sanity execute fallback runs UPDATE with NULL params on a
+    // freshly-created scratch table — zero rows match WHERE so the
+    // domain-not-null check never fires at runtime. Keep the skip and
+    // rely on the analyzer's compile-time guard.
     let mut db = PgCatalog::new();
     db.skip_pg_sanity();
     db.apply_sql(

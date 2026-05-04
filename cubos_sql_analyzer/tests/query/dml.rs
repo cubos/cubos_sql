@@ -315,24 +315,29 @@ fn update_set_not_null_column_to_null_rejected() {
     // it statically. PG sanity's `prepare` doesn't reach runtime evaluation,
     // so opt out of the mirror — analyzer behavior is the load-bearing
     // assertion here.
+    // The pg_sanity execute fallback fires INSERTs with all-NULL params,
+    // but UPDATE on a freshly-created scratch table affects 0 rows and
+    // doesn't reach the row-level NOT NULL check — keep the skip and rely
+    // on the analyzer's stricter compile-time guard here.
     let mut db = setup();
     db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("UPDATE users SET name = NULL WHERE id = $p1 RETURNING id"),
         AnalyzeError::Invalid(_),
-        "cannot assign NULL to NOT NULL column `users.name`",
+        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot assign NULL to NOT NULL column `users.name`)",
     );
 }
 
 #[test]
 fn insert_null_into_not_null_column_rejected() {
-    // Same pattern as above — analyzer-only static check.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // INSERT with a literal NULL hits PG's row-level constraint at execute
+    // time; the pg_sanity fallback observes the same wording the analyzer
+    // emits, so no skip needed here.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) VALUES (NULL, $p1)"),
         AnalyzeError::Invalid(_),
-        "cannot insert NULL into NOT NULL column `users.name`",
+        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot insert NULL into NOT NULL column `users.name`)",
     );
 }
 
@@ -519,8 +524,7 @@ fn insert_on_conflict_do_update_with_param_expression() {
 fn on_conflict_on_non_unique_column_should_error() {
     // ON CONFLICT validation is a planner-time check in PG; pglite-socket's
     // wire `prepare` skips it. Opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    let db = setup();
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
@@ -534,7 +538,6 @@ fn on_conflict_on_non_unique_column_should_error() {
 #[test]
 fn on_conflict_on_nonexistent_constraint_name_should_error() {
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (
             id   BIGINT PRIMARY KEY,
@@ -581,15 +584,14 @@ fn on_conflict_on_unique_column_is_accepted() {
 
 #[test]
 fn on_conflict_on_unknown_column_is_rejected() {
-    let mut db = setup();
-    db.skip_pg_sanity();
+    let db = setup();
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
              ON CONFLICT (ghost) DO NOTHING",
         ),
         AnalyzeError::Invalid(_),
-        "column \"ghost\" referenced in ON CONFLICT does not exist",
+        "column \"ghost\" does not exist (referenced in ON CONFLICT)",
     );
 }
 
@@ -636,7 +638,6 @@ fn on_conflict_on_composite_unique_match_is_accepted() {
 fn on_conflict_on_partial_composite_unique_set_is_rejected() {
     // A two-column UNIQUE doesn't cover ON CONFLICT on a single column.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (
             a INT NOT NULL,
@@ -718,10 +719,9 @@ fn on_conflict_on_check_constraint_name_is_rejected() {
 
 #[test]
 fn insert_into_generated_always_as_identity_should_error() {
-    // GENERATED ALWAYS check: PG only catches at execution; analyzer
-    // catches at compile time. Mirror skipped.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // GENERATED ALWAYS is enforced at parse_analyze in PG (not row-level),
+    // so `prepare` already errors with the wording our analyzer mirrors.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("INSERT INTO users (id, name, email) VALUES ($p1, $p2, $p3)"),
         AnalyzeError::Invalid(_),
@@ -731,6 +731,11 @@ fn insert_into_generated_always_as_identity_should_error() {
 
 #[test]
 fn overriding_system_value_on_table_without_identity_should_error() {
+    // The analyzer rejects this at compile time with a targeted message.
+    // Real PG accepts at parse and only reports a NOT-NULL violation at
+    // execute (since `id INT NOT NULL` happens to be NOT NULL but isn't
+    // an identity column, so `OVERRIDING SYSTEM VALUE` is silently
+    // allowed). Two genuinely different errors, so keep the skip.
     let mut db = PgCatalog::new();
     db.skip_pg_sanity();
     db.apply_sql(
@@ -960,7 +965,6 @@ fn merge_update_generated_always_is_rejected() {
     // sometimes truncates the message so the prefix can't be checked
     // reliably — opt out of the mirror and rely on the analyzer.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE src (n BIGINT NOT NULL, label TEXT NOT NULL);
          CREATE TABLE dst (
@@ -1228,10 +1232,9 @@ fn merge_update_unknown_column_errors() {
 
 #[test]
 fn merge_insert_null_into_not_null_column_errors() {
-    // Compile-time NOT NULL guard — PG only catches it at runtime, so the
-    // pglite mirror can't validate it. Opt out.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // MERGE that ends up doing an INSERT — pg_sanity's execute fallback
+    // hits the row-level NOT NULL check and PG's wording matches ours.
+    let db = setup();
     assert_analyze_err!(
         db.analyze(
             "MERGE INTO users u \
@@ -1240,14 +1243,16 @@ fn merge_insert_null_into_not_null_column_errors() {
              WHEN NOT MATCHED THEN INSERT (name, email) VALUES (NULL, src.email)"
         ),
         AnalyzeError::Invalid(_),
-        "cannot insert NULL into NOT NULL column `users.name`",
+        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot insert NULL into NOT NULL column `users.name`)",
     );
 }
 
 #[test]
 fn merge_update_set_not_null_to_null_literal_errors() {
-    // Same pattern as above — analyzer is strict at compile time, PG only
-    // checks at execution.
+    // MERGE that ends up doing an UPDATE — the execute fallback runs with
+    // NULL params against an empty scratch table, so the WHEN MATCHED arm
+    // never fires and the row-level NOT NULL check stays out of reach.
+    // Keep the skip and rely on the analyzer's compile-time guard.
     let mut db = setup();
     db.skip_pg_sanity();
     assert_analyze_err!(
@@ -1258,7 +1263,7 @@ fn merge_update_set_not_null_to_null_literal_errors() {
              WHEN MATCHED THEN UPDATE SET name = NULL"
         ),
         AnalyzeError::Invalid(_),
-        "cannot assign NULL to NOT NULL column `users.name`",
+        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot assign NULL to NOT NULL column `users.name`)",
     );
 }
 

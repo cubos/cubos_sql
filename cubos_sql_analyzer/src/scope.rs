@@ -162,18 +162,23 @@ impl Scope {
         }
 
         for tier in [&self.sources, &self.outer_sources] {
-            let mut found: Option<&ScopeColumn> = None;
+            let mut matches: Vec<&ScopeColumn> = Vec::new();
             for source in tier {
                 if let Some(col) = source.columns.iter().find(|c| c.name == column) {
-                    if found.is_some() {
-                        return Err(AnalyzeError::UndefinedColumn(format!(
-                            "column reference \"{column}\" is ambiguous"
-                        )));
-                    }
-                    found = Some(col);
+                    matches.push(col);
                 }
             }
-            if let Some(col) = found {
+            if matches.len() > 1 {
+                let candidates = matches
+                    .iter()
+                    .map(|c| QualifiedName::new(&c.table_alias, column).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AnalyzeError::UndefinedColumn(format!(
+                    "column reference \"{column}\" is ambiguous (could be: {candidates})"
+                )));
+            }
+            if let Some(col) = matches.first() {
                 return Ok(col);
             }
         }

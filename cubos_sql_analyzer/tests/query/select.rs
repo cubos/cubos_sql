@@ -313,6 +313,34 @@ fn stress_ambiguous_id_columns() {
 }
 
 #[test]
+fn err_ambiguous_column_lists_candidate_tables() {
+    let db = setup();
+    // Unqualified `id` is present in both `users` and `posts` — the error
+    // must keep PG's prefix and add a suffix listing every alias that
+    // could provide it, in FROM-clause order.
+    let sql = "SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id";
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UndefinedColumn(_),
+        "column reference \"id\" is ambiguous (could be: u.id, p.id)",
+    );
+}
+
+#[test]
+fn err_ambiguous_column_lists_three_candidates() {
+    let db = setup();
+    // Three tables all expose `id` — confirm every alias shows up.
+    let sql = "SELECT id FROM users u \
+               INNER JOIN posts p ON p.user_id = u.id \
+               INNER JOIN comments c ON c.post_id = p.id";
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UndefinedColumn(_),
+        "column reference \"id\" is ambiguous (could be: u.id, p.id, c.id)",
+    );
+}
+
+#[test]
 fn stress_distinct_on() {
     let db = setup();
     // Differs from `distinct_on` by adding the nullable `body` column.

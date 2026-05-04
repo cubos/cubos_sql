@@ -15,6 +15,7 @@ use crate::oid::PgTypeOid;
 use crate::param::LexOutput;
 use crate::param_collector::ParamCollector;
 use crate::pg_catalog::{AttIdentity, ConType, PgCatalog, TypCategory, TypType, oid};
+use crate::qualified_name::QualifiedName;
 use crate::scope::{Scope, ScopeColumn};
 use crate::types::Type;
 
@@ -431,8 +432,12 @@ fn validate_on_conflict_target(
             match attnum {
                 Some(an) => targets.push(an),
                 None => {
+                    // PG runtime wording: `column "ghost" does not exist`.
+                    // Append the ON CONFLICT context as a suffix so the
+                    // execute-fallback prefix check passes while the macro
+                    // caller still sees the clause that produced it.
                     return Err(AnalyzeError::Invalid(format!(
-                        "column \"{}\" referenced in ON CONFLICT does not exist",
+                        "column \"{}\" does not exist (referenced in ON CONFLICT)",
                         ie.name
                     )));
                 }
@@ -464,8 +469,12 @@ fn validate_on_conflict_target(
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
 /// (either column-level `attnotnull`, or a domain in the type chain whose
 /// `typnotnull` is set), return the matching `AnalyzeError`. `op` selects
-/// the wording — `"insert"` mirrors PG's INSERT message, `"assign"` covers
-/// UPDATE / MERGE UPDATE.
+/// the wording — `"insert"` mirrors PG's INSERT-time message, `"assign"`
+/// covers UPDATE / MERGE UPDATE.
+///
+/// Both branches start with PG's exact runtime wording so the `pg_sanity`
+/// execute-fallback prefix check passes; the analyzer's stricter form
+/// (table+column qualified) follows in parentheses for the macro caller.
 fn null_assignment_error(
     tc: &crate::pg_catalog::PgAttribute,
     snapshot: &PgCatalog,
@@ -482,9 +491,12 @@ fn null_assignment_error(
             "insert" => "insert NULL into",
             _ => "assign NULL to",
         };
+        let qualified = QualifiedName::new(table_relname, &tc.attname);
         return Some(AnalyzeError::Invalid(format!(
-            "cannot {verb} NOT NULL column `{}.{}`",
-            table_relname, tc.attname,
+            "null value in column \"{}\" of relation \"{table_relname}\" \
+             violates not-null constraint \
+             (cannot {verb} NOT NULL column `{qualified}`)",
+            tc.attname,
         )));
     }
     None

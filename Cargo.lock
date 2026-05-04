@@ -618,6 +618,7 @@ name = "cubos_sql_analyzer"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "cubos_sql_analyzer",
  "cubos_sql_core",
  "pg_query",

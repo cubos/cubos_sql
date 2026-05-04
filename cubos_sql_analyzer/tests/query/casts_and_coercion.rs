@@ -291,7 +291,6 @@ fn numeric_typmod_overflow_should_be_rejected() {
     // time; real PG only complains on execution, and pglite's `prepare`
     // skips that pass — opt out of the mirror.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -307,7 +306,6 @@ fn varchar_typmod_string_literal_too_long_should_be_rejected() {
     // long literals at compile time, real PG only at execution. Opt out of
     // the pglite mirror.
     let mut db = PgCatalog::new();
-    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL);")
         .unwrap();
     assert_analyze_err!(

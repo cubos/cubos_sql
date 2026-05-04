@@ -28,12 +28,51 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::BytesMut;
 use postgres::config::Config;
+use postgres::types::{IsNull, ToSql, Type as PgType};
 use postgres::{Client, NoTls};
 
 use crate::error::AnalyzeError;
 use crate::resolve::AnalyzedQuery;
 use crate::types::Type;
+
+/// `ToSql` adapter that always serializes as SQL NULL regardless of the
+/// requested PG type. Used by the `(analyzer rejected, PG accepted at
+/// prepare)` execute fallback so we can fire the prepared statement
+/// without inventing a typed value for every parameter slot. PG defers the
+/// checks we actually want to observe (planner-level ON CONFLICT,
+/// row-level NOT NULL via literal NULL, numeric/varchar overflow on
+/// literals, identity-column rules) to execute time, and they all fire
+/// regardless of parameter values — so passing NULLs is enough.
+#[derive(Debug)]
+struct NullParam;
+
+impl ToSql for NullParam {
+    fn to_sql(
+        &self,
+        _ty: &PgType,
+        _out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(IsNull::Yes)
+    }
+
+    fn accepts(_ty: &PgType) -> bool {
+        true
+    }
+
+    // Skip the standard `to_sql_checked!()` macro because it dispatches
+    // through `accepts` — we want the value to claim compatibility with
+    // any type, even ones the macro's WrongType guard would normally
+    // reject.
+    fn to_sql_checked(
+        &self,
+        _ty: &PgType,
+        _out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(IsNull::Yes)
+    }
+}
 
 pub(crate) struct PgSanityServer {
     /// Connected to the per-instance scratch database.
@@ -231,16 +270,55 @@ impl PgSanityServer {
                     render_pg_error(e),
                 );
             }
-            (Err(e), Ok(stmt)) => {
-                panic!(
-                    "pg_sanity: analyzer rejected query but PG accepted it.\n\
-                     SQL:\n---\n{analysis_sql}\n---\n\
-                     analyzer error: {e}\nPG columns: {:?}",
-                    stmt.columns()
-                        .iter()
-                        .map(|c| (c.name().to_string(), c.type_().oid()))
-                        .collect::<Vec<_>>(),
-                );
+            (Err(_), Ok(stmt)) => {
+                // PG accepted at prepare/parse time, but several checks
+                // (planner ON CONFLICT validation, row-level NOT NULL via
+                // literal NULL, numeric/varchar overflow on literals,
+                // identity-column rules in MERGE/UPDATE) only fire at
+                // execute time. Re-run the prepared statement inside a
+                // BEGIN/ROLLBACK transaction with all-NULL parameters so
+                // we observe the real runtime error before declaring a
+                // divergence; if it does fire and matches our analyzer's
+                // wording, the test is consistent.
+                let n_params = stmt.params().len();
+                let null_params: Vec<NullParam> = (0..n_params).map(|_| NullParam).collect();
+                let null_param_refs: Vec<&(dyn ToSql + Sync)> =
+                    null_params.iter().map(|p| p as _).collect();
+
+                let exec_result = match self.client.transaction() {
+                    Ok(mut tx) => {
+                        let r = tx.execute(stmt, &null_param_refs);
+                        // `tx` drops here → automatic rollback so the
+                        // scratch DB stays clean across tests.
+                        r
+                    }
+                    Err(e) => panic!(
+                        "pg_sanity: BEGIN failed in execute-fallback for {analysis_sql}: {e}"
+                    ),
+                };
+
+                match exec_result {
+                    Ok(_rows) => panic!(
+                        "pg_sanity: analyzer rejected query but PG accepted AND \
+                         executed it (with all-NULL params).\n\
+                         SQL:\n---\n{analysis_sql}\n---\n\
+                         analyzer error: {}\nPG columns: {:?}",
+                        our_result.as_ref().unwrap_err(),
+                        stmt.columns()
+                            .iter()
+                            .map(|c| (c.name().to_string(), c.type_().oid()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(exec_err) => {
+                        let our_msg = format!("{}", our_result.as_ref().unwrap_err());
+                        assert_error_prefix_matches(
+                            &our_msg,
+                            &exec_err,
+                            analysis_sql,
+                            "analyze (execute fallback)",
+                        );
+                    }
+                }
             }
         }
     }
