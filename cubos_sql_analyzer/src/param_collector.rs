@@ -17,6 +17,13 @@ pub(crate) struct ParamCollector {
     nullable: HashMap<i32, bool>,
     /// Param numbers that have an explicit annotation from `$foo?` syntax (takes precedence).
     explicit_nullable: HashSet<i32>,
+    /// Param numbers seen in a position where PG refuses to default to
+    /// `text` — bare `$N` inside `ROW(...)` is the canonical case. If
+    /// such a param is still untyped at finalization, [`into_sorted`]
+    /// raises `could not determine data type of parameter $N` instead of
+    /// silently falling back. Marking is harmless if a later inference
+    /// site (e.g. ROW=ROW back-fill) pins the param to a concrete type.
+    indeterminate_required: HashSet<i32>,
 }
 
 impl ParamCollector {
@@ -62,11 +69,34 @@ impl ParamCollector {
             .unwrap_or(oid::UNKNOWN)
     }
 
+    /// Mark `param_num` as having appeared in a context (e.g. inside
+    /// `ROW(...)`) where PG refuses to default to `text`. If finalization
+    /// finds the param still untyped, it errors instead of falling back.
+    pub fn mark_indeterminate_required(&mut self, param_num: i32) {
+        self.indeterminate_required.insert(param_num);
+    }
+
     /// Return all parameters in order, validating that every seen param has a type.
     ///
     /// Returns `(param_number, type_oid, nullable)` tuples.
     /// Fails if any `$N` was referenced but its type could not be inferred.
     pub fn into_sorted(self) -> Result<Vec<(i32, PgTypeOid, bool)>, AnalyzeError> {
+        // Reject params that surfaced in an indeterminate-required context
+        // and never got a concrete type pinned. This mirrors PG's
+        // `could not determine data type of parameter $N` for cases like
+        // `SELECT ROW($1)`. Iterate in numeric order so the diagnostic
+        // points at the *lowest*-numbered offending param — `HashSet`
+        // iteration order is otherwise non-deterministic across builds.
+        let mut indeterminate: Vec<i32> = self.indeterminate_required.iter().copied().collect();
+        indeterminate.sort_unstable();
+        for num in indeterminate {
+            if !self.constraints.contains_key(&num) {
+                return Err(AnalyzeError::IndeterminateType(format!(
+                    "could not determine data type of parameter ${num}"
+                )));
+            }
+        }
+
         // Params that were seen but not typed default to TEXT, matching PG's
         // behavior (preferred type of the string category for unknown params).
         let mut params: Vec<(i32, PgTypeOid, bool)> = self

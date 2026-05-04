@@ -53,12 +53,6 @@ fn setup() -> PgCatalog {
     db
 }
 
-// Pseudo `record` type — what the analyzer surfaces for `ROW(...)` and other
-// untyped composite producers. Built once because every test below uses it.
-fn record_ty() -> Type {
-    basic("pg_catalog", "record")
-}
-
 // ── ROW(...) constructor ─────────────────────────────────────────────────────
 
 #[test]
@@ -365,35 +359,39 @@ fn bare_alias_resolves_to_composite_value() {
     // implicit composite type (`public.users`), with the column shape
     // populated for downstream `(u).field` resolution.
     let s = db.analyze("SELECT u FROM users u").unwrap();
-    let users_record = composite("public", "users", vec![
-        rf("id", int8()),
-        rf("name", text()),
-        rfn("age", int4()),
-        rfn(
-            "home",
-            composite(
-                "public",
-                "address",
-                vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text()),
-                ],
+    let users_record = composite(
+        "public",
+        "users",
+        vec![
+            rf("id", int8()),
+            rf("name", text()),
+            rfn("age", int4()),
+            rfn(
+                "home",
+                composite(
+                    "public",
+                    "address",
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text()),
+                    ],
+                ),
             ),
-        ),
-        rf(
-            "work",
-            composite(
-                "public",
-                "address",
-                vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text()),
-                ],
+            rf(
+                "work",
+                composite(
+                    "public",
+                    "address",
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text()),
+                    ],
+                ),
             ),
-        ),
-    ]);
+        ],
+    );
     assert_cols(&s, vec![c("u", users_record)]);
 }
 
@@ -482,28 +480,22 @@ fn srf_record_field_via_subquery_propagation() {
 // ── User-defined RETURNS RECORD / RETURNS TABLE ──────────────────────────────
 
 #[test]
-fn returns_record_with_named_out_params_in_from() {
-    // `CREATE FUNCTION f(OUT a int, OUT b text)` is the canonical user
-    // form of declaring a record-returning function. PG exposes it as a
-    // SRF with named columns when used in FROM. Real PG additionally
-    // requires a column definition list when invoking a `RETURNS RECORD`
-    // function in FROM without out args (`column definition list is
-    // required for functions returning "record"`); the analyzer is more
-    // lenient and surfaces a single `pair record` column instead. Opt
-    // out of the mirror — fixing this would require modeling PG's
-    // column-list requirement at parse time.
+fn returns_record_in_from_without_coldeflist_is_rejected() {
+    // `RETURNS RECORD` without OUT args and without a column-definition
+    // list at the call site (`AS p(a int, b text)`) is rejected by PG at
+    // parse_analyze. The analyzer mirrors the wording.
     let mut db = setup();
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE FUNCTION pair() RETURNS RECORD AS $$
              SELECT 1, 'x'::text
          $$ LANGUAGE SQL;",
     )
     .unwrap();
-    // Without OUT args / column definition list, calling RETURNS RECORD in
-    // FROM yields a single opaque `pair` column of pseudo `record`.
-    let s = db.analyze("SELECT pair FROM pair()").unwrap();
-    assert_eq!(col(&s, "pair").pg_type, record_ty());
+    assert_analyze_err!(
+        db.analyze("SELECT pair FROM pair()"),
+        AnalyzeError::Invalid(_),
+        "a column definition list is required for functions returning \"record\"",
+    );
 }
 
 #[test]
@@ -667,35 +659,39 @@ fn subquery_select_bare_alias_yields_composite_column() {
     let s = db
         .analyze("SELECT t.u FROM (SELECT u FROM users u) t")
         .unwrap();
-    let users_record = composite("public", "users", vec![
-        rf("id", int8()),
-        rf("name", text()),
-        rfn("age", int4()),
-        rfn(
-            "home",
-            composite(
-                "public",
-                "address",
-                vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text()),
-                ],
+    let users_record = composite(
+        "public",
+        "users",
+        vec![
+            rf("id", int8()),
+            rf("name", text()),
+            rfn("age", int4()),
+            rfn(
+                "home",
+                composite(
+                    "public",
+                    "address",
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text()),
+                    ],
+                ),
             ),
-        ),
-        rf(
-            "work",
-            composite(
-                "public",
-                "address",
-                vec![
-                    rfn("street", text()),
-                    rfn("city", text()),
-                    rfn("zip", text()),
-                ],
+            rf(
+                "work",
+                composite(
+                    "public",
+                    "address",
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text()),
+                    ],
+                ),
             ),
-        ),
-    ]);
+        ],
+    );
     assert_cols(&s, vec![c("u", users_record)]);
 }
 
@@ -754,14 +750,15 @@ fn jsonb_build_object_from_row_fields() {
 // ── ROW operator with mismatched arity ───────────────────────────────────────
 
 #[test]
-fn row_compare_mismatched_arity_resolves_to_bool() {
-    // PG rejects mismatched-arity row compares at parse_analyze (`unequal
-    // number of entries in row expressions`); the analyzer only types the
-    // operator and surfaces bool. Documented gap — opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
-    let s = db.analyze("SELECT ROW(1) = ROW(1, 2) AS e").unwrap();
-    assert_cols(&s, vec![c("e", bool_ty())]);
+fn row_compare_mismatched_arity_is_rejected() {
+    // PG rejects mismatched-arity row compares at parse_analyze; the
+    // analyzer mirrors the wording so pg_sanity stays aligned.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT ROW(1) = ROW(1, 2) AS e"),
+        AnalyzeError::Invalid(_),
+        "unequal number of entries in row expressions",
+    );
 }
 
 // ── VALUES-derived record-shaped relation ────────────────────────────────────
@@ -930,19 +927,31 @@ fn row_with_arithmetic_inferred_per_field() {
 }
 
 #[test]
-fn row_inside_subquery_in_where() {
-    // Equality between a ROW from outer scope and a derived ROW in the
-    // subquery — both sides should agree on field types. PG counts the
-    // subquery as having a single record column and rejects (`subquery has
-    // too few columns`) since the LHS unwraps to two values; the analyzer
-    // happily resolves both as records and types the comparison as bool.
-    // Documented gap — opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+fn row_inside_subquery_in_where_arity_check() {
+    // PG counts subquery columns at the boundary, so a `ROW(a, b) =
+    // (SELECT ROW(...))` mismatches because the inner ROW counts as a
+    // single record column. Analyzer mirrors PG's `subquery has too few
+    // columns` for the same shape.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "SELECT u.id FROM users u \
+             WHERE ROW(u.id, u.name) = (SELECT ROW(u2.id, u2.name) FROM users u2 WHERE u2.id = u.id)",
+        ),
+        AnalyzeError::Invalid(_),
+        "subquery has too few columns (subquery has 1, lhs has 2)",
+    );
+}
+
+#[test]
+fn row_inside_subquery_with_matching_arity_resolves_to_bool() {
+    let db = setup();
+    // Same shape but the subquery selects two columns directly — arity
+    // matches, comparison types as bool.
     let s = db
         .analyze(
             "SELECT u.id FROM users u \
-             WHERE ROW(u.id, u.name) = (SELECT ROW(u2.id, u2.name) FROM users u2 WHERE u2.id = u.id)",
+             WHERE ROW(u.id, u.name) = (SELECT u2.id, u2.name FROM users u2 WHERE u2.id = u.id)",
         )
         .unwrap();
     assert_eq!(col(&s, "id").pg_type, int8());
@@ -1209,7 +1218,11 @@ fn array_agg_of_composite_column_returns_array_of_composite() {
                 composite(
                     "public",
                     "address",
-                    vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text())
+                    ],
                 )
             );
         }
@@ -1366,7 +1379,11 @@ fn domain_over_composite_in_param() {
                 composite(
                     "public",
                     "address",
-                    vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+                    vec![
+                        rfn("street", text()),
+                        rfn("city", text()),
+                        rfn("zip", text())
+                    ],
                 )
             );
         }
@@ -1643,43 +1660,51 @@ fn param_used_in_row_then_indirected_picks_up_type() {
 }
 
 #[test]
-fn param_seeded_via_indirection_into_concrete_type() {
-    // `(ROW($p1, 1::int4)).f2` — second element is int4, so `.f2` pulls
-    // int4 out. The first element ($p1) is left UNKNOWN; the analyzer
-    // defaults it to text. PG raises `could not determine data type of
-    // parameter $1` because the param is never positionally pinned.
-    // Skip the mirror — analyzer fallback is intentional.
-    let mut db = setup();
-    db.skip_pg_sanity();
+fn param_inside_row_unconsumed_is_indeterminate() {
+    // `(ROW($p1, 1::int4)).f2` — only `.f2` is consumed; $p1 (at f1) is
+    // never re-bound. PG and the analyzer both reject with `could not
+    // determine data type of parameter $1` because PG refuses to default
+    // params inside ROW to text.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT (ROW($p1, 1::int4)).f2 + 1 AS n"),
+        AnalyzeError::IndeterminateType(_),
+        "could not determine data type of parameter $1",
+    );
+}
+
+#[test]
+fn param_inside_row_pinned_via_row_eq_row_back_fill() {
+    // `ROW($1, u.name) = ROW(u.id, $2)` — both params live inside a ROW,
+    // so the indeterminate-required marker fires for both. The ROW=ROW
+    // pre-pass then back-fills each position from the peer's concrete
+    // type ($1 → bigint from u.id, $2 → text from u.name), pinning them
+    // before finalization.
+    let db = setup();
     let s = db
-        .analyze("SELECT (ROW($p1, 1::int4)).f2 + 1 AS n")
+        .analyze("SELECT u.id FROM users u WHERE ROW($p1, u.name) = ROW(u.id, $p2)")
         .unwrap();
-    assert_eq!(col(&s, "n").pg_type, int4());
-    // $p1 stays UNKNOWN → text fallback.
-    assert_eq!(s.params.len(), 1);
-    assert_eq!(s.params[0].pg_type, text());
+    assert_eq!(s.params.len(), 2);
+    assert_eq!(s.params[0].pg_type, int8());
+    assert_eq!(s.params[1].pg_type, text());
 }
 
 #[test]
 fn param_in_nested_row_compared_inferred_per_field() {
-    // Nested ROW comparison: outer ROW arity 2, inner ROW arity 2. Each
-    // position resolves independently. The pre-pass only handles a single
-    // level (ROW = ROW), but element types cross over via re-inference.
-    // PG raises `could not determine data type of parameter $2` because
-    // it can't infer params nested inside an inner ROW from the LHS;
-    // analyzer is more aggressive. Skip the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
-    let s = db
-        .analyze(
+    // Nested ROW comparison: top-level ROW=ROW pre-pass pins $p1 from
+    // u.id, but the inner ROW is treated as a single record column on
+    // the LHS, so $p2/$p3 inside the inner ROW have no peer to infer
+    // from. PG raises `could not determine data type of parameter $2`;
+    // the analyzer mirrors that exact error.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
             "SELECT u.id FROM users u \
              WHERE ROW(u.id, ROW(u.name, u.age)) = ROW($p1, ROW($p2, $p3))",
-        )
-        .unwrap();
-    // Top-level pre-pass pins $p1 → int8 directly, then re-infers the
-    // RHS inner ROW with no goal — $p2 and $p3 fall back to text/UNKNOWN.
-    // Document the current behavior; even partial pinning is useful.
-    assert_eq!(s.params[0].pg_type, int8());
+        ),
+        AnalyzeError::IndeterminateType(_),
+        "could not determine data type of parameter $2",
+    );
 }
 
 #[test]
@@ -1909,7 +1934,11 @@ fn cast_row_to_composite_lands_on_named_composite() {
         composite(
             "public",
             "address",
-            vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+            vec![
+                rfn("street", text()),
+                rfn("city", text()),
+                rfn("zip", text())
+            ],
         ),
     );
 }
@@ -1949,7 +1978,11 @@ fn composite_array_column_is_array_of_composite() {
             composite(
                 "public",
                 "address",
-                vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+                vec![
+                    rfn("street", text()),
+                    rfn("city", text()),
+                    rfn("zip", text())
+                ],
             ),
         ),
         other => panic!("expected Array<Composite>, got {other:?}"),
@@ -1972,7 +2005,11 @@ fn composite_join_preserves_named_identity_on_each_side() {
         composite(
             "public",
             "address",
-            vec![rfn("street", text()), rfn("city", text()), rfn("zip", text())],
+            vec![
+                rfn("street", text()),
+                rfn("city", text()),
+                rfn("zip", text())
+            ],
         ),
     );
     match &col(&s, "info").pg_type {
@@ -2054,9 +2091,7 @@ fn composite_function_return_lands_as_named_composite() {
 fn composite_propagated_through_subquery_keeps_identity() {
     let db = setup();
     let s = db
-        .analyze(
-            "SELECT t.work AS addr FROM (SELECT id, work FROM users) t",
-        )
+        .analyze("SELECT t.work AS addr FROM (SELECT id, work FROM users) t")
         .unwrap();
     match &col(&s, "addr").pg_type {
         Type::Composite { schema, name, .. } => {

@@ -2425,6 +2425,15 @@ fn process_range_function(
                     record_fields: None,
                 })
                 .collect()
+        } else if resolved.return_type_oid == oid::RECORD && rf.coldeflist.is_empty() {
+            // `RETURNS RECORD` without OUT args needs a column-definition
+            // list at the call site so PG knows what shape to expose.
+            // Mirror PG's exact wording so the analyzer's diagnostic is
+            // pg_sanity-aligned.
+            return Err(AnalyzeError::Invalid(
+                "a column definition list is required for functions returning \"record\""
+                    .to_owned(),
+            ));
         } else {
             // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from
             // their arguments — `FROM unnest(int4[] NOT NULL)` produces

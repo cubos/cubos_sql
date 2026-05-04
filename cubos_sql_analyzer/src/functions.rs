@@ -369,6 +369,15 @@ pub(crate) fn bind_polymorphic_from(
     bound_element: &mut Option<PgTypeOid>,
     bound_array: &mut Option<PgTypeOid>,
 ) {
+    // PG (`enforce_generic_type_consistency`) skips UNKNOWN actuals when
+    // unifying polymorphic args — the unknown is coerced to the resolved
+    // polymorphic type *after* binding, so letting it land as the bound
+    // type would freeze the resolution at UNKNOWN and propagate to the
+    // other side (e.g. `'admin'::unknown = role::user_role` would resolve
+    // both anyenum slots to UNKNOWN instead of `user_role`).
+    if actual == oid::UNKNOWN {
+        return;
+    }
     match expected {
         ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
             bound_element.get_or_insert(actual);

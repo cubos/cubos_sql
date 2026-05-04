@@ -348,6 +348,10 @@ impl PgCatalog {
         // never appear as exact matches — PG resolves them by checking the
         // shape of the concrete operands against the pseudo-type's
         // constraint, then substitutes the bound types into the result.
+        // UNKNOWN actuals are deliberately *not* accepted here — when one
+        // side is UNKNOWN we defer to step 3, which prefers a candidate
+        // whose known side matches *exactly* (e.g. `text || text` over
+        // `anycompatible || anycompatiblearray` for `text || 'foo'`).
         let poly_matches: Vec<&PgOperator> = candidates
             .iter()
             .filter(|o| {
@@ -402,18 +406,34 @@ impl PgCatalog {
             return None;
         }
 
-        // 3a. Keep candidates where known sides match (exact or implicit
-        //     cast) and UNKNOWN sides are treated as compatible with anything.
+        // 3a. Keep candidates where known sides match (exact, implicit cast,
+        //     or polymorphic constraint) and UNKNOWN sides are treated as
+        //     compatible with anything. Polymorphic positions (`anyenum`,
+        //     `anycompatiblearray`, …) accept any actual whose shape matches
+        //     the pseudo-type's constraint — `enforce_generic_type_consistency`
+        //     binds the concrete type later, and we mirror it here so an
+        //     `enum_col = 'literal'` resolves through `anyenum = anyenum`.
         let mut remaining: Vec<&PgOperator> = candidates
             .iter()
             .filter(|o| {
                 let left_ok = match (op_left(o), left_oid) {
                     (Some(_), Some(actual)) if actual == oid::UNKNOWN => true,
+                    (Some(expected), Some(actual))
+                        if crate::functions::is_polymorphic(expected) =>
+                    {
+                        crate::functions::matches_polymorphic(expected, actual, self)
+                    }
                     (Some(expected), Some(actual)) => self.has_implicit_cast(actual, expected),
                     (None, None) => true,
                     _ => false,
                 };
-                let right_ok = right_unknown || self.has_implicit_cast(right_oid, o.oprright);
+                let right_ok = if right_unknown {
+                    true
+                } else if crate::functions::is_polymorphic(o.oprright) {
+                    crate::functions::matches_polymorphic(o.oprright, right_oid, self)
+                } else {
+                    self.has_implicit_cast(right_oid, o.oprright)
+                };
                 left_ok && right_ok
             })
             .copied()

@@ -438,9 +438,18 @@ pub(crate) fn infer_expr(
             // PG names anonymous ROW elements `f1`, `f2`, ... by position.
             // The element's full ExprType (with any nested record shape)
             // goes straight onto the field — recursion handled by ExprType.
+            // For each bare `$N` element, mark the param as
+            // indeterminate-required: PG refuses to default these to text
+            // (`SELECT ROW($1)` raises `could not determine data type of
+            // parameter $1`). The marker is harmless if a later inference
+            // site (ROW=ROW back-fill, composite-cast pre-pass, …) pins
+            // the param to a concrete type.
             let mut fields = Vec::with_capacity(row.args.len());
             for (i, arg) in row.args.iter().enumerate() {
                 let ty = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+                if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+                    params.mark_indeterminate_required(p.number);
+                }
                 fields.push(RecordField {
                     name: format!("f{}", i + 1),
                     ty,
@@ -521,8 +530,7 @@ pub(crate) fn infer_expr(
                     // (`int4` → `integer`) but drop the schema prefix for
                     // user types so a `public.address` column reads the
                     // same way PG would: `... by type address`.
-                    let formatted =
-                        crate::ddl::util::format_type_for_message(snapshot, base);
+                    let formatted = crate::ddl::util::format_type_for_message(snapshot, base);
                     let type_name = match formatted.rsplit_once('.') {
                         Some((_, bare)) => bare.to_owned(),
                         None => formatted,
@@ -1245,12 +1253,24 @@ fn infer_type_cast(
 
     // An explicit cast (::type / CAST) overrides type checking — we do NOT
     // check compatibility of the inner expression against the target type.
-    // We pass NONE as goal to avoid false TypeMismatch errors (e.g. age::text
-    // where int4→text has no implicit cast).
-    //
-    // For ParamRef, we manually record the cast target type (equivalent to
-    // PG's coerce_type handling of Param nodes in explicit cast context).
-    let inner_type = infer_expr(inner, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+    // The inner expression is normally inferred with NONE to avoid false
+    // TypeMismatch errors (e.g. age::text where int4→text has no implicit
+    // cast). The one exception is a `ROW(...)::composite` shape: PG uses
+    // the cast target as the composite goal so each ROW element gets
+    // pinned against the matching field type — without that propagation,
+    // params inside the ROW would remain indeterminate. Mirror it.
+    let inner_goal = match (
+        inner.node.as_ref(),
+        snapshot
+            .get_type(snapshot.unwrap_domain(target_oid))
+            .map(|t| t.typtype),
+    ) {
+        (Some(node::Node::RowExpr(_)), Some(TypType::Composite)) => {
+            TypeGoal::assignment(target_oid)
+        }
+        _ => TypeGoal::NONE,
+    };
+    let inner_type = infer_expr(inner, scope, null_ctx, snapshot, params, inner_goal)?;
 
     if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
         && params.get(p.number) == oid::UNKNOWN
@@ -1832,8 +1852,15 @@ fn infer_a_expr(
         && let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref())
         && let (Some(node::Node::RowExpr(lrow)), Some(node::Node::RowExpr(rrow))) =
             (lexpr.node.as_ref(), rexpr.node.as_ref())
-        && lrow.args.len() == rrow.args.len()
     {
+        // PG (parse_analyze): `unequal number of entries in row expressions`
+        // when the two ROWs have different arity. Catch it up front so the
+        // back-fill loop below can assume aligned positions.
+        if lrow.args.len() != rrow.args.len() {
+            return Err(AnalyzeError::Invalid(
+                "unequal number of entries in row expressions".to_owned(),
+            ));
+        }
         // Pass 1: collect element types for each side with no goal.
         let mut left_types = Vec::with_capacity(lrow.args.len());
         let mut right_types = Vec::with_capacity(rrow.args.len());
@@ -1875,6 +1902,40 @@ fn infer_a_expr(
         }
 
         return Ok(ExprType::scalar(oid::BOOL, any_nullable));
+    }
+
+    // ROW(...) compared against a sub-SELECT: PG counts columns at the
+    // subquery boundary (the inner ROW stays a single record column), so
+    // the LHS arity must equal the subquery's column count. Mirror PG's
+    // `subquery has too few/many columns` for the mismatch case.
+    if matches!(op_name, "=" | "<>" | "<" | ">" | "<=" | ">=")
+        && let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref())
+        && let (Some(node::Node::RowExpr(lrow)), Some(node::Node::SubLink(sub))) =
+            (lexpr.node.as_ref(), rexpr.node.as_ref())
+        && matches!(
+            protobuf::SubLinkType::try_from(sub.sub_link_type),
+            Ok(protobuf::SubLinkType::ExprSublink)
+        )
+        && let Some(subselect) = sub.subselect.as_ref()
+        && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
+    {
+        for la in &lrow.args {
+            let _ = infer_expr(la, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+        }
+        let (cols, _) = crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
+        if cols.len() != lrow.args.len() {
+            let pg_msg = if cols.len() < lrow.args.len() {
+                "subquery has too few columns"
+            } else {
+                "subquery has too many columns"
+            };
+            return Err(AnalyzeError::Invalid(format!(
+                "{pg_msg} (subquery has {}, lhs has {})",
+                cols.len(),
+                lrow.args.len(),
+            )));
+        }
+        return Ok(ExprType::scalar(oid::BOOL, true));
     }
 
     // Pass 1: infer both sides bottom-up.

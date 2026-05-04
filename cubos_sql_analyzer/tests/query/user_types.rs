@@ -128,6 +128,102 @@ fn enum_in_where() {
     );
 }
 
+// ── Polymorphic operator resolution with UNKNOWN literals ────────────────────
+//
+// PostgreSQL has no `myenum = unknown` operator — equality on user-defined
+// enums goes through the polymorphic `anyenum = anyenum`. Same story for
+// arrays (`anyarray = anyarray`) and ranges (`anyrange = anyrange`). When
+// one side is a string literal (`unknown`), the analyzer must still resolve
+// the polymorphic operator and let the unknown side be coerced to the
+// bound concrete type — matching `enforce_generic_type_consistency` in PG.
+
+#[test]
+fn enum_eq_unknown_literal_resolves_via_anyenum() {
+    let db = setup_user_types();
+    let s = db
+        .analyze("SELECT id FROM users WHERE role = 'admin'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn enum_eq_unknown_literal_lhs_resolves_via_anyenum() {
+    // Symmetric case: literal on the left, enum column on the right. The
+    // resolver must bind the polymorphic type from the *non*-UNKNOWN side
+    // regardless of operand order.
+    let db = setup_user_types();
+    let s = db
+        .analyze("SELECT id FROM users WHERE 'admin' = role")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn enum_neq_unknown_literal_resolves_via_anyenum() {
+    let db = setup_user_types();
+    let s = db
+        .analyze("SELECT id FROM users WHERE role <> 'viewer'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn enum_in_list_of_unknown_literals_resolves_via_anyenum() {
+    // `IN (...)` desugars to a chain of `=` comparisons; each unknown
+    // literal must resolve against the enum on the LHS.
+    let db = setup_user_types();
+    let s = db
+        .analyze("SELECT id FROM users WHERE role IN ('admin', 'editor')")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn enum_array_contains_unknown_literal_resolves() {
+    // `arr @> '{admin}'::user_role[]` — operator is `anyarray @> anyarray`.
+    // Without the cast the literal is `unknown`, and the resolver must bind
+    // `anyarray` from the column-side array type.
+    let mut db = PgCatalog::new();
+    db.apply_sql(
+        "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
+         CREATE TABLE users (
+            id    BIGINT PRIMARY KEY,
+            roles user_role[] NOT NULL
+         );",
+    )
+    .unwrap();
+    let s = db
+        .analyze("SELECT id FROM users WHERE roles @> '{admin}'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn text_array_contains_unknown_literal_resolves() {
+    // Same shape with a built-in text[] — exercises the polymorphic path
+    // when the left side is a concrete array of a built-in element type.
+    let mut db = PgCatalog::new();
+    db.apply_sql("CREATE TABLE t (id INT PRIMARY KEY, tags TEXT[] NOT NULL);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT id FROM t WHERE tags @> '{a,b}'")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int4())]);
+}
+
+#[test]
+fn text_concat_with_unknown_literal_stays_text() {
+    // Regression guard: `text || 'foo'` must NOT be hijacked by the
+    // polymorphic `anycompatible || anycompatiblearray` (which would
+    // produce `text[]`). Step 3's "exactly match the known side" filter
+    // must keep `text || text` over the polymorphic candidate.
+    let db = setup_user_types();
+    let s = db
+        .analyze("SELECT name || '!' AS greeting FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("greeting", text())]);
+}
+
 #[test]
 fn enum_in_insert() {
     let db = setup_user_types();
