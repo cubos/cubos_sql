@@ -1387,3 +1387,114 @@ fn delete_with_cte_param_is_seen() {
         .unwrap();
     assert_params(&s, vec![p(int8()), p(int4())]);
 }
+
+// ── can_run_as_subquery ──────────────────────────────────────────────────────
+//
+// Drives the `SELECT * FROM (<query>) LIMIT 2` wrap that the codegen applies
+// to fetch_one / fetch_optional. Must be true only when PG accepts the query
+// as a subquery body — top-level DML and `WITH (DML) SELECT` both fail
+// (`E0A000: WITH clause containing a data-modifying statement must be at the
+// top level`), so they are sent unwrapped.
+
+#[test]
+fn can_run_as_subquery_plain_select() {
+    let db = setup();
+    let s = db.analyze("SELECT id, name FROM users").unwrap();
+    assert!(s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_with_pure_select_cte() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH adults AS (SELECT id FROM users WHERE age >= 18) \
+             SELECT id FROM adults",
+        )
+        .unwrap();
+    assert!(s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_values_clause() {
+    let db = setup();
+    // `VALUES (…)` parses as a SelectStmt; safe to wrap.
+    let s = db.analyze("VALUES (1, 'a'), (2, 'b')").unwrap();
+    assert!(s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_top_level_update_returning() {
+    let db = setup();
+    let s = db
+        .analyze("UPDATE users SET age = $p1 WHERE id = $p2 RETURNING id, age")
+        .unwrap();
+    assert!(!s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_top_level_insert_returning() {
+    let db = setup();
+    let s = db
+        .analyze("INSERT INTO users (name, email) VALUES ($p1, $p2) RETURNING id")
+        .unwrap();
+    assert!(!s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_top_level_delete_returning() {
+    let db = setup();
+    let s = db
+        .analyze("DELETE FROM users WHERE id = $p1 RETURNING id")
+        .unwrap();
+    assert!(!s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_with_update_cte_select_body() {
+    let db = setup();
+    // The bug case: top-level SELECT looks wrappable, but the CTE contains
+    // an UPDATE — PG only accepts data-modifying CTEs at the top level.
+    let s = db
+        .analyze(
+            "WITH bumped AS ( \
+                 UPDATE users SET age = age + 1 \
+                 WHERE id = $p1 \
+                 RETURNING id, age \
+             ) \
+             SELECT b.id, b.age, u.email \
+             FROM bumped b JOIN users u ON u.id = b.id",
+        )
+        .unwrap();
+    assert!(!s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_with_insert_cte_select_body() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH ins AS ( \
+                 INSERT INTO users (name, email) VALUES ($p1, $p2) \
+                 RETURNING id \
+             ) \
+             SELECT id FROM ins",
+        )
+        .unwrap();
+    assert!(!s.can_run_as_subquery);
+}
+
+#[test]
+fn can_run_as_subquery_with_delete_cte_select_body() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH gone AS ( \
+                 DELETE FROM comments WHERE rating < $p1 \
+                 RETURNING id, post_id \
+             ) \
+             SELECT id FROM gone",
+        )
+        .unwrap();
+    assert!(!s.can_run_as_subquery);
+}

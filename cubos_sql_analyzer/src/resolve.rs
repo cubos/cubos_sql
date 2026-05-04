@@ -72,29 +72,6 @@ pub struct AnalyzedSpread {
     pub fields: Vec<AnalyzedSpreadField>,
 }
 
-/// Top-level command kind, after stripping any leading `WITH` clause. Useful
-/// for code generators that need to know whether a query is row-producing
-/// (`SELECT`) or a data-modifying statement (`INSERT`/`UPDATE`/`DELETE`/
-/// `MERGE`) — e.g. to decide whether wrapping it in a `SELECT * FROM (…)`
-/// subquery is even legal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopLevelKind {
-    /// Plain `SELECT`, `VALUES`, `TABLE foo`, or `WITH … SELECT/VALUES`. All
-    /// of these parse as `SelectStmt` in `pg_query`.
-    Select,
-    /// `INSERT … [RETURNING …]`, possibly preceded by `WITH …`.
-    Insert,
-    /// `UPDATE … [RETURNING …]`, possibly preceded by `WITH …`.
-    Update,
-    /// `DELETE … [RETURNING …]`, possibly preceded by `WITH …`.
-    Delete,
-    /// `MERGE …`, possibly preceded by `WITH …`.
-    Merge,
-    /// Anything else the analyzer accepts (e.g. `EXPLAIN`, `NOTIFY`,
-    /// `LISTEN`, `UNLISTEN`).
-    Other,
-}
-
 /// The full result of analyzing a SQL query template.
 #[derive(Debug, Clone)]
 pub struct AnalyzedQuery {
@@ -105,11 +82,13 @@ pub struct AnalyzedQuery {
     pub params: Vec<AnalyzedParam>,
     pub spreads: Vec<AnalyzedSpread>,
     pub columns: Vec<AnalyzedColumn>,
-    /// Kind of the top-level statement. Used by code generators that wrap the
-    /// query in a subquery — only `Select` is safe to wrap; CTE-DML statements
-    /// like `WITH x AS (UPDATE … RETURNING) INSERT …` are invalid as a
-    /// subquery body and must be sent to PG as-is.
-    pub top_level_kind: TopLevelKind,
+    /// True when the query is safe to embed as the body of a subquery
+    /// (`SELECT * FROM (<query>) …`). False for top-level
+    /// `INSERT`/`UPDATE`/`DELETE`/`MERGE`, for utility statements like
+    /// `EXPLAIN`/`NOTIFY`/`LISTEN`/`UNLISTEN`, and for `WITH …
+    /// (INSERT/UPDATE/DELETE/MERGE …) SELECT …` — PG only accepts a
+    /// data-modifying CTE at the top level, not nested in a subquery.
+    pub can_run_as_subquery: bool,
 }
 
 /// Build a "sample" SQL for analysis when the query contains spreads.
@@ -148,7 +127,7 @@ pub(crate) fn fuse(
     lex_output: LexOutput,
     columns: Vec<AnalyzedColumn>,
     info_params: Vec<ParamInfo>,
-    top_level_kind: TopLevelKind,
+    can_run_as_subquery: bool,
 ) -> AnalyzedQuery {
     let LexOutput {
         sql,
@@ -199,7 +178,7 @@ pub(crate) fn fuse(
         params,
         spreads,
         columns,
-        top_level_kind,
+        can_run_as_subquery,
     }
 }
 
@@ -208,7 +187,8 @@ pub(crate) fn fuse(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Parse `sql` with `pg_query`, walk the AST, and produce the resolved output
-/// columns, parameter type information, and the top-level statement kind.
+/// columns, parameter type information, and the subquery-wrap eligibility
+/// flag.
 ///
 /// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
 /// 1-based positional parameter index minus one.
@@ -216,7 +196,7 @@ pub(crate) fn analyze_static(
     snapshot: &PgCatalog,
     sql: &str,
     param_nullability: &[Option<bool>],
-) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, TopLevelKind), AnalyzeError> {
+) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, bool), AnalyzeError> {
     let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(e.to_string()))?;
 
     let stmt = parsed
@@ -227,7 +207,7 @@ pub(crate) fn analyze_static(
         .and_then(|n| n.node.as_ref())
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
-    let kind = top_level_kind_of(stmt);
+    let can_run_as_subquery = can_run_as_subquery(stmt);
     let (raw_columns, raw_params) = analyze_raw_node(snapshot, stmt, param_nullability)?;
 
     let columns = raw_columns
@@ -250,19 +230,39 @@ pub(crate) fn analyze_static(
         .map(|(_, type_oid, nullable)| build_param_info(type_oid, nullable, snapshot))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok((columns, params_info, kind))
+    Ok((columns, params_info, can_run_as_subquery))
 }
 
-/// Map a parsed top-level AST node to the public [`TopLevelKind`] enum.
-fn top_level_kind_of(stmt: &node::Node) -> TopLevelKind {
-    match stmt {
-        node::Node::SelectStmt(_) => TopLevelKind::Select,
-        node::Node::InsertStmt(_) => TopLevelKind::Insert,
-        node::Node::UpdateStmt(_) => TopLevelKind::Update,
-        node::Node::DeleteStmt(_) => TopLevelKind::Delete,
-        node::Node::MergeStmt(_) => TopLevelKind::Merge,
-        _ => TopLevelKind::Other,
-    }
+/// True when `stmt` can appear as the body of a `SELECT * FROM (<stmt>) …`
+/// subquery. False for top-level DML (`INSERT`/`UPDATE`/`DELETE`/`MERGE`),
+/// utility statements (`EXPLAIN`/`NOTIFY`/`LISTEN`/`UNLISTEN`), and
+/// `WITH … (DML …) SELECT …` — PG only allows a data-modifying CTE at the
+/// top level, not nested inside a subquery (`E0A000`).
+///
+/// CTEs nested deeper than the top-level `WITH` don't need to be inspected:
+/// PG already rejects `WITH (DML)` outside the top level, so any query that
+/// reaches the analyzer has its DML-CTEs (if any) attached to the root node.
+fn can_run_as_subquery(stmt: &node::Node) -> bool {
+    let node::Node::SelectStmt(sel) = stmt else {
+        return false;
+    };
+    let Some(with) = &sel.with_clause else {
+        return true;
+    };
+    !with.ctes.iter().any(|cte_node| {
+        let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() else {
+            return false;
+        };
+        matches!(
+            cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+            Some(
+                node::Node::InsertStmt(_)
+                    | node::Node::UpdateStmt(_)
+                    | node::Node::DeleteStmt(_)
+                    | node::Node::MergeStmt(_)
+            )
+        )
+    })
 }
 
 /// A positional parameter slot: `(position, type_oid, nullable)`. Shared by

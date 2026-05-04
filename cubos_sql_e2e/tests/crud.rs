@@ -125,6 +125,55 @@ async fn cte_dml_insert_with_fetch_one() {
 }
 
 #[tokio::test]
+async fn cte_dml_select_with_fetch_optional() {
+    // Regression: top-level `WITH (UPDATE … RETURNING) SELECT … JOIN …`. The
+    // outer node is a SelectStmt, so a previous version of the codegen treated
+    // it as wrappable and emitted `SELECT * FROM (<query>) LIMIT 2` for
+    // `fetch_optional` — which PG rejects with `E0A000: WITH clause containing
+    // a data-modifying statement must be at the top level`. The analyzer's
+    // `can_run_as_subquery` flag now catches the DML-CTE and the codegen sends
+    // the query unwrapped.
+    let pool = common::setup().await;
+
+    let owner_email = "fred-crud@example.com";
+    let owner = sql!(
+        &pool,
+        "INSERT INTO users (name, email, age) VALUES ('Fred', $owner_email, 25) RETURNING id"
+    )
+    .fetch_one()
+    .await
+    .expect("insert user");
+
+    let owner_id = owner.id;
+    let post = sql!(
+        &pool,
+        "INSERT INTO posts (user_id, title, body) VALUES ($owner_id, 'Hi', 'before') RETURNING id"
+    )
+    .fetch_one()
+    .await
+    .expect("insert post");
+
+    let post_id = post.id;
+    let new_body = "after";
+    let row = sql!(
+        &pool,
+        "WITH bumped AS ( \
+             UPDATE posts SET body = $new_body WHERE id = $post_id RETURNING id, user_id, body \
+         ) \
+         SELECT b.id, b.body, u.email \
+         FROM bumped b JOIN users u ON u.id = b.user_id"
+    )
+    .fetch_optional()
+    .await
+    .expect("cte-dml select");
+
+    let row = row.expect("row present");
+    assert_eq!(row.id, post_id);
+    assert_eq!(row.body, Some("after".to_string()));
+    assert_eq!(row.email, "fred-crud@example.com");
+}
+
+#[tokio::test]
 async fn fetch_all_returns_multiple_rows() {
     let pool = common::setup().await;
 

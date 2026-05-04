@@ -8,8 +8,7 @@ use quote::{format_ident, quote};
 use syn::parse_str;
 
 use cubos_sql_analyzer::{
-    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, TopLevelKind,
-    Type,
+    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, Type,
 };
 use cubos_sql_core::config::ResolvedConfig;
 
@@ -52,24 +51,17 @@ fn make_field_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
-/// If the SQL is a row-producing `SELECT`, wrap it in a subquery with
-/// `LIMIT 2` so that `fetch_one` / `fetch_optional` can detect
-/// more-than-one-row without fetching the entire result set.
+/// Wrap the SQL in a `SELECT * FROM (<sql>) AS __cubos_sql_limit LIMIT 2`
+/// subquery so that `fetch_one` / `fetch_optional` can detect more-than-one-
+/// row without fetching the entire result set.
 ///
-/// Wrapping is only legal for top-level `SELECT` (which in `pg_query` covers
-/// `SELECT`, `VALUES`, `TABLE foo`, and `WITH … SELECT`). Top-level
-/// `INSERT`/`UPDATE`/`DELETE`/`MERGE` — even with `RETURNING` and even when
-/// preceded by a `WITH` clause — cannot appear as the body of a subquery, so
-/// for those we leave the SQL unwrapped and let the runtime materialize all
-/// returned rows before the row-count check.
-fn wrap_with_limit(sql: &str, kind: TopLevelKind) -> Option<String> {
-    if matches!(kind, TopLevelKind::Select) {
-        Some(format!(
-            "SELECT * FROM ({sql}) AS __cubos_sql_limit LIMIT 2"
-        ))
-    } else {
-        None
-    }
+/// Only safe when [`AnalyzedQuery::can_run_as_subquery`] is true. PG rejects
+/// the wrap for top-level DML (`INSERT`/`UPDATE`/`DELETE`/`MERGE`, with or
+/// without `RETURNING`), utility statements (`EXPLAIN`/`NOTIFY`/…), and
+/// `WITH … (DML …) SELECT …` — for those we send the SQL unwrapped and
+/// let the runtime materialize all returned rows before the row-count check.
+fn wrap_with_limit(sql: &str, can_run_as_subquery: bool) -> Option<String> {
+    can_run_as_subquery.then(|| format!("SELECT * FROM ({sql}) AS __cubos_sql_limit LIMIT 2"))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +341,7 @@ fn generate_regular(
 
     let sql_str = cast_params(analyzed);
     let sql_limited =
-        wrap_with_limit(&sql_str, analyzed.top_level_kind).unwrap_or_else(|| sql_str.clone());
+        wrap_with_limit(&sql_str, analyzed.can_run_as_subquery).unwrap_or_else(|| sql_str.clone());
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config)?;
 
