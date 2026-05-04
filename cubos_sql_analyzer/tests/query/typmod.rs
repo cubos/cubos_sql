@@ -220,19 +220,25 @@ fn alter_column_type_to_vector_with_dim() {
 
 #[test]
 fn update_varchar_too_long_rejected() {
+    // Compile-time guard — PG only catches the overflow at runtime, so
+    // pglite's `prepare` accepts. Opt out of the mirror.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL);")
         .unwrap();
     assert_analyze_err!(
         db.analyze("UPDATE t SET slug = 'toolong'"),
         AnalyzeError::Invalid(_),
-        "too long for type character varying",
+        "value too long for type character varying(3)",
     );
 }
 
 #[test]
 fn update_numeric_overflow_rejected() {
+    // Compile-time guard: PG only catches numeric overflow at execution
+    // time, so pglite's `prepare` doesn't see it. Opt out of the mirror.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
     assert_analyze_err!(

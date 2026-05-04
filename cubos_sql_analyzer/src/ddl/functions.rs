@@ -143,17 +143,35 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         })
         .unwrap_or(crate::pg_catalog::ProVolatile::Volatile);
 
-    // Check for an existing entry with the same (signature, kind).
+    // Check for an existing pg_proc row with the same (name, args) — PG
+    // shares the function/procedure/aggregate namespace, so a duplicate
+    // signature collides regardless of prokind. CREATE OR REPLACE only
+    // overrides when the *kind* matches; otherwise it's still a hard
+    // duplicate (SQLSTATE 42723).
     let key = (nsoid, name.clone());
     if let Some(oids) = interp.proc_by_qname.get(&key).cloned() {
         let conflict = oids.iter().find(|&&oid| {
-            interp.pg_proc.get(&oid).is_some_and(|p| {
-                p.proargtypes == proargtypes
-                    && std::mem::discriminant(&p.prokind) == std::mem::discriminant(&prokind)
-            })
+            interp
+                .pg_proc
+                .get(&oid)
+                .is_some_and(|p| p.proargtypes == proargtypes)
         });
         if let Some(&conflict_oid) = conflict {
-            if stmt.replace {
+            let same_kind = interp.pg_proc.get(&conflict_oid).is_some_and(|p| {
+                std::mem::discriminant(&p.prokind) == std::mem::discriminant(&prokind)
+            });
+            if stmt.replace && same_kind {
+                // PG: `cannot change return type of existing function`
+                // (SQLSTATE 42P13). CREATE OR REPLACE FUNCTION must keep
+                // the same return type as the existing function — only the
+                // body can change.
+                if let Some(existing) = interp.pg_proc.get(&conflict_oid)
+                    && existing.prorettype != prorettype
+                {
+                    return Err(DdlError::DuplicateObject(
+                        "cannot change return type of existing function".into(),
+                    ));
+                }
                 interp.remove_pg_proc(conflict_oid);
             } else {
                 let kind = if matches!(prokind, ProKind::Procedure) {

@@ -83,7 +83,7 @@ fn in_subquery_with_wrong_arity_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE id IN (SELECT id, name FROM users)"),
         AnalyzeError::Invalid(_),
-        "subquery has 2 columns, lhs has 1",
+        "subquery has too many columns",
     );
 }
 
@@ -375,7 +375,7 @@ fn multi_column_in_subquery_arity_mismatch_rejected() {
              WHERE (post_id, author_name) IN (SELECT id FROM posts)"
         ),
         AnalyzeError::Invalid(_),
-        "",
+        "subquery has too few columns",
     );
 }
 

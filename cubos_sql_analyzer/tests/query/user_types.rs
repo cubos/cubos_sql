@@ -67,8 +67,11 @@ fn star_expr_not_null_because_row_is_always_present() {
 
 #[test]
 fn star_expr_on_cte_is_unsupported() {
-    let db = setup();
-    // CTE rows don't have a registered composite type — analyzer errors.
+    // CTE rows don't have a registered composite type — the analyzer can't
+    // resolve `u.*` to a typed shape so it errors. Real PG accepts because
+    // it composes the row type at planning time. Opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let sql = "WITH u AS (SELECT id, name FROM users) \
                SELECT row_to_json(u.*) FROM u";
     assert_analyze_err!(
@@ -431,13 +434,16 @@ fn domain_not_null_propagates_to_column_nullability() {
 
 #[test]
 fn insert_null_into_nn_domain_column_is_rejected() {
+    // PG only catches the domain-not-null violation at runtime; the
+    // analyzer catches it at compile time. PG sanity's `prepare` doesn't
+    // reach runtime, so opt out of the mirror.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",
     )
     .unwrap();
-    // PG: `domain nn_int does not allow null values`.
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, x) VALUES ($p1, NULL)"),
         AnalyzeError::Invalid(_),
@@ -447,7 +453,9 @@ fn insert_null_into_nn_domain_column_is_rejected() {
 
 #[test]
 fn update_null_into_nn_domain_column_is_rejected() {
+    // Same compile-time-only check as the INSERT case above.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",

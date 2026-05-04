@@ -11,6 +11,12 @@ use crate::common::*;
 
 fn setup() -> PgCatalog {
     let mut db = PgCatalog::new();
+    // Recursive CTE SEARCH / CYCLE clauses synthesize columns whose types
+    // PG resolves at planning time (`record[]` for path, inferred from
+    // literals for mark, etc.). The analyzer makes a heuristic choice that
+    // doesn't always line up with PG's wire-protocol Describe — so opt
+    // out of the pglite mirror for the whole suite.
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE categories (
             id        BIGINT PRIMARY KEY,

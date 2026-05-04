@@ -18,7 +18,7 @@ pub enum AnalyzeError {
     Lex(String),
 
     /// The SQL could not be parsed.
-    #[error("SQL parse error: {0}")]
+    #[error("{0}")]
     Parse(String),
 
     /// A table or view referenced in the query was not found in the schema
@@ -65,7 +65,7 @@ pub enum AnalyzeError {
     },
 
     /// The analyzer encountered an AST node or SQL feature it does not yet support.
-    #[error("unsupported SQL feature: {0}")]
+    #[error("{0}")]
     Unsupported(String),
 
     /// The query violates PostgreSQL's placement rules for a construct
@@ -73,7 +73,10 @@ pub enum AnalyzeError {
     /// INSERT/SELECT arity mismatch, etc.). Maps to a mix of PG SQLSTATEs —
     /// primarily `grouping_error` (42803) and `syntax_error` (42601) — that we
     /// don't yet split further.
-    #[error("invalid SQL: {0}")]
+    ///
+    /// Display emits the payload verbatim (no `"invalid SQL: "` prefix) so
+    /// the `pglite_sanity` mirror can match it against PG's wording.
+    #[error("{0}")]
     Invalid(String),
 
     /// The parser reported a JOIN kind the analyzer does not recognize.

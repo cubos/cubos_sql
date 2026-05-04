@@ -44,6 +44,8 @@ mod oid;
 mod param;
 mod param_collector;
 mod pg_catalog;
+#[cfg(feature = "pg_sanity")]
+mod pg_sanity;
 mod resolve;
 mod scope;
 mod seed;

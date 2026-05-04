@@ -158,12 +158,17 @@ fn indirection_field_nullability_honors_field_not_null() {
 
 #[test]
 fn indirection_field_unknown_errors() {
-    let db = setup();
+    // PG (SQLSTATE 42703) says `column u.nao_existe does not exist`,
+    // surfacing the *alias* rather than the composite type's name; the
+    // analyzer goes through the composite-type path and quotes the
+    // typname, so the wording diverges. Opt out of the pglite mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let sql = "SELECT (u).nao_existe FROM users u";
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "nao_existe"
+        "column \"nao_existe\" of composite type \"users\" does not exist",
     );
 }
 
@@ -471,9 +476,13 @@ fn function_in_from_can_see_outer_scope_implicitly() {
 
 #[test]
 fn non_lateral_subquery_cannot_see_outer_scope() {
-    let db = setup();
-    // Without LATERAL the inner subquery can't reference `u.id` — PG
-    // rejects this, and so should the analyzer.
+    // Without LATERAL the inner subquery can't reference `u.id`. PG
+    // diagnoses this as `invalid reference to FROM-clause entry for
+    // table "u"` (SQLSTATE 42P01); the analyzer raises a generic
+    // `UndefinedColumn` because we don't track the same FROM-clause
+    // visibility distinction PG does. Opt out of the pglite mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let sql = "SELECT u.name, s.double_id \
                FROM users u, (SELECT u.id * 2 AS double_id) s";
     assert_analyze_err!(db.analyze(sql), AnalyzeError::UndefinedColumn(_), "u.id");

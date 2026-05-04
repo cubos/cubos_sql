@@ -96,14 +96,17 @@ fn immutable_function_in_index_expression_is_accepted() {
 
 #[test]
 fn on_conflict_against_partial_unique_index_should_error() {
+    // PG rejects ON CONFLICT on a partial-index column at planning time
+    // (`there is no unique or exclusion constraint matching the ON CONFLICT
+    // specification`). PG sanity's wire-level `prepare` skips planning, so the
+    // sanity mirror can't see this — opt out and rely on the analyzer.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL, deleted_at TIMESTAMPTZ);
          CREATE UNIQUE INDEX t_slug_live ON t (slug) WHERE deleted_at IS NULL;",
     )
     .unwrap();
-    // PG: `there is no unique or exclusion constraint matching the ON
-    // CONFLICT specification` (the partial index doesn't qualify).
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
@@ -133,8 +136,10 @@ fn on_conflict_against_full_unique_index_is_accepted() {
 
 #[test]
 fn unique_index_does_not_match_against_distinct_columns() {
-    // The unique covers `(a, b)`, not `(a)` alone.
+    // The unique covers `(a, b)`, not `(a)` alone — same opt-out reason as
+    // above (planner-only check, invisible to PG sanity's `prepare`).
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL);
          CREATE UNIQUE INDEX t_ab ON t (a, b);",
@@ -155,7 +160,13 @@ fn expression_unique_index_does_not_match_column_on_conflict() {
     // PG: ON CONFLICT (lower(slug)) needs an expression-based unique
     // index. We don't model that, so the test just confirms a column
     // ON CONFLICT against a func-only unique index isn't matched.
+    //
+    // Real PG rejects this at planning time, but `pglite-socket`'s
+    // wire-level `prepare` skips planning, so the sanity check can't see
+    // it. Disable the mirror — our analyzer is still the load-bearing
+    // check at compile time.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL);
          CREATE UNIQUE INDEX t_slug_lower ON t ((lower(slug)));",
@@ -385,21 +396,24 @@ fn alter_table_drop_constraint_removes_backing_index() {
 }
 
 #[test]
-fn drop_column_referenced_by_index_fails_without_cascade() {
-    // PG: `cannot drop column ... because index ... depends on it`. The
-    // analyzer mirrors the protection so a stand-alone CREATE INDEX is
-    // honored just like a UNIQUE constraint would be.
-    assert_ddl_err!(
-        try_apply(&[
-            (
-                "0001.sql",
-                "CREATE TABLE t (id INT NOT NULL, slug TEXT NOT NULL);
-                 CREATE INDEX t_slug_idx ON t (slug);",
-            ),
-            ("0002.sql", "ALTER TABLE t DROP COLUMN slug;"),
-        ]),
-        DdlError::DependencyError(_),
-        "depend",
+fn drop_column_referenced_by_index_drops_index_silently() {
+    // PG only blocks DROP COLUMN on *external* dependencies (FKs in other
+    // tables, views). Indexes that exist purely on this column piggyback on
+    // the column drop — they're removed silently along with the column,
+    // CASCADE not required.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id INT NOT NULL, slug TEXT NOT NULL);
+             CREATE INDEX t_slug_idx ON t (slug);",
+        ),
+        ("0002.sql", "ALTER TABLE t DROP COLUMN slug;"),
+    ]);
+
+    let table = snap.resolve_table(None, "t").unwrap();
+    assert!(
+        snap.pg_index_values().all(|i| i.indrelid != table.oid),
+        "index on dropped column should be removed silently",
     );
 }
 
@@ -432,7 +446,9 @@ fn on_conflict_user_column_not_polluted_by_catalog_indexes() {
     // `oid` is indexed across pg_catalog (`pg_class_oid_index`,
     // `pg_proc_oid_index`, …). A user table with an `oid` column should
     // still need its OWN unique constraint to participate in ON CONFLICT.
+    // PG sanity's `prepare` skips planning, so opt out of the sanity mirror.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE my_objs (oid BIGINT NOT NULL, name TEXT NOT NULL);")
         .unwrap();
     assert_analyze_err!(

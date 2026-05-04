@@ -3,7 +3,7 @@
 use pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 
 use super::DdlError;
-use super::util::{extract_names, node_string, resolve_type_name};
+use super::util::{extract_names, format_type_for_message, node_string, resolve_type_name};
 use super::views;
 use crate::oid::{PgCastOid, PgClassOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
@@ -77,13 +77,27 @@ fn drop_relation(
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+        return Err(DdlError::TableNotFound(format!(
+            "table \"{name}\" does not exist"
+        )));
     };
     let Some(class_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied() else {
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+        return Err(DdlError::TableNotFound(format!(
+            "table \"{name}\" does not exist"
+        )));
+    };
+
+    // PG renders DROP errors in terms of the relation's kind (table, view,
+    // materialized view, sequence). Pick the right keyword so the message
+    // prefix lines up with PG's wire-protocol error.
+    let kind = match interp.pg_class.get(&class_oid).map(|c| c.relkind) {
+        Some(RelKind::View) => "view",
+        Some(RelKind::MaterializedView) => "materialized view",
+        Some(RelKind::Sequence) => "sequence",
+        _ => "table",
     };
 
     let dependent_views = views::find_dependent_views(interp, class_oid);
@@ -97,7 +111,8 @@ fn drop_relation(
             })
             .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {schema}.{name} because view(s) {} depend on it",
+            "cannot drop {kind} {name} because other objects depend on it \
+             (view(s) {} depend on this)",
             view_names.join(", "),
         )));
     }
@@ -124,7 +139,8 @@ fn drop_relation(
             .map(|(c, owner)| format!("{} on {}", c.conname, owner))
             .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {schema}.{name} because foreign key constraint(s) {} depend on it",
+            "cannot drop {kind} {name} because other objects depend on it \
+             (foreign key constraint(s) {} depend on this)",
             labels.join(", "),
         )));
     }
@@ -203,7 +219,7 @@ fn drop_index(
             return Ok(());
         }
         return Err(DdlError::DependencyError(format!(
-            "index \"{schema}.{name}\" does not exist"
+            "index \"{name}\" does not exist"
         )));
     };
     let Some(class_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied() else {
@@ -211,17 +227,17 @@ fn drop_index(
             return Ok(());
         }
         return Err(DdlError::DependencyError(format!(
-            "index \"{schema}.{name}\" does not exist"
+            "index \"{name}\" does not exist"
         )));
     };
 
-    // Reject if the resolved relation isn't an index — PG: "X is not an index".
+    // Reject if the resolved relation isn't an index — PG: `"X" is not an index`.
     if !matches!(
         interp.pg_class.get(&class_oid).map(|c| c.relkind),
         Some(RelKind::Index)
     ) {
         return Err(DdlError::DependencyError(format!(
-            "\"{schema}.{name}\" is not an index"
+            "\"{name}\" is not an index"
         )));
     }
 
@@ -294,7 +310,8 @@ fn drop_type(
             })
             .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop type {schema}.{name} because table(s) {} depend on it",
+            "cannot drop type {name} because other objects depend on it \
+             (table(s) {} depend on this type)",
             dep_names.join(", "),
         )));
     }
@@ -307,7 +324,8 @@ fn drop_type(
     if !dependent_views.is_empty() && !cascade {
         let view_names = format_view_list(interp, &dependent_views);
         return Err(DdlError::DependencyError(format!(
-            "cannot drop type {schema}.{name} because view(s) {view_names} depend on it",
+            "cannot drop type {name} because other objects depend on it \
+             (view(s) {view_names} depend on this type)",
         )));
     }
 
@@ -443,6 +461,7 @@ fn drop_function(
         .collect();
 
     let want_procedure = expected_kind == ObjectType::ObjectProcedure;
+    let arg_oids_for_match = arg_oids.clone();
     let matches_overload = move |p: &PgProc| -> bool {
         let kind_ok = matches!(
             (p.prokind, want_procedure),
@@ -454,7 +473,7 @@ fn drop_function(
         if owa.objargs.is_empty() && owa.args_unspecified {
             true
         } else {
-            p.proargtypes == arg_oids
+            p.proargtypes == arg_oids_for_match
         }
     };
 
@@ -481,7 +500,9 @@ fn drop_function(
                 "function"
             };
             return Err(DdlError::DependencyError(format!(
-                "cannot drop {kind} {name} because view(s) {view_names} depend on it",
+                "cannot drop {kind} {name}({}) because other objects depend on it \
+                 (view(s) {view_names} depend on this {kind})",
+                format_arg_oids(&arg_oids, interp),
             )));
         }
         if !dependent_views.is_empty() {
@@ -592,9 +613,14 @@ fn drop_aggregate(
     if let Some(oid) = target {
         let dependent_views = views::find_views_depending_on_function(interp, oid);
         if !dependent_views.is_empty() && !cascade {
+            // PG renders aggregate-with-deps errors using "function"
+            // wording (aggregates live in `pg_proc` like ordinary functions
+            // for dependency-tracking purposes).
             let view_names = format_view_list(interp, &dependent_views);
             return Err(DdlError::DependencyError(format!(
-                "cannot drop aggregate {name} because view(s) {view_names} depend on it",
+                "cannot drop function {name}({}) because other objects depend on it \
+                 (view(s) {view_names} depend on this aggregate)",
+                format_arg_oids(&arg_oids, interp),
             )));
         }
         if !dependent_views.is_empty() {
@@ -640,8 +666,12 @@ fn drop_operator(
     let target = find_operator(interp, schema_opt.as_deref(), &op_name, &matches);
 
     if target.is_none() && !missing_ok {
+        let left_name = left_oid
+            .map(|oid| format_type_for_message(interp, oid))
+            .unwrap_or_else(|| "NONE".to_string());
+        let right_name = format_type_for_message(interp, right_oid);
         return Err(DdlError::DependencyError(format!(
-            "operator {op_name} does not exist for the requested operand types"
+            "operator does not exist: {left_name} {op_name} {right_name}"
         )));
     }
 
@@ -745,9 +775,9 @@ fn drop_cast(
     let cast_oid = interp.cast_by_pair.get(&(src, tgt)).copied();
     if cast_oid.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
-            "cast from OID {} to OID {} does not exist",
-            src.get(),
-            tgt.get(),
+            "cast from type {} to type {} does not exist",
+            format_type_for_message(interp, src),
+            format_type_for_message(interp, tgt),
         )));
     }
     if let Some(oid) = cast_oid {
@@ -758,15 +788,12 @@ fn drop_cast(
     Ok(())
 }
 
-/// Format a list of argument OIDs as PG type names for error messages.
+/// Format a list of argument OIDs as PG-aligned user-facing type names for
+/// error messages — `int2 → smallint`, `int4 → integer`, etc. — so error
+/// strings line up with PG's wire-protocol output.
 fn format_arg_oids(oids: &[PgTypeOid], snapshot: &PgCatalog) -> String {
     oids.iter()
-        .map(|oid| {
-            snapshot
-                .get_type(*oid)
-                .map(|t| t.typname.clone())
-                .unwrap_or_else(|| format!("oid:{}", oid.get()))
-        })
+        .map(|oid| format_type_for_message(snapshot, *oid))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -798,7 +825,7 @@ fn drop_schema(
 
     if has_objects && !cascade {
         return Err(DdlError::DependencyError(format!(
-            "cannot drop schema \"{name}\" because other objects depend on it"
+            "cannot drop schema {name} because other objects depend on it"
         )));
     }
 

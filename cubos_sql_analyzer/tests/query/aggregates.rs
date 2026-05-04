@@ -334,10 +334,12 @@ fn nested_aggregate_rejected() {
 #[test]
 fn window_function_in_aggregate_argument_rejected() {
     let db = setup();
-    // PG: `window functions are not allowed in aggregate function arguments`.
+    // PG (SQLSTATE 42803): `aggregate function calls cannot contain window
+    // function calls`. Mirror PG's wording verbatim so the sanity check
+    // passes.
     assert_analyze_err!(
         db.analyze("SELECT SUM(ROW_NUMBER() OVER ()) FROM posts"),
         AnalyzeError::Invalid(_),
-        "window functions are not allowed inside aggregate arguments",
+        "aggregate function calls cannot contain window function calls",
     );
 }

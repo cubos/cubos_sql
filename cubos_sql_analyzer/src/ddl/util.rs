@@ -139,6 +139,43 @@ fn normalize_type_name(name: &str) -> &str {
     }
 }
 
+/// Render a type OID into PG's user-facing name for diagnostic messages —
+/// e.g. `int2` → `smallint`, `pg_catalog.int4` → `integer`. Mirrors PG's
+/// `format_type_be(oid)` for the SQL standard aliases. Used to align our
+/// error messages with PG's so the `pglite_sanity` cross-check passes.
+pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
+    let Some(t) = snapshot.pg_type.get(&oid) else {
+        return format!("oid={oid}");
+    };
+    // Built-ins that PG renames in user-facing output.
+    let aliased = match t.typname.as_str() {
+        "bool" => Some("boolean"),
+        "int2" => Some("smallint"),
+        "int4" => Some("integer"),
+        "int8" => Some("bigint"),
+        "float4" => Some("real"),
+        "float8" => Some("double precision"),
+        "bpchar" => Some("character"),
+        "varchar" => Some("character varying"),
+        "timestamp" => Some("timestamp without time zone"),
+        "timestamptz" => Some("timestamp with time zone"),
+        "time" => Some("time without time zone"),
+        "timetz" => Some("time with time zone"),
+        _ => None,
+    };
+    if let Some(name) = aliased {
+        return name.to_string();
+    }
+    // Non-aliased types: PG omits the `pg_catalog.` schema prefix for
+    // built-ins, but qualifies user types.
+    if let Some(ns) = snapshot.namespace_name(t.typnamespace)
+        && ns != "pg_catalog"
+    {
+        return format!("{ns}.{}", t.typname);
+    }
+    t.typname.clone()
+}
+
 /// Extract a string value from a Node.
 pub fn node_string(n: &Node) -> Option<&str> {
     match n.node.as_ref()? {

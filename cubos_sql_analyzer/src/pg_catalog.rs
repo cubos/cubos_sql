@@ -876,6 +876,32 @@ pub struct PgCatalog {
     /// Namespace OIDs in search order (analog of PG's `search_path` GUC).
     pub(crate) search_path: Vec<PgNamespaceOid>,
     pub(crate) next_oid: u32,
+
+    /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
+    /// cross-check `apply_sql` / `analyze` against a real PG protocol server.
+    /// `None` means the catalog was built from a non-default seed (via
+    /// [`PgCatalog::from_seed`]) where no synced live server is available.
+    /// The outer `Arc` lets `Clone` share one server across catalog clones —
+    /// only the macro caches a clone, and it never enables `pg_sanity`.
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) pg_sanity: Option<
+        std::sync::Arc<std::sync::OnceLock<std::sync::Mutex<crate::pg_sanity::PgSanityServer>>>,
+    >,
+
+    /// Set once any `CREATE/ALTER/DROP EXTENSION` statement has touched the
+    /// catalog. Our embedded extension SQL diverges from what PG sanity ships
+    /// natively, so once an extension is in play the sanity check skips
+    /// every later mirror call to avoid spurious panics.
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) pg_sanity_tainted: bool,
+
+    /// Per-catalog opt-out: tests that exercise behavior PG sanity can't
+    /// validate (e.g. ON CONFLICT planner-level checks that the wire-level
+    /// `prepare` doesn't reach) flip this on via [`PgCatalog::skip_pg_sanity`]
+    /// to silence the sanity check without giving up the compile-time
+    /// analyzer assertion.
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) pg_sanity_skip: bool,
 }
 
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
@@ -892,7 +918,19 @@ impl Default for PgCatalog {
 impl PgCatalog {
     /// Create a catalog seeded with the embedded PG18 snapshot.
     pub fn new() -> Self {
-        Self::from_seed(load_seed())
+        #[cfg(not(feature = "pg_sanity"))]
+        {
+            Self::from_seed(load_seed())
+        }
+        #[cfg(feature = "pg_sanity")]
+        {
+            // Only `new()` (default seed) gets a PG sanity mirror — `from_seed`
+            // with arbitrary seeds can't be reproduced on a fresh PG sanity
+            // instance.
+            let mut cat = Self::from_seed(load_seed());
+            cat.pg_sanity = Some(std::sync::Arc::new(std::sync::OnceLock::new()));
+            cat
+        }
     }
 
     /// Build a catalog from a serialized seed. `next_oid` is set to one past
@@ -1044,6 +1082,12 @@ impl PgCatalog {
             collation_by_qname: HashMap::new(),
             search_path: Vec::new(),
             next_oid: USER_OID_START,
+            #[cfg(feature = "pg_sanity")]
+            pg_sanity: None,
+            #[cfg(feature = "pg_sanity")]
+            pg_sanity_tainted: false,
+            #[cfg(feature = "pg_sanity")]
+            pg_sanity_skip: false,
         }
     }
 
@@ -1140,7 +1184,22 @@ impl PgCatalog {
 
     /// Parse and apply all DDL statements in `sql`, mutating the catalog.
     pub fn apply_sql(&mut self, sql: &str) -> Result<(), DdlError> {
-        apply_sql_to(self, sql)
+        let result = apply_sql_to(self, sql);
+        #[cfg(feature = "pg_sanity")]
+        {
+            if sql_touches_extension(sql) {
+                // PG sanity doesn't ship the same extension catalog as real PG
+                // (no uuid-ossp, etc.) — and even ones it does ship would
+                // need explicit `--extensions=...` wiring. Once an extension
+                // is in play, downstream tables/queries reference types
+                // PG sanity doesn't know about, so we taint the catalog and
+                // skip every later mirror call.
+                self.pg_sanity_tainted = true;
+            } else if !self.pg_sanity_tainted && !self.pg_sanity_skip {
+                self.run_pg_sanity_apply_check(sql, &result);
+            }
+        }
+        result
     }
 
     /// Parse `expr_sql` as a SELECT-list expression (`SELECT <expr>`),
@@ -1169,7 +1228,24 @@ impl PgCatalog {
     /// positional placeholders; infers parameter and output column types; and
     /// returns everything combined in an [`AnalyzedQuery`].
     pub fn analyze(&self, sql: &str) -> Result<AnalyzedQuery, AnalyzeError> {
-        let lex_output = lex(sql)?;
+        let (_analysis_sql, result) = self.analyze_with_sql(sql);
+
+        #[cfg(feature = "pg_sanity")]
+        if !self.pg_sanity_tainted && !self.pg_sanity_skip {
+            self.run_pg_sanity_analyze_check(&_analysis_sql, &result);
+        }
+
+        result
+    }
+
+    /// Inner analyze that also returns the rewritten SQL handed to the
+    /// static pass — used by [`Self::analyze`] to mirror the same string on
+    /// PG sanity under `pg_sanity`.
+    fn analyze_with_sql(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
+        let lex_output = match lex(sql) {
+            Ok(l) => l,
+            Err(e) => return (sql.to_string(), Err(e.into())),
+        };
 
         // Collect explicit nullability annotations from the lexer, ordered by
         // positional parameter index (regular params first, then spread fields).
@@ -1194,7 +1270,11 @@ impl PgCatalog {
             build_spread_sample_sql(&lex_output)
         };
 
-        let (columns, mut info_params) = analyze_static(self, &analysis_sql, &param_nullability)?;
+        let (columns, mut info_params) =
+            match analyze_static(self, &analysis_sql, &param_nullability) {
+                Ok(p) => p,
+                Err(e) => return (analysis_sql, Err(e)),
+            };
 
         // Invariant: the analyzer must produce exactly one param entry per
         // positional placeholder the lexer extracted. Surface a mismatch as
@@ -1206,12 +1286,15 @@ impl PgCatalog {
                 .map(|s| s.fields.as_ref().map(|f| f.len()).unwrap_or(0))
                 .sum::<usize>();
         if info_params.len() != expected_param_count {
-            return Err(AnalyzeError::Internal(format!(
-                "analyzer param count ({}) does not match lexer placeholder count ({}) \
-                 for SQL: {analysis_sql}",
-                info_params.len(),
-                expected_param_count,
-            )));
+            return (
+                analysis_sql.clone(),
+                Err(AnalyzeError::Internal(format!(
+                    "analyzer param count ({}) does not match lexer placeholder count ({}) \
+                     for SQL: {analysis_sql}",
+                    info_params.len(),
+                    expected_param_count,
+                ))),
+            );
         }
 
         // Merge explicit $foo? / $foo! annotations from the lexer on top of
@@ -1222,13 +1305,85 @@ impl PgCatalog {
             }
         }
 
-        Ok(fuse(lex_output, columns, info_params))
+        (analysis_sql, Ok(fuse(lex_output, columns, info_params)))
     }
 
     pub(crate) fn alloc_oid(&mut self) -> u32 {
         let oid = self.next_oid;
         self.next_oid += 1;
         oid
+    }
+
+    /// Disable the `pg_sanity` cross-check on this catalog instance for
+    /// the rest of its lifetime. Useful when the analyzer enforces a stricter
+    /// rule than what PG sanity's wire-level `prepare` validates — e.g. ON
+    /// CONFLICT target matching, which real PG rejects at planning time but
+    /// PG sanity's `prepare` skips. Without the feature this is a no-op so
+    /// callers can always invoke it without `#[cfg]`.
+    pub fn skip_pg_sanity(&mut self) {
+        #[cfg(feature = "pg_sanity")]
+        {
+            self.pg_sanity_skip = true;
+        }
+    }
+}
+
+// ─── PG sanity sanity check (feature-gated) ───────────────────────────────────
+
+/// Quick check: does `sql` contain any `CREATE/ALTER/DROP EXTENSION`
+/// statement? Used to skip the PG sanity mirror when the analyzer's embedded
+/// extension support diverges from what PG sanity ships natively. We parse via
+/// `pg_query` (cheap — `apply_sql_to` parses anyway) and inspect the AST so
+/// a column or identifier named `extension` doesn't cause a false skip.
+#[cfg(feature = "pg_sanity")]
+fn sql_touches_extension(sql: &str) -> bool {
+    use pg_query::protobuf::node;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    parsed.protobuf.stmts.iter().any(|raw| {
+        let Some(stmt) = raw.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+            return false;
+        };
+        match stmt {
+            node::Node::CreateExtensionStmt(_) | node::Node::AlterExtensionStmt(_) => true,
+            node::Node::DropStmt(d) => {
+                d.remove_type == pg_query::protobuf::ObjectType::ObjectExtension as i32
+            }
+            _ => false,
+        }
+    })
+}
+
+#[cfg(feature = "pg_sanity")]
+impl PgCatalog {
+    /// Lazily spawn the PG sanity mirror and run `f` against it. No-op if the
+    /// catalog was built via [`PgCatalog::from_seed`] (where there's no
+    /// reproducible live state).
+    fn with_pg_sanity<R>(
+        &self,
+        f: impl FnOnce(&mut crate::pg_sanity::PgSanityServer) -> R,
+    ) -> Option<R> {
+        let cell = self.pg_sanity.as_ref()?;
+        let mutex = cell.get_or_init(|| {
+            let server = crate::pg_sanity::PgSanityServer::spawn()
+                .unwrap_or_else(|e| panic!("pg_sanity: {e}"));
+            std::sync::Mutex::new(server)
+        });
+        let mut guard = mutex.lock().expect("pg_sanity: pg sanity mutex poisoned");
+        Some(f(&mut guard))
+    }
+
+    fn run_pg_sanity_apply_check(&self, sql: &str, result: &Result<(), DdlError>) {
+        self.with_pg_sanity::<()>(|server| server.assert_apply_matches(sql, result));
+    }
+
+    fn run_pg_sanity_analyze_check(
+        &self,
+        analysis_sql: &str,
+        result: &Result<AnalyzedQuery, AnalyzeError>,
+    ) {
+        self.with_pg_sanity::<()>(|server| server.assert_analyze_matches(analysis_sql, result));
     }
 }
 

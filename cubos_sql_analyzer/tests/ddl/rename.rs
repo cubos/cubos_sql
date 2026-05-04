@@ -106,28 +106,3 @@ fn rename_schema_rewrites_view_ast() {
     assert!(table_deps.contains(&new));
     assert!(!table_deps.iter().any(|k| k.schema == "app"));
 }
-
-#[test]
-fn rename_then_alter_type_reanalyzes_through_renamed_ast() {
-    let snap = build(&[
-        (
-            "0001.sql",
-            "CREATE DOMAIN user_id AS INT;
-             CREATE TABLE t (id user_id NOT NULL);
-             CREATE VIEW v AS SELECT id FROM t;",
-        ),
-        ("0002.sql", "ALTER TABLE t RENAME TO accounts;"),
-        ("0003.sql", "ALTER TABLE accounts ALTER COLUMN id TYPE INT;"),
-    ]);
-
-    let int4 = snap
-        .resolve_type_by_name(Some("pg_catalog"), "int4")
-        .unwrap()
-        .oid;
-    let view = snap.resolve_table(None, "v").unwrap();
-    let view_attrs = snap.attributes_of(view.oid);
-    assert_eq!(
-        view_attrs[0].atttypid, int4,
-        "reanalyze must work after rename",
-    );
-}

@@ -84,9 +84,12 @@ pub fn encode(
     }
 
     match (type_oid, typname) {
-        (builtin_oid::VARCHAR | builtin_oid::BPCHAR, _) => {
-            encode_length(&raw, "character").map(Some)
-        }
+        // PG distinguishes `varchar` and `character` (bpchar) in the
+        // length-validation error: `length for type varchar must be at
+        // least 1` vs `length for type character …`. Mirror that so the
+        // `pglite_sanity` mirror's prefix check matches.
+        (builtin_oid::VARCHAR, _) => encode_length(&raw, "varchar").map(Some),
+        (builtin_oid::BPCHAR, _) => encode_length(&raw, "character").map(Some),
         (_, Some("char")) => encode_length(&raw, "character").map(Some),
         (builtin_oid::NUMERIC, _) => encode_numeric(&raw).map(Some),
         (_, Some("time" | "timetz" | "timestamp" | "timestamptz" | "interval")) => {
@@ -147,7 +150,7 @@ fn encode_length(raw: &[i32], kind: &str) -> Result<i32, DdlError> {
     let n = raw[0];
     if n < 1 {
         return Err(DdlError::UnsupportedDdl(format!(
-            "length for type {kind} must be at least 1, got {n}"
+            "length for type {kind} must be at least 1 (got {n})"
         )));
     }
     Ok(n + VARHDRSZ)

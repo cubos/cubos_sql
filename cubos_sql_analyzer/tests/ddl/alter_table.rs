@@ -102,10 +102,14 @@ fn alter_table_alter_column_type() {
 }
 
 // ── ALTER COLUMN TYPE with dependent views ─────────────────────────────────
+//
+// PG (SQLSTATE 0A000) blocks `ALTER COLUMN TYPE` on any column referenced by a
+// view, even when the change would be binary-coercible. We mirror that — the
+// only safe migration is DROP VIEW → ALTER → CREATE VIEW.
 
 #[test]
-fn alter_column_type_binary_coercible_with_view_succeeds() {
-    let snap = build(&[
+fn alter_column_type_with_view_fails_even_when_binary_coercible() {
+    let result = try_apply(&[
         (
             "0001.sql",
             "CREATE DOMAIN user_id AS INT;
@@ -115,21 +119,20 @@ fn alter_column_type_binary_coercible_with_view_succeeds() {
         ("0002.sql", "ALTER TABLE t ALTER COLUMN id TYPE INT;"),
     ]);
 
-    let view = snap.resolve_table(None, "v").unwrap();
-    let view_attrs = snap.attributes_of(view.oid);
-    assert_eq!(view_attrs.len(), 1, "view must survive the ALTER");
-    let int4 = snap
-        .resolve_type_by_name(Some("pg_catalog"), "int4")
-        .unwrap()
-        .oid;
-    assert_eq!(
-        view_attrs[0].atttypid, int4,
-        "view column OID should be updated to the new base type",
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot alter type of a column used by a view or rule",
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("drop"),
+        "error should hint at drop-and-recreate: {err}",
     );
 }
 
 #[test]
-fn alter_column_type_non_binary_coercible_with_view_fails_with_hint() {
+fn alter_column_type_with_view_fails_when_not_binary_coercible() {
     let result = try_apply(&[
         (
             "0001.sql",
@@ -139,35 +142,16 @@ fn alter_column_type_non_binary_coercible_with_view_fails_with_hint() {
         ("0002.sql", "ALTER TABLE t ALTER COLUMN amount TYPE BIGINT;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "binary coercible");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot alter type of a column used by a view or rule",
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("drop"),
         "error should hint at drop-and-recreate: {err}",
     );
-}
-
-// ── ALTER COLUMN TYPE triggers view AST reanalyze ──────────────────────────
-
-#[test]
-fn alter_column_type_reanalyzes_view_column_oid() {
-    let snap = build(&[
-        (
-            "0001.sql",
-            "CREATE DOMAIN user_id AS INT;
-             CREATE TABLE t (id user_id NOT NULL);
-             CREATE VIEW v AS SELECT id FROM t;",
-        ),
-        ("0002.sql", "ALTER TABLE t ALTER COLUMN id TYPE INT;"),
-    ]);
-
-    let int4 = snap
-        .resolve_type_by_name(Some("pg_catalog"), "int4")
-        .unwrap()
-        .oid;
-    let view = snap.resolve_table(None, "v").unwrap();
-    let view_attrs = snap.attributes_of(view.oid);
-    assert_eq!(view_attrs[0].atttypid, int4);
 }
 
 // ── ADD COLUMN and IF NOT EXISTS ──────────────────────────────────────────
@@ -307,24 +291,4 @@ fn alter_column_type_on_nonexistent_column_errors() {
     ]);
 
     assert_ddl_err!(result, DdlError::Parse(_), "does not exist");
-}
-
-#[test]
-fn alter_column_type_reanalyze_is_noop_for_legacy_view() {
-    // Simulate a legacy snapshot where the `_RETURN` rule was never
-    // populated: the ALTER path must still succeed (best-effort), not
-    // blow up.
-    let mut db = build_db(&[(
-        "0001.sql",
-        "CREATE DOMAIN user_id AS INT;
-         CREATE TABLE t (id user_id NOT NULL);
-         CREATE VIEW v AS SELECT id FROM t;",
-    )]);
-
-    // Clear the view's pg_rewrite._RETURN row to mimic a legacy snapshot.
-    let view_oid = db.resolve_table(None, "v").map(|c| c.oid).unwrap();
-    db.clear_view_body(view_oid);
-
-    db.apply_sql("ALTER TABLE t ALTER COLUMN id TYPE INT;")
-        .unwrap();
 }

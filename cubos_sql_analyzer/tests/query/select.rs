@@ -41,30 +41,41 @@ fn setup() -> PgCatalog {
 #[test]
 fn limit_bool_literal_rejected() {
     let db = setup();
-    assert_type_mismatch(&db, "SELECT id FROM users LIMIT true", "bool", "int8");
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users LIMIT true"),
+        AnalyzeError::Invalid(_),
+        "argument of LIMIT must be type bigint, not type boolean",
+    );
 }
 
 #[test]
 fn limit_text_column_rejected() {
     let db = setup();
-    assert_type_mismatch(&db, "SELECT id FROM users LIMIT name", "text", "int8");
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users LIMIT name"),
+        AnalyzeError::Invalid(_),
+        "argument of LIMIT must be type bigint, not type text",
+    );
 }
 
 #[test]
 fn limit_timestamptz_column_rejected() {
     let db = setup();
-    assert_type_mismatch(
-        &db,
-        "SELECT id FROM users LIMIT created_at",
-        "timestamptz",
-        "int8",
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users LIMIT created_at"),
+        AnalyzeError::Invalid(_),
+        "argument of LIMIT must be type bigint, not type timestamp with time zone",
     );
 }
 
 #[test]
 fn offset_bool_literal_rejected() {
     let db = setup();
-    assert_type_mismatch(&db, "SELECT id FROM users OFFSET false", "bool", "int8");
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users OFFSET false"),
+        AnalyzeError::Invalid(_),
+        "argument of OFFSET must be type bigint, not type boolean",
+    );
 }
 
 // ── Basic SELECT ─────────────────────────────────────────────────────────────

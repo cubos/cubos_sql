@@ -30,7 +30,7 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
             return Ok(());
         }
         return Err(DdlError::DuplicateObject(format!(
-            "collation \"{name}\" already exists"
+            "collation \"{name}\" for encoding \"UTF8\" already exists"
         )));
     }
 
@@ -66,7 +66,9 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
                 }
             };
             let source = interp.resolve_collation(schema, src_name).ok_or_else(|| {
-                DdlError::DependencyError(format!("collation \"{src_name}\" does not exist"))
+                DdlError::DependencyError(format!(
+                    "collation \"{src_name}\" for encoding \"UTF8\" does not exist"
+                ))
             })?;
             collencoding = source.collencoding;
         }

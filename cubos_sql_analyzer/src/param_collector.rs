@@ -7,7 +7,7 @@ use crate::oid::PgTypeOid;
 use crate::pg_catalog::oid;
 
 /// Collects type constraints for positional parameters ($1, $2, ...).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ParamCollector {
     /// Maps param number (1-based) → inferred type OID.
     constraints: HashMap<i32, PgTypeOid>,

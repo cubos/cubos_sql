@@ -22,29 +22,40 @@ fn setup() -> PgCatalog {
 #[test]
 fn where_int4_not_boolean() {
     let db = setup();
-    assert_type_mismatch(&db, "SELECT id FROM users WHERE 42", "int4", "bool");
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE 42"),
+        AnalyzeError::Invalid(_),
+        "argument of WHERE must be type boolean, not type integer",
+    );
 }
 
 #[test]
 fn where_text_column_not_boolean() {
     let db = setup();
-    assert_type_mismatch(&db, "SELECT id FROM users WHERE name", "text", "bool");
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE name"),
+        AnalyzeError::Invalid(_),
+        "argument of WHERE must be type boolean, not type text",
+    );
 }
 
 #[test]
 fn where_int8_column_not_boolean() {
     let db = setup();
-    assert_type_mismatch(&db, "SELECT name FROM users WHERE id", "int8", "bool");
+    assert_analyze_err!(
+        db.analyze("SELECT name FROM users WHERE id"),
+        AnalyzeError::Invalid(_),
+        "argument of WHERE must be type boolean, not type bigint",
+    );
 }
 
 #[test]
 fn where_timestamptz_column_not_boolean() {
     let db = setup();
-    assert_type_mismatch(
-        &db,
-        "SELECT id FROM users WHERE created_at",
-        "timestamptz",
-        "bool",
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE created_at"),
+        AnalyzeError::Invalid(_),
+        "argument of WHERE must be type boolean, not type timestamp with time zone",
     );
 }
 
@@ -276,7 +287,7 @@ fn text_eq_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name = id"),
         AnalyzeError::UndefinedOperator(_),
-        "operator = does not exist",
+        "operator does not exist:",
     );
 }
 
@@ -286,7 +297,7 @@ fn text_eq_int_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name = 42"),
         AnalyzeError::UndefinedOperator(_),
-        "operator = does not exist",
+        "operator does not exist:",
     );
 }
 
@@ -296,7 +307,7 @@ fn timestamptz_lt_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE created_at < 42"),
         AnalyzeError::UndefinedOperator(_),
-        "operator < does not exist",
+        "operator does not exist:",
     );
 }
 
@@ -308,7 +319,7 @@ fn int_like_text_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE id LIKE '%1%'"),
         AnalyzeError::UndefinedOperator(_),
-        "operator ~~ does not exist",
+        "operator does not exist:",
     );
 }
 
@@ -321,7 +332,7 @@ fn same_param_with_conflicting_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE age = $p1 AND name = $p1"),
         AnalyzeError::UndefinedOperator(_),
-        "operator = does not exist",
+        "operator does not exist:",
     );
 }
 

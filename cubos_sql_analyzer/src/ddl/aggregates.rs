@@ -99,6 +99,20 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         return Ok(());
     };
 
+    // PG: aggregates and regular functions share the `pg_proc` namespace, so
+    // creating an aggregate `name(args)` collides with any existing function
+    // of the same signature (and vice versa). Reject up-front to mirror PG's
+    // SQLSTATE 42723 (`function "X" already exists with same argument types`).
+    if interp
+        .pg_proc
+        .values()
+        .any(|p| p.pronamespace == nsoid && p.proname == name && p.proargtypes == arg_types)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "function \"{name}\" already exists with same argument types"
+        )));
+    }
+
     let proc_oid = PgProcOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
     interp.insert_pg_proc(PgProc {
         oid: proc_oid,

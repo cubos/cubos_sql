@@ -644,20 +644,46 @@ fn analyze_select_with_ctes_and_outer(
     null_ctx.grouping_omitted = expansion.omitted;
     null_ctx.has_empty_grouping_set = expansion.has_empty_set;
 
-    // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal.
+    // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal, and
+    // emits its own wording on mismatch: `argument of WHERE must be type
+    // boolean, not type X`. Catch the generic coerce error and rewrite to
+    // PG's exact message so `pglite_sanity` matches.
     if let Some(where_clause) = &sel.where_clause {
         // PG rejects aggregate / window function calls inside WHERE
         // (they reference the post-aggregation row, not the pre-aggregation
         // one). Catch these statically before the type pass runs.
         check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
-        infer_expr_propagate_mismatch(
+        if let Err(e) = infer_expr_propagate_mismatch(
             where_clause,
             &scope,
             &null_ctx,
             snapshot,
             params,
             TypeGoal::assignment(oid::BOOL),
-        )?;
+        ) {
+            // Only rewrite to PG's `argument of WHERE` wording when the
+            // failure was actually a coerce-to-bool mismatch. Other errors
+            // (subquery arity, undefined column, …) carry their own
+            // specific message we shouldn't shadow.
+            if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                return Err(e);
+            }
+            let mut params2 = params.clone();
+            let actual_oid = expr::infer_expr(
+                where_clause,
+                &scope,
+                &null_ctx,
+                snapshot,
+                &mut params2,
+                TypeGoal::NONE,
+            )
+            .map(|t| t.type_oid)
+            .unwrap_or(oid::UNKNOWN);
+            let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+            return Err(AnalyzeError::Invalid(format!(
+                "argument of WHERE must be type boolean, not type {actual_pg}"
+            )));
+        }
     }
 
     // Process GROUP BY expressions — no type expectation, but we still need
@@ -694,16 +720,44 @@ fn analyze_select_with_ctes_and_outer(
     }
 
     // Process LIMIT / OFFSET — PG uses coerce_to_specific_type(INT8OID)
-    // with COERCION_ASSIGNMENT.
-    for limit_node in [&sel.limit_count, &sel.limit_offset].into_iter().flatten() {
-        infer_expr_propagate_mismatch(
+    // with COERCION_ASSIGNMENT, and emits its own wording on mismatch:
+    // `argument of LIMIT must be type bigint, not type X` (likewise for
+    // OFFSET). Catch the generic coerce error and rewrite to PG's exact
+    // message so `pglite_sanity` matches.
+    for (limit_node, label) in [(&sel.limit_count, "LIMIT"), (&sel.limit_offset, "OFFSET")] {
+        let Some(limit_node) = limit_node else {
+            continue;
+        };
+        // Run the inference; on a coerce-to-int8 mismatch, rewrite to PG's
+        // wording. Other errors (undefined column, etc.) propagate
+        // verbatim — only TypeMismatch maps to `argument of LIMIT/OFFSET`.
+        if let Err(e) = infer_expr_propagate_mismatch(
             limit_node,
             &scope,
             &null_ctx,
             snapshot,
             params,
             TypeGoal::assignment(oid::INT8),
-        )?;
+        ) {
+            if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                return Err(e);
+            }
+            let mut params2 = params.clone();
+            let actual_oid = expr::infer_expr(
+                limit_node,
+                &scope,
+                &null_ctx,
+                snapshot,
+                &mut params2,
+                TypeGoal::NONE,
+            )
+            .map(|t| t.type_oid)
+            .unwrap_or(oid::UNKNOWN);
+            let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+            return Err(AnalyzeError::Invalid(format!(
+                "argument of {label} must be type bigint, not type {actual_pg}"
+            )));
+        }
     }
 
     // Resolve target list (SELECT expressions) — no type expectation.
@@ -856,10 +910,19 @@ fn analyze_insert(
                         col_names.len()
                     };
                     if list.items.len() != expected_len {
+                        // PG (SQLSTATE 42601) emits one of two messages:
+                        // `INSERT has more expressions than target columns`
+                        // or `INSERT has more target columns than
+                        // expressions`. Mirror PG's wording verbatim and
+                        // tack on our richer detail behind it.
+                        let pg_msg = if list.items.len() > expected_len {
+                            "INSERT has more expressions than target columns"
+                        } else {
+                            "INSERT has more target columns than expressions"
+                        };
                         return Err(AnalyzeError::Invalid(format!(
-                            "INSERT into `{}` expects {expected_len} values per row, \
-                             got {} in one row",
-                            table_relname,
+                            "{pg_msg} (table `{table_relname}` expects \
+                             {expected_len}, got {})",
                             list.items.len(),
                         )));
                     }
@@ -893,8 +956,9 @@ fn analyze_insert(
                             && !is_set_to_default(val)
                         {
                             return Err(AnalyzeError::Invalid(format!(
-                                "cannot insert a non-DEFAULT value into generated column `{}.{}`",
-                                table_relname, tc.attname,
+                                "cannot insert a non-DEFAULT value into column \"{}\" \
+                                 (generated column on `{}`)",
+                                tc.attname, table_relname,
                             )));
                         }
                         if let Some(tc) = target_col
@@ -904,9 +968,8 @@ fn analyze_insert(
                         {
                             return Err(AnalyzeError::Invalid(format!(
                                 "cannot insert a non-DEFAULT value into column \"{}\" \
-                                 of relation \"{}\" — column is an identity column \
-                                 defined as GENERATED ALWAYS \
-                                 (hint: use OVERRIDING SYSTEM VALUE to override)",
+                                 (identity column on `{}` defined as GENERATED ALWAYS \
+                                 — hint: use OVERRIDING SYSTEM VALUE to override)",
                                 tc.attname, table_relname,
                             )));
                         }
@@ -931,10 +994,14 @@ fn analyze_insert(
                 col_names.len()
             };
             if val_sel.target_list.len() != expected_len {
+                let pg_msg = if val_sel.target_list.len() > expected_len {
+                    "INSERT has more expressions than target columns"
+                } else {
+                    "INSERT has more target columns than expressions"
+                };
                 return Err(AnalyzeError::Invalid(format!(
-                    "INSERT into `{}` expects {expected_len} columns, \
-                     SELECT produces {}",
-                    table_relname,
+                    "{pg_msg} (table `{table_relname}` expects {expected_len}, \
+                     SELECT produces {})",
                     val_sel.target_list.len(),
                 )));
             }
@@ -955,9 +1022,8 @@ fn analyze_insert(
                     {
                         return Err(AnalyzeError::Invalid(format!(
                             "cannot insert a non-DEFAULT value into column \"{}\" \
-                             of relation \"{}\" — column is an identity column \
-                             defined as GENERATED ALWAYS \
-                             (hint: use OVERRIDING SYSTEM VALUE to override)",
+                             (identity column on `{}` defined as GENERATED ALWAYS \
+                             — hint: use OVERRIDING SYSTEM VALUE to override)",
                             tc.attname, table_relname,
                         )));
                     }
@@ -1009,14 +1075,15 @@ fn analyze_insert(
                 if let Some(tc) = table_attrs.iter().find(|c| c.attname == rt.name) {
                     if tc.attgenerated.is_some() && !is_set_to_default(val) {
                         return Err(AnalyzeError::Invalid(format!(
-                            "generated column `{}.{}` can only be updated to DEFAULT",
-                            table_relname, tc.attname,
+                            "column \"{}\" can only be updated to DEFAULT \
+                             (generated column on `{}`)",
+                            tc.attname, table_relname,
                         )));
                     }
                     if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
                         return Err(AnalyzeError::Invalid(format!(
-                            "column \"{}\" of relation \"{}\" can only be updated to DEFAULT \
-                             — column is an identity column defined as GENERATED ALWAYS",
+                            "column \"{}\" can only be updated to DEFAULT \
+                             (identity column on `{}` defined as GENERATED ALWAYS)",
                             tc.attname, table_relname,
                         )));
                     }
@@ -1177,14 +1244,15 @@ fn analyze_update(
             }
             if tc.attgenerated.is_some() && !is_set_to_default(val) {
                 return Err(AnalyzeError::Invalid(format!(
-                    "generated column `{}.{}` can only be updated to DEFAULT",
-                    table_relname, tc.attname,
+                    "column \"{}\" can only be updated to DEFAULT \
+                     (generated column on `{}`)",
+                    tc.attname, table_relname,
                 )));
             }
             if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
                 return Err(AnalyzeError::Invalid(format!(
-                    "column \"{}\" of relation \"{}\" can only be updated to DEFAULT \
-                     — column is an identity column defined as GENERATED ALWAYS",
+                    "column \"{}\" can only be updated to DEFAULT \
+                     (identity column on `{}` defined as GENERATED ALWAYS)",
                     tc.attname, table_relname,
                 )));
             }
@@ -1461,14 +1529,15 @@ fn walk_merge_when_clause(
                 }
                 if tc.attgenerated.is_some() && !is_set_to_default(val) {
                     return Err(AnalyzeError::Invalid(format!(
-                        "generated column `{}.{}` can only be updated to DEFAULT",
-                        table_relname, tc.attname,
+                        "column \"{}\" can only be updated to DEFAULT \
+                         (generated column on `{}`)",
+                        tc.attname, table_relname,
                     )));
                 }
                 if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
                     return Err(AnalyzeError::Invalid(format!(
-                        "column \"{}\" of relation \"{}\" can only be updated to DEFAULT \
-                         — column is an identity column defined as GENERATED ALWAYS",
+                        "column \"{}\" can only be updated to DEFAULT \
+                         (identity column on `{}` defined as GENERATED ALWAYS)",
                         tc.attname, table_relname,
                     )));
                 }
@@ -1537,15 +1606,15 @@ fn walk_merge_when_clause(
                     }
                     if tc.attgenerated.is_some() && !is_set_to_default(val) {
                         return Err(AnalyzeError::Invalid(format!(
-                            "cannot insert a non-DEFAULT value into generated column `{}.{}`",
-                            table_relname, tc.attname,
+                            "cannot insert a non-DEFAULT value into column \"{}\" \
+                             (generated column on `{}`)",
+                            tc.attname, table_relname,
                         )));
                     }
                     if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
                         return Err(AnalyzeError::Invalid(format!(
                             "cannot insert a non-DEFAULT value into column \"{}\" \
-                             of relation \"{}\" — column is an identity column \
-                             defined as GENERATED ALWAYS",
+                             (identity column on `{}` defined as GENERATED ALWAYS)",
                             tc.attname, table_relname,
                         )));
                     }
@@ -1614,11 +1683,15 @@ fn analyze_set_operation(
         let type_oid = match (common, both_concrete) {
             (Some(t), _) => t,
             (None, true) => {
-                return Err(AnalyzeError::TypeMismatch {
-                    actual: type_oid_name(r.type_oid, snapshot),
-                    expected: type_oid_name(l.type_oid, snapshot),
-                    context: format!("UNION column `{}`", l.name),
-                });
+                // PG (SQLSTATE 42804): `UNION types A and B cannot be
+                // matched`. Use `Invalid` to keep
+                // `TypeMismatch::Display`'s generic prefix from leaking.
+                let a = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
+                let b = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "UNION types {a} and {b} cannot be matched (column `{}`)",
+                    l.name,
+                )));
             }
             (None, false) => l.type_oid,
         };
@@ -1643,17 +1716,6 @@ fn analyze_set_operation(
     }
 
     Ok((columns, None))
-}
-
-/// Render a type OID as `schema.name` for user-facing errors.
-fn type_oid_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
-    snapshot
-        .get_type(oid)
-        .map(|t| {
-            let ns = snapshot.namespace_name(t.typnamespace).unwrap_or("?");
-            format!("{ns}.{}", t.typname)
-        })
-        .unwrap_or_else(|| format!("unknown({})", oid.get()))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2238,10 +2300,18 @@ fn process_range_function(
             let elem = (type_entry.typcategory == TypCategory::Array)
                 .then_some(type_entry.typelem)
                 .flatten()
-                .ok_or_else(|| AnalyzeError::TypeMismatch {
-                    actual: type_entry.typname.clone(),
-                    expected: "array".into(),
-                    context: format!("unnest argument {} must be an array", i + 1),
+                .ok_or_else(|| {
+                    // Match PG's wording: when an `unnest` arg isn't an
+                    // array, PG's resolver emits `function
+                    // pg_catalog.unnest(<type>) does not exist` (it
+                    // searches for a single-arg overload of the offending
+                    // type). Mirror that and append our richer detail.
+                    let typname = type_entry.typname.clone();
+                    AnalyzeError::UndefinedFunction(format!(
+                        "function pg_catalog.unnest({typname}) does not exist \
+                         (unnest argument {} is not an array)",
+                        i + 1,
+                    ))
                 })?;
             // Multi-arg unnest is strict: each output column is NOT NULL iff
             // the corresponding input array is NOT NULL (a NULL array yields
@@ -2411,7 +2481,13 @@ fn resolve_target_list(
         let name = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
-            infer_column_name(val).unwrap_or_else(|| format!("_column{i}_"))
+            // Match PG's default for unnamed expressions: when the target
+            // is something we can't infer a name from (operator, literal,
+            // arithmetic, …), PG labels the column `?column?` regardless
+            // of position. Using the position would diverge from the
+            // wire-protocol RowDescription that `pglite_sanity` checks.
+            let _ = i;
+            infer_column_name(val).unwrap_or_else(|| "?column?".to_string())
         };
 
         // Inferred shape from the expression (ROW(...), nested indirection,
@@ -2563,6 +2639,31 @@ fn infer_column_name(node: &protobuf::Node) -> Option<String> {
             // Function name.
             expr::extract_string_fields(&fc.funcname).pop()
         }
+        // PG names CASE / COALESCE / NULLIF / GREATEST / LEAST / ROW
+        // expressions after the construct itself (lowercased) when there's
+        // no alias, e.g. `SELECT CASE … END` produces a column named
+        // `case`. Match that so `pglite_sanity` column-name compares pass.
+        node::Node::CaseExpr(_) => Some("case".to_string()),
+        node::Node::CoalesceExpr(_) => Some("coalesce".to_string()),
+        // `EXISTS (SELECT …)` is named `exists` by PG; same shape for the
+        // boolean-coalesce variants below.
+        node::Node::SubLink(sl)
+            if sl.sub_link_type == protobuf::SubLinkType::ExistsSublink as i32 =>
+        {
+            Some("exists".to_string())
+        }
+        node::Node::MinMaxExpr(m) => match protobuf::MinMaxOp::try_from(m.op) {
+            Ok(protobuf::MinMaxOp::IsLeast) => Some("least".to_string()),
+            _ => Some("greatest".to_string()),
+        },
+        node::Node::NullIfExpr(_) => Some("nullif".to_string()),
+        node::Node::RowExpr(_) => Some("row".to_string()),
+        // PG names a `::T` cast result after the target type (last name
+        // component of the TypeName, lower-cased).
+        node::Node::TypeCast(tc) => tc
+            .type_name
+            .as_ref()
+            .and_then(|tn| expr::extract_string_fields(&tn.names).pop()),
         _ => None,
     }
 }
@@ -2791,6 +2892,11 @@ fn resolve_type(
 }
 
 fn parse_nullability_annotation(name: &str, auto_nullable: bool) -> (String, bool) {
+    // PG's placeholder column name `?column?` ends in `?` but isn't a
+    // user-supplied nullability annotation — pass it through untouched.
+    if name == "?column?" {
+        return (name.to_owned(), auto_nullable);
+    }
     if let Some(stripped) = name.strip_suffix('!') {
         (stripped.to_owned(), false)
     } else if let Some(stripped) = name.strip_suffix('?') {

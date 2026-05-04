@@ -68,12 +68,43 @@ pub(crate) fn resolve_function(
     arg_types: &[PgTypeOid],
     _is_agg_star: bool,
 ) -> Result<ResolvedFunction, AnalyzeError> {
-    let candidates: Vec<&PgProc> = snapshot
-        .find_functions(schema, name)
-        .into_iter()
+    let all_matches = snapshot.find_functions(schema, name);
+    let candidates: Vec<&PgProc> = all_matches
+        .iter()
+        .copied()
         .filter(|f| !matches!(f.prokind, ProKind::Procedure))
         .collect();
     if candidates.is_empty() {
+        // PG distinguishes "function not found at all" from "the name
+        // resolves but only to a procedure" (SQLSTATE 42809). Mirror that
+        // so the sanity check matches PG verbatim.
+        if let Some(proc) = all_matches
+            .iter()
+            .find(|f| matches!(f.prokind, ProKind::Procedure))
+        {
+            let arg_list = proc
+                .proargtypes
+                .iter()
+                .map(|oid| {
+                    snapshot
+                        .pg_type
+                        .get(oid)
+                        .map(|t| match t.typname.as_str() {
+                            "int2" => "smallint".to_string(),
+                            "int4" => "integer".to_string(),
+                            "int8" => "bigint".to_string(),
+                            "float4" => "real".to_string(),
+                            "float8" => "double precision".to_string(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AnalyzeError::UndefinedFunction(format!(
+                "{name}({arg_list}) is a procedure"
+            )));
+        }
         return Err(AnalyzeError::UndefinedFunction(format!(
             "function {name}() does not exist"
         )));

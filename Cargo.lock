@@ -621,6 +621,7 @@ dependencies = [
  "cubos_sql_analyzer",
  "cubos_sql_core",
  "pg_query",
+ "postgres",
  "prost 0.13.5",
  "serde",
  "serde_json",

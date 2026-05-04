@@ -199,6 +199,33 @@ fn update_with_from() {
     assert_params(&s, vec![p(text()), p(text())]);
 }
 
+#[test]
+fn update_set_coalesce_param_is_nullable() {
+    // `SET col = COALESCE($p, col)` is the canonical "patch this field
+    // only if the caller supplied a value" pattern. The param has to be
+    // typed nullable — otherwise the COALESCE is pointless and the caller
+    // would be forced to wrap every value in `Some(...)`.
+    let db = setup();
+    let s = db
+        .analyze("UPDATE posts SET title = COALESCE($p1, title) WHERE id = $p2 RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![pn(text()), p(int8())]);
+}
+
+#[test]
+fn update_set_coalesce_param_on_not_null_column_still_nullable() {
+    // Even when the target column is NOT NULL, the param sitting inside
+    // COALESCE is still nullable — the COALESCE itself is what guarantees
+    // the assignment never receives NULL.
+    let db = setup();
+    let s = db
+        .analyze("UPDATE users SET name = COALESCE($p1, name) WHERE id = $p2 RETURNING id")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_params(&s, vec![pn(text()), p(int8())]);
+}
+
 // ── DELETE … RETURNING ───────────────────────────────────────────────────────
 
 #[test]
@@ -283,10 +310,13 @@ fn complex_insert_select_with_join() {
 
 #[test]
 fn update_set_not_null_column_to_null_rejected() {
-    let db = setup();
-    // PG rejects this at runtime (`null value in column "name" violates
-    // not-null constraint`). We can catch it statically because the table
-    // schema says `name` is NOT NULL.
+    // PG only catches NULL-into-NOT-NULL at runtime (`null value in
+    // column "name" violates not-null constraint`); the analyzer catches
+    // it statically. PG sanity's `prepare` doesn't reach runtime evaluation,
+    // so opt out of the mirror — analyzer behavior is the load-bearing
+    // assertion here.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("UPDATE users SET name = NULL WHERE id = $p1 RETURNING id"),
         AnalyzeError::Invalid(_),
@@ -296,7 +326,9 @@ fn update_set_not_null_column_to_null_rejected() {
 
 #[test]
 fn insert_null_into_not_null_column_rejected() {
-    let db = setup();
+    // Same pattern as above — analyzer-only static check.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) VALUES (NULL, $p1)"),
         AnalyzeError::Invalid(_),
@@ -312,7 +344,7 @@ fn insert_values_row_wrong_arity_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) VALUES ($p1, $p2, $p3)"),
         AnalyzeError::Invalid(_),
-        "expects 2 values per row",
+        "INSERT has more expressions than target columns",
     );
 }
 
@@ -323,7 +355,7 @@ fn insert_select_column_count_mismatch_rejected() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) SELECT name FROM users"),
         AnalyzeError::Invalid(_),
-        "expects 2 columns, SELECT produces 1",
+        "INSERT has more target columns than expressions",
     );
 }
 
@@ -485,22 +517,24 @@ fn insert_on_conflict_do_update_with_param_expression() {
 
 #[test]
 fn on_conflict_on_non_unique_column_should_error() {
-    let db = setup();
-    // `name` has no unique/primary key constraint. PG: `there is no unique
-    // or exclusion constraint matching the ON CONFLICT specification`.
+    // ON CONFLICT validation is a planner-time check in PG; pglite-socket's
+    // wire `prepare` skips it. Opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
              ON CONFLICT (name) DO NOTHING",
         ),
         AnalyzeError::Invalid(_),
-        "no unique or exclusion constraint",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
     );
 }
 
 #[test]
 fn on_conflict_on_nonexistent_constraint_name_should_error() {
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (
             id   BIGINT PRIMARY KEY,
@@ -547,7 +581,8 @@ fn on_conflict_on_unique_column_is_accepted() {
 
 #[test]
 fn on_conflict_on_unknown_column_is_rejected() {
-    let db = setup();
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
@@ -601,6 +636,7 @@ fn on_conflict_on_composite_unique_match_is_accepted() {
 fn on_conflict_on_partial_composite_unique_set_is_rejected() {
     // A two-column UNIQUE doesn't cover ON CONFLICT on a single column.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE t (
             a INT NOT NULL,
@@ -615,7 +651,7 @@ fn on_conflict_on_partial_composite_unique_set_is_rejected() {
              ON CONFLICT (a) DO NOTHING"
         ),
         AnalyzeError::Invalid(_),
-        "no unique or exclusion constraint",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
     );
 }
 
@@ -682,9 +718,10 @@ fn on_conflict_on_check_constraint_name_is_rejected() {
 
 #[test]
 fn insert_into_generated_always_as_identity_should_error() {
-    let db = setup();
-    // PG: `cannot insert a non-DEFAULT value into column "id"` — `id` is
-    // GENERATED ALWAYS AS IDENTITY (see setup()).
+    // GENERATED ALWAYS check: PG only catches at execution; analyzer
+    // catches at compile time. Mirror skipped.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("INSERT INTO users (id, name, email) VALUES ($p1, $p2, $p3)"),
         AnalyzeError::Invalid(_),
@@ -695,6 +732,7 @@ fn insert_into_generated_always_as_identity_should_error() {
 #[test]
 fn overriding_system_value_on_table_without_identity_should_error() {
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE plain (
             id   INT NOT NULL,
@@ -702,12 +740,10 @@ fn overriding_system_value_on_table_without_identity_should_error() {
          );",
     )
     .unwrap();
-    // PG: `OVERRIDING SYSTEM VALUE is not allowed for a non-identity column`.
-    // The override is only meaningful when there's an identity column.
     assert_analyze_err!(
         db.analyze("INSERT INTO plain (id, name) OVERRIDING SYSTEM VALUE VALUES ($p1, $p2)",),
         AnalyzeError::Invalid(_),
-        "OVERRIDING SYSTEM VALUE",
+        "OVERRIDING SYSTEM VALUE is not allowed for a non-identity column",
     );
 }
 
@@ -920,7 +956,11 @@ fn merge_insert_into_generated_always_is_rejected() {
 
 #[test]
 fn merge_update_generated_always_is_rejected() {
+    // PG raises this at planning time, but pglite-socket's `prepare`
+    // sometimes truncates the message so the prefix can't be checked
+    // reliably — opt out of the mirror and rely on the analyzer.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE src (n BIGINT NOT NULL, label TEXT NOT NULL);
          CREATE TABLE dst (
@@ -935,7 +975,7 @@ fn merge_update_generated_always_is_rejected() {
              WHEN MATCHED THEN UPDATE SET id = s.n"
         ),
         AnalyzeError::Invalid(_),
-        "GENERATED ALWAYS",
+        "column \"id\" can only be updated to DEFAULT",
     );
 }
 
@@ -1188,8 +1228,10 @@ fn merge_update_unknown_column_errors() {
 
 #[test]
 fn merge_insert_null_into_not_null_column_errors() {
-    let db = setup();
-    // Compile-time NOT NULL guard mirrors the existing INSERT path.
+    // Compile-time NOT NULL guard — PG only catches it at runtime, so the
+    // pglite mirror can't validate it. Opt out.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze(
             "MERGE INTO users u \
@@ -1198,15 +1240,16 @@ fn merge_insert_null_into_not_null_column_errors() {
              WHEN NOT MATCHED THEN INSERT (name, email) VALUES (NULL, src.email)"
         ),
         AnalyzeError::Invalid(_),
-        "NOT NULL column",
+        "cannot insert NULL into NOT NULL column `users.name`",
     );
 }
 
 #[test]
 fn merge_update_set_not_null_to_null_literal_errors() {
-    let db = setup();
-    // `name` is NOT NULL — the analyzer rejects `SET name = NULL` at
-    // compile time, same as plain UPDATE.
+    // Same pattern as above — analyzer is strict at compile time, PG only
+    // checks at execution.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze(
             "MERGE INTO users u \
@@ -1215,7 +1258,7 @@ fn merge_update_set_not_null_to_null_literal_errors() {
              WHEN MATCHED THEN UPDATE SET name = NULL"
         ),
         AnalyzeError::Invalid(_),
-        "NOT NULL column",
+        "cannot assign NULL to NOT NULL column `users.name`",
     );
 }
 
@@ -1257,4 +1300,85 @@ fn torture_expression_in_insert_returning() {
             c("is_adult", bool_ty()),
         ],
     );
+}
+
+// ── WITH (CTE) on INSERT / UPDATE / DELETE ───────────────────────────────────
+//
+// CTEs attached directly to a DML statement (`WITH x AS (…) INSERT …`) are
+// parsed into the DML node's own `with_clause`, not into the inner SELECT.
+// The analyzer must walk that clause so parameters used only inside the CTE
+// are seen — otherwise `into_sorted` reports a "parameter gap" because lower
+// param numbers are missing from the seen set.
+
+#[test]
+fn insert_with_cte_select_param_is_seen() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH src AS (SELECT $p1::text AS author) \
+             INSERT INTO comments (post_id, author_name, content) \
+             SELECT $p2, src.author, $p3 FROM src",
+        )
+        .unwrap();
+    // $p1 is consumed inside the CTE; without walking with_clause the
+    // analyzer would only see $p2/$p3 and complain about a gap at $p1.
+    assert_params(&s, vec![p(text()), p(int8()), p(text())]);
+}
+
+#[test]
+fn insert_with_cte_updating_table_reuses_param() {
+    let db = setup();
+    // Mirrors the user-reported case: a data-modifying CTE feeds an INSERT,
+    // and the same named param ($p1) appears both inside the CTE and in the
+    // outer SELECT. The lexer dedupes to `$1` so the rewritten SQL stays
+    // valid; the analyzer must walk the CTE so $p2 (only used in the CTE)
+    // doesn't get skipped.
+    let s = db
+        .analyze(
+            "WITH bump AS ( \
+                 UPDATE posts SET body = $p3 \
+                 WHERE id = $p1 AND user_id = $p2 \
+                 RETURNING id, user_id \
+             ) \
+             INSERT INTO comments (post_id, author_name, content) \
+             SELECT $p1, $p4, $p5 FROM bump",
+        )
+        .unwrap();
+    // Lexer assigns positional numbers in the order each named param first
+    // appears: $p3 (SET body), $p1 (WHERE id), $p2 (user_id), $p4, $p5.
+    // body is nullable, so $p3 is inferred nullable.
+    assert_params(
+        &s,
+        vec![pn(text()), p(int8()), p(int8()), p(text()), p(text())],
+    );
+}
+
+#[test]
+fn update_with_cte_param_is_seen() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "WITH src AS (SELECT $p1::int AS bump) \
+             UPDATE users SET age = age + src.bump FROM src WHERE id = $p2",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int4()), p(int8())]);
+}
+
+#[test]
+fn delete_with_cte_param_is_seen() {
+    let db = setup();
+    // CTEs attached to a DELETE land in `DeleteStmt.with_clause` (not the
+    // WHERE sublink). The analyzer must walk it so $p1 — only referenced
+    // inside the CTE — gets registered. The CTE here is unused by the body
+    // (PG emits a NOTICE but accepts it); we use this minimal shape to
+    // isolate the with_clause walk from the separate question of whether
+    // sublinks resolve outer CTEs.
+    let s = db
+        .analyze(
+            "WITH dead AS (SELECT $p1::bigint AS id) \
+             DELETE FROM comments WHERE rating < $p2",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int8()), p(int4())]);
 }

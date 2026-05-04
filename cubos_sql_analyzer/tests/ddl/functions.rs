@@ -95,9 +95,12 @@ fn create_aggregate_with_finalfunc_uses_final_return_type() {
 
 #[test]
 fn drop_aggregate_removes_only_aggregate() {
+    // The scalar and the aggregate must take *different* argument types —
+    // PG (SQLSTATE 42723) rejects two pg_proc rows sharing name + args
+    // regardless of prokind.
     let snap = build(&[(
         "0001.sql",
-        "CREATE FUNCTION dup(int4) RETURNS int4 AS 'SELECT $1' LANGUAGE SQL;
+        "CREATE FUNCTION dup(text) RETURNS text AS 'SELECT $1' LANGUAGE SQL;
          CREATE FUNCTION dup_sfunc(int4, int4) RETURNS int4 AS 'SELECT $1 + $2' LANGUAGE SQL;
          CREATE AGGREGATE dup(int4) (
              SFUNC = dup_sfunc,
@@ -107,7 +110,7 @@ fn drop_aggregate_removes_only_aggregate() {
     )]);
 
     let fns = snap.find_functions(None, "dup");
-    assert_eq!(fns.len(), 1, "scalar dup(int4) should remain");
+    assert_eq!(fns.len(), 1, "scalar dup(text) should remain");
     assert_eq!(fns[0].prokind, ProKind::Function);
 }
 
@@ -197,20 +200,24 @@ fn alter_function_rename_with_overloads_only_moves_matching_signature() {
 
 #[test]
 fn alter_aggregate_rename_only_touches_aggregate() {
+    // Aggregates and regular functions share `pg_proc`'s name+args
+    // namespace, so the scalar must take a different signature than the
+    // aggregate (here a different argument type) — otherwise PG rejects the
+    // CREATE AGGREGATE with SQLSTATE 42723.
     let snap = build(&[(
         "0001.sql",
-        "CREATE FUNCTION ag(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
+        "CREATE FUNCTION ag(x text) RETURNS text AS 'SELECT $1' LANGUAGE SQL;
          CREATE FUNCTION ag_sfunc(state int, val int) RETURNS int AS 'SELECT $1 + $2' LANGUAGE SQL;
          CREATE AGGREGATE ag(int) (SFUNC = ag_sfunc, STYPE = int);
          ALTER AGGREGATE ag(int) RENAME TO ag_total;",
     )]);
 
-    // Scalar survives under original name.
+    // Scalar (text-arg) survives under original name.
     let scalar = snap.find_functions(None, "ag");
     assert_eq!(scalar.len(), 1);
     assert_eq!(scalar[0].prokind, ProKind::Function);
 
-    // Aggregate moved.
+    // Aggregate (int-arg) moved.
     let moved = snap.find_functions(None, "ag_total");
     assert_eq!(moved.len(), 1);
     assert_eq!(moved[0].prokind, ProKind::Aggregate);
@@ -220,10 +227,12 @@ fn alter_aggregate_rename_only_touches_aggregate() {
 
 #[test]
 fn drop_function_does_not_touch_procedure_of_same_name() {
+    // Function and procedure share `pg_proc`'s name+args namespace, so
+    // they must take different signatures (PG SQLSTATE 42723 otherwise).
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION f(x int) RETURNS int AS 'SELECT $1' LANGUAGE SQL;
-         CREATE PROCEDURE f(x int) LANGUAGE SQL AS $$ SELECT $1 $$;
+         CREATE PROCEDURE f(x text) LANGUAGE SQL AS $$ SELECT 1 $$;
          DROP FUNCTION f(int);",
     )]);
 
@@ -241,22 +250,35 @@ fn drop_function_does_not_touch_procedure_of_same_name() {
 // ── CREATE OR REPLACE / overloading ────────────────────────────────────────
 
 #[test]
-fn create_or_replace_function_updates_existing() {
+fn create_or_replace_function_updates_existing_body() {
+    // CREATE OR REPLACE only swaps the body — return type is fixed.
+    // Changing the return type would be SQLSTATE 42P13
+    // ("cannot change return type of existing function").
     let snap = build(&[(
         "0001.sql",
         "CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x $$ LANGUAGE sql;
-         CREATE OR REPLACE FUNCTION foo(x INT) RETURNS BIGINT AS $$ SELECT x::bigint $$ LANGUAGE sql;",
+         CREATE OR REPLACE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x + 1 $$ LANGUAGE sql;",
     )]);
 
     let fns = snap.find_functions(None, "foo");
     assert_eq!(fns.len(), 1, "should have exactly 1 overload");
-    let int8_oid = snap
-        .resolve_type_by_name(Some("pg_catalog"), "int8")
+    let int4_oid = snap
+        .resolve_type_by_name(Some("pg_catalog"), "int4")
         .unwrap()
         .oid;
-    assert_eq!(
-        fns[0].prorettype, int8_oid,
-        "return type must be updated to int8",
+    assert_eq!(fns[0].prorettype, int4_oid);
+}
+
+#[test]
+fn create_or_replace_function_with_different_return_type_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x $$ LANGUAGE sql;
+             CREATE OR REPLACE FUNCTION foo(x INT) RETURNS BIGINT AS $$ SELECT x::bigint $$ LANGUAGE sql;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "cannot change return type of existing function",
     );
 }
 

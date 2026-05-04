@@ -293,7 +293,7 @@ fn drop_pk_referenced_by_fk_without_cascade_is_rejected() {
             ("0002.sql", "ALTER TABLE p DROP CONSTRAINT p_pkey;"),
         ]),
         DdlError::DependencyError(_),
-        "depends on it",
+        "because other objects depend on it",
     );
 }
 
@@ -384,17 +384,22 @@ fn drop_table_referenced_by_fk_with_cascade_drops_fk_too() {
 // ── DROP COLUMN with constraints ───────────────────────────────────────────
 
 #[test]
-fn drop_column_with_pkey_dependency_without_cascade_is_rejected() {
-    assert_ddl_err!(
-        try_apply(&[
-            (
-                "0001.sql",
-                "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT);"
-            ),
-            ("0002.sql", "ALTER TABLE t DROP COLUMN id;"),
-        ]),
-        DdlError::DependencyError(_),
-        "constraint(s) t_pkey",
+fn drop_column_with_pkey_dependency_drops_pkey_silently() {
+    // PG drops the PK constraint along with the column it covers (only
+    // *external* dependencies block DROP COLUMN without CASCADE — local
+    // PK/UNIQUE/CHECK/FK source/indexes all piggyback on the column).
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT);",
+        ),
+        ("0002.sql", "ALTER TABLE t DROP COLUMN id;"),
+    ]);
+
+    let names = snap.pg_constraint_names_for_table("public", "t");
+    assert!(
+        !names.iter().any(|n| n == "t_pkey"),
+        "PK constraint should be dropped along with the column: {names:?}",
     );
 }
 
@@ -431,19 +436,23 @@ fn drop_column_with_fk_target_without_cascade_is_rejected() {
 }
 
 #[test]
-fn drop_column_with_fk_source_without_cascade_is_rejected() {
-    // The dropped column is the *source* of an FK on the same table.
-    assert_ddl_err!(
-        try_apply(&[
-            (
-                "0001.sql",
-                "CREATE TABLE p (id BIGINT PRIMARY KEY);
-                 CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT NOT NULL REFERENCES p(id));"
-            ),
-            ("0002.sql", "ALTER TABLE c DROP COLUMN p_id;"),
-        ]),
-        DdlError::DependencyError(_),
-        "constraint(s)",
+fn drop_column_with_fk_source_drops_fk_silently() {
+    // PG drops the FK source-side constraint along with the column it
+    // covers — only the FK *target* side (an FK in a different table that
+    // points at this column) blocks DROP COLUMN without CASCADE.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE p (id BIGINT PRIMARY KEY);
+             CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT NOT NULL REFERENCES p(id));",
+        ),
+        ("0002.sql", "ALTER TABLE c DROP COLUMN p_id;"),
+    ]);
+
+    let names = snap.pg_constraint_names_for_table("public", "c");
+    assert!(
+        !names.iter().any(|n| n == "c_p_id_fkey"),
+        "FK source-side constraint should be dropped along with the column: {names:?}",
     );
 }
 
@@ -461,20 +470,24 @@ fn drop_column_unrelated_to_constraints_is_accepted() {
 }
 
 #[test]
-fn drop_column_with_check_dependency_without_cascade_is_rejected() {
-    assert_ddl_err!(
-        try_apply(&[
-            (
-                "0001.sql",
-                "CREATE TABLE t (
-                    id  BIGINT PRIMARY KEY,
-                    qty INT NOT NULL CHECK (qty >= 0)
-                 );"
-            ),
-            ("0002.sql", "ALTER TABLE t DROP COLUMN qty;"),
-        ]),
-        DdlError::DependencyError(_),
-        "constraint(s) t_qty_check",
+fn drop_column_with_check_dependency_drops_check_silently() {
+    // PG drops a column-local CHECK constraint along with the column —
+    // CHECK isn't a "blocker" the way PK/UNIQUE/FK are. No CASCADE needed.
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (
+                id  BIGINT PRIMARY KEY,
+                qty INT NOT NULL CHECK (qty >= 0)
+             );",
+        ),
+        ("0002.sql", "ALTER TABLE t DROP COLUMN qty;"),
+    ]);
+
+    let names = snap.pg_constraint_names_for_table("public", "t");
+    assert!(
+        !names.iter().any(|n| n == "t_qty_check"),
+        "CHECK constraint should be dropped along with the column: {names:?}",
     );
 }
 

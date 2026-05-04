@@ -176,23 +176,6 @@ impl ExprType {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Type OID → display name
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Render a type OID as `schema.name` for error messages. Falls back to
-/// `unknown(<oid>)` when the snapshot doesn't know the OID — should never
-/// happen in practice but avoids panicking during error formatting.
-fn type_oid_display(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
-    snapshot
-        .get_type(oid)
-        .map(|t| {
-            let ns = snapshot.namespace_name(t.typnamespace).unwrap_or("?");
-            format!("{ns}.{}", t.typname)
-        })
-        .unwrap_or_else(|| format!("unknown({})", oid.get()))
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Context-rule validation
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -533,10 +516,7 @@ pub(crate) fn infer_expr(
                     .map(|t| t.typcategory)
                     .unwrap_or(TypCategory::UserDefined);
                 if category != TypCategory::String {
-                    let type_name = snapshot
-                        .get_type(base)
-                        .map(|t| t.typname.clone())
-                        .unwrap_or_else(|| format!("oid {base}"));
+                    let type_name = crate::ddl::util::format_type_for_message(snapshot, base);
                     return Err(AnalyzeError::Invalid(format!(
                         "collations are not supported by type {type_name}"
                     )));
@@ -819,7 +799,10 @@ fn infer_indirection(
                 break;
             };
             let field = fields.iter().find(|f| f.name == s.sval).ok_or_else(|| {
-                AnalyzeError::UndefinedColumn(format!("record field \"{}\" does not exist", s.sval))
+                AnalyzeError::UndefinedColumn(format!(
+                    "could not identify column \"{}\" in record data type",
+                    s.sval
+                ))
             })?;
             current = Some(field.ty.clone());
             idx += 1;
@@ -983,7 +966,9 @@ fn resolve_composite_field(
 ) -> Result<ExprType, AnalyzeError> {
     if let Some(shape) = current.record_fields.as_deref() {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
-            AnalyzeError::UndefinedColumn(format!("record field \"{field_name}\" does not exist"))
+            AnalyzeError::UndefinedColumn(format!(
+                "could not identify column \"{field_name}\" in record data type"
+            ))
         })?;
         // Field's full ExprType (including any nested record shape) is
         // already on `field.ty`; just OR the enclosing nullability in.
@@ -1069,22 +1054,18 @@ fn infer_array_expr(
             let names: Vec<String> = concrete
                 .iter()
                 .take(2)
-                .map(|&t| {
-                    snapshot
-                        .get_type(t)
-                        .map(|te| te.typname.clone())
-                        .unwrap_or_else(|| format!("oid {t}"))
-                })
+                .map(|&t| crate::ddl::util::format_type_for_message(snapshot, t))
                 .collect();
-            return Err(AnalyzeError::TypeMismatch {
-                actual: names.first().cloned().unwrap_or_default(),
-                expected: names.get(1).cloned().unwrap_or_default(),
-                context: format!(
-                    "ARRAY types {} and {} cannot be matched",
-                    names.first().map(String::as_str).unwrap_or("?"),
-                    names.get(1).map(String::as_str).unwrap_or("?"),
-                ),
-            });
+            // PG (SQLSTATE 42804) emits this exactly as `ARRAY types A and
+            // B cannot be matched`. We keep the same wording so the
+            // `pglite_sanity` mirror passes; demote to `Invalid` so the
+            // generic `type mismatch: …` prefix from `TypeMismatch::Display`
+            // doesn't leak in front of it.
+            return Err(AnalyzeError::Invalid(format!(
+                "ARRAY types {} and {} cannot be matched",
+                names.first().map(String::as_str).unwrap_or("?"),
+                names.get(1).map(String::as_str).unwrap_or("?"),
+            )));
         }
     };
     // PG collapses array dimensions into the same type OID:
@@ -1295,7 +1276,7 @@ fn infer_func_call(
             }
             if kinds.has_window {
                 return Err(AnalyzeError::Invalid(
-                    "window functions are not allowed inside aggregate arguments".into(),
+                    "aggregate function calls cannot contain window function calls".into(),
                 ));
             }
         }
@@ -1904,10 +1885,16 @@ fn infer_a_expr(
             "could not determine data type of operator {op_name}"
         )));
     }
+    // PG (SQLSTATE 42883): `operator does not exist: <left> <op> <right>`.
+    // Use PG's user-facing type names (`integer`, `bigint`, …) so the
+    // sanity-check prefix match passes.
+    let left_pg = crate::ddl::util::format_type_for_message(
+        snapshot,
+        left_oid_resolved.unwrap_or(oid::UNKNOWN),
+    );
+    let right_pg = crate::ddl::util::format_type_for_message(snapshot, right_oid_resolved);
     Err(AnalyzeError::UndefinedOperator(format!(
-        "operator {op_name} does not exist for types {} and {}",
-        type_oid_display(left_oid_resolved.unwrap_or(oid::UNKNOWN), snapshot),
-        type_oid_display(right_oid_resolved, snapshot),
+        "operator does not exist: {left_pg} {op_name} {right_pg}"
     )))
 }
 
@@ -1978,11 +1965,20 @@ fn infer_coalesce(
             .unwrap_or(oid::UNKNOWN)
     } else {
         coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
-            AnalyzeError::TypeMismatch {
-                actual: type_oid_display(concrete_types[concrete_types.len() - 1], snapshot),
-                expected: type_oid_display(concrete_types[0], snapshot),
-                context: "COALESCE arguments have no common type".into(),
-            }
+            // PG (SQLSTATE 42804): `COALESCE types A and B cannot be
+            // matched`. PG reports the COALESCE args in source order
+            // (first then last), the *opposite* of CASE which orders the
+            // last branch first. We use `Invalid` to keep
+            // `TypeMismatch::Display`'s generic prefix from leaking in
+            // front of PG's exact wording.
+            let first = crate::ddl::util::format_type_for_message(snapshot, concrete_types[0]);
+            let last = crate::ddl::util::format_type_for_message(
+                snapshot,
+                concrete_types[concrete_types.len() - 1],
+            );
+            AnalyzeError::Invalid(format!(
+                "COALESCE types {first} and {last} cannot be matched"
+            ))
         })?
     };
 
@@ -2079,11 +2075,14 @@ fn infer_case(
             .unwrap_or(oid::UNKNOWN)
     } else {
         coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
-            AnalyzeError::TypeMismatch {
-                actual: type_oid_display(concrete_types[concrete_types.len() - 1], snapshot),
-                expected: type_oid_display(concrete_types[0], snapshot),
-                context: "CASE branches have no common type".into(),
-            }
+            // PG: `CASE types A and B cannot be matched` — last branch
+            // first, candidate type from prior branches second.
+            let last = crate::ddl::util::format_type_for_message(
+                snapshot,
+                concrete_types[concrete_types.len() - 1],
+            );
+            let first = crate::ddl::util::format_type_for_message(snapshot, concrete_types[0]);
+            AnalyzeError::Invalid(format!("CASE types {last} and {first} cannot be matched"))
         })?
     };
 
@@ -2193,10 +2192,14 @@ fn infer_sublink(
                     })
                     .unwrap_or(1);
                 if lhs_arity != cols.len() {
+                    let pg_msg = if cols.len() < lhs_arity {
+                        "subquery has too few columns"
+                    } else {
+                        "subquery has too many columns"
+                    };
                     return Err(AnalyzeError::Invalid(format!(
-                        "subquery has {} column{}, lhs has {lhs_arity}",
+                        "{pg_msg} (subquery has {}, lhs has {lhs_arity})",
                         cols.len(),
-                        if cols.len() == 1 { "" } else { "s" },
                     )));
                 }
             }

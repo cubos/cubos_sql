@@ -30,23 +30,21 @@ fn binary_coercible_reflexive_and_domain() {
 }
 
 #[test]
-fn binary_coercible_user_defined_cast_without_function() {
-    // `CREATE CAST (a AS b) WITHOUT FUNCTION AS IMPLICIT` is the exact syntax
-    // that flags castmethod='b'/castcontext='i' — the pair that makes the
-    // cast binary coercible.
-    let snap = build(&[(
+fn create_cast_with_enum_without_function_is_rejected() {
+    // PG (SQLSTATE 42P17) rejects WITHOUT FUNCTION casts touching enums —
+    // they have an internal sort order that isn't safe to bit-cast through.
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE TYPE color_a AS ENUM ('red');
          CREATE TYPE color_b AS ENUM ('red');
          CREATE CAST (color_a AS color_b) WITHOUT FUNCTION AS IMPLICIT;",
     )]);
 
-    let a = snap.resolve_type_by_name(None, "color_a").unwrap().oid;
-    let b = snap.resolve_type_by_name(None, "color_b").unwrap().oid;
-
-    assert!(snap.is_binary_coercible(a, b));
-    // The reverse direction wasn't declared; should be false.
-    assert!(!snap.is_binary_coercible(b, a));
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "enum data types are not binary-compatible",
+    );
 }
 
 // ── CREATE / DROP CAST ──────────────────────────────────────────────────────
@@ -104,22 +102,19 @@ fn drop_cast_missing_errors_without_if_exists() {
 }
 
 #[test]
-fn create_cast_between_user_types() {
-    // CREATE CAST on a user-defined domain: the resulting implicit cast
-    // must be registered in the snapshot so query analysis picks it up.
-    let snap = build(&[(
+fn create_cast_with_domain_without_function_is_rejected() {
+    // PG (SQLSTATE 42P17) rejects WITHOUT FUNCTION / WITH INOUT casts that
+    // touch a domain — domains carry CHECK constraints that only a casting
+    // function can run. The user must define a function-based cast instead.
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE DOMAIN email AS TEXT;
          CREATE CAST (email AS text) WITHOUT FUNCTION AS IMPLICIT;",
     )]);
 
-    let email_oid = snap.resolve_type_by_name(None, "email").unwrap().oid;
-    let text_oid = snap
-        .resolve_type_by_name(Some("pg_catalog"), "text")
-        .unwrap()
-        .oid;
-    assert!(
-        snap.has_implicit_cast(email_oid, text_oid),
-        "implicit cast email -> text must be registered",
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "domain data types must not be marked binary-compatible",
     );
 }

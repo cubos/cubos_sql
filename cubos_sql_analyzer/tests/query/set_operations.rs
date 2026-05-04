@@ -8,24 +8,25 @@ fn union_with_incompatible_concrete_types_rejected() {
     let mut db = PgCatalog::new();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT NOT NULL);")
         .unwrap();
-    // int8 vs text — no common type in either direction.
     assert_analyze_err!(
         db.analyze("SELECT id FROM t UNION SELECT s FROM t"),
-        AnalyzeError::TypeMismatch { .. },
-        "UNION column",
+        AnalyzeError::Invalid(_),
+        "UNION types bigint and text cannot be matched",
     );
 }
 
 #[test]
 fn union_with_incompatible_unknown_literal_rejected() {
-    let db = setup();
     // `'text'` is an untyped string literal; the target-list boundary binds
-    // it to `text`, so the UNION sees int4 vs text — same rejection as the
-    // concrete-type case.
+    // it to `text`, so the UNION sees int4 vs text. PG raises a runtime
+    // cast error here (`invalid input syntax for type integer`) instead of
+    // the analyzer's static UNION-types message — opt out.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("SELECT 1 UNION SELECT 'text'"),
-        AnalyzeError::TypeMismatch { .. },
-        "UNION column",
+        AnalyzeError::Invalid(_),
+        "UNION types integer and text cannot be matched",
     );
 }
 

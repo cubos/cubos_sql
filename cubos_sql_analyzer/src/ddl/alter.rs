@@ -58,8 +58,9 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
         return Err(DdlError::TableNotFound(format!("{schema_name}.{relname}")));
     };
 
-    // PG: `constraint "x" of relation "t" does not exist` when the name
-    // doesn't match anything attached to the relation.
+    // PG (RENAME CONSTRAINT) emits `constraint "x" for table "t" does not
+    // exist` (note "for table", not "of relation" — DROP CONSTRAINT uses the
+    // latter wording, RENAME uses the former).
     let target_oid = interp
         .pg_constraint
         .values()
@@ -70,7 +71,7 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
             return Ok(());
         }
         return Err(DdlError::DependencyError(format!(
-            "constraint \"{}\" of relation \"{relname}\" does not exist",
+            "constraint \"{}\" for table \"{relname}\" does not exist",
             stmt.subname,
         )));
     };

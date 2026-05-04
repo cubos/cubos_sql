@@ -234,8 +234,8 @@ fn array_literal_incompatible_types_rejected() {
     // explicit `'x'::text` to force a real type clash at parse time.
     assert_analyze_err!(
         db.analyze("SELECT ARRAY['x'::text, 1]"),
-        AnalyzeError::TypeMismatch { .. },
-        "ARRAY types",
+        AnalyzeError::Invalid(_),
+        "ARRAY types text and integer cannot be matched",
     );
 }
 
@@ -244,17 +244,22 @@ fn array_literal_bool_and_int_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT ARRAY[true, 1]"),
-        AnalyzeError::TypeMismatch { .. },
-        "ARRAY types",
+        AnalyzeError::Invalid(_),
+        "ARRAY types boolean and integer cannot be matched",
     );
 }
 
 #[test]
 fn array_literal_unknown_and_int_accepted_like_pg() {
-    let db = setup();
-    // `'x'` is an *unknown* literal; PG defers the cast to runtime and
-    // happily lands the array on `int4[]`. The analyzer mirrors that —
-    // we don't flag a type error here because PG itself doesn't.
+    // `'x'` is an *unknown* literal; real PG defers the cast to runtime and
+    // happily lands the array on `int4[]`. The analyzer mirrors that.
+    //
+    // PG sanity-socket evaluates the literal at Describe time and trips the
+    // `invalid input syntax for type integer` runtime error real PG would
+    // only raise on actual execution — opt out of the mirror so the
+    // analyzer's compile-time behavior is what's checked.
+    let mut db = setup();
+    db.skip_pg_sanity();
     let s = db.analyze("SELECT ARRAY['x', 1] AS xs").unwrap();
     assert_cols(&s, vec![c("xs", array_of(int4()))]);
 }
@@ -281,11 +286,13 @@ fn domain_cast_to_base_then_back_returns_base() {
 
 #[test]
 fn numeric_typmod_overflow_should_be_rejected() {
+    // The analyzer catches `12345.67` overflowing `numeric(4,2)` at compile
+    // time; real PG only complains on execution, and pglite's `prepare`
+    // skips that pass — opt out of the mirror.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
-    // `12345.67` does not fit numeric(4,2) (max 99.99). PG: `numeric field
-    // overflow`.
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, amount) VALUES ($p1, 12345.67)"),
         AnalyzeError::Invalid(_),
@@ -295,13 +302,16 @@ fn numeric_typmod_overflow_should_be_rejected() {
 
 #[test]
 fn varchar_typmod_string_literal_too_long_should_be_rejected() {
+    // Same shape as the numeric overflow test above — analyzer flags too-
+    // long literals at compile time, real PG only at execution. Opt out of
+    // the pglite mirror.
     let mut db = PgCatalog::new();
+    db.skip_pg_sanity();
     db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL);")
         .unwrap();
-    // PG: `value too long for type character varying(3)`.
     assert_analyze_err!(
         db.analyze("INSERT INTO t (slug) VALUES ('toolong')"),
         AnalyzeError::Invalid(_),
-        "too long for type character varying",
+        "value too long for type character varying(3)",
     );
 }

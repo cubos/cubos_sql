@@ -423,16 +423,17 @@ fn generated_stored_column_has_default() {
 // hard-coded allow-list of well-known VOLATILE functions.
 
 #[test]
-fn volatile_function_in_check_constraint_should_error() {
-    // PG: `cannot use volatile function "random" in check constraint`.
-    assert_ddl_err!(
-        try_apply(&[(
-            "0001.sql",
-            "CREATE TABLE t (id INT NOT NULL CHECK (id < (random() * 100)::int));",
-        )]),
-        DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
-    );
+fn volatile_function_in_check_constraint_is_accepted_at_ddl_time() {
+    // Despite documentation suggesting CHECK constraints should be
+    // IMMUTABLE, PG does not enforce this at DDL time — the constraint is
+    // accepted and only flagged at runtime if PG actually trips on the
+    // mutability. The analyzer mirrors this so it doesn't reject DDL that
+    // PG happily accepts.
+    try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (id INT NOT NULL CHECK (id < (random() * 100)::int));",
+    )])
+    .expect("PG accepts volatile-in-CHECK at DDL time, so the analyzer must too");
 }
 
 #[test]
@@ -453,35 +454,29 @@ fn volatile_function_in_generated_stored_column_should_error() {
 }
 
 #[test]
-fn volatile_function_in_table_level_check_constraint_should_error() {
-    // Table-level `CHECK` constraints (declared after all columns) go
-    // through the same volatility validation as column-level ones.
-    assert_ddl_err!(
-        try_apply(&[(
-            "0001.sql",
-            "CREATE TABLE t (
-                id INT NOT NULL,
-                CHECK (id < (random() * 100)::int)
-            );",
-        )]),
-        DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
-    );
+fn volatile_function_in_table_level_check_constraint_is_accepted() {
+    // Table-level CHECK behaves identically to column-level: PG accepts
+    // volatile expressions at DDL time; the analyzer mirrors that.
+    try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+            id INT NOT NULL,
+            CHECK (id < (random() * 100)::int)
+        );",
+    )])
+    .expect("PG accepts volatile-in-CHECK at DDL time");
 }
 
 #[test]
-fn alter_table_add_volatile_check_constraint_should_error() {
-    assert_ddl_err!(
-        try_apply(&[
-            ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
-            (
-                "0002.sql",
-                "ALTER TABLE t ADD CONSTRAINT chk CHECK (id > random()::int);"
-            ),
-        ]),
-        DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
-    );
+fn alter_table_add_volatile_check_constraint_is_accepted() {
+    try_apply(&[
+        ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
+        (
+            "0002.sql",
+            "ALTER TABLE t ADD CONSTRAINT chk CHECK (id > random()::int);",
+        ),
+    ])
+    .expect("PG accepts volatile-in-CHECK at DDL time");
 }
 
 #[test]
@@ -499,35 +494,31 @@ fn check_constraint_calling_immutable_function_is_accepted() {
 }
 
 #[test]
-fn nested_volatile_call_in_check_is_detected() {
-    // The walker must descend into casts, arithmetic, and other expression
-    // nodes to find the buried VOLATILE call.
-    assert_ddl_err!(
-        try_apply(&[(
-            "0001.sql",
-            "CREATE TABLE t (
-                id INT NOT NULL CHECK (id > COALESCE(NULLIF((random() * 10)::int, 0), 1))
-            );",
-        )]),
-        DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
-    );
+fn nested_volatile_call_in_check_is_accepted() {
+    // PG doesn't run the volatility walk on CHECK at DDL time, so even a
+    // VOLATILE call buried inside COALESCE / NULLIF / arithmetic / casts
+    // sails through. The analyzer matches that behavior.
+    try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+            id INT NOT NULL CHECK (id > COALESCE(NULLIF((random() * 10)::int, 0), 1))
+        );",
+    )])
+    .expect("PG accepts volatile-in-CHECK at DDL time");
 }
 
 #[test]
-fn nextval_in_check_constraint_is_rejected() {
-    // `nextval` is VOLATILE — its result depends on sequence state.
-    assert_ddl_err!(
-        try_apply(&[
-            ("0001.sql", "CREATE SEQUENCE seq;"),
-            (
-                "0002.sql",
-                "CREATE TABLE t (id INT NOT NULL CHECK (id < nextval('seq')::int));"
-            ),
-        ]),
-        DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
-    );
+fn nextval_in_check_constraint_is_accepted_at_ddl_time() {
+    // `nextval` is VOLATILE, but PG still accepts it inside a CHECK at DDL
+    // time — only runtime evaluation may flag it.
+    try_apply(&[
+        ("0001.sql", "CREATE SEQUENCE seq;"),
+        (
+            "0002.sql",
+            "CREATE TABLE t (id INT NOT NULL CHECK (id < nextval('seq')::int));",
+        ),
+    ])
+    .expect("PG accepts volatile-in-CHECK at DDL time");
 }
 
 #[test]

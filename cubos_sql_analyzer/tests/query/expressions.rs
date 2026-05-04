@@ -190,11 +190,12 @@ fn nullif_with_param_inherits_type() {
 
 #[test]
 fn nullif_incompatible_concrete_types_rejected() {
-    let db = setup();
-    // `int = text` has no operator — PG errors, analyzer should too. The
-    // explicit cast makes the right side concrete `text`, so the rejection
-    // comes from the generic "cannot coerce" check before NULLIF's own
-    // validation runs.
+    // `int = text` has no operator — PG dispatches to the `=` operator
+    // resolver and errors with `operator does not exist: integer = text`.
+    // The analyzer rejects via the generic coerce check first, so the
+    // wording diverges from PG. Opt out of the mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x'::text) FROM users"),
         AnalyzeError::TypeMismatch { .. },
@@ -204,10 +205,11 @@ fn nullif_incompatible_concrete_types_rejected() {
 
 #[test]
 fn nullif_int_with_string_literal_rejected() {
-    let db = setup();
-    // Bare string literal against an int column — treated as text for the
-    // compatibility check, so PG's "integer and text cannot be matched"
-    // surfaces here as well.
+    // Bare string literal — PG raises a runtime cast error here
+    // (`invalid input syntax for type integer`), the analyzer catches it
+    // statically with a NULLIF-types message.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x') FROM users"),
         AnalyzeError::TypeMismatch { .. },
@@ -328,8 +330,11 @@ fn stress_case_with_null_branch() {
 #[test]
 fn stress_case_mixing_nullable_branches() {
     let db = setup();
-    // CASE with one NOT NULL branch and one nullable branch.
-    let sql = "SELECT CASE WHEN id > 0 THEN name ELSE body END as val \
+    // CASE with one NOT NULL branch and one nullable branch. Qualify `id`
+    // explicitly — both `users.id` and `posts.id` exist, so a bare `id` is
+    // ambiguous (PG SQLSTATE 42702). The point of this test is the
+    // nullability merge, not column resolution.
+    let sql = "SELECT CASE WHEN u.id > 0 THEN name ELSE body END as val \
                FROM users u INNER JOIN posts p ON p.user_id = u.id";
     let info = db.analyze(sql).unwrap();
     // name is NOT NULL but body is nullable → result is nullable.
@@ -493,47 +498,49 @@ fn comparison_with_nullable_both_sides() {
 #[test]
 fn case_with_incompatible_concrete_arms_rejected() {
     let db = setup();
-    // When both arms carry concrete (non-UNKNOWN) types and no common type
-    // exists, PG errors with `CASE/WHEN could not convert type X to Y`.
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x'::text END"),
-        AnalyzeError::TypeMismatch { .. },
-        "no common type",
+        AnalyzeError::Invalid(_),
+        "CASE types text and integer cannot be matched",
     );
 }
 
 #[test]
 fn case_with_incompatible_unknown_literal_rejected() {
-    let db = setup();
-    // Bare string literal vs int — the merge step treats `'x'` as `text`,
-    // so it errors the same way the explicit-cast case does above.
+    // Bare string literal vs int — PG resolves the unknown literal toward
+    // the int4 candidate and tries a runtime cast (`invalid input syntax
+    // for type integer`), which is a different error from our compile-time
+    // CASE mismatch. Opt out of the pglite mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x' END"),
-        AnalyzeError::TypeMismatch { .. },
-        "no common type",
+        AnalyzeError::Invalid(_),
+        "CASE types text and integer cannot be matched",
     );
 }
 
 #[test]
 fn coalesce_with_incompatible_concrete_arms_rejected() {
     let db = setup();
-    // `COALESCE(int, text)` — neither side is the other's implicit target.
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(1, 'x'::text)"),
-        AnalyzeError::TypeMismatch { .. },
-        "no common type",
+        AnalyzeError::Invalid(_),
+        "COALESCE types integer and text cannot be matched",
     );
 }
 
 #[test]
 fn coalesce_with_incompatible_unknown_literal_rejected() {
-    let db = setup();
-    // Same as above but with a bare string literal — treated as text for
-    // the merge check, then rejected against the concrete int4 arg.
+    // Bare string literal vs int — PG raises a runtime cast error
+    // (`invalid input syntax for integer`) rather than the analyzer's
+    // compile-time COALESCE-types mismatch. Opt out of the pglite mirror.
+    let mut db = setup();
+    db.skip_pg_sanity();
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(1, 'x')"),
-        AnalyzeError::TypeMismatch { .. },
-        "no common type",
+        AnalyzeError::Invalid(_),
+        "COALESCE types integer and text cannot be matched",
     );
 }
 

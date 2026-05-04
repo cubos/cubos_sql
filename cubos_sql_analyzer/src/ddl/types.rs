@@ -294,11 +294,19 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
     let key = names_key(&stmt.type_name, interp);
     let nsoid = match interp.namespace_oid(&key.schema) {
         Some(oid) => oid,
-        None => return Err(DdlError::TypeNotFound(key.to_string())),
+        None => {
+            return Err(DdlError::TypeNotFound(format!(
+                "type \"{}\" does not exist",
+                key.name
+            )));
+        }
     };
 
     let Some(&oid) = interp.type_by_qname.get(&(nsoid, key.name.clone())) else {
-        return Err(DdlError::TypeNotFound(key.to_string()));
+        return Err(DdlError::TypeNotFound(format!(
+            "type \"{}\" does not exist",
+            key.name
+        )));
     };
 
     if !matches!(
@@ -443,6 +451,28 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
     } else {
         CastMethod::Binary
     };
+
+    // PG rejects WITHOUT FUNCTION (binary-compatible) casts that touch a
+    // domain or enum on either side. Domains carry CHECK constraints that
+    // must run at cast time, and enums have an internal ordering that's not
+    // safe to bit-cast through. Only WITH FUNCTION supports either case.
+    // The two errors come out with different wording on PG's side
+    // (SQLSTATE 42P17), so we match each precisely.
+    if matches!(castmethod, CastMethod::Binary) {
+        let typtype = |oid: PgTypeOid| interp.pg_type.get(&oid).map(|t| t.typtype);
+        let src_kind = typtype(src);
+        let tgt_kind = typtype(tgt);
+        if src_kind == Some(TypType::Domain) || tgt_kind == Some(TypType::Domain) {
+            return Err(DdlError::Parse(
+                "domain data types must not be marked binary-compatible".into(),
+            ));
+        }
+        if src_kind == Some(TypType::Enum) || tgt_kind == Some(TypType::Enum) {
+            return Err(DdlError::Parse(
+                "enum data types are not binary-compatible".into(),
+            ));
+        }
+    }
 
     let cast_oid = PgCastOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
     interp.insert_pg_cast(PgCast {

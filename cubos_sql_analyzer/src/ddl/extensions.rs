@@ -1263,7 +1263,12 @@ fn apply_with_schema(
     let mut result = Ok(());
     for sql in scripts {
         if !sql.is_empty() {
-            result = interp.apply_sql(sql);
+            // Bypass the public `apply_sql` so we don't double-mirror to
+            // PGlite under `pglite_sanity` — the user-facing `CREATE
+            // EXTENSION` already went there once and PGlite handles its
+            // own internal scripts. Our embedded scripts also use
+            // `MODULE_PATHNAME` placeholders that PGlite would reject.
+            result = super::apply_sql_to(interp, sql);
             if result.is_err() {
                 break;
             }

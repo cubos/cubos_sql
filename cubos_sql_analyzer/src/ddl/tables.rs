@@ -12,7 +12,8 @@ use crate::pg_catalog::{
 
 use super::DdlError;
 use super::util::{
-    ensure_range_var, range_var_names, register_composite_to_record_cast, resolve_type_name,
+    ensure_range_var, format_type_for_message, range_var_names, register_composite_to_record_cast,
+    resolve_type_name,
 };
 use super::views;
 use crate::pg_catalog::PgCatalog;
@@ -21,6 +22,29 @@ use crate::pg_catalog::PgCatalog;
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
 type PendingConstraint = (String, ConType, Vec<i16>, Option<PgClassOid>, Vec<i16>);
+
+/// Look up the `pg_class.relname` for `relid`. Used to produce PG-aligned
+/// error messages of the form `column "X" of relation "T" does not exist` —
+/// the analyzer's `pglite_sanity` cross-check requires this exact prefix.
+fn relname_of(interp: &PgCatalog, relid: PgClassOid) -> String {
+    interp
+        .pg_class
+        .get(&relid)
+        .map(|c| c.relname.clone())
+        .unwrap_or_else(|| format!("oid={relid}"))
+}
+
+/// Build a PG-shaped `column "X" of relation "T" does not exist` message.
+fn column_not_found_msg(interp: &PgCatalog, relid: PgClassOid, col: &str) -> String {
+    let rel = relname_of(interp, relid);
+    format!("column \"{col}\" of relation \"{rel}\" does not exist")
+}
+
+/// Build a PG-shaped `column "X" of relation "T" already exists` message.
+fn column_exists_msg(interp: &PgCatalog, relid: PgClassOid, col: &str) -> String {
+    let rel = relname_of(interp, relid);
+    format!("column \"{col}\" of relation \"{rel}\" already exists")
+}
 
 // ─── CREATE TABLE ───────────────────────────────────────────────────────────
 
@@ -47,22 +71,19 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // First pass: extract table-level PRIMARY KEY constraint keys, and
     // validate any table-level CHECK constraint expressions for volatility.
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
-        if let Some(node::Node::Constraint(c)) = elt.node.as_ref() {
-            if c.contype == ConstrType::ConstrPrimary as i32 {
-                for key_node in &c.keys {
-                    if let Some(node::Node::String(s)) = key_node.node.as_ref() {
-                        pk_columns.push(s.sval.clone());
-                    }
+        // PG does *not* enforce volatility on CHECK constraints at DDL
+        // time — it only warns at runtime if the CHECK turns out to be
+        // mutable. Indexes and GENERATED expressions are still checked
+        // (further down). Skip the volatility walk for CHECK to stay
+        // aligned with PG, otherwise the analyzer would reject DDL that
+        // PG happily accepts.
+        if let Some(node::Node::Constraint(c)) = elt.node.as_ref()
+            && c.contype == ConstrType::ConstrPrimary as i32
+        {
+            for key_node in &c.keys {
+                if let Some(node::Node::String(s)) = key_node.node.as_ref() {
+                    pk_columns.push(s.sval.clone());
                 }
-            }
-            if c.contype == ConstrType::ConstrCheck as i32
-                && let Some(expr) = c.raw_expr.as_deref()
-            {
-                super::volatile::check_no_volatile(
-                    expr,
-                    super::volatile::ExprLocation::Check,
-                    interp,
-                )?;
             }
         }
     }
@@ -231,8 +252,9 @@ fn emit_constraints(
                     ));
                 }
                 Ok(ConstrType::ConstrForeign) => {
+                    let local_names = [cd.colname.clone()];
                     let (target_oid, target_attnums) =
-                        resolve_fk_target(interp, c, relname, &[my_type])?;
+                        resolve_fk_target(interp, c, relname, &local_names, &[my_type])?;
                     to_emit.push((
                         constraint_name(&c.conname, || format!("{relname}_{}_fkey", cd.colname)),
                         ConType::ForeignKey,
@@ -310,7 +332,7 @@ fn emit_constraints(
                 }
                 let fk_columns: Vec<i16> = fk_names.iter().filter_map(|n| attnum_of(n)).collect();
                 let (target_oid, target_attnums) =
-                    resolve_fk_target(interp, c, relname, &local_types)?;
+                    resolve_fk_target(interp, c, relname, &fk_names, &local_types)?;
                 to_emit.push((
                     constraint_name(&c.conname, || {
                         format!("{relname}_{}_fkey", fk_names.join("_"))
@@ -401,8 +423,16 @@ fn resolve_fk_target(
     interp: &PgCatalog,
     c: &pg_query::protobuf::Constraint,
     relname: &str,
+    local_col_names: &[String],
     local_types: &[PgTypeOid],
 ) -> Result<(PgClassOid, Vec<i16>), DdlError> {
+    // Match PG's auto-naming: explicit `CONSTRAINT <name>` if given, otherwise
+    // `<relname>_<col1>_<col2>_..._fkey`. Used as the prefix on error
+    // messages so `pglite_sanity` matches PG's `foreign key constraint
+    // "<name>" cannot be implemented`.
+    let fk_name = constraint_name(&c.conname, || {
+        format!("{relname}_{}_fkey", local_col_names.join("_"))
+    });
     let pkrv = c
         .pktable
         .as_ref()
@@ -410,7 +440,8 @@ fn resolve_fk_target(
     let (target_schema, target_name) = range_var_names(pkrv, interp);
     let target_nsoid = interp.namespace_oid(&target_schema).ok_or_else(|| {
         DdlError::TableNotFound(format!(
-            "referenced table \"{target_schema}.{target_name}\" does not exist"
+            "relation \"{target_schema}.{target_name}\" does not exist (referenced \
+             by foreign key constraint \"{fk_name}\")"
         ))
     })?;
     let target_oid = interp
@@ -418,7 +449,10 @@ fn resolve_fk_target(
         .get(&(target_nsoid, target_name.clone()))
         .copied()
         .ok_or_else(|| {
-            DdlError::TableNotFound(format!("referenced table \"{target_name}\" does not exist"))
+            DdlError::TableNotFound(format!(
+                "relation \"{target_name}\" does not exist (referenced by foreign key \
+                 constraint \"{fk_name}\")"
+            ))
         })?;
 
     // No explicit column list → default to the target's PRIMARY KEY.
@@ -487,29 +521,26 @@ fn resolve_fk_target(
         .collect();
     if target_types.len() != target_attnums.len() {
         return Err(DdlError::Parse(format!(
-            "foreign key on {relname} references unknown column on \"{target_name}\""
+            "foreign key constraint \"{fk_name}\" cannot be implemented \
+             (references an unknown column on \"{target_name}\")"
         )));
     }
     if target_types.len() != local_types.len() {
         return Err(DdlError::Parse(format!(
-            "foreign key on {relname} has {} local column(s) but references {} on \"{target_name}\"",
+            "number of referencing and referenced columns for foreign key disagree \
+             (constraint \"{fk_name}\": {} local column(s) vs {} on \"{target_name}\")",
             local_types.len(),
             target_types.len()
         )));
     }
     for (lt, tt) in local_types.iter().zip(target_types.iter()) {
         if interp.unwrap_domain(*lt) != interp.unwrap_domain(*tt) {
-            let lt_name = interp
-                .get_type(*lt)
-                .map(|t| t.typname.clone())
-                .unwrap_or_default();
-            let tt_name = interp
-                .get_type(*tt)
-                .map(|t| t.typname.clone())
-                .unwrap_or_default();
+            let lt_name = format_type_for_message(interp, *lt);
+            let tt_name = format_type_for_message(interp, *tt);
             return Err(DdlError::DependencyError(format!(
-                "foreign key constraint on {relname} has incompatible types: \
-                 local {lt_name} vs referenced {tt_name} on \"{target_name}\""
+                "foreign key constraint \"{fk_name}\" cannot be implemented \
+                 (key columns of \"{relname}\" and \"{target_name}\" are of incompatible \
+                 types: {lt_name} and {tt_name})"
             )));
         }
     }
@@ -595,19 +626,20 @@ fn validate_constraint_expressions(
                             TypeGoal::NONE,
                         )
                         .map_err(|e| {
+                            // Forward the analyzer's message verbatim so it
+                            // can match PG's wording (e.g. `column "ghost"
+                            // does not exist`); append the constraint
+                            // location as supplementary detail.
                             DdlError::UnsupportedDdl(format!(
-                                "CHECK constraint on \"{relname}\".\"{}\": {e}",
+                                "{e} (in CHECK constraint on \"{relname}\".\"{}\")",
                                 cd.colname
                             ))
                         })?;
                         if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
-                            let typname = interp
-                                .get_type(result.type_oid)
-                                .map(|t| t.typname.clone())
-                                .unwrap_or_else(|| format!("oid {}", result.type_oid));
+                            let typname = format_type_for_message(interp, result.type_oid);
                             return Err(DdlError::UnsupportedDdl(format!(
-                                "argument of CHECK constraint on \"{relname}\".\"{}\" \
-                                 must be type boolean, not type {typname}",
+                                "argument of CHECK must be type boolean, not type {typname} \
+                                 (CHECK constraint on \"{relname}\".\"{}\")",
                                 cd.colname
                             )));
                         }
@@ -626,20 +658,37 @@ fn validate_constraint_expressions(
                                     cd.colname
                                 ))
                             })?;
-                        infer_expr(
+                        // Use a no-goal pass so we can compare the expression's
+                        // type to the column's type ourselves and emit PG's
+                        // exact wording on mismatch (`column "X" is of type T
+                        // but default expression is of type U`).
+                        let result = infer_expr(
                             expr,
                             &scope,
                             &null_ctx,
                             interp,
                             &mut params,
-                            TypeGoal::assignment(col_type),
+                            TypeGoal::NONE,
                         )
                         .map_err(|e| {
                             DdlError::UnsupportedDdl(format!(
-                                "GENERATED expression on \"{relname}\".\"{}\": {e}",
+                                "{e} (in GENERATED expression on \"{relname}\".\"{}\")",
                                 cd.colname
                             ))
                         })?;
+                        if interp.unwrap_domain(result.type_oid) != interp.unwrap_domain(col_type)
+                            && result.type_oid != oid::UNKNOWN
+                            && !interp.has_implicit_cast(result.type_oid, col_type)
+                        {
+                            let col_typname = format_type_for_message(interp, col_type);
+                            let expr_typname = format_type_for_message(interp, result.type_oid);
+                            return Err(DdlError::UnsupportedDdl(format!(
+                                "column \"{}\" is of type {col_typname} but default expression \
+                                 is of type {expr_typname} (in GENERATED expression on \
+                                 \"{relname}\")",
+                                cd.colname
+                            )));
+                        }
                     }
                 }
                 _ => {}
@@ -657,17 +706,14 @@ fn validate_constraint_expressions(
             let result = infer_expr(expr, &scope, &null_ctx, interp, &mut params, TypeGoal::NONE)
                 .map_err(|e| {
                 DdlError::UnsupportedDdl(format!(
-                    "table-level CHECK constraint on \"{relname}\": {e}"
+                    "{e} (in table-level CHECK constraint on \"{relname}\")"
                 ))
             })?;
             if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
-                let typname = interp
-                    .get_type(result.type_oid)
-                    .map(|t| t.typname.clone())
-                    .unwrap_or_else(|| format!("oid {}", result.type_oid));
+                let typname = format_type_for_message(interp, result.type_oid);
                 return Err(DdlError::UnsupportedDdl(format!(
-                    "argument of CHECK constraint on \"{relname}\" \
-                     must be type boolean, not type {typname}"
+                    "argument of CHECK must be type boolean, not type {typname} \
+                     (table-level CHECK constraint on \"{relname}\")"
                 )));
             }
         }
@@ -853,15 +899,9 @@ fn parse_column_def(
                         )?;
                     }
                 }
-                Ok(ConstrType::ConstrCheck) => {
-                    if let Some(expr) = c.raw_expr.as_deref() {
-                        super::volatile::check_no_volatile(
-                            expr,
-                            super::volatile::ExprLocation::Check,
-                            interp,
-                        )?;
-                    }
-                }
+                // No CHECK volatility check here — PG accepts the DDL even
+                // when the predicate calls a VOLATILE function (it only
+                // complains at runtime).
                 _ => {}
             }
         }
@@ -887,9 +927,14 @@ fn parse_column_def(
             [schema, name] => (Some(*schema), *name),
             _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
         };
-        let resolved = interp
-            .resolve_collation(schema, name)
-            .ok_or_else(|| DdlError::Parse(format!("collation \"{name}\" does not exist")))?;
+        let resolved = interp.resolve_collation(schema, name).ok_or_else(|| {
+            // PG includes the encoding in the message: `collation "X" for
+            // encoding "UTF8" does not exist`. We don't model encoding so
+            // we hardcode UTF8 (real PG uses the database's encoding).
+            DdlError::Parse(format!(
+                "collation \"{name}\" for encoding \"UTF8\" does not exist"
+            ))
+        })?;
         Some(resolved.oid)
     } else {
         None
@@ -1029,8 +1074,8 @@ fn drop_constraint(
                 .map(|c| c.relname.as_str())
                 .unwrap_or("?");
             return Err(DdlError::DependencyError(format!(
-                "cannot drop constraint \"{conname}\" on \"{relname}\" because foreign key \
-                 constraint \"{dep}\" depends on it"
+                "cannot drop constraint {conname} on table {relname} because other objects \
+                 depend on it (foreign key constraint \"{dep}\" depends on this)"
             )));
         }
     }
@@ -1102,12 +1147,15 @@ fn set_identity(
         _ => return Ok(()),
     };
 
+    let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
-        return Err(DdlError::TableNotFound(format!("relation oid {relid}")));
+        return Err(DdlError::TableNotFound(format!(
+            "relation \"{rel}\" does not exist"
+        )));
     };
     let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name) else {
         return Err(DdlError::Parse(format!(
-            "column \"{}\" of relation does not exist",
+            "column \"{}\" of relation \"{rel}\" does not exist",
             cmd.name
         )));
     };
@@ -1124,15 +1172,18 @@ fn drop_identity(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
+    let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
-        return Err(DdlError::TableNotFound(format!("relation oid {relid}")));
+        return Err(DdlError::TableNotFound(format!(
+            "relation \"{rel}\" does not exist"
+        )));
     };
     let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name) else {
         if cmd.missing_ok {
             return Ok(());
         }
         return Err(DdlError::Parse(format!(
-            "column \"{}\" of relation does not exist",
+            "column \"{}\" of relation \"{rel}\" does not exist",
             cmd.name
         )));
     };
@@ -1160,9 +1211,10 @@ fn add_column(
         if cmd.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::DuplicateObject(format!(
-            "column \"{}\" of relation already exists",
-            cd.colname
+        return Err(DdlError::DuplicateObject(column_exists_msg(
+            interp,
+            relid,
+            &cd.colname,
         )));
     }
 
@@ -1202,9 +1254,8 @@ fn drop_column(
         if cmd.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::Parse(format!(
-            "column \"{}\" of relation does not exist",
-            cmd.name
+        return Err(DdlError::Parse(column_not_found_msg(
+            interp, relid, &cmd.name,
         )));
     }
 
@@ -1230,7 +1281,8 @@ fn drop_column(
             .map(|c| c.relname.clone())
             .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop column {relname}.{} because view(s) {} depend on it",
+            "cannot drop column {} of table {relname} because other objects depend on it \
+             (view(s) {} depend on this column)",
             cmd.name,
             view_names.join(", "),
         )));
@@ -1245,42 +1297,35 @@ fn drop_column(
         .map(|a| a.attnum);
 
     // PG also blocks DROP COLUMN when a `pg_constraint` row references
-    // it (PK/UNIQUE/CHECK on this relation, or an FK on another relation
-    // whose target column matches), or when a `pg_index` row's `indkey`
-    // contains the attnum. Without CASCADE we surface the same error PG
-    // does.
+    // it (PK/UNIQUE on this relation, or an FK on another relation whose
+    // target column matches), or when a `pg_index` row's `indkey` contains
+    // the attnum. CHECK constraints local to the column are *not* blockers
+    // — PG silently drops them along with the column. Without CASCADE we
+    // surface the same error PG does.
     if let Some(an) = target_attnum {
+        // PG only blocks DROP COLUMN when there's an *external* dependency
+        // — an FK in some *other* table that points at this column (or any
+        // view, handled above). Everything local to the column on the
+        // *same* relation (PK, UNIQUE, CHECK, FK source side, indexes) is
+        // dropped silently along with the column, no CASCADE needed. This
+        // matches PG's `dropdb` cascade-only-external semantics.
         let mut blockers: Vec<String> = Vec::new();
         for c in interp.pg_constraint.values() {
-            if c.conrelid == relid && c.conkey.contains(&an) {
-                blockers.push(c.conname.clone());
-            }
+            // FKs in *other* tables referencing this column.
             if matches!(c.contype, ConType::ForeignKey)
                 && c.confrelid == Some(relid)
                 && c.confkey.contains(&an)
+                && c.conrelid != relid
             {
                 blockers.push(c.conname.clone());
             }
         }
-        // Indexes whose indkey references this attnum block too. Skip
-        // indexes that are *already* covered by a constraint above (their
-        // pg_class name matches a pg_constraint we'll drop anyway) so the
-        // error message doesn't double-up.
-        let constraint_names: std::collections::HashSet<String> =
-            blockers.iter().cloned().collect();
         let dependent_indexes: Vec<PgClassOid> = interp
             .pg_index
             .values()
             .filter(|i| i.indrelid == relid && i.indkey.contains(&an))
             .map(|i| i.indexrelid)
             .collect();
-        for idx_oid in &dependent_indexes {
-            if let Some(c) = interp.pg_class.get(idx_oid)
-                && !constraint_names.contains(&c.relname)
-            {
-                blockers.push(c.relname.clone());
-            }
-        }
         if !blockers.is_empty() && !cascade {
             let relname = interp
                 .pg_class
@@ -1288,35 +1333,49 @@ fn drop_column(
                 .map(|c| c.relname.clone())
                 .unwrap_or_default();
             return Err(DdlError::DependencyError(format!(
-                "cannot drop column {relname}.{} because constraint(s) {} depend on it",
+                "cannot drop column {} of table {relname} because other objects depend on it \
+                 (constraint(s) {} depend on this column)",
                 cmd.name,
                 blockers.join(", "),
             )));
         }
+        // Drop everything local to this column on this relation —
+        // PK/UNIQUE/CHECK constraints, FK source side, and indexes —
+        // regardless of CASCADE. PG treats these as part of the column.
+        // External FKs (in other tables) only fall away under CASCADE.
+        let always_drop: Vec<_> = interp
+            .pg_constraint
+            .values()
+            .filter(|c| c.conrelid == relid && c.conkey.contains(&an))
+            .map(|c| c.oid)
+            .collect();
+        for oid in always_drop {
+            interp.pg_constraint.remove(&oid);
+        }
+        for &idx_oid in &dependent_indexes {
+            interp.remove_pg_index(idx_oid);
+            interp.remove_pg_class(idx_oid);
+            let obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+            interp.remove_dependencies_of(crate::pg_catalog::PG_CLASS_RELID, obj);
+            interp.remove_dependencies_on(crate::pg_catalog::PG_CLASS_RELID, obj);
+        }
+
         if cascade && !blockers.is_empty() {
-            // CASCADE: drop the dependent constraints + their backing
-            // indexes + any non-constraint indexes that reference this
-            // column.
+            // CASCADE: drop the external FKs (in other tables) that
+            // reference this column. Local stuff was already removed above.
             let to_drop_constraints: Vec<_> = interp
                 .pg_constraint
                 .values()
                 .filter(|c| {
-                    (c.conrelid == relid && c.conkey.contains(&an))
-                        || (matches!(c.contype, ConType::ForeignKey)
-                            && c.confrelid == Some(relid)
-                            && c.confkey.contains(&an))
+                    matches!(c.contype, ConType::ForeignKey)
+                        && c.confrelid == Some(relid)
+                        && c.confkey.contains(&an)
+                        && c.conrelid != relid
                 })
                 .map(|c| c.oid)
                 .collect();
             for oid in to_drop_constraints {
                 interp.pg_constraint.remove(&oid);
-            }
-            for idx_oid in dependent_indexes {
-                interp.remove_pg_index(idx_oid);
-                interp.remove_pg_class(idx_oid);
-                let obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
-                interp.remove_dependencies_of(crate::pg_catalog::PG_CLASS_RELID, obj);
-                interp.remove_dependencies_on(crate::pg_catalog::PG_CLASS_RELID, obj);
             }
         }
     }
@@ -1370,12 +1429,15 @@ fn set_not_null(
     col_name: &str,
     not_null: bool,
 ) -> Result<(), DdlError> {
+    let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
-        return Err(DdlError::TableNotFound(format!("relation oid {relid}")));
+        return Err(DdlError::TableNotFound(format!(
+            "relation \"{rel}\" does not exist"
+        )));
     };
     let Some(col) = attrs.iter_mut().find(|c| c.attname == col_name) else {
         return Err(DdlError::Parse(format!(
-            "column \"{col_name}\" of relation does not exist"
+            "column \"{col_name}\" of relation \"{rel}\" does not exist"
         )));
     };
     col.attnotnull = not_null;
@@ -1387,12 +1449,15 @@ fn set_default(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
+    let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
-        return Err(DdlError::TableNotFound(format!("relation oid {relid}")));
+        return Err(DdlError::TableNotFound(format!(
+            "relation \"{rel}\" does not exist"
+        )));
     };
     let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name) else {
         return Err(DdlError::Parse(format!(
-            "column \"{}\" of relation does not exist",
+            "column \"{}\" of relation \"{rel}\" does not exist",
             cmd.name
         )));
     };
@@ -1428,15 +1493,15 @@ fn alter_column_type(
         .iter()
         .find(|a| a.attname == cmd.name)
         .map(|a| a.atttypid)
-        .ok_or_else(|| {
-            DdlError::Parse(format!(
-                "column \"{}\" of relation does not exist",
-                cmd.name
-            ))
-        })?;
+        .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, &cmd.name)))?;
 
     let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
-    if !dependent_views.is_empty() && !interp.is_binary_coercible(old_type_oid, new_type_oid) {
+    if !dependent_views.is_empty() {
+        // Match PG (SQLSTATE 0A000): any dependent view blocks `ALTER COLUMN
+        // TYPE`, even when the change is binary-coercible. PG has no exemption
+        // for "new type is the base of the old domain", so we don't either —
+        // otherwise migrations the analyzer accepts would still fail at
+        // production runtime.
         let view_names: Vec<String> = dependent_views
             .iter()
             .filter_map(|&v| {
@@ -1451,9 +1516,9 @@ fn alter_column_type(
             .map(|c| c.relname.clone())
             .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot alter type of column {relname}.{} because view(s) {} depend on it \
-             and the new type is not binary coercible with the old one \
-             (hint: drop the view(s) first, alter the column, then recreate)",
+            "cannot alter type of a column used by a view or rule: column {relname}.{} \
+             is referenced by view(s) {} (hint: drop the view(s) first, alter the column, \
+             then recreate)",
             cmd.name,
             view_names.join(", "),
         )));
@@ -1467,10 +1532,6 @@ fn alter_column_type(
     }
 
     let _ = old_type_oid;
-    for view_oid in &dependent_views {
-        views::reanalyze_view(interp, *view_oid)?;
-    }
-
     Ok(())
 }
 
@@ -1602,7 +1663,8 @@ fn add_constraint(
     if c.contype == ConstrType::ConstrCheck as i32
         && let Some(expr) = c.raw_expr.as_deref()
     {
-        super::volatile::check_no_volatile(expr, super::volatile::ExprLocation::Check, interp)?;
+        // No volatility walk for CHECK — PG accepts volatile expressions at
+        // DDL time, only the type-must-be-bool check below has teeth.
         validate_check_expression_for_table(interp, relid, expr)?;
         // Emit pg_constraint row for the CHECK so future inspections see it.
         let conname = if c.conname.is_empty() {
@@ -1658,7 +1720,7 @@ fn add_constraint(
             .map(|c| c.relname.clone())
             .unwrap_or_default();
         let (target_oid, target_attnums) =
-            resolve_fk_target(interp, c, &relname_owned, &local_types)?;
+            resolve_fk_target(interp, c, &relname_owned, &column_names, &local_types)?;
         let conname = if c.conname.is_empty() {
             format!("{relname_owned}_{}_fkey", column_names.join("_"))
         } else {
@@ -1719,12 +1781,10 @@ fn validate_check_expression_for_table(
     let result = infer_expr(expr, &scope, &null_ctx, interp, &mut params, TypeGoal::NONE)
         .map_err(|e| DdlError::UnsupportedDdl(format!("CHECK on \"{relname}\": {e}")))?;
     if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
-        let typname = interp
-            .get_type(result.type_oid)
-            .map(|t| t.typname.clone())
-            .unwrap_or_else(|| format!("oid {}", result.type_oid));
+        let typname = format_type_for_message(interp, result.type_oid);
         return Err(DdlError::UnsupportedDdl(format!(
-            "argument of CHECK constraint on \"{relname}\" must be type boolean, not type {typname}"
+            "argument of CHECK must be type boolean, not type {typname} \
+             (CHECK constraint on \"{relname}\")"
         )));
     }
     Ok(())

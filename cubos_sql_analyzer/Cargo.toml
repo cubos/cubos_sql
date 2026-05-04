@@ -6,6 +6,11 @@ description = "Static SQL type and nullability analyzer for cubos_sql"
 
 [features]
 internal = []
+# Cross-check every `apply_sql` / `analyze` call against a real PostgreSQL
+# server. Each `PgCatalog` creates its own scratch database inside the
+# shared cluster pointed to by `POSTGRES_URL` and tears it down on Drop.
+# Spin up the cluster + run tests via `scripts/run-pg-sanity.sh`.
+pg_sanity = ["dep:postgres"]
 
 [dependencies]
 cubos_sql_core = { path = "../cubos_sql_core" }
@@ -16,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_tuple = "1"
 thiserror = "2"
+postgres = { version = "0.19", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

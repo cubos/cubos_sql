@@ -49,7 +49,11 @@ fn drop_operator_if_exists_no_error() {
 #[test]
 fn drop_operator_missing_errors_without_if_exists() {
     let result = try_apply(&[("0001.sql", "DROP OPERATOR <=> (int4, int4);")]);
-    assert_ddl_err!(result, DdlError::DependencyError(_), "operator <=>");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "operator does not exist: integer <=> integer",
+    );
 }
 
 // ── ALTER OPERATOR ──────────────────────────────────────────────────────────

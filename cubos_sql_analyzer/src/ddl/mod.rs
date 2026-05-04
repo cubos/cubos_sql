@@ -48,20 +48,30 @@ pub enum DdlError {
 }
 
 impl std::fmt::Display for DdlError {
+    /// Display emits the variant's stored message verbatim — variants are for
+    /// pattern matching on the kind of failure, not for adding a prefix to
+    /// the message. This keeps wording aligned with PG, where the
+    /// server-side message contains the full diagnostic; the
+    /// `pglite_sanity` cross-check requires our messages to *start with*
+    /// PG's message verbatim.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DdlError::Parse(msg) => write!(f, "SQL parse error: {msg}"),
+            DdlError::Parse(msg)
+            | DdlError::UnsupportedDdl(msg)
+            | DdlError::TypeNotFound(msg)
+            | DdlError::TableNotFound(msg)
+            | DdlError::DuplicateObject(msg)
+            | DdlError::ExtensionError(msg)
+            | DdlError::DependencyError(msg) => write!(f, "{msg}"),
             DdlError::Migration { filename, source } => {
                 write!(f, "in migration '{filename}': {source}")
             }
-            DdlError::UnsupportedDdl(msg) => write!(f, "unsupported DDL: {msg}"),
-            DdlError::TypeNotFound(name) => write!(f, "type not found: {name}"),
-            DdlError::TableNotFound(name) => write!(f, "table not found: {name}"),
-            DdlError::DuplicateObject(name) => write!(f, "duplicate object: {name}"),
-            DdlError::ExtensionError(msg) => write!(f, "extension error: {msg}"),
-            DdlError::DependencyError(msg) => write!(f, "{msg}"),
             DdlError::ViewAnalysis { view, source } => {
-                write!(f, "cannot analyze view '{view}': {source}")
+                // Lead with the inner analyzer message so it stays
+                // verbatim-aligned with PG's wording (the `pglite_sanity`
+                // mirror checks `starts_with` against PG); append the view
+                // identifier as supplementary context.
+                write!(f, "{source} (while analyzing view '{view}')")
             }
         }
     }

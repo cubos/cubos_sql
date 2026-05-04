@@ -161,7 +161,11 @@ fn view_alter_type_fails_without_cascade() {
         ("0002.sql", "ALTER TABLE t ALTER COLUMN amount TYPE BIGINT;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "binary coercible");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot alter type of a column used by a view or rule",
+    );
 }
 
 #[test]

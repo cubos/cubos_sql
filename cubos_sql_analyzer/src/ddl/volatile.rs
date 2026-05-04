@@ -59,7 +59,6 @@ pub(super) fn check_no_volatile(
 
 #[derive(Clone, Copy)]
 pub(super) enum ExprLocation {
-    Check,
     Generated,
     Index,
 }
@@ -67,15 +66,13 @@ pub(super) enum ExprLocation {
 impl ExprLocation {
     fn error(self, fname: &str) -> DdlError {
         match self {
-            ExprLocation::Check => DdlError::UnsupportedDdl(format!(
-                "function \"{fname}\" used in check constraint must be marked IMMUTABLE"
-            )),
             ExprLocation::Generated => DdlError::UnsupportedDdl(format!(
                 "generation expression is not immutable: \
                  function \"{fname}\" must be marked IMMUTABLE"
             )),
             ExprLocation::Index => DdlError::UnsupportedDdl(format!(
-                "function \"{fname}\" in index expression must be marked IMMUTABLE"
+                "functions in index expression must be marked IMMUTABLE \
+                 (function \"{fname}\" is not)"
             )),
         }
     }
