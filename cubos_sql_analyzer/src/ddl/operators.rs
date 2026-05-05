@@ -31,7 +31,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         [schema, name] => (schema.clone(), name.clone()),
         _ => return Ok(()),
     };
-    let nsoid = ensure_namespace(interp, &schema);
+    let nsoid = ensure_namespace(interp, &schema)?;
 
     let mut left_type: Option<PgTypeOid> = None;
     let mut right_type: Option<PgTypeOid> = None;
@@ -72,7 +72,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         return Ok(());
     };
 
-    let oid = PgOperatorOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgOperatorOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_operator(PgOperator {
         oid,
         oprname: op_name,

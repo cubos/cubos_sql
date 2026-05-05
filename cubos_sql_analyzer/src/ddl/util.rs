@@ -2,6 +2,7 @@
 
 use pg_query::protobuf::{Node, RangeVar, TypeName, node};
 
+use crate::ddl::DdlError;
 use crate::oid::{PgCastOid, PgNamespaceOid, PgTypeOid};
 use crate::pg_catalog::{
     CastContext, CastMethod, PgCast, PgCatalog, PgNamespace, oid as builtin_oid,
@@ -62,30 +63,36 @@ pub fn names_key(names: &[Node], snapshot: &PgCatalog) -> QualifiedName {
 /// keep that leniency by registering the schema on demand, allocating a fresh
 /// OID. Callers that *need* strict checks (e.g. `ALTER … RENAME TO`) should
 /// look at [`PgCatalog::namespace_oid`] directly and surface their own errors.
-pub fn ensure_namespace(interp: &mut PgCatalog, name: &str) -> PgNamespaceOid {
+pub fn ensure_namespace(interp: &mut PgCatalog, name: &str) -> Result<PgNamespaceOid, DdlError> {
     if let Some(oid) = interp.namespace_oid(name) {
-        return oid;
+        return Ok(oid);
     }
-    let oid = PgNamespaceOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgNamespaceOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_namespace(PgNamespace {
         oid,
         nspname: name.to_owned(),
     });
-    oid
+    Ok(oid)
 }
 
 /// Extract a `(nspoid, name)` pair, creating the namespace if it doesn't
 /// exist yet. Convenience wrapper around `extract_names` + `ensure_namespace`
 /// for DDL handlers that are about to insert a row.
-pub fn ensure_qualified_name(interp: &mut PgCatalog, names: &[Node]) -> (PgNamespaceOid, String) {
+pub fn ensure_qualified_name(
+    interp: &mut PgCatalog,
+    names: &[Node],
+) -> Result<(PgNamespaceOid, String), DdlError> {
     let (schema, name) = extract_names(names, interp);
-    (ensure_namespace(interp, &schema), name)
+    Ok((ensure_namespace(interp, &schema)?, name))
 }
 
 /// Same as `ensure_qualified_name` but for `RangeVar` inputs.
-pub fn ensure_range_var(interp: &mut PgCatalog, rv: &RangeVar) -> (PgNamespaceOid, String) {
+pub fn ensure_range_var(
+    interp: &mut PgCatalog,
+    rv: &RangeVar,
+) -> Result<(PgNamespaceOid, String), DdlError> {
     let (schema, name) = range_var_names(rv, interp);
-    (ensure_namespace(interp, &schema), name)
+    Ok((ensure_namespace(interp, &schema)?, name))
 }
 
 /// Resolve a `TypeName` AST node to a type OID in the snapshot.
@@ -188,8 +195,11 @@ pub fn node_string(n: &Node) -> Option<&str> {
 /// composite type. Used by the operator resolver so that `composite =
 /// composite` reaches the polymorphic `record = record` (record_eq) operator
 /// via cast lookup.
-pub fn register_composite_to_record_cast(interp: &mut PgCatalog, composite_oid: PgTypeOid) {
-    let cast_oid = PgCastOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+pub fn register_composite_to_record_cast(
+    interp: &mut PgCatalog,
+    composite_oid: PgTypeOid,
+) -> Result<(), DdlError> {
+    let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_cast(PgCast {
         oid: cast_oid,
         castsource: composite_oid,
@@ -197,4 +207,5 @@ pub fn register_composite_to_record_cast(interp: &mut PgCatalog, composite_oid: 
         castcontext: CastContext::Implicit,
         castmethod: CastMethod::Binary,
     });
+    Ok(())
 }

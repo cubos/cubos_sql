@@ -21,7 +21,7 @@ use crate::pg_catalog::PgCatalog;
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
 
 pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<(), DdlError> {
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.domainname);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.domainname)?;
 
     if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
@@ -84,7 +84,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
             .and_then(|t| t.typcollation)
     };
 
-    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -101,14 +101,14 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typcollation: domain_collation,
     });
 
-    register_array_type(interp, nsoid, &name, oid);
+    register_array_type(interp, nsoid, &name, oid)?;
     Ok(())
 }
 
 // ─── CREATE TYPE AS ENUM ────────────────────────────────────────────────────
 
 pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), DdlError> {
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.type_name);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.type_name)?;
 
     if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
@@ -122,7 +122,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         .filter_map(|n| node_string(n).map(|s| s.to_owned()))
         .collect();
 
-    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -139,7 +139,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         typcollation: None,
     });
     for (i, label) in labels.into_iter().enumerate() {
-        let enum_oid = PgEnumOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_enum(PgEnum {
             oid: enum_oid,
             enumtypid: oid,
@@ -148,7 +148,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         });
     }
 
-    register_array_type(interp, nsoid, &name, oid);
+    register_array_type(interp, nsoid, &name, oid)?;
     Ok(())
 }
 
@@ -169,7 +169,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     } else {
         rv.schemaname.clone()
     };
-    let nsoid = ensure_namespace(interp, &schema);
+    let nsoid = ensure_namespace(interp, &schema)?;
     let name = rv.relname.clone();
 
     if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
@@ -191,8 +191,8 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         }
     }
 
-    let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-    let type_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let class_oid = PgClassOid::from_nonzero(interp.alloc_oid()?);
+    let type_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
 
     interp.insert_pg_class(PgClass {
         oid: class_oid,
@@ -231,8 +231,8 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         typcollation: None,
     });
 
-    register_array_type(interp, nsoid, &name, type_oid);
-    register_composite_to_record_cast(interp, type_oid);
+    register_array_type(interp, nsoid, &name, type_oid)?;
+    register_composite_to_record_cast(interp, type_oid)?;
 
     Ok(())
 }
@@ -240,7 +240,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 // ─── CREATE TYPE AS RANGE ───────────────────────────────────────────────────
 
 pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<(), DdlError> {
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.type_name);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.type_name)?;
 
     if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(
@@ -263,7 +263,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         return Ok(());
     };
 
-    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -284,7 +284,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         rngsubtype: subtype_oid,
     });
 
-    register_array_type(interp, nsoid, &name, oid);
+    register_array_type(interp, nsoid, &name, oid)?;
     Ok(())
 }
 
@@ -370,7 +370,7 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
             + 1.0
     };
 
-    let enum_oid = PgEnumOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_enum(PgEnum {
         oid: enum_oid,
         enumtypid: oid,
@@ -391,14 +391,14 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         return Ok(());
     }
 
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames)?;
 
     if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         // Full definition after shell type — just confirm it exists.
         return Ok(());
     }
 
-    let oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -414,7 +414,7 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         typtypmod: None,
         typcollation: None,
     });
-    register_array_type(interp, nsoid, &name, oid);
+    register_array_type(interp, nsoid, &name, oid)?;
     Ok(())
 }
 
@@ -474,7 +474,7 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
         }
     }
 
-    let cast_oid = PgCastOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_cast(PgCast {
         oid: cast_oid,
         castsource: src,
@@ -499,8 +499,8 @@ pub(crate) fn register_array_type(
     nsoid: PgNamespaceOid,
     base_name: &str,
     element_oid: PgTypeOid,
-) -> PgTypeOid {
-    let array_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+) -> Result<PgTypeOid, DdlError> {
+    let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
         oid: array_oid,
         typname: array_name(base_name),
@@ -519,5 +519,5 @@ pub(crate) fn register_array_type(
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);
     }
-    array_oid
+    Ok(array_oid)
 }

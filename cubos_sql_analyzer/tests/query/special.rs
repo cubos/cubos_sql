@@ -6,7 +6,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id          BIGINT PRIMARY KEY,
@@ -570,7 +570,7 @@ fn srf_generate_series_int() {
 #[test]
 fn stress_annotation_on_left_join_star() {
     // Force nullable LEFT JOIN column to NOT NULL via annotation.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,

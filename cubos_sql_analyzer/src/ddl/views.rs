@@ -33,7 +33,7 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW without name".into()))?;
 
-    let (nsoid, name) = ensure_range_var(interp, rv);
+    let (nsoid, name) = ensure_range_var(interp, rv)?;
     let qn_label = crate::qualified_name::QualifiedName::new(
         interp.namespace_name(nsoid).unwrap_or("?"),
         name.clone(),
@@ -71,7 +71,7 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         super::drop::drop_relation_by_oid(interp, existing_oid);
     }
 
-    install_relation(interp, nsoid, name, RelKind::View, resolved);
+    install_relation(interp, nsoid, name, RelKind::View, resolved)?;
     Ok(())
 }
 
@@ -87,7 +87,7 @@ pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Resu
         _ => RelKind::Table,
     };
 
-    let (nsoid, name) = ensure_range_var(interp, rv);
+    let (nsoid, name) = ensure_range_var(interp, rv)?;
     let qn_label = crate::qualified_name::QualifiedName::new(
         interp.namespace_name(nsoid).unwrap_or("?"),
         name.clone(),
@@ -105,7 +105,7 @@ pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Resu
         None => ResolvedView::default(),
     };
 
-    install_relation(interp, nsoid, name, kind, resolved);
+    install_relation(interp, nsoid, name, kind, resolved)?;
     Ok(())
 }
 
@@ -128,16 +128,16 @@ fn install_relation(
     name: String,
     relkind: RelKind,
     resolved: ResolvedView,
-) {
+) -> Result<(), DdlError> {
     let ResolvedView {
         columns,
         bindings,
         ast,
         deps,
     } = resolved;
-    let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-    let composite_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-    let array_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let class_oid = PgClassOid::from_nonzero(interp.alloc_oid()?);
+    let composite_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
 
     interp.insert_pg_class(PgClass {
         oid: class_oid,
@@ -149,7 +149,7 @@ fn install_relation(
     // PG stores the SELECT body as a `_RETURN` rule in pg_rewrite — only
     // for views/matviews; CTAS-as-table doesn't get one.
     if matches!(relkind, RelKind::View | RelKind::MaterializedView) {
-        let rewrite_oid = PgRewriteOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        let rewrite_oid = PgRewriteOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_rewrite(PgRewrite {
             oid: rewrite_oid,
             rulename: "_RETURN".to_owned(),
@@ -207,31 +207,48 @@ fn install_relation(
     });
 
     // Record dependencies in pg_depend.
-    let class_obj = PgGenericOid::new(class_oid.get()).unwrap();
-    let dep = |refclassid: PgClassOid, refobjid: u32, refobjsubid: i16| PgDepend {
+    let class_obj = PgGenericOid::from_nonzero(class_oid.into_nonzero());
+    let dep = |refclassid: PgClassOid, refobjid: PgGenericOid, refobjsubid: i16| PgDepend {
         classid: PG_CLASS_RELID,
         objid: class_obj,
         objsubid: 0,
         refclassid,
-        refobjid: PgGenericOid::new(refobjid).unwrap(),
+        refobjid,
         refobjsubid,
         deptype: DepType::Normal,
     };
     let mut whole_recorded = std::collections::HashSet::new();
     for (refrelid, refattnum) in &deps.column_refs {
-        interp.add_dependency(dep(PG_CLASS_RELID, refrelid.get(), *refattnum));
+        interp.add_dependency(dep(
+            PG_CLASS_RELID,
+            PgGenericOid::from_nonzero(refrelid.into_nonzero()),
+            *refattnum,
+        ));
     }
     for refrelid in &deps.relation_refs {
         if whole_recorded.insert(*refrelid) {
-            interp.add_dependency(dep(PG_CLASS_RELID, refrelid.get(), 0));
+            interp.add_dependency(dep(
+                PG_CLASS_RELID,
+                PgGenericOid::from_nonzero(refrelid.into_nonzero()),
+                0,
+            ));
         }
     }
     for proc_oid in &deps.function_refs {
-        interp.add_dependency(dep(PG_PROC_RELID, proc_oid.get(), 0));
+        interp.add_dependency(dep(
+            PG_PROC_RELID,
+            PgGenericOid::from_nonzero(proc_oid.into_nonzero()),
+            0,
+        ));
     }
     for type_oid in &deps.type_refs {
-        interp.add_dependency(dep(PG_TYPE_RELID, type_oid.get(), 0));
+        interp.add_dependency(dep(
+            PG_TYPE_RELID,
+            PgGenericOid::from_nonzero(type_oid.into_nonzero()),
+            0,
+        ));
     }
+    Ok(())
 }
 
 #[derive(Clone)]

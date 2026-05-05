@@ -7,11 +7,17 @@
 //! is embedded at compile time via `include_str!` and deserialized into a
 //! [`PgCatalogSeed`] DTO before being moved into a fresh [`crate::PgCatalog`].
 
+use crate::error::AnalyzeError;
 use crate::pg_catalog::PgCatalogSeed;
 
 const SEED_JSON: &str = include_str!("seed.json");
 
 /// Load the embedded seed (clean PostgreSQL 18 catalog).
-pub(crate) fn load_seed() -> PgCatalogSeed {
-    serde_json::from_str(SEED_JSON).expect("embedded seed.json is invalid")
+///
+/// The seed is bundled with the analyzer crate and validated by the
+/// regenerator (`cargo run -p cubos_sql_seed`); a malformed seed surfaces as
+/// an [`AnalyzeError::Serde`] rather than a panic so callers using
+/// [`crate::PgCatalog::try_new`] can capture it.
+pub(crate) fn load_seed() -> Result<PgCatalogSeed, AnalyzeError> {
+    serde_json::from_str(SEED_JSON).map_err(AnalyzeError::from)
 }

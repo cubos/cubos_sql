@@ -5,7 +5,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,

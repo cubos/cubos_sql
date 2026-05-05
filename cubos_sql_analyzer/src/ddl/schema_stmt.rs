@@ -8,7 +8,7 @@ use crate::pg_catalog::PgCatalog;
 
 pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
     if !stmt.schemaname.is_empty() {
-        ensure_namespace(interp, &stmt.schemaname);
+        ensure_namespace(interp, &stmt.schemaname)?;
     }
     // Process any inline schema elements (CREATE SCHEMA ... CREATE TABLE ...).
     for elt in &stmt.schema_elts {

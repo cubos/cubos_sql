@@ -118,7 +118,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
 
     // ── Allocate the index's pg_class oid + insert pg_index ──
-    let indexrelid = PgClassOid::new(db.alloc_oid()).expect("alloc_oid is non-zero");
+    let indexrelid = PgClassOid::from_nonzero(db.alloc_oid()?);
     db.insert_pg_class(PgClass {
         oid: indexrelid,
         relname: conname.clone(),
@@ -151,12 +151,16 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // make `ON CONFLICT (slug)` correctly fail to find a match for a
     // partial-unique-only schema.
     if stmt.unique && stmt.where_clause.is_none() {
-        let idx = db.pg_index.get(&indexrelid).expect("just inserted");
+        let idx = db.pg_index.get(&indexrelid).ok_or_else(|| {
+            DdlError::Internal(format!(
+                "create_index expects pg_index row for indexrelid={indexrelid} just inserted to be present"
+            ))
+        })?;
         // Expression-based UNIQUE INDEXes never line up with a
         // column-list ON CONFLICT, so skip those.
         if idx.indexprs.is_empty() && !idx.indkey.is_empty() {
             let conkey: Vec<i16> = idx.indkey.clone();
-            let oid = PgConstraintOid::new(db.alloc_oid()).expect("alloc_oid is non-zero");
+            let oid = PgConstraintOid::from_nonzero(db.alloc_oid()?);
             db.insert_pg_constraint(PgConstraint {
                 oid,
                 conname: conname.clone(),

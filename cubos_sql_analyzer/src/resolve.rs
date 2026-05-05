@@ -96,7 +96,11 @@ pub struct AnalyzedQuery {
 /// Replaces each spread insertion point with a single row of positional
 /// placeholders numbered after the last regular parameter. Field mapping is
 /// mandatory for spreads, so `fields.len()` gives the column count.
-pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> String {
+///
+/// Returns [`AnalyzeError::Internal`] if any spread reaches this point without
+/// the field list the lexer is supposed to attach — that would indicate a
+/// lexer/macro contract bug rather than user input.
+pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
     let base_sql = &lex_output.sql;
     let num_regular_params = lex_output.params.len();
     let mut result = String::with_capacity(base_sql.len() + 64);
@@ -105,7 +109,12 @@ pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> String {
 
     for spread in &lex_output.spreads {
         result.push_str(&base_sql[last_offset..spread.offset]);
-        let fields = spread.fields.as_ref().expect("spread must have fields");
+        let fields = spread.fields.as_ref().ok_or_else(|| {
+            AnalyzeError::Internal(format!(
+                "spread '${}' reached the analyzer without a field list",
+                spread.name
+            ))
+        })?;
         result.push('(');
         for (i, _) in fields.iter().enumerate() {
             if i > 0 {
@@ -120,7 +129,7 @@ pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> String {
     }
 
     result.push_str(&base_sql[last_offset..]);
-    result
+    Ok(result)
 }
 
 pub(crate) fn fuse(
@@ -128,7 +137,7 @@ pub(crate) fn fuse(
     columns: Vec<AnalyzedColumn>,
     info_params: Vec<ParamInfo>,
     can_run_as_subquery: bool,
-) -> AnalyzedQuery {
+) -> Result<AnalyzedQuery, AnalyzeError> {
     let LexOutput {
         sql,
         params: lex_params,
@@ -155,7 +164,12 @@ pub(crate) fn fuse(
     let mut spread_param_cursor = num_regular;
     let mut spreads = Vec::with_capacity(lex_spreads.len());
     for spread in lex_spreads {
-        let lex_fields = spread.fields.expect("spread must have fields");
+        let lex_fields = spread.fields.ok_or_else(|| {
+            AnalyzeError::Internal(format!(
+                "spread '${}' reached fuse() without a field list",
+                spread.name
+            ))
+        })?;
         let mut fields = Vec::with_capacity(lex_fields.len());
         for lf in lex_fields {
             let pi = &info_params[spread_param_cursor];
@@ -173,13 +187,13 @@ pub(crate) fn fuse(
         });
     }
 
-    AnalyzedQuery {
+    Ok(AnalyzedQuery {
         sql,
         params,
         spreads,
         columns,
         can_run_as_subquery,
-    }
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -302,7 +302,7 @@ impl PgCatalog {
             .iter()
             .find(|o| op_left(o) == left_oid && o.oprright == right_oid)
         {
-            return Some(concretize_operator(op, left_oid, right_oid, self));
+            return concretize_operator(op, left_oid, right_oid, self);
         }
 
         // Step 2: match via implicit casts. More than one candidate can
@@ -324,23 +324,22 @@ impl PgCatalog {
             })
             .copied()
             .collect();
-        if !cast_matches.is_empty() {
-            let exact_score = |o: &&PgOperator| -> u8 {
-                let left_exact = match (op_left(o), left_oid) {
-                    (Some(e), Some(a)) => (e == a) as u8,
-                    (None, None) => 1,
-                    _ => 0,
-                };
-                let right_exact = (o.oprright == right_oid) as u8;
-                left_exact + right_exact
+        let exact_score = |o: &&PgOperator| -> u8 {
+            let left_exact = match (op_left(o), left_oid) {
+                (Some(e), Some(a)) => (e == a) as u8,
+                (None, None) => 1,
+                _ => 0,
             };
-            let max_score = cast_matches.iter().map(exact_score).max().unwrap();
-            let best = cast_matches
+            let right_exact = (o.oprright == right_oid) as u8;
+            left_exact + right_exact
+        };
+        if let Some(max_score) = cast_matches.iter().map(exact_score).max()
+            && let Some(best) = cast_matches
                 .iter()
                 .find(|o| exact_score(o) == max_score)
                 .copied()
-                .unwrap();
-            return Some(concretize_operator(best, left_oid, right_oid, self));
+        {
+            return concretize_operator(best, left_oid, right_oid, self);
         }
 
         // Step 2b: polymorphic match. Operators declared over pseudo-types
@@ -388,14 +387,15 @@ impl PgCatalog {
                 let r = crate::functions::polymorphic_specificity(o.oprright) as u16;
                 l + r
             };
-            let max_score = poly_matches.iter().map(&score).max().unwrap();
-            let best: Vec<&PgOperator> = poly_matches
-                .iter()
-                .filter(|o| score(o) == max_score)
-                .copied()
-                .collect();
-            if best.len() == 1 {
-                return Some(concretize_operator(best[0], left_oid, right_oid, self));
+            if let Some(max_score) = poly_matches.iter().map(&score).max() {
+                let best: Vec<&PgOperator> = poly_matches
+                    .iter()
+                    .filter(|o| score(o) == max_score)
+                    .copied()
+                    .collect();
+                if best.len() == 1 {
+                    return concretize_operator(best[0], left_oid, right_oid, self);
+                }
             }
         }
 
@@ -443,7 +443,7 @@ impl PgCatalog {
             return remaining
                 .into_iter()
                 .next()
-                .map(|o| concretize_operator(o, left_oid, right_oid, self));
+                .and_then(|o| concretize_operator(o, left_oid, right_oid, self));
         }
 
         // 3b. If one side is known, keep only candidates that accept exactly
@@ -473,7 +473,7 @@ impl PgCatalog {
             return remaining
                 .into_iter()
                 .next()
-                .map(|o| concretize_operator(o, left_oid, right_oid, self));
+                .and_then(|o| concretize_operator(o, left_oid, right_oid, self));
         }
 
         // 3c (PG §10.2 step 3e-f). For each UNKNOWN position, check if all
@@ -493,7 +493,7 @@ impl PgCatalog {
         }
 
         if remaining.len() == 1 {
-            return Some(concretize_operator(remaining[0], left_oid, right_oid, self));
+            return concretize_operator(remaining[0], left_oid, right_oid, self);
         }
 
         // 3d. Final fallback: resolve UNKNOWN positions to `text`, since
@@ -512,12 +512,7 @@ impl PgCatalog {
             .copied()
             .collect();
         if exact_matches.len() == 1 {
-            return Some(concretize_operator(
-                exact_matches[0],
-                resolved_left,
-                resolved_right,
-                self,
-            ));
+            return concretize_operator(exact_matches[0], resolved_left, resolved_right, self);
         }
 
         let text_matches: Vec<&PgOperator> = remaining
@@ -537,12 +532,7 @@ impl PgCatalog {
             .copied()
             .collect();
         if text_matches.len() == 1 {
-            return Some(concretize_operator(
-                text_matches[0],
-                resolved_left,
-                resolved_right,
-                self,
-            ));
+            return concretize_operator(text_matches[0], resolved_left, resolved_right, self);
         }
 
         None
@@ -637,7 +627,7 @@ impl PgCatalog {
             })
             .map(|d| {
                 (
-                    PgClassOid::new(d.refobjid.get()).expect("refobjid non-zero"),
+                    PgClassOid::from_nonzero(d.refobjid.into_nonzero()),
                     d.refobjsubid,
                 )
             })
@@ -794,12 +784,16 @@ impl PgCatalog {
 /// substituted with the concrete types derived from the caller's operands.
 /// For non-polymorphic operators the result just mirrors the entry's declared
 /// OIDs.
+///
+/// Returns `None` for shell operators (`oprresult = None`); those are
+/// pre-filtered out of [`PgCatalog::find_operator`]'s candidate list, so in
+/// practice this only short-circuits if a caller bypasses that filter.
 fn concretize_operator(
     op: &PgOperator,
     left_actual: Option<PgTypeOid>,
     right_actual: PgTypeOid,
     db: &PgCatalog,
-) -> ResolvedOperator {
+) -> Option<ResolvedOperator> {
     let op_left = op.oprleft;
     let mut bound_element: Option<PgTypeOid> = None;
     let mut bound_array: Option<PgTypeOid> = None;
@@ -823,7 +817,7 @@ fn concretize_operator(
             &mut bound_array,
         );
     }
-    ResolvedOperator {
+    Some(ResolvedOperator {
         left_type_oid: op_left
             .map(|o| crate::functions::substitute_polymorphic(o, bound_element, bound_array, db)),
         right_type_oid: crate::functions::substitute_polymorphic(
@@ -832,14 +826,11 @@ fn concretize_operator(
             bound_array,
             db,
         ),
-        // Shell operators (oprresult = None) can't be resolved — find_operator
-        // already filters them out of the candidate list, so this unwrap is
-        // safe: any PgOperator that reaches here has a result type.
         result_type_oid: crate::functions::substitute_polymorphic(
-            op.oprresult.expect("non-shell operator"),
+            op.oprresult?,
             bound_element,
             bound_array,
             db,
         ),
-    }
+    })
 }

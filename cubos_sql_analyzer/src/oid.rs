@@ -70,10 +70,26 @@ macro_rules! define_oid {
                 }
             }
 
+            /// Wrap an existing `NonZeroU32` as this OID. Infallible — the
+            /// non-zero invariant is already encoded in the input.
+            #[inline]
+            pub const fn from_nonzero(nz: NonZeroU32) -> Self {
+                Self(nz)
+            }
+
             /// The underlying `u32`. Always non-zero by construction.
             #[inline]
             pub const fn get(self) -> u32 {
                 self.0.get()
+            }
+
+            /// The underlying `NonZeroU32`. Useful for re-tagging this OID
+            /// as a different kind (typically the polymorphic
+            /// [`PgGenericOid`]) without going through the fallible
+            /// [`Self::new`].
+            #[inline]
+            pub const fn into_nonzero(self) -> NonZeroU32 {
+                self.0
             }
         }
 
@@ -85,6 +101,13 @@ macro_rules! define_oid {
             #[inline]
             fn get(self) -> u32 {
                 self.get()
+            }
+        }
+
+        impl From<NonZeroU32> for $name {
+            #[inline]
+            fn from(nz: NonZeroU32) -> Self {
+                Self(nz)
             }
         }
 

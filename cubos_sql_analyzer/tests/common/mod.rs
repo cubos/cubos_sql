@@ -73,7 +73,7 @@ pub fn build(migrations: &[(&str, &str)]) -> PgCatalog {
 /// Apply a sequence of migrations and return the live [`PgCatalog`] — useful
 /// when the test also needs to analyze queries against the resulting schema.
 pub fn build_db(migrations: &[(&str, &str)]) -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     for (_, sql) in migrations {
         db.apply_sql(sql).unwrap();
     }
@@ -83,7 +83,7 @@ pub fn build_db(migrations: &[(&str, &str)]) -> PgCatalog {
 /// Apply a sequence of migrations and return the `Result` so tests can match
 /// on the specific [`DdlError`] variant.
 pub fn try_apply(migrations: &[(&str, &str)]) -> Result<(), DdlError> {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     for (_, sql) in migrations {
         db.apply_sql(sql)?;
     }

@@ -5,11 +5,11 @@
 use crate::common::*;
 
 fn empty_db() -> PgCatalog {
-    PgCatalog::new()
+    PgCatalog::new().unwrap()
 }
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id         BIGINT PRIMARY KEY,
@@ -638,7 +638,7 @@ fn preferred_type_text_wins_over_bytea_in_reverse_registration_order() {
     // bytea is category 'U' and text is the preferred type of category 'S'.
     // Registering bytea first puts it at Vec[0]; without the tie-break,
     // `pick($p)` would choose bytea and `$p` would become `Vec<u8>`.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE FUNCTION public.pick(bytea) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -656,7 +656,7 @@ fn preferred_type_text_wins_over_bpchar_in_reverse_registration_order() {
     // without the tie-break we'd return bpchar (OID 1042) — even though
     // both map to `String` in Rust, the chosen PG OID differs and drives
     // downstream behavior (e.g. generated `::text` casts).
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE FUNCTION public.pick(bpchar) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -672,7 +672,7 @@ fn preferred_type_text_wins_over_varchar_in_reverse_registration_order() {
     // `varchar` and `text` share category 'S' and Rust type `String`; only
     // `text` is preferred. Without the tie-break, varchar would win since
     // it is registered first.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE FUNCTION public.pick(varchar) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -689,7 +689,7 @@ fn preferred_type_ignores_non_string_category_when_only_non_preferred_in_string(
     // it is the only string-category (even though it is NOT preferred).
     // This exercises step 1 of the tie-break (category filter) independent
     // of step 2 (preferred-type filter).
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE FUNCTION public.pick(bytea) RETURNS int
              AS 'SELECT 1' LANGUAGE sql;
@@ -729,7 +729,7 @@ fn param_as_array_in_all_rhs() {
 #[test]
 fn param_as_element_in_any_lhs() {
     // $tag = ANY(tags): $tag deve ser inferido como text (elemento do array)
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE items (id BIGINT PRIMARY KEY, tags TEXT[] NOT NULL)")
         .unwrap();
     let info = db

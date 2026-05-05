@@ -11,7 +11,7 @@ use crate::common::*;
 
 #[test]
 fn varchar_typmod_propagates_to_select() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(50) NOT NULL);")
         .unwrap();
     let s = db.analyze("SELECT name FROM t").unwrap();
@@ -21,7 +21,7 @@ fn varchar_typmod_propagates_to_select() {
 
 #[test]
 fn numeric_typmod_propagates_to_select() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, price NUMERIC(10, 2) NOT NULL);")
         .unwrap();
     let s = db.analyze("SELECT price FROM t").unwrap();
@@ -30,7 +30,7 @@ fn numeric_typmod_propagates_to_select() {
 
 #[test]
 fn varchar_typmod_within_bounds_is_accepted() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (slug VARCHAR(8) NOT NULL);")
         .unwrap();
     db.analyze("INSERT INTO t (slug) VALUES ('hi')").unwrap();
@@ -38,7 +38,7 @@ fn varchar_typmod_within_bounds_is_accepted() {
 
 #[test]
 fn numeric_typmod_within_bounds_is_accepted() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
     db.analyze("INSERT INTO t (id, amount) VALUES ($p1, 12.34)")
@@ -49,7 +49,7 @@ fn numeric_typmod_within_bounds_is_accepted() {
 
 #[test]
 fn vector_dimension_propagates_to_select() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE EXTENSION vector;
          CREATE TABLE items (id BIGINT PRIMARY KEY, embedding vector(384) NOT NULL);",
@@ -73,7 +73,7 @@ fn vector_dimension_propagates_to_select() {
 
 #[test]
 fn vector_dimension_mismatch_in_insert_rejected() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE EXTENSION vector;
          CREATE TABLE items (id BIGINT PRIMARY KEY, embedding vector(4) NOT NULL);",
@@ -91,14 +91,14 @@ fn vector_dimension_mismatch_in_insert_rejected() {
 
 #[test]
 fn cast_keeps_typmod_when_target_pinned() {
-    let db = PgCatalog::new();
+    let db = PgCatalog::new().unwrap();
     let s = db.analyze("SELECT 'hi'::varchar(10) AS s").unwrap();
     assert_cols(&s, vec![c("s", varchar_n(10))]);
 }
 
 #[test]
 fn cast_strips_typmod_when_target_has_none() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (s VARCHAR(20) NOT NULL);")
         .unwrap();
     // Cast varchar(20) → text drops typmod since the target type changes.
@@ -110,7 +110,7 @@ fn cast_strips_typmod_when_target_has_none() {
 
 #[test]
 fn domain_inherits_typmod_to_column() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN short_name AS VARCHAR(20);
          CREATE TABLE t (id BIGINT PRIMARY KEY, n short_name NOT NULL);",
@@ -138,7 +138,7 @@ fn domain_inherits_typmod_to_column() {
 
 #[test]
 fn union_with_uniform_typmod_propagates() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE a (s VARCHAR(20) NOT NULL);
          CREATE TABLE b (s VARCHAR(20) NOT NULL);",
@@ -152,7 +152,7 @@ fn union_with_uniform_typmod_propagates() {
 
 #[test]
 fn union_with_mixed_typmod_drops_to_none() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE a (s VARCHAR(20) NOT NULL);
          CREATE TABLE b (s VARCHAR(50) NOT NULL);",
@@ -169,7 +169,7 @@ fn union_with_mixed_typmod_drops_to_none() {
 
 #[test]
 fn alter_column_type_updates_typmod() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (s VARCHAR(20) NOT NULL);
          ALTER TABLE t ALTER COLUMN s TYPE VARCHAR(80);",
@@ -181,7 +181,7 @@ fn alter_column_type_updates_typmod() {
 
 #[test]
 fn alter_column_type_to_unmodified_clears_typmod() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (s VARCHAR(20) NOT NULL);
          ALTER TABLE t ALTER COLUMN s TYPE TEXT;",
@@ -193,7 +193,7 @@ fn alter_column_type_to_unmodified_clears_typmod() {
 
 #[test]
 fn alter_column_type_to_vector_with_dim() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE EXTENSION vector;
          CREATE TABLE items (id BIGINT PRIMARY KEY, embedding vector(64) NOT NULL);
@@ -222,7 +222,7 @@ fn alter_column_type_to_vector_with_dim() {
 fn update_varchar_too_long_rejected() {
     // Compile-time guard — PG only catches the overflow at runtime, so
     // pglite's `prepare` accepts. Opt out of the mirror.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -236,7 +236,7 @@ fn update_varchar_too_long_rejected() {
 fn update_numeric_overflow_rejected() {
     // Compile-time guard: PG only catches numeric overflow at execution
     // time, so pglite's `prepare` doesn't see it. Opt out of the mirror.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -250,14 +250,14 @@ fn update_numeric_overflow_rejected() {
 
 #[test]
 fn varchar_with_invalid_zero_length_rejected_at_ddl() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     let res = db.apply_sql("CREATE TABLE t (s VARCHAR(0));");
     assert!(res.is_err(), "VARCHAR(0) must be rejected, got: {res:?}");
 }
 
 #[test]
 fn numeric_precision_out_of_range_rejected_at_ddl() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     let res = db.apply_sql("CREATE TABLE t (a NUMERIC(2000, 2));");
     assert!(
         res.is_err(),

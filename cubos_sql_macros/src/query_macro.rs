@@ -42,7 +42,12 @@ fn get_or_build_pg_catalog(
         drop(borrow);
 
         let migrations = collect_migration_files(migrations_dirs)?;
-        let mut catalog = PgCatalog::new();
+        let mut catalog = PgCatalog::new().map_err(|e| {
+            syn::Error::new(
+                Span::call_site(),
+                format!("failed to load embedded PG catalog seed: {e}"),
+            )
+        })?;
         for (filename, sql) in &migrations {
             catalog.apply_sql(sql).map_err(|e| {
                 syn::Error::new(

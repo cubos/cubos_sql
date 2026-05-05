@@ -10,7 +10,7 @@ use super::util::{ensure_qualified_name, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.funcname);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.funcname)?;
 
     // Walk parameters once, splitting IN/INOUT/VARIADIC into the call
     // signature and OUT/TABLE/INOUT into the named output columns.
@@ -186,7 +186,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         }
     }
 
-    let oid = PgProcOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgProcOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_proc(PgProc {
         oid,
         proname: name,

@@ -7,7 +7,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id    BIGINT PRIMARY KEY,
@@ -224,7 +224,7 @@ fn array_slice_open_upper_bound() {
 
 #[test]
 fn multi_dim_array_constructor() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
         .unwrap();
     // PG types `INT[][]` the same as `INT[]` (postgres collapses dimensions
@@ -238,7 +238,7 @@ fn multi_dim_array_constructor() {
 
 #[test]
 fn multi_dim_subscript_two_levels() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
         .unwrap();
     // `grid[1][2]` projects an int4. Always nullable (out-of-bounds → NULL).
@@ -258,7 +258,7 @@ fn three_dim_array_constructor() {
 
 #[test]
 fn multi_dim_subscript_three_levels() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE c (id BIGINT PRIMARY KEY, cube INT[][][] NOT NULL);")
         .unwrap();
     // Three consecutive subscripts on a 3-dim array reduce all the way down
@@ -269,7 +269,7 @@ fn multi_dim_subscript_three_levels() {
 
 #[test]
 fn multi_dim_subscript_intermediate_keeps_array() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE m (id BIGINT PRIMARY KEY, grid INT[][] NOT NULL);")
         .unwrap();
     // PG does not actually track the declared dimensions in the type system —
@@ -293,7 +293,7 @@ fn multi_dim_array_text_constructor() {
 
 #[test]
 fn multi_dim_subscript_then_field_chain() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TYPE pt AS (x INT, y INT);").unwrap();
     db.apply_sql("CREATE TABLE board (id BIGINT PRIMARY KEY, cells pt[][] NOT NULL);")
         .unwrap();

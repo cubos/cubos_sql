@@ -100,7 +100,7 @@ fn on_conflict_against_partial_unique_index_should_error() {
     // (`there is no unique or exclusion constraint matching the ON CONFLICT
     // specification`). PG sanity's wire-level `prepare` skips planning, so the
     // sanity mirror can't see this — opt out and rely on the analyzer.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL, deleted_at TIMESTAMPTZ);
          CREATE UNIQUE INDEX t_slug_live ON t (slug) WHERE deleted_at IS NULL;",
@@ -120,7 +120,7 @@ fn on_conflict_against_partial_unique_index_should_error() {
 fn on_conflict_against_full_unique_index_is_accepted() {
     // A non-partial UNIQUE INDEX makes the column a valid ON CONFLICT
     // target — same shape PG uses to back primary-key/unique constraints.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL);
          CREATE UNIQUE INDEX t_slug_uniq ON t (slug);",
@@ -137,7 +137,7 @@ fn on_conflict_against_full_unique_index_is_accepted() {
 fn unique_index_does_not_match_against_distinct_columns() {
     // The unique covers `(a, b)`, not `(a)` alone — same opt-out reason as
     // above (planner-only check, invisible to PG sanity's `prepare`).
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL);
          CREATE UNIQUE INDEX t_ab ON t (a, b);",
@@ -163,7 +163,7 @@ fn expression_unique_index_does_not_match_column_on_conflict() {
     // wire-level `prepare` skips planning, so the sanity check can't see
     // it. Disable the mirror — our analyzer is still the load-bearing
     // check at compile time.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL);
          CREATE UNIQUE INDEX t_slug_lower ON t ((lower(slug)));",
@@ -444,7 +444,7 @@ fn on_conflict_user_column_not_polluted_by_catalog_indexes() {
     // `pg_proc_oid_index`, …). A user table with an `oid` column should
     // still need its OWN unique constraint to participate in ON CONFLICT.
     // PG sanity's `prepare` skips planning, so opt out of the sanity mirror.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE my_objs (oid BIGINT NOT NULL, name TEXT NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -462,7 +462,7 @@ fn user_unique_index_still_resolves_on_conflict() {
     // Sanity: with the noisy catalog still loaded, a user-created UNIQUE
     // INDEX on a column whose name collides with a catalog column must
     // still resolve.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE my_objs (oid BIGINT NOT NULL, name TEXT NOT NULL);
          CREATE UNIQUE INDEX my_objs_oid_uniq ON my_objs (oid);",

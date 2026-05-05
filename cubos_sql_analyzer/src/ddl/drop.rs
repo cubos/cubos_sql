@@ -166,7 +166,7 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
     let Some(class) = interp.remove_pg_class(class_oid) else {
         return;
     };
-    let class_obj = crate::oid::PgGenericOid::new(class_oid.get()).unwrap();
+    let class_obj = crate::oid::PgGenericOid::from_nonzero(class_oid.into_nonzero());
     interp.remove_dependencies_of(PG_CLASS_RELID, class_obj);
     interp.remove_dependencies_on(PG_CLASS_RELID, class_obj);
     interp.remove_pg_constraints_of(class_oid);
@@ -185,7 +185,7 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
         let index_oids = interp.remove_pg_indexes_of(class_oid);
         for idx_oid in index_oids {
             interp.remove_pg_class(idx_oid);
-            let idx_obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+            let idx_obj = crate::oid::PgGenericOid::from_nonzero(idx_oid.into_nonzero());
             interp.remove_dependencies_of(PG_CLASS_RELID, idx_obj);
             interp.remove_dependencies_on(PG_CLASS_RELID, idx_obj);
         }
@@ -255,7 +255,7 @@ fn drop_index(
         interp.pg_constraint.remove(&oid);
     }
     interp.remove_pg_class(class_oid);
-    let obj = crate::oid::PgGenericOid::new(class_oid.get()).unwrap();
+    let obj = crate::oid::PgGenericOid::from_nonzero(class_oid.into_nonzero());
     interp.remove_dependencies_of(PG_CLASS_RELID, obj);
     interp.remove_dependencies_on(PG_CLASS_RELID, obj);
     Ok(())
@@ -344,12 +344,12 @@ fn drop_type(
 
     if let Some(arr_oid) = array_oid {
         interp.remove_pg_type(arr_oid);
-        let arr_obj = crate::oid::PgGenericOid::new(arr_oid.get()).unwrap();
+        let arr_obj = crate::oid::PgGenericOid::from_nonzero(arr_oid.into_nonzero());
         interp.remove_dependencies_of(PG_TYPE_RELID, arr_obj);
         interp.remove_dependencies_on(PG_TYPE_RELID, arr_obj);
     }
     interp.remove_pg_type(type_oid);
-    let type_obj = crate::oid::PgGenericOid::new(type_oid.get()).unwrap();
+    let type_obj = crate::oid::PgGenericOid::from_nonzero(type_oid.into_nonzero());
     interp.remove_dependencies_of(PG_TYPE_RELID, type_obj);
     interp.remove_dependencies_on(PG_TYPE_RELID, type_obj);
     Ok(())
@@ -417,7 +417,7 @@ fn drop_extension(
     }
 
     interp.remove_pg_extension(ext_oid);
-    let ext_obj = crate::oid::PgGenericOid::new(ext_oid.get()).unwrap();
+    let ext_obj = crate::oid::PgGenericOid::from_nonzero(ext_oid.into_nonzero());
     interp.remove_dependencies_of(PG_EXTENSION_RELID, ext_obj);
     interp.remove_dependencies_on(PG_EXTENSION_RELID, ext_obj);
     Ok(())
@@ -509,7 +509,7 @@ fn drop_function(
             views::drop_views(interp, &dependent_views);
         }
         interp.remove_pg_proc(oid);
-        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
         interp.remove_dependencies_of(PG_PROC_RELID, obj);
         interp.remove_dependencies_on(PG_PROC_RELID, obj);
     }
@@ -627,7 +627,7 @@ fn drop_aggregate(
             views::drop_views(interp, &dependent_views);
         }
         interp.remove_pg_proc(oid);
-        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
         interp.remove_dependencies_of(PG_PROC_RELID, obj);
         interp.remove_dependencies_on(PG_PROC_RELID, obj);
     }
@@ -677,7 +677,7 @@ fn drop_operator(
 
     if let Some(oid) = target {
         interp.remove_pg_operator(oid);
-        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
         interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
         interp.remove_dependencies_on(PG_OPERATOR_RELID, obj);
     }
@@ -782,7 +782,7 @@ fn drop_cast(
     }
     if let Some(oid) = cast_oid {
         interp.remove_pg_cast(oid);
-        let obj = crate::oid::PgGenericOid::new(oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
         interp.remove_dependencies_of(PG_CAST_RELID, obj);
     }
     Ok(())
@@ -851,7 +851,7 @@ fn drop_schema(
         .collect();
     for type_oid in type_oids {
         interp.remove_pg_type(type_oid);
-        let obj = crate::oid::PgGenericOid::new(type_oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(type_oid.into_nonzero());
         interp.remove_dependencies_of(PG_TYPE_RELID, obj);
         interp.remove_dependencies_on(PG_TYPE_RELID, obj);
     }
@@ -864,7 +864,7 @@ fn drop_schema(
         .collect();
     for proc_oid in proc_oids {
         interp.remove_pg_proc(proc_oid);
-        let obj = crate::oid::PgGenericOid::new(proc_oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(proc_oid.into_nonzero());
         interp.remove_dependencies_of(PG_PROC_RELID, obj);
         interp.remove_dependencies_on(PG_PROC_RELID, obj);
     }
@@ -877,13 +877,13 @@ fn drop_schema(
         .collect();
     for op_oid in op_oids {
         interp.remove_pg_operator(op_oid);
-        let obj = crate::oid::PgGenericOid::new(op_oid.get()).unwrap();
+        let obj = crate::oid::PgGenericOid::from_nonzero(op_oid.into_nonzero());
         interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
     }
 
     interp.search_path.retain(|&s| s != nsoid);
     interp.remove_pg_namespace(nsoid);
-    let ns_obj = crate::oid::PgGenericOid::new(nsoid.get()).unwrap();
+    let ns_obj = crate::oid::PgGenericOid::from_nonzero(nsoid.into_nonzero());
     interp.remove_dependencies_of(PG_NAMESPACE_RELID, ns_obj);
     interp.remove_dependencies_on(PG_NAMESPACE_RELID, ns_obj);
     Ok(())

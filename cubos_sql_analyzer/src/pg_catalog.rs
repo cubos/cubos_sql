@@ -875,7 +875,7 @@ pub struct PgCatalog {
     // ── Session state (non-PG) ──
     /// Namespace OIDs in search order (analog of PG's `search_path` GUC).
     pub(crate) search_path: Vec<PgNamespaceOid>,
-    pub(crate) next_oid: u32,
+    pub(crate) next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
     /// cross-check `apply_sql` / `analyze` against a real PG protocol server.
@@ -907,29 +907,38 @@ pub struct PgCatalog {
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
 pub(crate) const USER_OID_START: u32 = 100_000;
 
-impl Default for PgCatalog {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// `USER_OID_START` as a [`NonZeroU32`]. Validated at compile time so the
+/// `next_oid` counter can be a `NonZeroU32` from construction onward without
+/// a runtime check at each `alloc_oid` call.
+pub(crate) const USER_OID_START_NZ: std::num::NonZeroU32 =
+    match std::num::NonZeroU32::new(USER_OID_START) {
+        Some(v) => v,
+        None => panic!("USER_OID_START must be non-zero"),
+    };
 
 // ─── Construction ──────────────────────────────────────────────────────────
 
 impl PgCatalog {
     /// Create a catalog seeded with the embedded PG18 snapshot.
-    pub fn new() -> Self {
+    ///
+    /// Returns an [`AnalyzeError`] only if the embedded `seed.json` fails to
+    /// deserialize — a build-time invariant of the analyzer crate that would
+    /// only fire on a corrupted seed regeneration. Surfacing it as an error
+    /// (rather than a panic) lets host processes such as the `sql!` macro
+    /// report the failure cleanly.
+    pub fn new() -> Result<Self, AnalyzeError> {
         #[cfg(not(feature = "pg_sanity"))]
         {
-            Self::from_seed(load_seed())
+            Ok(Self::from_seed(load_seed()?))
         }
         #[cfg(feature = "pg_sanity")]
         {
             // Only `new()` (default seed) gets a PG sanity mirror — `from_seed`
             // with arbitrary seeds can't be reproduced on a fresh PG sanity
             // instance.
-            let mut cat = Self::from_seed(load_seed());
+            let mut cat = Self::from_seed(load_seed()?);
             cat.pg_sanity = Some(std::sync::Arc::new(std::sync::OnceLock::new()));
-            cat
+            Ok(cat)
         }
     }
 
@@ -970,7 +979,11 @@ impl PgCatalog {
         for e in &seed.pg_enum {
             bump(e.oid.get(), &mut max_oid);
         }
-        cat.next_oid = max_oid.saturating_add(1).max(USER_OID_START);
+        // `max_oid` always carries a value >= `USER_OID_START` (the seed
+        // bumper started there), so the `+1` cannot wrap and the result is
+        // always >= `USER_OID_START + 1` — non-zero by construction.
+        cat.next_oid = std::num::NonZeroU32::new(max_oid.saturating_add(1).max(USER_OID_START))
+            .unwrap_or(USER_OID_START_NZ);
 
         for ns in seed.pg_namespace {
             cat.namespace_by_name.insert(ns.nspname.clone(), ns.oid);
@@ -1081,7 +1094,7 @@ impl PgCatalog {
             extension_by_name: HashMap::new(),
             collation_by_qname: HashMap::new(),
             search_path: Vec::new(),
-            next_oid: USER_OID_START,
+            next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
             #[cfg(feature = "pg_sanity")]
@@ -1267,7 +1280,10 @@ impl PgCatalog {
         let analysis_sql = if lex_output.spreads.is_empty() {
             lex_output.sql.clone()
         } else {
-            build_spread_sample_sql(&lex_output)
+            match build_spread_sample_sql(&lex_output) {
+                Ok(s) => s,
+                Err(e) => return (lex_output.sql.clone(), Err(e)),
+            }
         };
 
         let (columns, mut info_params, can_run_as_subquery) =
@@ -1305,16 +1321,25 @@ impl PgCatalog {
             }
         }
 
-        (
-            analysis_sql,
-            Ok(fuse(lex_output, columns, info_params, can_run_as_subquery)),
-        )
+        let fused = fuse(lex_output, columns, info_params, can_run_as_subquery);
+        (analysis_sql, fused)
     }
 
-    pub(crate) fn alloc_oid(&mut self) -> u32 {
+    /// Allocate a fresh user-space OID. Returns the [`NonZeroU32`] directly so
+    /// callers can re-tag it as the appropriate typed OID kind via
+    /// `XxxOid::from_nonzero(...)` (or the equivalent `From<NonZeroU32>`
+    /// impl) without the fallible `XxxOid::new(...).expect(...)` round-trip.
+    ///
+    /// Errors with [`DdlError::Internal`] only when the OID space (`u32`) is
+    /// exhausted — practically unreachable in a single analyzer run since
+    /// allocation starts at [`USER_OID_START`] (100_000) and steps by one.
+    pub(crate) fn alloc_oid(&mut self) -> Result<std::num::NonZeroU32, DdlError> {
         let oid = self.next_oid;
-        self.next_oid += 1;
-        oid
+        self.next_oid = self
+            .next_oid
+            .checked_add(1)
+            .ok_or_else(|| DdlError::Internal("OID space exhausted".into()))?;
+        Ok(oid)
     }
 
     /// Disable the `pg_sanity` cross-check on this catalog instance for

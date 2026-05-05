@@ -1044,8 +1044,8 @@ pub fn create_extension(
 
     // Allocate the pg_extension row up front so we can reference its OID
     // when tagging objects created during installation.
-    let target_nsoid = ensure_namespace(interp, &target_schema);
-    let ext_oid = PgExtensionOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let target_nsoid = ensure_namespace(interp, &target_schema)?;
+    let ext_oid = PgExtensionOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_extension(PgExtension {
         oid: ext_oid,
         extname: name.clone(),
@@ -1151,7 +1151,7 @@ fn record_extension_membership(
         .copied()
         .collect();
 
-    let ref_oid = PgGenericOid::new(ext_oid.get()).expect("ext_oid non-zero");
+    let ref_oid = PgGenericOid::from_nonzero(ext_oid.into_nonzero());
     let ext_dep = |classid: PgClassOid, objid: PgGenericOid| PgDepend {
         classid,
         objid,
@@ -1162,15 +1162,15 @@ fn record_extension_membership(
         deptype: DepType::Extension,
     };
     for type_oid in new_types {
-        let g = PgGenericOid::new(type_oid.get()).unwrap();
+        let g = PgGenericOid::from_nonzero(type_oid.into_nonzero());
         interp.add_dependency(ext_dep(PG_TYPE_RELID, g));
     }
     for proc_oid in new_procs {
-        let g = PgGenericOid::new(proc_oid.get()).unwrap();
+        let g = PgGenericOid::from_nonzero(proc_oid.into_nonzero());
         interp.add_dependency(ext_dep(PG_PROC_RELID, g));
     }
     for cast_oid in new_casts {
-        let g = PgGenericOid::new(cast_oid.get()).unwrap();
+        let g = PgGenericOid::from_nonzero(cast_oid.into_nonzero());
         interp.add_dependency(ext_dep(PG_CAST_RELID, g));
     }
 }
@@ -1255,7 +1255,7 @@ fn apply_with_schema(
     scripts: &[&str],
 ) -> Result<(), DdlError> {
     let original = interp.search_path.clone();
-    let target_oid = ensure_namespace(interp, schema);
+    let target_oid = ensure_namespace(interp, schema)?;
     if interp.search_path.first().copied() != Some(target_oid) {
         interp.search_path.insert(0, target_oid);
     }

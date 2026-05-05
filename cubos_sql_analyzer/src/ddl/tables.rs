@@ -54,7 +54,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE TABLE without relation".into()))?;
 
-    let (nsoid, name) = ensure_range_var(interp, rv);
+    let (nsoid, name) = ensure_range_var(interp, rv)?;
 
     if interp.class_by_qname.contains_key(&(nsoid, name.clone())) {
         if stmt.if_not_exists {
@@ -108,9 +108,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
 
     // Allocate OIDs for the relation row, its composite type, and the array
     // type wrapping the composite.
-    let class_oid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-    let composite_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
-    let array_oid = PgTypeOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let class_oid = PgClassOid::from_nonzero(interp.alloc_oid()?);
+    let composite_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
 
     interp.insert_pg_class(PgClass {
         oid: class_oid,
@@ -148,7 +148,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typtypmod: None,
         typcollation: None,
     });
-    register_composite_to_record_cast(interp, composite_oid);
+    register_composite_to_record_cast(interp, composite_oid)?;
 
     // Array type for the composite (`_<name>` in the same schema).
     interp.insert_pg_type(PgType {
@@ -350,7 +350,7 @@ fn emit_constraints(
     for (conname, contype, conkey, confrelid, confkey) in to_emit {
         emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey,
-        );
+        )?;
     }
     Ok(())
 }
@@ -370,8 +370,8 @@ fn emit_constraint_with_backing_index(
     conkey: Vec<i16>,
     confrelid: Option<PgClassOid>,
     confkey: Vec<i16>,
-) {
-    let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+) -> Result<(), DdlError> {
+    let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
         oid,
         conname: conname.clone(),
@@ -386,8 +386,12 @@ fn emit_constraint_with_backing_index(
             .pg_class
             .get(&relid)
             .map(|c| c.relnamespace)
-            .expect("relid is registered");
-        let indexrelid = PgClassOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+            .ok_or_else(|| {
+                DdlError::Internal(format!(
+                    "constraint backing index expects pg_class row for relid={relid} to be registered"
+                ))
+            })?;
+        let indexrelid = PgClassOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_class(PgClass {
             oid: indexrelid,
             relname: conname,
@@ -408,6 +412,7 @@ fn emit_constraint_with_backing_index(
             indpred: None,
         });
     }
+    Ok(())
 }
 
 /// Resolve a `FOREIGN KEY` target: returns `(target_class_oid, target_attnums)`.
@@ -579,14 +584,17 @@ fn validate_constraint_expressions(
     use crate::scope::Scope;
 
     let table_attrs = interp.attributes_of(class_oid).to_vec();
+    let relnamespace = interp
+        .pg_class
+        .get(&class_oid)
+        .map(|c| c.relnamespace)
+        .ok_or_else(|| {
+            DdlError::Internal(format!(
+                "validate_constraint_expressions expects pg_class row for class_oid={class_oid} to be registered"
+            ))
+        })?;
     let nspname = interp
-        .namespace_name(
-            interp
-                .pg_class
-                .get(&class_oid)
-                .map(|c| c.relnamespace)
-                .expect("class just inserted"),
-        )
+        .namespace_name(relnamespace)
         .map(str::to_owned)
         .unwrap_or_else(|| "public".to_owned());
 
@@ -1096,7 +1104,7 @@ fn drop_constraint(
         {
             interp.remove_pg_index(idx_oid);
             interp.remove_pg_class(idx_oid);
-            let obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+            let obj = crate::oid::PgGenericOid::from_nonzero(idx_oid.into_nonzero());
             interp.remove_dependencies_of(crate::pg_catalog::PG_CLASS_RELID, obj);
             interp.remove_dependencies_on(crate::pg_catalog::PG_CLASS_RELID, obj);
         }
@@ -1355,7 +1363,7 @@ fn drop_column(
         for &idx_oid in &dependent_indexes {
             interp.remove_pg_index(idx_oid);
             interp.remove_pg_class(idx_oid);
-            let obj = crate::oid::PgGenericOid::new(idx_oid.get()).unwrap();
+            let obj = crate::oid::PgGenericOid::from_nonzero(idx_oid.into_nonzero());
             interp.remove_dependencies_of(crate::pg_catalog::PG_CLASS_RELID, obj);
             interp.remove_dependencies_on(crate::pg_catalog::PG_CLASS_RELID, obj);
         }
@@ -1595,7 +1603,7 @@ fn add_constraint(
                 attnums,
                 None,
                 Vec::new(),
-            );
+            )?;
         }
     }
 
@@ -1637,7 +1645,7 @@ fn add_constraint(
                 attnums,
                 None,
                 Vec::new(),
-            );
+            )?;
         }
     }
 
@@ -1677,7 +1685,7 @@ fn add_constraint(
         } else {
             c.conname.clone()
         };
-        let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_constraint(PgConstraint {
             oid,
             conname,
@@ -1726,7 +1734,7 @@ fn add_constraint(
         } else {
             c.conname.clone()
         };
-        let oid = PgConstraintOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+        let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_constraint(PgConstraint {
             oid,
             conname,

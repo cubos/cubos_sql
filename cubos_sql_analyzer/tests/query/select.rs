@@ -4,7 +4,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
          CREATE DOMAIN user_prefs AS JSONB;
@@ -496,7 +496,7 @@ fn select_for_update_of_specific_table() {
 
 #[test]
 fn select_from_child_table_sees_inherited_columns() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE animals (
             name  TEXT NOT NULL,

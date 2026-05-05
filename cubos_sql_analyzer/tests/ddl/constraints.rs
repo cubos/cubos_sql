@@ -8,7 +8,7 @@ use crate::common::*;
 
 #[test]
 fn create_table_emits_pkey_and_unique_constraints() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (
             id BIGINT PRIMARY KEY,
@@ -35,7 +35,7 @@ fn create_table_emits_pkey_and_unique_constraints() {
 
 #[test]
 fn create_table_emits_check_constraint_rows() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (
             id  INT NOT NULL CHECK (id > 0),
@@ -59,7 +59,7 @@ fn create_table_emits_check_constraint_rows() {
 
 #[test]
 fn create_table_column_level_references_emits_fk_constraint() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (id BIGINT PRIMARY KEY);
          CREATE TABLE c (
@@ -78,7 +78,7 @@ fn create_table_column_level_references_emits_fk_constraint() {
 #[test]
 fn create_table_references_without_column_uses_target_pk() {
     // PG: `REFERENCES p` (no column list) defaults to the target's PK.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (id BIGINT PRIMARY KEY);
          CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT REFERENCES p);",
@@ -153,7 +153,7 @@ fn create_table_references_with_incompatible_type_is_rejected() {
 #[test]
 fn create_table_references_into_unique_constraint_is_accepted() {
     // FK can target any UNIQUE column, not just PK.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (id BIGINT PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
          CREATE TABLE c (
@@ -168,7 +168,7 @@ fn create_table_references_into_unique_constraint_is_accepted() {
 
 #[test]
 fn create_table_table_level_foreign_key_with_composite_target_is_accepted() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (
             a INT NOT NULL,
@@ -211,7 +211,7 @@ fn create_table_table_level_foreign_key_arity_mismatch_is_rejected() {
 
 #[test]
 fn alter_table_add_foreign_key_emits_constraint_row() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (id BIGINT PRIMARY KEY);
          CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT NOT NULL);
@@ -245,7 +245,7 @@ fn alter_table_add_foreign_key_without_target_pk_is_rejected() {
 
 #[test]
 fn alter_table_drop_constraint_removes_row() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
          ALTER TABLE t DROP CONSTRAINT t_slug_key;",
@@ -299,7 +299,7 @@ fn drop_pk_referenced_by_fk_without_cascade_is_rejected() {
 
 #[test]
 fn drop_pk_referenced_by_fk_with_cascade_is_accepted() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (id BIGINT PRIMARY KEY);
          CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT NOT NULL REFERENCES p(id));
@@ -319,7 +319,7 @@ fn drop_pk_referenced_by_fk_with_cascade_is_accepted() {
 
 #[test]
 fn alter_table_rename_constraint_renames_row() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY);
          ALTER TABLE t RENAME CONSTRAINT t_pkey TO t_id_pkey;",
@@ -368,7 +368,7 @@ fn drop_table_referenced_by_fk_without_cascade_is_rejected() {
 
 #[test]
 fn drop_table_referenced_by_fk_with_cascade_drops_fk_too() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE p (id BIGINT PRIMARY KEY);
          CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT NOT NULL REFERENCES p(id));
@@ -405,7 +405,7 @@ fn drop_column_with_pkey_dependency_drops_pkey_silently() {
 
 #[test]
 fn drop_column_with_pkey_dependency_with_cascade_drops_pkey_too() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
          ALTER TABLE t DROP COLUMN id CASCADE;",
@@ -458,7 +458,7 @@ fn drop_column_with_fk_source_drops_fk_silently() {
 
 #[test]
 fn drop_column_unrelated_to_constraints_is_accepted() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT, payload TEXT);
          ALTER TABLE t DROP COLUMN payload;",
@@ -495,7 +495,7 @@ fn drop_column_with_check_dependency_drops_check_silently() {
 
 #[test]
 fn drop_table_with_no_fk_target_succeeds() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY);
          DROP TABLE t;",

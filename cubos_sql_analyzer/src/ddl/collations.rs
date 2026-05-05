@@ -19,7 +19,7 @@ use crate::oid::PgCollationOid;
 use crate::pg_catalog::{PgCatalog, PgCollation};
 
 pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames)?;
 
     // PG: `collation "<name>" already exists`. Names are unique per schema.
     if interp
@@ -74,7 +74,7 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         }
     }
 
-    let oid = PgCollationOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let oid = PgCollationOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_collation(PgCollation {
         oid,
         collname: name,

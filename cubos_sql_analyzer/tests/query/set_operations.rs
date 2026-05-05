@@ -5,7 +5,7 @@ use crate::common::*;
 
 #[test]
 fn union_with_incompatible_concrete_types_rejected() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -31,7 +31,7 @@ fn union_with_incompatible_unknown_literal_rejected() {
 }
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,

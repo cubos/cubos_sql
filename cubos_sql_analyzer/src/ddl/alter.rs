@@ -311,7 +311,7 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
 pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
     let object_type = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
     let new_schema = stmt.newschema.clone();
-    let new_nsoid = ensure_namespace(interp, &new_schema);
+    let new_nsoid = ensure_namespace(interp, &new_schema)?;
 
     match object_type {
         ObjectType::ObjectTable

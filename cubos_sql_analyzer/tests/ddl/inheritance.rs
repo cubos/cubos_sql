@@ -33,7 +33,7 @@ fn create_table_inherits_copies_columns_into_child() {
 fn drop_column_on_parent_cascades_to_children() {
     // DROP COLUMN sound CASCADE on the parent removes the inherited
     // column from `dogs` too.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE animals (
             name  TEXT NOT NULL,
@@ -58,7 +58,7 @@ fn drop_column_on_parent_cascades_to_children() {
 
 #[test]
 fn inherits_propagates_not_null_and_default_flags() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE base (
             id   BIGINT NOT NULL,
@@ -77,7 +77,7 @@ fn inherits_propagates_not_null_and_default_flags() {
 
 #[test]
 fn inherits_multiple_parents_appends_columns_in_order() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE a (x INT NOT NULL);
          CREATE TABLE b (y INT NOT NULL);
@@ -97,7 +97,7 @@ fn inherits_multiple_parents_appends_columns_in_order() {
 fn inherits_dedupes_same_named_column() {
     // PG: when the child already declares a column with the same name, the
     // parent's copy is merged into it (types must match) — no duplicate row.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE base (id BIGINT NOT NULL, tag TEXT);
          CREATE TABLE leaf (id BIGINT NOT NULL) INHERITS (base);",
@@ -116,7 +116,7 @@ fn inherits_dedupes_same_named_column() {
 fn drop_column_cascade_descends_two_levels_of_inheritance() {
     // grand <- parent <- child. DROP on grand must also remove the column
     // from `parent` AND `child`.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE grand (id BIGINT NOT NULL, label TEXT);
          CREATE TABLE parent () INHERITS (grand);
@@ -141,7 +141,7 @@ fn drop_column_cascade_descends_two_levels_of_inheritance() {
 
 #[test]
 fn pg_inherits_records_one_row_per_parent() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE a (x INT NOT NULL);
          CREATE TABLE b (y INT NOT NULL);

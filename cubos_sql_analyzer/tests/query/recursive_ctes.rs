@@ -10,7 +10,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     // Recursive CTE SEARCH / CYCLE clauses synthesize columns whose types
     // PG resolves at planning time (`record[]` for path, inferred from
     // literals for mark, etc.). The analyzer makes a heuristic choice that

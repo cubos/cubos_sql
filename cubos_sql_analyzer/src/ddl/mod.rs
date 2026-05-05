@@ -45,6 +45,12 @@ pub enum DdlError {
         view: String,
         source: Box<crate::error::AnalyzeError>,
     },
+    /// An invariant the DDL interpreter relies on was violated — typically a
+    /// catalog row that should have been inserted moments before turned out
+    /// to be missing, or the OID counter overflowed `u32`. Surfaced as an
+    /// error so callers can report the offending DDL without crashing the
+    /// macro host process.
+    Internal(String),
 }
 
 impl std::fmt::Display for DdlError {
@@ -63,6 +69,7 @@ impl std::fmt::Display for DdlError {
             | DdlError::DuplicateObject(msg)
             | DdlError::ExtensionError(msg)
             | DdlError::DependencyError(msg) => write!(f, "{msg}"),
+            DdlError::Internal(msg) => write!(f, "internal DDL interpreter error: {msg}"),
             DdlError::Migration { filename, source } => {
                 write!(f, "in migration '{filename}': {source}")
             }

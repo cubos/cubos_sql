@@ -7,7 +7,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,
@@ -19,7 +19,7 @@ fn setup() -> PgCatalog {
 }
 
 fn setup_user_types() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
          CREATE DOMAIN user_prefs AS JSONB;
@@ -183,7 +183,7 @@ fn enum_array_contains_unknown_literal_resolves() {
     // `arr @> '{admin}'::user_role[]` — operator is `anyarray @> anyarray`.
     // Without the cast the literal is `unknown`, and the resolver must bind
     // `anyarray` from the column-side array type.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
          CREATE TABLE users (
@@ -202,7 +202,7 @@ fn enum_array_contains_unknown_literal_resolves() {
 fn text_array_contains_unknown_literal_resolves() {
     // Same shape with a built-in text[] — exercises the polymorphic path
     // when the left side is a concrete array of a built-in element type.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id INT PRIMARY KEY, tags TEXT[] NOT NULL);")
         .unwrap();
     let s = db
@@ -330,7 +330,7 @@ fn schema_qualified_domain_column() {
 #[test]
 fn text_array_column_type_resolves_to_array_kind() {
     // TEXT[] must land as an Array TypeKind in the snapshot (not OID 0).
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id INT NOT NULL, tags TEXT[] NOT NULL);")
         .unwrap();
 
@@ -355,7 +355,7 @@ fn builtin_type_aliases_resolve_to_canonical_oid() {
     // PG accepts "integer"/"int"/"bigint"/"smallint"/"boolean"/"real" as
     // aliases for int4/int4/int8/int2/bool/float4. A column declared with
     // each alias must land on the canonical OID.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (
             a integer NOT NULL,
@@ -408,7 +408,7 @@ fn builtin_type_aliases_resolve_to_canonical_oid() {
 // ── Generated columns (GENERATED ALWAYS AS (expr) STORED) ──────────────────
 
 fn setup_generated() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE invoices (
             id        BIGINT PRIMARY KEY,
@@ -518,7 +518,7 @@ fn insert_skipping_generated_column_accepted() {
 
 #[test]
 fn domain_not_null_propagates_to_column_nullability() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",
@@ -535,7 +535,7 @@ fn insert_null_into_nn_domain_column_is_rejected() {
     // PG only catches the domain-not-null violation at runtime; the
     // analyzer catches it at compile time. PG sanity's `prepare` doesn't
     // reach runtime, so opt out of the mirror.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",
@@ -554,7 +554,7 @@ fn update_null_into_nn_domain_column_is_rejected() {
     // freshly-created scratch table — zero rows match WHERE so the
     // domain-not-null check never fires at runtime. Keep the skip and
     // rely on the analyzer's compile-time guard.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.skip_pg_sanity();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
@@ -570,7 +570,7 @@ fn update_null_into_nn_domain_column_is_rejected() {
 
 #[test]
 fn nn_domain_chain_propagates_through_intermediate_domain() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN base_int AS INT;
          CREATE DOMAIN nn_int AS base_int NOT NULL;
@@ -592,7 +592,7 @@ fn nn_domain_chain_propagates_through_intermediate_domain() {
 
 #[test]
 fn nullable_domain_does_not_force_non_null() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN maybe_int AS INT;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x maybe_int);",
@@ -609,7 +609,7 @@ fn nullable_domain_does_not_force_non_null() {
 
 #[test]
 fn returning_nn_domain_column_is_not_nullable() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN nn_int AS INT NOT NULL;
          CREATE TABLE t (id BIGINT PRIMARY KEY, x nn_int);",

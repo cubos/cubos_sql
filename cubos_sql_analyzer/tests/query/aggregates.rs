@@ -5,7 +5,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,
@@ -178,7 +178,7 @@ fn avg_numeric_returns_numeric_via_finalfn() {
     // Cover NUMERIC explicitly — its accumulator is `_numeric` (an array)
     // but the finalfn collapses to numeric. If `aggfinalfn` weren't
     // resolved, we'd surface the array intermediate.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (price NUMERIC NOT NULL);")
         .unwrap();
     let info = db.analyze("SELECT AVG(price) AS avg_price FROM t").unwrap();

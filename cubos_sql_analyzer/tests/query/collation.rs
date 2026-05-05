@@ -7,7 +7,7 @@
 use crate::common::*;
 
 fn setup() -> PgCatalog {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE users (
             id   BIGINT PRIMARY KEY,
@@ -90,7 +90,7 @@ fn collate_on_int_column_is_rejected() {
 
 #[test]
 fn collate_on_jsonb_column_is_rejected() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, meta JSONB NOT NULL);")
         .unwrap();
     assert_analyze_err!(
@@ -104,7 +104,7 @@ fn collate_on_jsonb_column_is_rejected() {
 fn collate_on_text_domain_accepted() {
     // A domain over text should still inherit the string category — the
     // analyzer must unwrap the domain before checking applicability.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE DOMAIN slug AS TEXT;
          CREATE TABLE t (id BIGINT PRIMARY KEY, name slug NOT NULL);",
@@ -148,7 +148,7 @@ fn collate_in_case_branch() {
 
 #[test]
 fn collate_unknown_collation_should_error() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);")
         .unwrap();
     // PG: `collation "definitely_not_a_real_collation" for encoding "UTF8"
@@ -172,7 +172,7 @@ fn collate_unknown_collation_should_error() {
 fn create_collation_then_use_it() {
     // PG: `CREATE COLLATION my_coll (LOCALE = 'C')` registers a new
     // collation in pg_collation. Subsequent `COLLATE "my_coll"` resolves.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE COLLATION my_coll (LOCALE = 'C');
          CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT NOT NULL);",
@@ -186,7 +186,7 @@ fn create_collation_then_use_it() {
 fn create_collation_from_existing() {
     // PG: `CREATE COLLATION new FROM existing` clones an existing entry.
     // The new row resolves with the same encoding semantics as its source.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE COLLATION my_c FROM \"C\";").unwrap();
     let resolved = db
         .resolve_collation(None, "my_c")
@@ -197,7 +197,7 @@ fn create_collation_from_existing() {
 
 #[test]
 fn create_collation_from_unknown_errors() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     let err = db
         .apply_sql("CREATE COLLATION my_c FROM \"definitely_not_a_real_one\";")
         .unwrap_err();
@@ -209,7 +209,7 @@ fn create_collation_from_unknown_errors() {
 
 #[test]
 fn create_collation_duplicate_name_errors() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE COLLATION my_c (LOCALE = 'C');")
         .unwrap();
     let err = db
@@ -223,7 +223,7 @@ fn create_collation_duplicate_name_errors() {
 
 #[test]
 fn create_collation_if_not_exists_swallows_duplicate() {
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE COLLATION my_c (LOCALE = 'C');
          CREATE COLLATION IF NOT EXISTS my_c (LOCALE = 'C');",
@@ -236,7 +236,7 @@ fn column_level_collate_in_create_table_is_preserved() {
     // PG: `name TEXT COLLATE "C"` pins the column's default collation in
     // pg_attribute.attcollation. The analyzer now records it, so two
     // tables with different declared collations no longer look identical.
-    let mut db = PgCatalog::new();
+    let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (
             id   BIGINT PRIMARY KEY,

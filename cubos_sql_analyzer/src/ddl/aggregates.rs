@@ -16,7 +16,7 @@ use super::util::{ensure_qualified_name, resolve_type_name};
 use crate::pg_catalog::PgCatalog;
 
 pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
-    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames);
+    let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames)?;
 
     // Argument types come from `args`. The shape varies between
     //   CREATE AGGREGATE name (type1, type2)        — bare type list
@@ -113,7 +113,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         )));
     }
 
-    let proc_oid = PgProcOid::new(interp.alloc_oid()).expect("alloc_oid is non-zero");
+    let proc_oid = PgProcOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_proc(PgProc {
         oid: proc_oid,
         proname: name,
