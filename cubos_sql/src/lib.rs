@@ -10,9 +10,9 @@
 //!   features like `JSONB`, advisory locks, and `CREATE DOMAIN`.
 //! - **SQL-native** -- write real SQL, not a Rust DSL. The `sql!` macro takes a SQL
 //!   string and verifies it at compile time.
-//! - **Compile-time checked** -- the proc macro spins up a Docker container, runs your
-//!   migrations, and introspects every query. Type mismatches are caught before your code
-//!   ships.
+//! - **Compile-time checked** -- the proc macro reads your migrations, reconstructs the
+//!   PostgreSQL schema in memory, and statically type-checks every query against it.
+//!   No external server, no live database connection — just the migrations on disk.
 //! - **Human-friendly syntax** -- use `$name` for parameters instead of `$1`. Use
 //!   `$..spread` for bulk inserts. Get named fields on output structs, not positional
 //!   indices.
@@ -56,8 +56,8 @@
 //! }
 //! ```
 //!
-//! That's it. The macro spins up a Docker Postgres container at compile time,
-//! runs your migrations, and type-checks every query.
+//! That's it. The macro statically analyses every query against the schema built from
+//! your migrations — purely at compile time, with no database connection required.
 //!
 //! # Configuration
 //!
@@ -67,22 +67,31 @@
 //! ```toml
 //! [package.metadata.cubos_sql.database]
 //! migrations = "./migrations"             # required
-//! docker_image = "postgres"               # optional, default: "postgres"
+//! extra_migrations = ["../shared/migrations"]  # optional, compile-time only
 //!
 //! [package.metadata.cubos_sql.migrations]
 //! table = "public._migrations"            # optional, tracking table name
 //! lock_id = 713705                        # optional, advisory lock ID
 //! use_transaction = true                  # optional, wrap each migration in a tx
+//! fail_on_drift = true                    # optional, abort if applied migration changed
 //!
 //! [package.metadata.cubos_sql.domains]
 //! user_preferences = "crate::UserPrefs"   # optional, JSONB domain mappings
+//!
+//! [package.metadata.cubos_sql.enums]
+//! user_role = "crate::UserRole"           # optional, PG enum mappings
+//!
+//! [package.metadata.cubos_sql.types]
+//! "extensions.ltree" = "String"           # optional, custom PG → Rust type mappings
 //! ```
 //!
 //! # `.gitignore`
 //!
 //! The `sql!` macro creates a `.cubos_sql/` directory in your project root to
-//! cache Docker container state and query introspection results. Add it to your
-//! `.gitignore`:
+//! cache the static-analysis results: a snapshot of the schema built from your
+//! migrations and a typed result per query. Entries are invalidated by a hash of
+//! the migrations, the SQL text, and the relevant config — so a cache hit is a
+//! verbatim re-use, not a stale guess. Add it to your `.gitignore`:
 //!
 //! ```text
 //! # cubos_sql compile-time cache
@@ -299,6 +308,7 @@
 //! | `int8` / `bigint` | `i64` |
 //! | `float4` / `real` | `f32` |
 //! | `float8` / `double precision` | `f64` |
+//! | `numeric` / `decimal` | `rust_decimal::Decimal` |
 //! | `text` | `String` |
 //! | `varchar` / `char(n)` | `String` |
 //! | `bytea` | `Vec<u8>` |
@@ -319,6 +329,11 @@
 //! | `text[]` | `Vec<String>` |
 //! | `uuid[]` | `Vec<uuid::Uuid>` |
 //! | `jsonb[]` | `Vec<serde_json::Value>` |
+//!
+//! Types declared in your own schema — JSONB domains, enums, composites, and
+//! types from extensions like `pgvector` — are mapped through the
+//! `[package.metadata.cubos_sql.{domains, enums, types}]` sections shown above.
+//! See `cubos_sql_macros::pg_type_map` for the full set of recognized built-ins.
 //!
 //! Nullable columns (no `NOT NULL` constraint) are wrapped in `Option<T>`.
 

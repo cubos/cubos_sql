@@ -46,7 +46,7 @@ are expected).
 Workspace with crates:
 
 ```
-cubos_sql_cli (binary, stub)
+cubos_sql_cli (binary: `cargo sql migrate up/down/status/create`)
     └── cubos_sql (runtime: Pool, Executor, migrate)
             ├── cubos_sql_core (shared config only — kept small so runtime does not pull pg_query)
             └── cubos_sql_macros (proc macro: sql!)
@@ -88,4 +88,4 @@ user_preferences = "crate::domains::UserPreferences"
 
 ## Implementation Status
 
-The `sql!` macro is wired end-to-end with static analysis (no Docker needed at compile time). CLI is a stub. Full spec in `cubos_sql.md`, detailed plan in `ARCHITECTURE.md`.
+The `sql!` macro is wired end-to-end with static analysis (no Docker needed at compile time). For high-level context see `PROJECT_GOAL.md` and `README.md`.
