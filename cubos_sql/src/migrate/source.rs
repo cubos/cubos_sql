@@ -145,6 +145,11 @@ impl MigrationSource {
     /// [`from_dir`](Self::from_dir). Migrations are sorted by their
     /// numeric prefix.
     ///
+    /// For the typical case of embedding `*.sql` files from a directory at
+    /// compile-time, prefer [`embed_migrations!`](crate::embed_migrations);
+    /// this method is the lower-level entry point when migration sources
+    /// come from arbitrary in-memory strings.
+    ///
     /// # Errors
     ///
     /// - [`Error::Migration`](crate::Error::Migration) if a `file_stem`
@@ -156,11 +161,15 @@ impl MigrationSource {
     /// use cubos_sql::migrate::MigrationSource;
     ///
     /// let source = MigrationSource::from_embedded([
-    ///     ("0001_create_users", include_str!("../migrations/0001_create_users.sql"), None),
+    ///     (
+    ///         "0001_create_users",
+    ///         "CREATE TABLE users (id SERIAL PRIMARY KEY);",
+    ///         None,
+    ///     ),
     ///     (
     ///         "0002_add_email",
-    ///         include_str!("../migrations/0002_add_email.sql"),
-    ///         Some(include_str!("../migrations/0002_add_email.down.sql")),
+    ///         "ALTER TABLE users ADD COLUMN email TEXT NOT NULL;",
+    ///         Some("ALTER TABLE users DROP COLUMN email;"),
     ///     ),
     /// ]).unwrap();
     /// ```
