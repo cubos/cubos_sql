@@ -2110,6 +2110,24 @@ fn process_from_item(
             }
             let right_end = scope.sources.len();
 
+            // Walk the ON clause *before* applying outer-join nullability:
+            // PG evaluates `ON` on paired rows where right-side columns are
+            // still NOT NULL (for LEFT JOIN), and only null-pads non-matches
+            // afterwards. Without this walk, `$N` parameters used only in
+            // `ON` are never registered with the collector and `into_sorted`
+            // reports a spurious "parameter gap".
+            if let Some(quals) = &join.quals {
+                check_no_aggregates_or_windows(quals, snapshot, "JOIN/ON")?;
+                infer_expr_propagate_mismatch(
+                    quals,
+                    scope,
+                    null_ctx,
+                    snapshot,
+                    params,
+                    TypeGoal::assignment(oid::BOOL),
+                )?;
+            }
+
             // Apply JOIN nullability. Fail loudly on unknown join kinds rather
             // than defaulting to INNER, which would silently produce wrong
             // nullability for outer joins the parser couldn't classify.

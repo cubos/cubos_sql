@@ -190,6 +190,40 @@ fn left_join_with_subquery() {
     assert!(col(&info, "latest_title").nullable);
 }
 
+// ── Parameters inside ON clauses ─────────────────────────────────────────────
+
+#[test]
+fn inner_join_param_in_on_clause() {
+    let db = setup();
+    // A `$N` referenced only inside `ON` must be registered with the param
+    // collector. Without that, `into_sorted` would report a spurious
+    // "parameter gap" when later `$N` slots are populated from WHERE.
+    let sql = "SELECT u.name, p.title \
+               FROM users u \
+               INNER JOIN posts p ON p.user_id = u.id AND p.user_id = $uid \
+               WHERE u.age > $min_age";
+    let info = db.analyze(sql).unwrap();
+    assert_cols(&info, vec![c("name", text()), c("title", text())]);
+    assert_params(&info, vec![p(int8()), p(int4())]);
+}
+
+#[test]
+fn left_join_param_in_on_clause_only() {
+    let db = setup();
+    // Reproduces the user-reported failure mode: the *first* placeholder is
+    // used solely in the LEFT JOIN's ON, and subsequent placeholders live in
+    // WHERE. Previously the analyzer didn't visit `JoinExpr.quals`, so $1
+    // was missing from the collector and emitted "parameter gap: expected $1".
+    let sql = "SELECT u.id, p.title \
+               FROM users u \
+               LEFT JOIN posts p ON p.user_id = u.id AND p.published_at > $cutoff \
+               WHERE u.id > $uid \
+               ORDER BY u.id \
+               LIMIT $lim";
+    let info = db.analyze(sql).unwrap();
+    assert_params(&info, vec![p(timestamptz()), p(int8()), p(int8())]);
+}
+
 // ── Stress ───────────────────────────────────────────────────────────────────
 
 #[test]
