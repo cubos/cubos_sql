@@ -209,3 +209,74 @@ fn jsonb_set_lax_two_arg_defaults() {
         .unwrap();
     assert_cols(&s, vec![cn("m", jsonb())]);
 }
+
+// ── Subscripting: data['key'], data[0], chained ─────────────────────────────
+
+#[test]
+fn jsonb_subscript_by_key_returns_jsonb() {
+    let db = setup();
+    // `prefs['theme']` — subscript yields jsonb, always nullable (a missing
+    // key produces NULL).
+    let s = db.analyze("SELECT prefs['theme'] AS v FROM users").unwrap();
+    assert_cols(&s, vec![cn("v", jsonb())]);
+}
+
+#[test]
+fn jsonb_subscript_on_not_null_column_is_nullable() {
+    let db = setup();
+    // Even on the NOT NULL `meta` column, a subscript is nullable — the key
+    // may not exist.
+    let s = db.analyze("SELECT meta['a'] AS v FROM users").unwrap();
+    assert_cols(&s, vec![cn("v", jsonb())]);
+}
+
+#[test]
+fn jsonb_subscript_chained() {
+    let db = setup();
+    // `meta['a']['b']` — chained subscripts keep yielding jsonb, nullable.
+    let s = db.analyze("SELECT meta['a']['b'] AS v FROM users").unwrap();
+    assert_cols(&s, vec![cn("v", jsonb())]);
+}
+
+#[test]
+fn jsonb_subscript_by_numeric_index() {
+    let db = setup();
+    // `meta[0]` — numeric index into a jsonb array also yields jsonb.
+    let s = db.analyze("SELECT meta[0] AS v FROM users").unwrap();
+    assert_cols(&s, vec![cn("v", jsonb())]);
+}
+
+#[test]
+fn jsonb_subscript_in_where_clause() {
+    let db = setup();
+    // Subscript in WHERE: `prefs['theme']` resolves to jsonb so the
+    // comparison against a jsonb literal type-checks.
+    let s = db
+        .analyze("SELECT id FROM users WHERE prefs['theme'] = '\"dark\"'::jsonb")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+}
+
+#[test]
+fn jsonb_slice_subscript_is_rejected() {
+    let db = setup();
+    // PG's jsonb subscript handler rejects slices — error message matches
+    // PG verbatim.
+    assert_analyze_err!(
+        db.analyze("SELECT meta['a':'b'] AS v FROM users"),
+        AnalyzeError::Unsupported(_),
+        "jsonb subscript does not support slices",
+    );
+}
+
+#[test]
+fn json_subscript_is_rejected() {
+    let db = setup();
+    // Only `jsonb` has a subscript handler in PG; the plain `json` type
+    // does not, so subscripting it is an error — message matches PG.
+    assert_analyze_err!(
+        db.analyze("SELECT ('{\"a\":1}'::json)['a'] AS v"),
+        AnalyzeError::Unsupported(_),
+        "cannot subscript type json because it does not support subscripting",
+    );
+}

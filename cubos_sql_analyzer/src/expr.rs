@@ -801,10 +801,10 @@ fn infer_star_ref(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Resolve `(expr).field1.field2…` chains. Each step either names a field in
-/// a composite (String) or subscripts an array (`AIndices`). Array subscript
-/// support is intentionally limited to the common `arr[n]` → element type
-/// case; more exotic slicing (`arr[1:3]`) falls back to unsupported so we
-/// don't silently return the wrong shape.
+/// a composite (String) or subscripts an array / `jsonb` (`AIndices`).
+/// Array subscripting handles both element access (`arr[n]`) and slicing
+/// (`arr[1:3]`, which keeps the array type). `jsonb` / `json` subscripting
+/// (`data['key']`, `data[0]`, chained) yields `jsonb` at every step.
 fn infer_indirection(
     ind: &protobuf::AIndirection,
     scope: &Scope,
@@ -905,6 +905,38 @@ fn infer_indirection(
                 current = resolve_composite_field(&current, &s.sval, snapshot, alias_hint)?;
             }
             Some(node::Node::AIndices(ai)) => {
+                // `jsonb` subscripting (PG 14+): `data['key']`, `data[0]`,
+                // chained. Each non-slice step yields `jsonb` and is always
+                // nullable — a missing key/index produces NULL. Only `jsonb`
+                // has a subscript handler in PG; the plain `json` type does
+                // not, so it falls through to the array path below, which
+                // rejects non-array types with PG's wording.
+                let jsonb_base_oid = snapshot.unwrap_domain(current.type_oid);
+                let current_is_jsonb = snapshot
+                    .get_type(jsonb_base_oid)
+                    .is_some_and(|t| t.typname == "jsonb");
+                if current_is_jsonb {
+                    if ai.is_slice {
+                        // PG's jsonb subscript handler rejects slices —
+                        // verbatim message for the sanity prefix match.
+                        return Err(AnalyzeError::Unsupported(
+                            "jsonb subscript does not support slices".into(),
+                        ));
+                    }
+                    // The subscript key is coerced by PG to `text` (an
+                    // object key) or `int4` (an array index) — both are
+                    // accepted, so infer the bounds without forcing a goal.
+                    for bound in [&ai.lidx, &ai.uidx].into_iter().flatten() {
+                        infer_expr(bound, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+                    }
+                    let jsonb_oid = snapshot
+                        .resolve_type_by_name(None, "jsonb")
+                        .map(|j| j.oid)
+                        .unwrap_or(jsonb_base_oid);
+                    current = ExprType::scalar(jsonb_oid, true);
+                    continue;
+                }
+
                 // Walk both bounds with an int4 goal so params and column
                 // refs inside `arr[lo:hi]` / `arr[i]` get typed and
                 // validated. Track nullability so slice results propagate
@@ -931,8 +963,11 @@ fn infer_indirection(
                     })?;
                     if type_entry.typcategory != TypCategory::Array {
                         return Err(AnalyzeError::Unsupported(format!(
-                            "slice on non-array type '{}'",
-                            type_entry.typname
+                            "cannot subscript type {} because it does not support subscripting",
+                            crate::ddl::util::format_type_for_message(
+                                snapshot,
+                                current.type_oid,
+                            )
                         )));
                     }
                     // `arr[lo:hi]` keeps the array type. Result is NULL iff
@@ -1197,17 +1232,20 @@ fn resolve_array_element(
                 oid: current.type_oid.get(),
                 context: "array subscript".into(),
             })?;
+    // PG (SQLSTATE 42804) rejects subscripting a type with no subscript
+    // handler with this verbatim wording; keep it exact for the sanity
+    // prefix match. `jsonb` is handled before reaching here.
+    let not_subscriptable = || {
+        AnalyzeError::Unsupported(format!(
+            "cannot subscript type {} because it does not support subscripting",
+            crate::ddl::util::format_type_for_message(snapshot, current.type_oid)
+        ))
+    };
     let Some(elem) = type_entry.typelem else {
-        return Err(AnalyzeError::Unsupported(format!(
-            "subscript on non-array type '{}'",
-            type_entry.typname
-        )));
+        return Err(not_subscriptable());
     };
     if type_entry.typcategory != TypCategory::Array {
-        return Err(AnalyzeError::Unsupported(format!(
-            "subscript on non-array type '{}'",
-            type_entry.typname
-        )));
+        return Err(not_subscriptable());
     }
     Ok(ExprType::scalar(elem, true))
 }
