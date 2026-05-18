@@ -75,12 +75,18 @@ static ENV: OnceCell<TestEnv> = OnceCell::const_new();
 pub async fn setup() -> Pool {
     let env = ENV
         .get_or_init(|| async {
-            // Run on the latest Postgres image with Docker's `--rm` flag, so
-            // the container is deleted as soon as it exits. This is the
-            // fallback for environments where the Ryuk reaper isn't running
-            // and would otherwise leak containers on panic or abort.
+            // Run on the `pgvector/pgvector` image — it ships the official
+            // Postgres image plus the `vector` extension, which migration
+            // `0006_vectors.sql` needs. The plain `postgres` image has no
+            // `vector` control files, so `CREATE EXTENSION vector` there
+            // fails; since every e2e test shares this one migration set,
+            // the image has to satisfy all of them. Docker's `--rm` flag
+            // deletes the container as soon as it exits — the fallback for
+            // environments where the Ryuk reaper isn't running and would
+            // otherwise leak containers on panic or abort.
             let container = Postgres::default()
-                .with_tag("latest")
+                .with_name("pgvector/pgvector")
+                .with_tag("pg18")
                 .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
                 .start()
                 .await
