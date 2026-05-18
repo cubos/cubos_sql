@@ -1,15 +1,13 @@
 //! CREATE / ALTER / DROP SEQUENCE (standalone, not via SERIAL) and the
 //! sequence-manipulation functions (`nextval` / `currval` / `lastval` /
-//! `setval`). Every test is `#[ignore]` until the implementation lands —
-//! see `cubos_sql_analyzer/src/ddl/mod.rs` where `CreateSeqStmt` /
-//! `AlterSeqStmt` are still no-ops.
+//! `setval`). Sequences are registered as `pg_class` rows with
+//! `relkind = Sequence` — see `cubos_sql_analyzer/src/ddl/sequences.rs`.
 
 use crate::common::*;
 
 // ── CREATE SEQUENCE ────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn create_sequence_basic_registers_pg_class() {
     let snap = build(&[("0001.sql", "CREATE SEQUENCE my_seq;")]);
 
@@ -20,7 +18,6 @@ fn create_sequence_basic_registers_pg_class() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn create_sequence_with_options_is_accepted() {
     let snap = build(&[(
         "0001.sql",
@@ -33,7 +30,6 @@ fn create_sequence_with_options_is_accepted() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn create_sequence_in_explicit_schema() {
     let snap = build(&[("0001.sql", "CREATE SCHEMA app; CREATE SEQUENCE app.s;")]);
 
@@ -44,7 +40,6 @@ fn create_sequence_in_explicit_schema() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn create_sequence_if_not_exists_is_silent_on_duplicate() {
     let snap = build(&[
         ("0001.sql", "CREATE SEQUENCE s;"),
@@ -65,7 +60,6 @@ fn create_sequence_if_not_exists_is_silent_on_duplicate() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn create_sequence_duplicate_without_if_not_exists_errors() {
     let result = try_apply(&[
         ("0001.sql", "CREATE SEQUENCE seq;"),
@@ -78,7 +72,6 @@ fn create_sequence_duplicate_without_if_not_exists_errors() {
 // ── DROP SEQUENCE ──────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn drop_sequence_existing_removes_it() {
     let snap = build(&[
         ("0001.sql", "CREATE SEQUENCE s;"),
@@ -89,7 +82,6 @@ fn drop_sequence_existing_removes_it() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn drop_sequence_missing_errors() {
     let result = try_apply(&[("0001.sql", "DROP SEQUENCE missing;")]);
 
@@ -106,14 +98,12 @@ fn drop_sequence_missing_errors() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn drop_sequence_if_exists_missing_is_silent() {
     let snap = build(&[("0001.sql", "DROP SEQUENCE IF EXISTS missing;")]);
     assert!(snap.resolve_table(None, "missing").is_none());
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn drop_sequence_against_table_errors() {
     let result = try_apply(&[
         ("0001.sql", "CREATE TABLE t (id INT NOT NULL);"),
@@ -126,7 +116,6 @@ fn drop_sequence_against_table_errors() {
 // ── ALTER SEQUENCE ─────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn alter_sequence_with_options_on_existing() {
     let snap = build(&[(
         "0001.sql",
@@ -138,7 +127,6 @@ fn alter_sequence_with_options_on_existing() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn alter_sequence_missing_errors() {
     let result = try_apply(&[("0001.sql", "ALTER SEQUENCE missing RESTART WITH 1;")]);
 
@@ -146,7 +134,6 @@ fn alter_sequence_missing_errors() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn alter_sequence_if_exists_missing_is_silent() {
     let _snap = build(&[(
         "0001.sql",
@@ -155,7 +142,6 @@ fn alter_sequence_if_exists_missing_is_silent() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn alter_sequence_rename_to() {
     let snap = build(&[(
         "0001.sql",
@@ -168,7 +154,6 @@ fn alter_sequence_rename_to() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn alter_sequence_set_schema() {
     let snap = build(&[(
         "0001.sql",
@@ -186,7 +171,6 @@ fn alter_sequence_set_schema() {
 // ── Sequence functions: nextval / currval / lastval / setval ───────────────
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn nextval_returns_int8_not_null() {
     let db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
 
@@ -195,7 +179,6 @@ fn nextval_returns_int8_not_null() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn currval_returns_int8_not_null() {
     let db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
 
@@ -204,7 +187,6 @@ fn currval_returns_int8_not_null() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn lastval_returns_int8_not_null() {
     let db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
 
@@ -213,7 +195,6 @@ fn lastval_returns_int8_not_null() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn setval_two_args_returns_int8_not_null() {
     let db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
 
@@ -222,7 +203,6 @@ fn setval_two_args_returns_int8_not_null() {
 }
 
 #[test]
-#[ignore = "TEST FIRST: requires sequence DDL implementation"]
 fn setval_three_args_returns_int8_not_null() {
     let db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
 

@@ -13,6 +13,7 @@ pub mod functions;
 pub mod indexes;
 pub mod operators;
 pub mod schema_stmt;
+pub mod sequences;
 pub mod tables;
 pub mod types;
 pub mod util;
@@ -133,6 +134,10 @@ pub(crate) fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(
         // ── Schema ──────────────────────────────────────────────────
         node::Node::CreateSchemaStmt(s) => schema_stmt::create_schema(db, s),
 
+        // ── Sequences ───────────────────────────────────────────────
+        node::Node::CreateSeqStmt(s) => sequences::create_sequence(db, s),
+        node::Node::AlterSeqStmt(s) => sequences::alter_sequence(db, s),
+
         // ── Functions ───────────────────────────────────────────────
         node::Node::CreateFunctionStmt(s) => functions::create_function(db, s),
 
@@ -170,9 +175,7 @@ pub(crate) fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(
         node::Node::IndexStmt(s) => indexes::create_index(db, s),
 
         // ── No-ops (irrelevant for type analysis) ───────────────────
-        node::Node::CreateSeqStmt(_)
-        | node::Node::AlterSeqStmt(_)
-        | node::Node::GrantStmt(_)
+        node::Node::GrantStmt(_)
         | node::Node::CommentStmt(_)
         | node::Node::CreateTrigStmt(_)
         | node::Node::RuleStmt(_)

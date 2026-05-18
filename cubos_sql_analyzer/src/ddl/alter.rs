@@ -22,6 +22,7 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectTable
         | ObjectType::ObjectView
         | ObjectType::ObjectMatview
+        | ObjectType::ObjectSequence
         | ObjectType::ObjectForeignTable => rename_relation(interp, stmt),
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
             rename_function_like(interp, stmt, rename_type)

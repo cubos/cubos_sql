@@ -24,7 +24,7 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             | ObjectType::ObjectView
             | ObjectType::ObjectMatview
             | ObjectType::ObjectSequence => {
-                drop_relation(interp, obj_node, stmt.missing_ok, cascade)?;
+                drop_relation(interp, obj_node, stmt.missing_ok, cascade, obj_type)?;
             }
             ObjectType::ObjectType | ObjectType::ObjectDomain => {
                 drop_type(interp, obj_node, stmt.missing_ok, cascade)?;
@@ -66,10 +66,21 @@ fn drop_relation(
     obj_node: &pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
+    requested: ObjectType,
 ) -> Result<(), DdlError> {
     let names = match obj_node.node.as_ref() {
         Some(node::Node::List(list)) => &list.items,
         _ => return Ok(()),
+    };
+
+    // The keyword `DROP` was issued with — `DROP SEQUENCE` must report
+    // `sequence "x" does not exist`, not `table "x" …`, so the message
+    // prefix lines up with PG's wire-protocol error.
+    let requested_kind = match requested {
+        ObjectType::ObjectView => "view",
+        ObjectType::ObjectMatview => "materialized view",
+        ObjectType::ObjectSequence => "sequence",
+        _ => "table",
     };
 
     let (schema, name) = extract_names(names, interp);
@@ -78,7 +89,7 @@ fn drop_relation(
             return Ok(());
         }
         return Err(DdlError::TableNotFound(format!(
-            "table \"{name}\" does not exist"
+            "{requested_kind} \"{name}\" does not exist"
         )));
     };
     let Some(class_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied() else {
@@ -86,19 +97,34 @@ fn drop_relation(
             return Ok(());
         }
         return Err(DdlError::TableNotFound(format!(
-            "table \"{name}\" does not exist"
+            "{requested_kind} \"{name}\" does not exist"
         )));
     };
 
-    // PG renders DROP errors in terms of the relation's kind (table, view,
-    // materialized view, sequence). Pick the right keyword so the message
-    // prefix lines up with PG's wire-protocol error.
-    let kind = match interp.pg_class.get(&class_oid).map(|c| c.relkind) {
+    // PG renders DROP errors in terms of the relation's *actual* kind
+    // (table, view, materialized view, sequence). Pick the right keyword
+    // so dependency-error messages line up with PG's wire-protocol error.
+    let actual_relkind = interp.pg_class.get(&class_oid).map(|c| c.relkind);
+    let kind = match actual_relkind {
         Some(RelKind::View) => "view",
         Some(RelKind::MaterializedView) => "materialized view",
         Some(RelKind::Sequence) => "sequence",
         _ => "table",
     };
+
+    // Reject a kind mismatch — `DROP SEQUENCE` on a table, `DROP TABLE` on
+    // a view, etc. PG: `"x" is not a sequence`.
+    let kind_matches = match requested {
+        ObjectType::ObjectView => actual_relkind == Some(RelKind::View),
+        ObjectType::ObjectMatview => actual_relkind == Some(RelKind::MaterializedView),
+        ObjectType::ObjectSequence => actual_relkind == Some(RelKind::Sequence),
+        _ => matches!(actual_relkind, Some(RelKind::Table | RelKind::Partitioned)),
+    };
+    if !kind_matches {
+        return Err(DdlError::TableNotFound(format!(
+            "\"{name}\" is not a {requested_kind}"
+        )));
+    }
 
     let dependent_views = views::find_dependent_views(interp, class_oid);
     if !dependent_views.is_empty() && !cascade {
