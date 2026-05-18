@@ -128,6 +128,30 @@ impl DatabaseConfig {
     fn default_migrations() -> PathBuf {
         PathBuf::from("./migrations")
     }
+
+    /// Resolve the migrations path relative to a base directory.
+    ///
+    /// Absolute paths are returned unchanged; relative paths are joined onto `base`.
+    pub fn migrations_dir(&self, base: &Path) -> PathBuf {
+        resolve_against(&self.migrations, base)
+    }
+
+    /// Resolve the extra (compile-time-only) migration paths relative to a base directory.
+    pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
+        self.extra_migrations
+            .iter()
+            .map(|p| resolve_against(p, base))
+            .collect()
+    }
+}
+
+/// Join `path` onto `base` unless `path` is already absolute.
+fn resolve_against(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 /// Configuration for the migration runner behavior.
@@ -349,27 +373,13 @@ impl Config {
 
     /// Resolve the migrations path relative to a base directory.
     pub fn migrations_dir(&self, base: &Path) -> PathBuf {
-        if self.database.migrations.is_absolute() {
-            self.database.migrations.clone()
-        } else {
-            base.join(&self.database.migrations)
-        }
+        self.database.migrations_dir(base)
     }
 
     /// Resolve extra migration paths relative to a base directory.
     /// These are migration directories from other crates, used only at compile time.
     pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
-        self.database
-            .extra_migrations
-            .iter()
-            .map(|p| {
-                if p.is_absolute() {
-                    p.clone()
-                } else {
-                    base.join(p)
-                }
-            })
-            .collect()
+        self.database.extra_migrations_dirs(base)
     }
 
     /// Resolve configuration for a specific database.
@@ -444,26 +454,12 @@ fn qualify_keys(
 impl ResolvedConfig<'_> {
     /// Resolve the migrations path relative to a base directory.
     pub fn migrations_dir(&self, base: &Path) -> PathBuf {
-        if self.database.migrations.is_absolute() {
-            self.database.migrations.clone()
-        } else {
-            base.join(&self.database.migrations)
-        }
+        self.database.migrations_dir(base)
     }
 
     /// Resolve extra migration paths relative to a base directory.
     pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
-        self.database
-            .extra_migrations
-            .iter()
-            .map(|p| {
-                if p.is_absolute() {
-                    p.clone()
-                } else {
-                    base.join(p)
-                }
-            })
-            .collect()
+        self.database.extra_migrations_dirs(base)
     }
 }
 

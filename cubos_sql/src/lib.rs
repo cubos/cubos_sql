@@ -32,6 +32,21 @@
 //! migrations = "./migrations"
 //! ```
 //!
+//! Add a `build.rs` next to your `Cargo.toml` so the `sql!` macro is
+//! re-checked whenever a migration file changes (see the [`build`] module):
+//!
+//! ```ignore
+//! // build.rs
+//! fn main() {
+//!     cubos_sql::build::track_migrations();
+//! }
+//! ```
+//!
+//! ```toml
+//! [build-dependencies]
+//! cubos_sql = "0.1"
+//! ```
+//!
 //! Create `migrations/0001_create_users.sql`:
 //!
 //! ```sql
@@ -97,6 +112,18 @@
 //! # cubos_sql compile-time cache
 //! .cubos_sql/
 //! ```
+//!
+//! # Rebuilding when migrations change
+//!
+//! The `sql!` macro reads your migration files at compile time, but a proc
+//! macro cannot, on stable Rust, declare those files as build inputs. Without
+//! help, editing or adding a migration would not trigger a rebuild and `sql!`
+//! would keep producing types from a stale schema.
+//!
+//! The fix is a one-line `build.rs` calling [`build::track_migrations`]. It
+//! tells Cargo to watch every migration directory (recursively, so future
+//! files count too) and to recompile — re-running every `sql!` — when their
+//! contents change. See the [`build`] module for details.
 //!
 //! # The `sql!` macro
 //!
@@ -346,6 +373,12 @@ mod pool; // Executor impls for pool types (deadpool, bb8)
 pub use error::Error;
 pub use executor::Executor;
 pub use from_row::FromRow;
+
+/// Build-script helpers — re-exported from `cubos_sql_core`.
+///
+/// Call [`build::track_migrations`] from your crate's `build.rs` so the `sql!`
+/// macro is re-checked whenever a migration file changes.
+pub use cubos_sql_core::build;
 
 pub use cubos_sql_macros::FromRow;
 /// Re-export the `embed_migrations!` macro from `cubos_sql_macros`.

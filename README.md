@@ -57,6 +57,17 @@ for user in &users {
 
 The macro reads your migration files, builds the schema in memory, and type-checks the query. The generated struct has correctly typed fields with proper nullability.
 
+**Optional:** add a `build.rs` (with `cubos_sql` also under `[build-dependencies]`) so `cargo` re-runs `sql!` automatically whenever a migration file changes:
+
+```rust
+// build.rs
+fn main() {
+    cubos_sql::build::track_migrations();
+}
+```
+
+Without it everything still works — you just have to invalidate the build manually after editing a migration.
+
 ## Compile-time error detection
 
 Errors in your SQL are caught at build time, not at runtime:

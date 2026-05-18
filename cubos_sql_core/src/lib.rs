@@ -10,8 +10,10 @@
 //! # Modules
 //!
 //! - [`config`] -- Parses `[package.metadata.cubos_sql]` from `Cargo.toml`.
+//! - [`build`] -- Build-script helper that re-runs `sql!` when migrations change.
 //! - [`qualified_name`] -- PostgreSQL schema-qualified identifiers.
 
+pub mod build;
 pub mod config;
 mod qualified_name;
 
