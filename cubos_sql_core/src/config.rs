@@ -19,20 +19,30 @@
 //! use_transaction = true         # wrap each migration in a transaction (default: true)
 //! fail_on_drift = true           # abort if an applied migration's file changed (default: true)
 //!
-//! [package.metadata.cubos_sql.domains]
-//! user_preferences = "crate::domains::UserPreferences"
-//! order_metadata = "crate::domains::OrderMetadata"
-//!
 //! [package.metadata.cubos_sql.types]
-//! "public.citext" = "String"                   # custom PG type → Rust type
-//! "extensions.ltree" = "String"                # schema-qualified lookup
-//! citext = "String"                            # also works without schema
+//! user_preferences = "crate::domains::UserPreferences"  # JSONB domain
+//! post_status = "crate::PostStatus"                     # enum
+//! "public.address" = "crate::Address"                   # composite type
+//! "public.citext" = "String"                            # custom scalar type
+//! "extensions.ltree" = "String"                         # schema-qualified
 //! ```
 //!
-//! Custom types in `[types]` are looked up by `schema.name` (or just `name`)
-//! in `pg_catalog` at compile time. The mapped Rust type must implement
-//! `tokio_postgres::types::ToSql + FromSql`. Array versions (`type[]`) are
-//! supported automatically as `Vec<RustType>`.
+//! `[types]` is a single unified map from a PostgreSQL type to the Rust type
+//! it should surface as. Keys are looked up by `schema.name` (or just `name`,
+//! defaulting to the `public` schema) in `pg_catalog` at compile time. The
+//! `sql!` macro picks how to (de)serialize the value from the PG type's kind:
+//!
+//! | PostgreSQL type        | Bridging contract on the Rust type             |
+//! |------------------------|------------------------------------------------|
+//! | domain over `jsonb`    | `serde::{Serialize, Deserialize}`              |
+//! | enum                   | `Display` + `FromStr`                          |
+//! | composite              | rebuilt field-by-field (names must match)      |
+//! | any other scalar       | `tokio_postgres::types::{ToSql, FromSql}`      |
+//!
+//! A transparent domain (over a non-`jsonb` base) is unwrapped to its base
+//! type, recursively — so a domain-over-domain is handled like the type it
+//! ultimately wraps. Array versions (`type[]`) are supported automatically as
+//! `Vec<RustType>`.
 //!
 //! All fields have sensible defaults. The `[package.metadata.cubos_sql]` section
 //! itself is required, but every field within it is optional.
@@ -55,16 +65,9 @@ pub struct Config {
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
     #[serde(default)]
     pub migrations: MigrationsConfig,
-    /// Custom JSONB domain mappings: PostgreSQL domain name to Rust type path.
-    #[serde(default)]
-    pub domains: HashMap<String, String>,
-    /// Custom enum mappings: PostgreSQL enum type name to Rust type path.
-    /// The Rust type must implement `ToString` + `FromStr` for serialization.
-    #[serde(default)]
-    pub enums: HashMap<String, String>,
-    /// Custom type mappings: `"schema.type_name"` or `"type_name"` to Rust type path.
-    /// The Rust type must implement `tokio_postgres::types::ToSql` + `FromSql`.
-    /// Array versions are supported automatically as `Vec<RustType>`.
+    /// Unified type mappings: `"schema.type_name"` or `"type_name"` to a Rust
+    /// type path. The `sql!` macro infers the (de)serialization contract from
+    /// the PostgreSQL type's kind — see the module docs.
     #[serde(default)]
     pub types: HashMap<String, String>,
     /// Named database configurations for multi-database support.
@@ -77,7 +80,7 @@ pub struct Config {
 /// A named database entry for multi-database support.
 ///
 /// Configured under `[package.metadata.cubos_sql.databases.<name>]` in `Cargo.toml`.
-/// Each entry has its own database settings, migrations, domain/enum/type mappings.
+/// Each entry has its own database settings, migrations, and type mappings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseEntry {
     /// Database-related settings (migrations path).
@@ -86,13 +89,7 @@ pub struct DatabaseEntry {
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
     #[serde(default)]
     pub migrations: MigrationsConfig,
-    /// Custom JSONB domain mappings.
-    #[serde(default)]
-    pub domains: HashMap<String, String>,
-    /// Custom enum mappings.
-    #[serde(default)]
-    pub enums: HashMap<String, String>,
-    /// Custom type mappings.
+    /// Unified type mappings.
     #[serde(default)]
     pub types: HashMap<String, String>,
 }
@@ -391,8 +388,6 @@ impl Config {
             None => Ok(ResolvedConfig {
                 database: &self.database,
                 migrations: &self.migrations,
-                domains: qualify_keys(&self.domains, "domains")?,
-                enums: qualify_keys(&self.enums, "enums")?,
                 types: qualify_keys(&self.types, "types")?,
             }),
             Some(name) => {
@@ -403,8 +398,6 @@ impl Config {
                 Ok(ResolvedConfig {
                     database: &entry.database,
                     migrations: &entry.migrations,
-                    domains: qualify_keys(&entry.domains, "domains")?,
-                    enums: qualify_keys(&entry.enums, "enums")?,
                     types: qualify_keys(&entry.types, "types")?,
                 })
             }
@@ -415,14 +408,14 @@ impl Config {
 /// A resolved view of a single database's configuration.
 ///
 /// Returned by [`Config::resolve`]. Borrows database/migration settings from the
-/// parent [`Config`], but owns the type-mapping HashMaps because keys are normalized
+/// parent [`Config`], but owns the type-mapping HashMap because keys are normalized
 /// into [`QualifiedName`]s. Bare names in Cargo.toml default to the `public` schema.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig<'a> {
     pub database: &'a DatabaseConfig,
     pub migrations: &'a MigrationsConfig,
-    pub domains: HashMap<QualifiedName, String>,
-    pub enums: HashMap<QualifiedName, String>,
+    /// Unified type map keyed by qualified PG type name. The `sql!` macro
+    /// infers the (de)serialization strategy from each type's kind.
     pub types: HashMap<QualifiedName, String>,
 }
 
@@ -478,7 +471,7 @@ edition = "2021"
 [package.metadata.cubos_sql.database]
 migrations = "./migrations"
 
-[package.metadata.cubos_sql.domains]
+[package.metadata.cubos_sql.types]
 user_preferences = "crate::domains::UserPreferences"
 order_metadata = "crate::domains::OrderMetadata"
 "#;
@@ -497,9 +490,9 @@ migrations = "./migrations"
     fn parse_full_config() {
         let config = Config::from_str(VALID_TOML).unwrap();
         assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
-        assert_eq!(config.domains.len(), 2);
+        assert_eq!(config.types.len(), 2);
         assert_eq!(
-            config.domains.get("user_preferences").unwrap(),
+            config.types.get("user_preferences").unwrap(),
             "crate::domains::UserPreferences"
         );
         // Defaults for migrations config
@@ -511,7 +504,7 @@ migrations = "./migrations"
     #[test]
     fn parse_minimal_config() {
         let config = Config::from_str(MINIMAL_TOML).unwrap();
-        assert!(config.domains.is_empty());
+        assert!(config.types.is_empty());
         assert_eq!(config.migrations.table, "public._migrations");
     }
 
@@ -527,7 +520,7 @@ edition = "2021"
 "#;
         let config = Config::from_str(toml).unwrap();
         assert_eq!(config.database.migrations, PathBuf::from("./migrations"));
-        assert!(config.domains.is_empty());
+        assert!(config.types.is_empty());
     }
 
     #[test]
@@ -714,7 +707,7 @@ migrations = "./migrations/analytics"
 [package.metadata.cubos_sql.databases.analytics.migrations]
 table = "public._analytics_migrations"
 
-[package.metadata.cubos_sql.databases.analytics.domains]
+[package.metadata.cubos_sql.databases.analytics.types]
 event_data = "crate::EventData"
 "#;
         let config = Config::from_str(toml).unwrap();
@@ -731,7 +724,7 @@ event_data = "crate::EventData"
         );
         assert_eq!(analytics.migrations.table, "public._analytics_migrations");
         assert_eq!(
-            analytics.domains.get("event_data").unwrap(),
+            analytics.types.get("event_data").unwrap(),
             "crate::EventData"
         );
     }
@@ -772,20 +765,20 @@ migrations = "./migrations/analytics"
     }
 
     #[test]
-    fn resolve_qualifies_unqualified_domain_keys() {
+    fn resolve_qualifies_unqualified_type_keys() {
         let config = Config::from_str(VALID_TOML).unwrap();
         let resolved = config.resolve(None).unwrap();
         // Unqualified "user_preferences" becomes "public.user_preferences"
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("public", "user_preferences"))
                 .unwrap(),
             "crate::domains::UserPreferences"
         );
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("public", "order_metadata"))
                 .unwrap(),
             "crate::domains::OrderMetadata"
@@ -793,7 +786,7 @@ migrations = "./migrations/analytics"
     }
 
     #[test]
-    fn resolve_preserves_qualified_domain_keys() {
+    fn resolve_preserves_qualified_type_keys() {
         let toml = r#"
 [package]
 name = "my-app"
@@ -803,7 +796,7 @@ edition = "2021"
 [package.metadata.cubos_sql.database]
 migrations = "./migrations"
 
-[package.metadata.cubos_sql.domains]
+[package.metadata.cubos_sql.types]
 "whatsapp.health_data" = "crate::domains::HealthData"
 "whatsapp.qr_data" = "crate::domains::QrData"
 user_preferences = "crate::domains::UserPreferences"
@@ -813,14 +806,14 @@ user_preferences = "crate::domains::UserPreferences"
         // Schema-qualified keys are preserved as-is
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("whatsapp", "health_data"))
                 .unwrap(),
             "crate::domains::HealthData"
         );
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("whatsapp", "qr_data"))
                 .unwrap(),
             "crate::domains::QrData"
@@ -828,7 +821,7 @@ user_preferences = "crate::domains::UserPreferences"
         // Unqualified key gets "public." prefix
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("public", "user_preferences"))
                 .unwrap(),
             "crate::domains::UserPreferences"
@@ -836,7 +829,7 @@ user_preferences = "crate::domains::UserPreferences"
     }
 
     #[test]
-    fn resolve_qualifies_enum_and_type_keys() {
+    fn resolve_qualifies_type_keys() {
         let toml = r#"
 [package]
 name = "my-app"
@@ -846,11 +839,9 @@ edition = "2021"
 [package.metadata.cubos_sql.database]
 migrations = "./migrations"
 
-[package.metadata.cubos_sql.enums]
+[package.metadata.cubos_sql.types]
 user_role = "crate::UserRole"
 "custom_schema.status" = "crate::Status"
-
-[package.metadata.cubos_sql.types]
 point = "crate::Point"
 "geo.polygon" = "crate::Polygon"
 "#;
@@ -859,14 +850,14 @@ point = "crate::Point"
 
         assert_eq!(
             resolved
-                .enums
+                .types
                 .get(&QualifiedName::new("public", "user_role"))
                 .unwrap(),
             "crate::UserRole"
         );
         assert_eq!(
             resolved
-                .enums
+                .types
                 .get(&QualifiedName::new("custom_schema", "status"))
                 .unwrap(),
             "crate::Status"
@@ -902,7 +893,7 @@ migrations = "./migrations/main"
 [package.metadata.cubos_sql.databases.analytics.database]
 migrations = "./migrations/analytics"
 
-[package.metadata.cubos_sql.databases.analytics.domains]
+[package.metadata.cubos_sql.databases.analytics.types]
 event_data = "crate::EventData"
 "stats.metric" = "crate::Metric"
 "#;
@@ -910,14 +901,14 @@ event_data = "crate::EventData"
         let resolved = config.resolve(Some("analytics")).unwrap();
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("public", "event_data"))
                 .unwrap(),
             "crate::EventData"
         );
         assert_eq!(
             resolved
-                .domains
+                .types
                 .get(&QualifiedName::new("stats", "metric"))
                 .unwrap(),
             "crate::Metric"

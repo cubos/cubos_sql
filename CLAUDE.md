@@ -82,8 +82,12 @@ table = "public._migrations"
 lock_id = 713705
 use_transaction = true
 
-[package.metadata.cubos_sql.domains]
-user_preferences = "crate::domains::UserPreferences"
+# Single unified type map. The `sql!` macro infers the (de)serialization
+# strategy from each PG type's kind: JSONB domain, enum, composite, or scalar.
+[package.metadata.cubos_sql.types]
+user_preferences = "crate::domains::UserPreferences"  # JSONB domain
+post_status = "crate::PostStatus"                     # enum
+"public.address" = "crate::Address"                   # composite type
 ```
 
 ## Implementation Status

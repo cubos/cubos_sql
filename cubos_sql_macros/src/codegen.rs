@@ -8,7 +8,8 @@ use quote::{format_ident, quote};
 use syn::parse_str;
 
 use cubos_sql_analyzer::{
-    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, Type,
+    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, RecordField,
+    Type,
 };
 use cubos_sql_core::config::ResolvedConfig;
 
@@ -106,6 +107,98 @@ impl TypedParam for AnalyzedSpreadField {
 }
 
 // ---------------------------------------------------------------------------
+// Record registry: synthesized Rust structs for composite / record types
+// ---------------------------------------------------------------------------
+
+/// A single synthesized Rust struct standing in for a PG composite type or an
+/// anonymous `ROW(...)` / subquery record.
+struct RecordType {
+    /// The PG type this struct represents — a [`Type::Composite`] or
+    /// [`Type::AnonymousRecord`]. Used as the dedup key.
+    pg_type: Type,
+    /// Generated struct name, e.g. `__CubosRecord0`.
+    ident: proc_macro2::Ident,
+    /// Decomposed fields, in declaration order.
+    fields: Vec<RecordField>,
+}
+
+/// Collects every distinct composite / record type a query references so the
+/// codegen can emit exactly one Rust struct per type (with hand-written
+/// `FromSql` / `ToSql`) and reference it by name from columns, parameters and
+/// nested fields.
+///
+/// Composite types pointed at a concrete Rust type via `[types]` are *not*
+/// registered — that override wins and no struct is synthesized.
+#[derive(Default)]
+struct RecordRegistry {
+    types: Vec<RecordType>,
+}
+
+impl RecordRegistry {
+    /// Walk every column, parameter and spread field of a query, registering
+    /// each composite / record type (and, recursively, the types nested
+    /// inside it).
+    fn build(analyzed: &AnalyzedQuery, config: &ResolvedConfig) -> RecordRegistry {
+        let mut reg = RecordRegistry::default();
+        for col in &analyzed.columns {
+            reg.register(&col.pg_type, config);
+        }
+        for param in &analyzed.params {
+            reg.register(&param.pg_type, config);
+        }
+        for spread in &analyzed.spreads {
+            for field in &spread.fields {
+                reg.register(&field.pg_type, config);
+            }
+        }
+        reg
+    }
+
+    /// Register `ty` if it is (or wraps) a composite / record type.
+    fn register(&mut self, ty: &Type, config: &ResolvedConfig) {
+        match ty {
+            Type::Domain { base, .. } => self.register(base, config),
+            Type::Array { element } => self.register(element, config),
+            Type::Range { subtype, .. } => self.register(subtype, config),
+            Type::Composite { fields, .. } => {
+                // Always synthesize a struct, even when a `[types]` override
+                // exists — the synthesized struct is the `FromSql` / `ToSql`
+                // decoder, and the override target is rebuilt from it.
+                self.intern(ty, fields, config);
+            }
+            Type::AnonymousRecord { fields } => self.intern(ty, fields, config),
+            Type::Basic { .. } | Type::Enum { .. } => {}
+        }
+    }
+
+    /// Assign a struct name to `ty` (if not already known) and recurse into
+    /// its fields. PG forbids a composite type from containing itself, so the
+    /// recursion always terminates.
+    fn intern(&mut self, ty: &Type, fields: &[RecordField], config: &ResolvedConfig) {
+        if self.types.iter().any(|rt| &rt.pg_type == ty) {
+            return;
+        }
+        let ident = format_ident!("__CubosRecord{}", self.types.len());
+        self.types.push(RecordType {
+            pg_type: ty.clone(),
+            ident,
+            fields: fields.to_vec(),
+        });
+        for field in fields {
+            self.register(&field.ty, config);
+        }
+    }
+
+    /// The synthesized struct name for `ty`, if one was registered.
+    fn lookup(&self, ty: &Type) -> Option<&proc_macro2::Ident> {
+        self.types
+            .iter()
+            .find(|rt| &rt.pg_type == ty)
+            .map(|rt| &rt.ident)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Type mapping: PG Type -> Rust
 // ---------------------------------------------------------------------------
 
@@ -141,93 +234,148 @@ enum DeserStrategy {
     VecOfJsonbDomain { inner: syn::Type },
     /// Homogeneous collection of enum values.
     VecOfEnumAsString { inner: syn::Type },
+    /// Composite type or anonymous `ROW(...)` / subquery record. Decoded
+    /// through a synthesized record struct (see [`RecordRegistry`]); when the
+    /// composite has a `[types]` override the decoded value is rebuilt
+    /// field-by-field into the user's struct. Valid for output columns only —
+    /// using a composite value as a query parameter is rejected.
+    Record,
+    /// Homogeneous array of composite / record values.
+    VecOfRecord,
 }
 
-/// Entry point: resolve the Rust mapping for a PG [`Type`] at a given site,
-/// consulting the user's [`ResolvedConfig`] for domain/enum/type overrides.
-fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMapping, syn::Error> {
+/// Unwrap every `Domain` layer of `ty`, returning the innermost non-domain
+/// type. Used to decide the (de)serialization strategy: a domain is just a
+/// labelled wrapper, so the contract is dictated by the type it ultimately
+/// wraps (a domain-over-domain-over-jsonb behaves like `jsonb`).
+fn innermost_type(ty: &Type) -> &Type {
+    match ty {
+        Type::Domain { base, .. } => innermost_type(base),
+        other => other,
+    }
+}
+
+/// Walk `ty` and its domain bases, returning the first `[types]` override
+/// found. A mapping keyed on a domain wins over one keyed on its base; if no
+/// level is mapped the result is `None` and the default mapping applies.
+fn override_path(ty: &Type, config: &ResolvedConfig) -> Option<String> {
+    let lookup = |schema: &str, name: &str| {
+        config
+            .types
+            .get(&QualifiedName::new(schema.to_string(), name.to_string()))
+            .cloned()
+    };
     match ty {
         Type::Domain {
             schema, name, base, ..
-        } => {
-            let qn = QualifiedName::new(schema.clone(), name.clone());
-            if let Some(path) = config.domains.get(&qn) {
-                let target: syn::Type = parse_str(path)?;
-                return Ok(RustMapping {
-                    rust_type: target.clone(),
-                    strategy: DeserStrategy::JsonbDomain { target },
-                    accepts_iter: false,
-                });
-            }
-            // Transparent domain: recurse into base.
-            resolve_type_mapping(base, config)
-        }
-        Type::Enum { schema, name, .. } => {
-            let qn = QualifiedName::new(schema.clone(), name.clone());
-            if let Some(path) = config.enums.get(&qn) {
-                let target: syn::Type = parse_str(path)?;
-                return Ok(RustMapping {
-                    rust_type: target.clone(),
-                    strategy: DeserStrategy::EnumAsString { target },
-                    accepts_iter: false,
-                });
-            }
-            // No mapping: surface as String.
+        } => lookup(schema, name).or_else(|| override_path(base, config)),
+        Type::Composite { schema, name, .. }
+        | Type::Enum { schema, name, .. }
+        | Type::Basic { schema, name, .. }
+        | Type::Range { schema, name, .. } => lookup(schema, name),
+        Type::Array { .. } | Type::AnonymousRecord { .. } => None,
+    }
+}
+
+/// True for the `json` / `jsonb` catalog types.
+fn is_jsonb_type(ty: &Type) -> bool {
+    matches!(ty, Type::Basic { name, .. } if name == "json" || name == "jsonb")
+}
+
+/// Entry point: resolve the Rust mapping for a PG [`Type`] at a given site.
+///
+/// The Rust type comes from the [`override_path`] walk (or a built-in default);
+/// the (de)serialization [`DeserStrategy`] is dictated by the *innermost* base
+/// type's kind — enum, JSONB, composite/record, or a plain scalar.
+fn resolve_type_mapping(
+    ty: &Type,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> Result<RustMapping, syn::Error> {
+    if let Type::Array { element } = ty {
+        return resolve_array_mapping(element, config, registry);
+    }
+
+    let ovr = override_path(ty, config);
+
+    match innermost_type(ty) {
+        // A domain over an array behaves like the array itself.
+        Type::Array { element } => resolve_array_mapping(element, config, registry),
+        Type::Composite { .. } | Type::AnonymousRecord { .. } => Ok(RustMapping {
+            rust_type: record_site_type(ty, config, registry)?,
+            strategy: DeserStrategy::Record,
+            accepts_iter: false,
+        }),
+        Type::Enum { .. } => {
+            let target: syn::Type = match &ovr {
+                Some(path) => parse_str(path)?,
+                None => parse_str("String")?,
+            };
             Ok(RustMapping {
-                rust_type: parse_str("String")?,
-                strategy: DeserStrategy::Plain {
-                    accepts_into_string: true,
-                },
+                rust_type: target.clone(),
+                strategy: DeserStrategy::EnumAsString { target },
                 accepts_iter: false,
             })
         }
-        Type::Array { element } => {
-            let inner = resolve_type_mapping(element, config)?;
-            match inner.strategy {
-                DeserStrategy::Plain { .. } => {
-                    let rt = inner.rust_type;
-                    Ok(RustMapping {
-                        rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
-                        strategy: DeserStrategy::Plain {
-                            accepts_into_string: false,
-                        },
-                        accepts_iter: true,
-                    })
-                }
-                DeserStrategy::JsonbDomain { target } => {
-                    let rt = inner.rust_type;
-                    Ok(RustMapping {
-                        rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
-                        strategy: DeserStrategy::VecOfJsonbDomain { inner: target },
-                        accepts_iter: false,
-                    })
-                }
-                DeserStrategy::EnumAsString { target } => {
-                    let rt = inner.rust_type;
-                    Ok(RustMapping {
-                        rust_type: parse_str(&format!("Vec<{}>", quote::quote! { #rt }))?,
-                        strategy: DeserStrategy::VecOfEnumAsString { inner: target },
-                        accepts_iter: false,
-                    })
-                }
-                DeserStrategy::VecOfJsonbDomain { .. }
-                | DeserStrategy::VecOfEnumAsString { .. } => Err(syn::Error::new(
-                    proc_macro2::Span::call_site(),
-                    "nested arrays of domain/enum types are not supported",
-                )),
-            }
-        }
-        Type::Range {
+        inner @ Type::Basic {
             schema,
             name,
-            subtype,
+            extension,
             ..
         } => {
-            let qn = QualifiedName::new(schema.clone(), name.clone());
-            if let Some(path) = config.types.get(&qn) {
+            if let Some(path) = &ovr {
                 let target: syn::Type = parse_str(path)?;
+                // A mapped JSONB type bridges through `serde`; any other
+                // mapped scalar must implement `ToSql`/`FromSql` directly.
+                let strategy = if is_jsonb_type(inner) {
+                    DeserStrategy::JsonbDomain {
+                        target: target.clone(),
+                    }
+                } else {
+                    DeserStrategy::Plain {
+                        accepts_into_string: false,
+                    }
+                };
                 return Ok(RustMapping {
                     rust_type: target,
+                    strategy,
+                    accepts_iter: false,
+                });
+            }
+            // No override: a known extension type, then a built-in.
+            if let Some(ext) = extension.as_deref()
+                && let Some(path) = pg_type_map::lookup_extension(ext, name)
+            {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: false,
+                    },
+                    accepts_iter: false,
+                });
+            }
+            if let Some(path) = pg_type_map::lookup_builtin(schema, name) {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
+                    strategy: DeserStrategy::Plain {
+                        accepts_into_string: pg_type_map::is_string_like(schema, name),
+                    },
+                    accepts_iter: false,
+                });
+            }
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "no Rust mapping for PostgreSQL type {qn} — add it to \
+                     [package.metadata.cubos_sql.types] in your Cargo.toml"
+                ),
+            ))
+        }
+        Type::Range { subtype, .. } => {
+            if let Some(path) = &ovr {
+                return Ok(RustMapping {
+                    rust_type: parse_str(path)?,
                     strategy: DeserStrategy::Plain {
                         accepts_into_string: false,
                     },
@@ -235,7 +383,7 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 });
             }
             // No override: map to postgres_range::Range<T>.
-            let inner = resolve_type_mapping(subtype, config)?;
+            let inner = resolve_type_mapping(subtype, config, registry)?;
             let inner_rt = inner.rust_type;
             Ok(RustMapping {
                 rust_type: parse_str(&format!(
@@ -248,90 +396,288 @@ fn resolve_type_mapping(ty: &Type, config: &ResolvedConfig) -> Result<RustMappin
                 accepts_iter: false,
             })
         }
-        Type::Basic {
-            schema,
-            name,
-            extension,
-            ..
-        } => {
-            let qn = QualifiedName::new(schema.clone(), name.clone());
-            // 1. User override in [types].
-            if let Some(path) = config.types.get(&qn) {
-                return Ok(RustMapping {
-                    rust_type: parse_str(path)?,
-                    strategy: DeserStrategy::Plain {
-                        accepts_into_string: false,
-                    },
-                    accepts_iter: false,
-                });
-            }
-            // 2. Known extension type.
-            if let Some(ext) = extension.as_deref()
-                && let Some(path) = pg_type_map::lookup_extension(ext, name)
-            {
-                return Ok(RustMapping {
-                    rust_type: parse_str(path)?,
-                    strategy: DeserStrategy::Plain {
-                        accepts_into_string: false,
-                    },
-                    accepts_iter: false,
-                });
-            }
-            // 3. Built-in PG catalog type.
-            if let Some(path) = pg_type_map::lookup_builtin(schema, name) {
-                return Ok(RustMapping {
-                    rust_type: parse_str(path)?,
-                    strategy: DeserStrategy::Plain {
-                        accepts_into_string: pg_type_map::is_string_like(schema, name),
-                    },
-                    accepts_iter: false,
-                });
-            }
-            Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "no Rust mapping for PostgreSQL type {qn} — add it to \
-                     [package.metadata.cubos_sql.types] in your Cargo.toml"
-                ),
-            ))
-        }
-        Type::Composite { schema, name, .. } => {
-            // Named composite: defer to a `[types]` override when the user
-            // pointed it at a concrete Rust type (e.g. `public.address` →
-            // `crate::Address`). Without an override, fall back to String
-            // — same shape `AnonymousRecord` takes — since the macro can't
-            // synthesise a deserializer for an arbitrary composite.
-            let qn = QualifiedName::new(schema.clone(), name.clone());
-            if let Some(path) = config.types.get(&qn) {
-                return Ok(RustMapping {
-                    rust_type: parse_str(path)?,
-                    strategy: DeserStrategy::Plain {
-                        accepts_into_string: false,
-                    },
-                    accepts_iter: false,
-                });
-            }
-            Ok(RustMapping {
-                rust_type: parse_str("String")?,
-                strategy: DeserStrategy::Plain {
-                    accepts_into_string: false,
-                },
-                accepts_iter: false,
-            })
-        }
-        Type::AnonymousRecord { .. } => {
-            // Anonymous record without a named Rust type: fall back to String
-            // so the generated struct compiles. Callers that need structured
-            // access can cast to a concrete composite at SQL level.
-            Ok(RustMapping {
-                rust_type: parse_str("String")?,
-                strategy: DeserStrategy::Plain {
-                    accepts_into_string: false,
-                },
-                accepts_iter: false,
-            })
-        }
+        Type::Domain { .. } => unreachable!("innermost_type never returns a Domain"),
     }
+}
+
+/// Resolve the mapping for a PG array, given its element type.
+fn resolve_array_mapping(
+    element: &Type,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> Result<RustMapping, syn::Error> {
+    let inner = resolve_type_mapping(element, config, registry)?;
+    let rt = &inner.rust_type;
+    let vec_type: syn::Type = parse_str(&format!("Vec<{}>", quote! { #rt }))?;
+    match inner.strategy {
+        DeserStrategy::Plain { .. } => Ok(RustMapping {
+            rust_type: vec_type,
+            strategy: DeserStrategy::Plain {
+                accepts_into_string: false,
+            },
+            accepts_iter: true,
+        }),
+        DeserStrategy::JsonbDomain { target } => Ok(RustMapping {
+            rust_type: vec_type,
+            strategy: DeserStrategy::VecOfJsonbDomain { inner: target },
+            accepts_iter: false,
+        }),
+        DeserStrategy::EnumAsString { target } => Ok(RustMapping {
+            rust_type: vec_type,
+            strategy: DeserStrategy::VecOfEnumAsString { inner: target },
+            accepts_iter: false,
+        }),
+        DeserStrategy::Record => Ok(RustMapping {
+            rust_type: vec_type,
+            strategy: DeserStrategy::VecOfRecord,
+            accepts_iter: false,
+        }),
+        DeserStrategy::VecOfJsonbDomain { .. }
+        | DeserStrategy::VecOfEnumAsString { .. }
+        | DeserStrategy::VecOfRecord => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "nested arrays of domain/enum/composite types are not supported",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composite / record type resolution
+// ---------------------------------------------------------------------------
+
+/// The synthesized struct name reserved for a composite / record `ty`, as a
+/// [`syn::Type`].
+fn record_struct_path(ty: &Type, registry: &RecordRegistry) -> Result<syn::Type, syn::Error> {
+    let ident = registry.lookup(ty).ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "internal error: composite/record type was not registered before codegen",
+        )
+    })?;
+    Ok(syn::Type::Path(syn::TypePath {
+        qself: None,
+        path: ident.clone().into(),
+    }))
+}
+
+/// The Rust type a composite / record value decodes *into* on the wire — the
+/// `FromSql`-capable representation. Composites always resolve to their
+/// synthesized struct here, **ignoring** any `[types]` override, since the
+/// override target is not assumed to implement `FromSql`.
+fn record_raw_type(ty: &Type, registry: &RecordRegistry) -> Result<syn::Type, syn::Error> {
+    match ty {
+        Type::Composite { .. } | Type::AnonymousRecord { .. } => record_struct_path(ty, registry),
+        Type::Domain { base, .. } => record_raw_type(base, registry),
+        Type::Array { element } => {
+            let inner = record_raw_type(element, registry)?;
+            Ok(parse_str(&format!("Vec<{}>", quote! { #inner }))?)
+        }
+        // Reached only for a `Record`-strategy type, which always bottoms out
+        // at a composite / anonymous record — never a scalar.
+        _ => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "internal error: record_raw_type on a non-record type",
+        )),
+    }
+}
+
+/// The Rust type a composite / record value is surfaced *as* — the `[types]`
+/// override target where the [`override_path`] walk finds one, otherwise the
+/// synthesized struct.
+fn record_site_type(
+    ty: &Type,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> Result<syn::Type, syn::Error> {
+    if let Some(path) = override_path(ty, config) {
+        return parse_str(&path);
+    }
+    match innermost_type(ty) {
+        inner @ (Type::Composite { .. } | Type::AnonymousRecord { .. }) => {
+            record_struct_path(inner, registry)
+        }
+        Type::Array { element } => {
+            let inner = record_site_type(element, config, registry)?;
+            Ok(parse_str(&format!("Vec<{}>", quote! { #inner }))?)
+        }
+        _ => record_raw_type(ty, registry),
+    }
+}
+
+/// Whether a decoded record value of `ty` must be rebuilt into a user struct —
+/// true exactly when the composite type itself carries a `[types]` override.
+/// Overrides on *nested* fields need no work here: the synthesized struct
+/// already holds every field in its site-typed form.
+fn record_needs_conversion(ty: &Type, config: &ResolvedConfig) -> bool {
+    match ty {
+        Type::Array { element } => record_needs_conversion(element, config),
+        _ => override_path(ty, config).is_some(),
+    }
+}
+
+/// Build an expression that turns a decoded value (`value`, of the synthesized
+/// struct type) into its site type.
+///
+/// For a composite carrying a `[types]` override this rebuilds the user's
+/// struct field-by-field — a flat move per field, since the synthesized
+/// struct already holds each field in its final site-typed form. Without an
+/// override it is the identity.
+fn convert_record_to_site(
+    value: TokenStream,
+    ty: &Type,
+    nullable: bool,
+    config: &ResolvedConfig,
+) -> Result<TokenStream, syn::Error> {
+    if !record_needs_conversion(ty, config) {
+        return Ok(value);
+    }
+    if let Type::Array { element } = ty {
+        let elem = convert_record_to_site(quote! { __elem }, element, false, config)?;
+        let map_vec = quote! {
+            __vec.into_iter().map(|__elem| #elem).collect::<::std::vec::Vec<_>>()
+        };
+        return Ok(if nullable {
+            quote! { #value.map(|__vec| #map_vec) }
+        } else {
+            quote! { { let __vec = #value; #map_vec } }
+        });
+    }
+
+    // Composite (possibly behind domains) with an override: rebuild the
+    // user's named struct from the synthesized record.
+    let Some(path) = override_path(ty, config) else {
+        return Ok(value);
+    };
+    let target: syn::Type = parse_str(&path)?;
+    let fields = match innermost_type(ty) {
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => fields,
+        _ => return Ok(value),
+    };
+    let mut field_inits = TokenStream::new();
+    for field in fields {
+        let fname = make_field_ident(&field.name);
+        field_inits.extend(quote! { #fname: __rec.#fname, });
+    }
+    let ctor = quote! { #target { #field_inits } };
+    Ok(if nullable {
+        quote! {
+            match #value {
+                ::std::option::Option::Some(__rec) => ::std::option::Option::Some(#ctor),
+                ::std::option::Option::None => ::std::option::Option::None,
+            }
+        }
+    } else {
+        quote! { { let __rec = #value; #ctor } }
+    })
+}
+
+/// Reject a composite / record value used as a query parameter. A composite
+/// param would need its catalog OID at bind time, which the macro does not
+/// have — callers should spell the value out with a `ROW(...)` constructor.
+fn reject_record_param(strategy: &DeserStrategy) -> Result<(), syn::Error> {
+    if matches!(strategy, DeserStrategy::Record | DeserStrategy::VecOfRecord) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "composite / record-typed query parameters are not supported — \
+             pass the fields individually using a ROW(...) constructor in SQL",
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Record struct synthesis
+// ---------------------------------------------------------------------------
+
+/// Emit one Rust struct (plus its `FromSql` impl) for every composite and
+/// anonymous record the query references.
+fn emit_records(
+    registry: &RecordRegistry,
+    config: &ResolvedConfig,
+) -> Result<TokenStream, syn::Error> {
+    let mut out = TokenStream::new();
+    for record in &registry.types {
+        out.extend(emit_one_record(record, config, registry)?);
+    }
+    Ok(out)
+}
+
+/// Emit the struct definition and the hand-written `FromSql` impl for a single
+/// composite / record type.
+///
+/// Each field is held in its *site* form — a custom enum, a JSONB-backed
+/// struct, a nested record struct, a scalar — exactly as a top-level column of
+/// that type would surface. The `FromSql` impl drives the same per-strategy
+/// decoding [`decode_value`] generates for columns, sourced from a
+/// [`RecordReader`] instead of a `Row`.
+fn emit_one_record(
+    record: &RecordType,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> Result<TokenStream, syn::Error> {
+    let ident = &record.ident;
+    let count_lit = proc_macro2::Literal::usize_unsuffixed(record.fields.len());
+
+    let mut struct_fields = TokenStream::new();
+    let mut from_sql_reads = TokenStream::new();
+    let mut from_sql_inits = TokenStream::new();
+
+    for (i, field) in record.fields.iter().enumerate() {
+        let fname = make_field_ident(&field.name);
+        let mapping = resolve_type_mapping(&field.ty, config, registry)?;
+        let site = &mapping.rust_type;
+        let field_ty: syn::Type = if field.nullable {
+            parse_str(&format!("::std::option::Option<{}>", quote! { #site }))?
+        } else {
+            mapping.rust_type.clone()
+        };
+        struct_fields.extend(quote! { pub #fname: #field_ty, });
+
+        let decode = decode_value(
+            &mapping,
+            &field.ty,
+            field.nullable,
+            config,
+            registry,
+            &|raw, hint| match hint {
+                Some(ty) => quote! { __reader.read_field_with::<#raw>(#ty)? },
+                None => quote! { __reader.read_field::<#raw>()? },
+            },
+            DecodeCtx::RecordField,
+        )?;
+        let tmp = format_ident!("__field_{}", i);
+        from_sql_reads.extend(quote! { let #tmp: #field_ty = #decode; });
+        from_sql_inits.extend(quote! { #fname: #tmp, });
+    }
+
+    let pg = quote! { ::cubos_sql::__private::tokio_postgres::types };
+    let box_err = quote! {
+        ::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync>
+    };
+
+    Ok(quote! {
+        #[derive(Debug, Clone)]
+        #[allow(non_camel_case_types, dead_code)]
+        pub struct #ident {
+            #struct_fields
+        }
+
+        impl<'__cubos_a> #pg::FromSql<'__cubos_a> for #ident {
+            fn from_sql(
+                _ty: &#pg::Type,
+                __raw: &'__cubos_a [u8],
+            ) -> ::std::result::Result<Self, #box_err> {
+                let mut __reader = ::cubos_sql::__private::RecordReader::new(__raw)?;
+                #from_sql_reads
+                __reader.finish(#count_lit)?;
+                ::std::result::Result::Ok(#ident { #from_sql_inits })
+            }
+
+            fn accepts(__ty: &#pg::Type) -> bool {
+                ::cubos_sql::__private::record_accepts(__ty)
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -358,19 +704,25 @@ fn generate_regular(
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
-    let output_struct = build_output_struct(&analyzed.columns, config)?;
-    let (param_field_defs, param_field_inits) = build_param_fields(analyzed, config, assignments)?;
-    let params_slice = build_params_slice(analyzed, config)?;
-    let row_mapping = build_row_mapping(&analyzed.columns, config)?;
+    let registry = RecordRegistry::build(analyzed, config);
+    let record_defs = emit_records(&registry, config)?;
+    let output_struct = build_output_struct(&analyzed.columns, config, &registry)?;
+    let (param_field_defs, param_field_inits) =
+        build_param_fields(analyzed, config, &registry, assignments)?;
+    let params_slice = build_params_slice(analyzed, config, &registry)?;
+    let row_mapping = build_row_mapping(&analyzed.columns, config, &registry)?;
 
     let sql_str = cast_params(analyzed);
     let sql_limited =
         wrap_with_limit(&sql_str, analyzed.can_run_as_subquery).unwrap_or_else(|| sql_str.clone());
 
-    let fetch_value_method = build_fetch_value_method(&analyzed.columns, config)?;
+    let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
 
     let ts = quote! {
         {
+            // ----- synthesized composite / record structs -----
+            #record_defs
+
             // ----- output type -----
             #[derive(Debug, Clone)]
             #[allow(non_camel_case_types)]
@@ -520,8 +872,10 @@ fn generate_spread(
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
-    let output_struct = build_output_struct(&analyzed.columns, config)?;
-    let row_mapping = build_row_mapping(&analyzed.columns, config)?;
+    let registry = RecordRegistry::build(analyzed, config);
+    let record_defs = emit_records(&registry, config)?;
+    let output_struct = build_output_struct(&analyzed.columns, config, &registry)?;
+    let row_mapping = build_row_mapping(&analyzed.columns, config, &registry)?;
     let num_regular_params = analyzed.params.len();
     let num_spreads = analyzed.spreads.len();
 
@@ -534,6 +888,7 @@ fn generate_spread(
         let (field_type, value_expr) = build_field_type_and_value(
             param,
             config,
+            &registry,
             &resolve_param_value(&param.name, assignments)?,
         )?;
 
@@ -542,7 +897,12 @@ fn generate_spread(
         regular_param_inits.extend(quote! {
             #field_name: { let #param_ident: #field_type = #value_expr; #param_ident },
         });
-        regular_param_pushes.extend(push_param(param, config, &quote! { self.#field_name })?);
+        regular_param_pushes.extend(push_param(
+            param,
+            config,
+            &registry,
+            &quote! { self.#field_name },
+        )?);
     }
 
     // ── Per-spread: generics, fields, inits, push exprs, SQL pieces ────
@@ -603,7 +963,7 @@ fn generate_spread(
         for field in &spread.fields {
             let accessor_ident = format_ident!("{}", field.name);
             let accessor: TokenStream = quote! { __item.#accessor_ident };
-            item_pushes.extend(push_param(field, config, &accessor)?);
+            item_pushes.extend(push_param(field, config, &registry, &accessor)?);
         }
 
         spread_param_pushes.extend(quote! {
@@ -668,10 +1028,13 @@ fn generate_spread(
             = __params.iter().map(|p| p.as_ref()).collect();
     };
 
-    let fetch_value_method = build_fetch_value_method(&analyzed.columns, config)?;
+    let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
 
     let ts = quote! {
         {
+            // ----- synthesized composite / record structs -----
+            #record_defs
+
             #[derive(Debug, Clone)]
             #[allow(non_camel_case_types)]
             struct __sql_output {
@@ -807,13 +1170,14 @@ fn generate_spread(
 fn build_fetch_value_method(
     columns: &[AnalyzedColumn],
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
 ) -> Result<TokenStream, syn::Error> {
     if columns.len() != 1 {
         return Ok(TokenStream::new());
     }
 
     let col = &columns[0];
-    let return_type = column_rust_type(col, config)?;
+    let return_type = column_rust_type(col, config, registry)?;
     let field_name = make_field_ident(&col.name);
 
     let optional_body = if col.nullable {
@@ -857,12 +1221,13 @@ fn build_fetch_value_method(
 fn build_output_struct(
     columns: &[AnalyzedColumn],
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
 ) -> Result<TokenStream, syn::Error> {
     let mut fields = TokenStream::new();
 
     for col in columns {
         let field_name = make_field_ident(&col.name);
-        let field_type = column_rust_type(col, config)?;
+        let field_type = column_rust_type(col, config, registry)?;
 
         fields.extend(quote! {
             pub #field_name: #field_type,
@@ -879,6 +1244,7 @@ fn build_output_struct(
 fn build_param_fields(
     analyzed: &AnalyzedQuery,
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
     assignments: &[ParamAssignment],
 ) -> Result<(TokenStream, TokenStream), syn::Error> {
     let mut defs = TokenStream::new();
@@ -887,7 +1253,8 @@ fn build_param_fields(
     for (idx, param) in analyzed.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
         let value_expr = resolve_param_value(&param.name, assignments)?;
-        let (field_type, value_expr) = build_field_type_and_value(param, config, &value_expr)?;
+        let (field_type, value_expr) =
+            build_field_type_and_value(param, config, registry, &value_expr)?;
 
         defs.extend(quote! {
             #field_name: #field_type,
@@ -907,9 +1274,11 @@ fn build_param_fields(
 fn build_field_type_and_value<P: TypedParam>(
     param: &P,
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
     value_expr: &TokenStream,
 ) -> Result<(syn::Type, TokenStream), syn::Error> {
-    let mapping = resolve_type_mapping(param.pg_type(), config)?;
+    let mapping = resolve_type_mapping(param.pg_type(), config, registry)?;
+    reject_record_param(&mapping.strategy)?;
     let is_nullable = param.nullable();
 
     let inner_rt = &mapping.rust_type;
@@ -952,9 +1321,11 @@ fn build_field_type_and_value<P: TypedParam>(
 fn push_param<P: TypedParam>(
     param: &P,
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
     accessor: &TokenStream,
 ) -> Result<TokenStream, syn::Error> {
-    let mapping = resolve_type_mapping(param.pg_type(), config)?;
+    let mapping = resolve_type_mapping(param.pg_type(), config, registry)?;
+    reject_record_param(&mapping.strategy)?;
     let is_nullable = param.nullable();
     let to_sql_ty = quote! {
         Box<dyn ::cubos_sql::__private::tokio_postgres::types::ToSql + Sync>
@@ -1035,6 +1406,8 @@ fn push_param<P: TypedParam>(
                 __params.push(Box::new(#accessor.clone()) as #to_sql_ty);
             }
         }
+        // `reject_record_param` above already bailed out for these.
+        DeserStrategy::Record | DeserStrategy::VecOfRecord => unreachable!(),
     };
     Ok(ts)
 }
@@ -1097,6 +1470,7 @@ fn cast_params(analyzed: &AnalyzedQuery) -> String {
 fn build_params_slice(
     analyzed: &AnalyzedQuery,
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
 ) -> Result<TokenStream, syn::Error> {
     let mut elems = TokenStream::new();
     let to_sql = quote! {
@@ -1106,7 +1480,8 @@ fn build_params_slice(
     for idx in 0..analyzed.params.len() {
         let field_name = format_ident!("p{}", idx);
         let pi = &analyzed.params[idx];
-        let mapping = resolve_type_mapping(&pi.pg_type, config)?;
+        let mapping = resolve_type_mapping(&pi.pg_type, config, registry)?;
+        reject_record_param(&mapping.strategy)?;
         let nullable = pi.nullable;
 
         let elem = match mapping.strategy {
@@ -1184,6 +1559,8 @@ fn build_params_slice(
             DeserStrategy::Plain { .. } => {
                 quote! { &self.#field_name as #to_sql, }
             }
+            // `reject_record_param` above already bailed out for these.
+            DeserStrategy::Record | DeserStrategy::VecOfRecord => unreachable!(),
         };
         elems.extend(elem);
     }
@@ -1198,12 +1575,13 @@ fn build_params_slice(
 fn build_row_mapping(
     columns: &[AnalyzedColumn],
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
 ) -> Result<TokenStream, syn::Error> {
     let mut mappings = TokenStream::new();
 
     for (idx, col) in columns.iter().enumerate() {
         let field_name = make_field_ident(&col.name);
-        let get_expr = column_get_expr(col, config, idx)?;
+        let get_expr = column_get_expr(col, config, registry, idx)?;
 
         mappings.extend(quote! {
             #field_name: #get_expr,
@@ -1220,8 +1598,9 @@ fn build_row_mapping(
 fn column_rust_type(
     col: &AnalyzedColumn,
     config: &ResolvedConfig,
+    registry: &RecordRegistry,
 ) -> Result<syn::Type, syn::Error> {
-    let mapping = resolve_type_mapping(&col.pg_type, config)?;
+    let mapping = resolve_type_mapping(&col.pg_type, config, registry)?;
     let inner = mapping.rust_type;
     if col.nullable {
         Ok(parse_str(&format!(
@@ -1233,125 +1612,200 @@ fn column_rust_type(
     }
 }
 
-fn column_get_expr(
-    col: &AnalyzedColumn,
-    config: &ResolvedConfig,
-    idx: usize,
-) -> Result<TokenStream, syn::Error> {
-    let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
-    let mapping = resolve_type_mapping(&col.pg_type, config)?;
-    let nullable = col.nullable;
+/// Where a decoded value is being produced. Determines the error type a
+/// failed conversion must yield so that `?` is well-typed.
+#[derive(Clone, Copy)]
+enum DecodeCtx {
+    /// Inside the `sql!` row-mapping closure — errors are [`cubos_sql::Error`].
+    Column,
+    /// Inside a synthesized record's `FromSql::from_sql` — errors are boxed.
+    RecordField,
+}
 
-    match mapping.strategy {
+impl DecodeCtx {
+    /// Wrap a `String` message expression into this context's error type.
+    fn wrap_err(self, msg: TokenStream) -> TokenStream {
+        match self {
+            DecodeCtx::Column => quote! { cubos_sql::Error::Deserialize(#msg) },
+            DecodeCtx::RecordField => quote! {
+                <::std::boxed::Box<
+                    dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
+                > as ::std::convert::From<::std::string::String>>::from(#msg)
+            },
+        }
+    }
+}
+
+/// Build the expression that produces a site-typed value of `ty` from a raw
+/// wire value, applying the [`DeserStrategy`]'s bridge.
+///
+/// `read(raw, hint)` turns a raw Rust type into an expression that reads a
+/// value of that type from the underlying source — `__row.get::<_, T>(idx)`
+/// for an output column, `__reader.read_field*::<T>()?` for a synthesized
+/// record field. `hint`, when set, is a PG `Type` expression the reader must
+/// decode the value *as*: a record field carries only its inline OID, which
+/// for a domain over `jsonb` does not resolve back to a built-in, so the
+/// type-sensitive `serde_json::Value` decoder needs to be told. A column
+/// reader gets the real type from the row description and ignores the hint.
+fn decode_value(
+    mapping: &RustMapping,
+    ty: &Type,
+    nullable: bool,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+    read: &dyn Fn(TokenStream, Option<TokenStream>) -> TokenStream,
+    ctx: DecodeCtx,
+) -> Result<TokenStream, syn::Error> {
+    // PG `Type` a JSONB-strategy value must be decoded as — `json` vs `jsonb`
+    // differ by a leading version byte.
+    let json_hint = || {
+        let variant = if matches!(innermost_type(ty), Type::Basic { name, .. } if name == "json") {
+            quote! { JSON }
+        } else {
+            quote! { JSONB }
+        };
+        quote! { &::cubos_sql::__private::tokio_postgres::types::Type::#variant }
+    };
+    match &mapping.strategy {
         DeserStrategy::JsonbDomain { target } => {
+            let err = ctx
+                .wrap_err(quote! { format!("failed to deserialize {}: {e}", stringify!(#target)) });
+            let hint = Some(json_hint());
             if nullable {
+                let rd = read(quote! { ::std::option::Option<::serde_json::Value> }, hint);
                 Ok(quote! {
-                    {
-                        let __json_val = __row.get::<_, ::std::option::Option<::serde_json::Value>>(#idx_lit);
-                        match __json_val {
-                            Some(__v) => Some(::serde_json::from_value::<#target>(__v)
-                                .map_err(|e| cubos_sql::Error::Deserialize(
-                                    format!("failed to deserialize {}: {e}", stringify!(#target))))?),
-                            None => None,
-                        }
+                    match #rd {
+                        ::std::option::Option::Some(__v) => ::std::option::Option::Some(
+                            ::serde_json::from_value::<#target>(__v).map_err(|e| #err)?),
+                        ::std::option::Option::None => ::std::option::Option::None,
                     }
                 })
             } else {
+                let rd = read(quote! { ::serde_json::Value }, hint);
                 Ok(quote! {
-                    ::serde_json::from_value::<#target>(
-                        __row.get::<_, ::serde_json::Value>(#idx_lit)
-                    ).map_err(|e| cubos_sql::Error::Deserialize(
-                        format!("failed to deserialize {}: {e}", stringify!(#target))))?
+                    ::serde_json::from_value::<#target>(#rd).map_err(|e| #err)?
                 })
             }
         }
         DeserStrategy::EnumAsString { target } => {
+            let err = ctx
+                .wrap_err(quote! { format!("failed to parse enum {}: {e}", stringify!(#target)) });
             if nullable {
+                let rd = read(
+                    quote! { ::std::option::Option<::cubos_sql::__private::EnumString> },
+                    None,
+                );
                 Ok(quote! {
-                    {
-                        let __enum_val = __row.get::<_, ::std::option::Option<::cubos_sql::__private::EnumString>>(#idx_lit);
-                        match __enum_val {
-                            Some(__v) => Some(__v.0.parse::<#target>()
-                                .map_err(|e| cubos_sql::Error::Deserialize(
-                                    format!("failed to parse enum {}: {e}", stringify!(#target))))?),
-                            None => None,
-                        }
+                    match #rd {
+                        ::std::option::Option::Some(__v) => ::std::option::Option::Some(
+                            __v.0.parse::<#target>().map_err(|e| #err)?),
+                        ::std::option::Option::None => ::std::option::Option::None,
                     }
                 })
             } else {
+                let rd = read(quote! { ::cubos_sql::__private::EnumString }, None);
                 Ok(quote! {
-                    {
-                        let __enum_val = __row.get::<_, ::cubos_sql::__private::EnumString>(#idx_lit);
-                        __enum_val.0.parse::<#target>()
-                            .map_err(|e| cubos_sql::Error::Deserialize(
-                                format!("failed to parse enum {}: {e}", stringify!(#target))))?
-                    }
+                    { let __v = #rd; __v.0.parse::<#target>().map_err(|e| #err)? }
                 })
             }
         }
         DeserStrategy::VecOfJsonbDomain { inner } => {
+            let err = ctx
+                .wrap_err(quote! { format!("failed to deserialize {}: {e}", stringify!(#inner)) });
+            let hint = Some(quote! {
+                &::cubos_sql::__private::tokio_postgres::types::Type::JSONB_ARRAY
+            });
+            let map = quote! {
+                __vs.into_iter()
+                    .map(|__v| ::serde_json::from_value::<#inner>(__v).map_err(|e| #err))
+                    .collect::<::std::result::Result<::std::vec::Vec<#inner>, _>>()?
+            };
             if nullable {
+                let rd = read(
+                    quote! { ::std::option::Option<::std::vec::Vec<::serde_json::Value>> },
+                    hint,
+                );
                 Ok(quote! {
-                    {
-                        let __json_vec = __row.get::<_, ::std::option::Option<Vec<::serde_json::Value>>>(#idx_lit);
-                        match __json_vec {
-                            Some(__vs) => Some(__vs.into_iter()
-                                .map(|__v| ::serde_json::from_value::<#inner>(__v)
-                                    .map_err(|e| cubos_sql::Error::Deserialize(
-                                        format!("failed to deserialize {}: {e}", stringify!(#inner)))))
-                                .collect::<::std::result::Result<Vec<#inner>, _>>()?),
-                            None => None,
-                        }
+                    match #rd {
+                        ::std::option::Option::Some(__vs) => ::std::option::Option::Some(#map),
+                        ::std::option::Option::None => ::std::option::Option::None,
                     }
                 })
             } else {
-                Ok(quote! {
-                    __row.get::<_, Vec<::serde_json::Value>>(#idx_lit)
-                        .into_iter()
-                        .map(|__v| ::serde_json::from_value::<#inner>(__v)
-                            .map_err(|e| cubos_sql::Error::Deserialize(
-                                format!("failed to deserialize {}: {e}", stringify!(#inner)))))
-                        .collect::<::std::result::Result<Vec<#inner>, _>>()?
-                })
+                let rd = read(quote! { ::std::vec::Vec<::serde_json::Value> }, hint);
+                Ok(quote! { { let __vs = #rd; #map } })
             }
         }
         DeserStrategy::VecOfEnumAsString { inner } => {
+            let err = ctx
+                .wrap_err(quote! { format!("failed to parse enum {}: {e}", stringify!(#inner)) });
+            let map = quote! {
+                __vs.into_iter()
+                    .map(|__v| __v.0.parse::<#inner>().map_err(|e| #err))
+                    .collect::<::std::result::Result<::std::vec::Vec<#inner>, _>>()?
+            };
             if nullable {
+                let rd = read(
+                    quote! { ::std::option::Option<::std::vec::Vec<::cubos_sql::__private::EnumString>> },
+                    None,
+                );
                 Ok(quote! {
-                    {
-                        let __str_vec = __row.get::<_, ::std::option::Option<Vec<String>>>(#idx_lit);
-                        match __str_vec {
-                            Some(__vs) => Some(__vs.into_iter()
-                                .map(|__v| __v.parse::<#inner>()
-                                    .map_err(|e| cubos_sql::Error::Deserialize(
-                                        format!("failed to parse enum {}: {e}", stringify!(#inner)))))
-                                .collect::<::std::result::Result<Vec<#inner>, _>>()?),
-                            None => None,
-                        }
+                    match #rd {
+                        ::std::option::Option::Some(__vs) => ::std::option::Option::Some(#map),
+                        ::std::option::Option::None => ::std::option::Option::None,
                     }
                 })
             } else {
-                Ok(quote! {
-                    __row.get::<_, Vec<String>>(#idx_lit)
-                        .into_iter()
-                        .map(|__v| __v.parse::<#inner>()
-                            .map_err(|e| cubos_sql::Error::Deserialize(
-                                format!("failed to parse enum {}: {e}", stringify!(#inner)))))
-                        .collect::<::std::result::Result<Vec<#inner>, _>>()?
-                })
+                let rd = read(
+                    quote! { ::std::vec::Vec<::cubos_sql::__private::EnumString> },
+                    None,
+                );
+                Ok(quote! { { let __vs = #rd; #map } })
             }
         }
-        DeserStrategy::Plain { .. } => {
-            let base_type = mapping.rust_type;
-            if nullable {
-                Ok(quote! {
-                    __row.get::<_, ::std::option::Option<#base_type>>(#idx_lit)
-                })
+        DeserStrategy::Record | DeserStrategy::VecOfRecord => {
+            // Decode through the synthesized record struct, then (when the
+            // composite type itself is mapped) rebuild the user's struct.
+            let raw_type = record_raw_type(ty, registry)?;
+            let rd = if nullable {
+                read(quote! { ::std::option::Option<#raw_type> }, None)
             } else {
-                Ok(quote! {
-                    __row.get::<_, #base_type>(#idx_lit)
-                })
+                read(quote! { #raw_type }, None)
+            };
+            let converted = convert_record_to_site(quote! { __raw }, ty, nullable, config)?;
+            Ok(quote! {
+                {
+                    let __raw = #rd;
+                    #converted
+                }
+            })
+        }
+        DeserStrategy::Plain { .. } => {
+            let base = &mapping.rust_type;
+            if nullable {
+                Ok(read(quote! { ::std::option::Option<#base> }, None))
+            } else {
+                Ok(read(quote! { #base }, None))
             }
         }
     }
+}
+
+fn column_get_expr(
+    col: &AnalyzedColumn,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+    idx: usize,
+) -> Result<TokenStream, syn::Error> {
+    let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+    let mapping = resolve_type_mapping(&col.pg_type, config, registry)?;
+    decode_value(
+        &mapping,
+        &col.pg_type,
+        col.nullable,
+        config,
+        registry,
+        &|raw, _hint| quote! { __row.get::<_, #raw>(#idx_lit) },
+        DecodeCtx::Column,
+    )
 }

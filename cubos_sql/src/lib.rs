@@ -357,10 +357,17 @@
 //! | `uuid[]` | `Vec<uuid::Uuid>` |
 //! | `jsonb[]` | `Vec<serde_json::Value>` |
 //!
-//! Types declared in your own schema — JSONB domains, enums, composites, and
-//! types from extensions like `pgvector` — are mapped through the
+//! Types declared in your own schema — JSONB domains, enums, and types from
+//! extensions like `pgvector` — are mapped through the
 //! `[package.metadata.cubos_sql.{domains, enums, types}]` sections shown above.
 //! See `cubos_sql_macros::pg_type_map` for the full set of recognized built-ins.
+//!
+//! Composite types and anonymous `ROW(...)` / subquery records are decoded
+//! into a Rust struct synthesized by the `sql!` macro, one typed field per
+//! composite attribute (nested composites nest). Pointing a composite at a
+//! pre-existing struct via `[package.metadata.cubos_sql.types]` makes the
+//! macro rebuild *that* struct field-by-field instead — its field names must
+//! match the composite's attributes.
 //!
 //! Nullable columns (no `NOT NULL` constraint) are wrapped in `Option<T>`.
 
@@ -398,9 +405,10 @@ pub use rust_decimal;
 /// Not part of the public API — do not rely on these directly.
 #[doc(hidden)]
 pub mod __private {
+    pub use bytes;
     pub use tokio_postgres;
 
-    use bytes::BytesMut;
+    use bytes::{Buf, BufMut, BytesMut};
     use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
     /// Bridge type for PostgreSQL enums.
@@ -486,5 +494,283 @@ pub mod __private {
         I::Item: Into<T>,
     {
         iter.into_iter().map(Into::into).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Composite / record (de)serialization
+    //
+    // PostgreSQL's binary wire format for a `record` value (and, identically,
+    // for any named composite type) is *self-describing*: an `i32` field
+    // count, then for each field a `u32` type OID, an `i32` byte length
+    // (`-1` for SQL NULL), and the field body. Because every field carries
+    // its own OID inline, a value can be decoded with no catalog round-trip.
+    //
+    // The `sql!` macro synthesizes a Rust struct for every composite column
+    // and anonymous `ROW(...)` / subquery record it sees, and emits a manual
+    // `FromSql` impl that drives [`RecordReader`]. The `write_record_*`
+    // helpers implement the reverse direction for future use.
+    // -----------------------------------------------------------------------
+
+    /// Boxed error used across the record (de)serialization helpers.
+    type BoxError = Box<dyn std::error::Error + Sync + Send>;
+
+    /// Returns `true` when `ty` is a composite / record type — i.e. a value
+    /// the synthesized record structs know how to decode. Domains are
+    /// unwrapped to their base type.
+    ///
+    /// Used by the `accepts` method of generated `FromSql` / `ToSql` impls.
+    pub fn record_accepts(ty: &Type) -> bool {
+        match ty.kind() {
+            Kind::Composite(_) => true,
+            Kind::Domain(inner) => record_accepts(inner),
+            _ => *ty == Type::RECORD,
+        }
+    }
+
+    /// Resolve the ordered field list of a composite `ty`, unwrapping domains.
+    ///
+    /// Generated `ToSql` impls call this to learn each field's PG type — the
+    /// OID must be written inline into the wire format, and a per-field
+    /// `Type` is needed to encode the body.
+    pub fn composite_fields(ty: &Type) -> Result<&[tokio_postgres::types::Field], BoxError> {
+        match ty.kind() {
+            Kind::Composite(fields) => Ok(fields),
+            Kind::Domain(inner) => composite_fields(inner),
+            _ => Err(format!("expected a composite type, got `{ty}`").into()),
+        }
+    }
+
+    /// Streaming reader over the binary wire format of a `record` / composite.
+    ///
+    /// Generated `FromSql` impls construct one with [`RecordReader::new`],
+    /// call [`RecordReader::read_field`] once per struct field, and close with
+    /// [`RecordReader::finish`].
+    pub struct RecordReader<'a> {
+        buf: &'a [u8],
+        declared: usize,
+        consumed: usize,
+    }
+
+    impl<'a> RecordReader<'a> {
+        /// Parse the leading `i32` field count. Fails on a truncated buffer.
+        pub fn new(mut raw: &'a [u8]) -> Result<Self, BoxError> {
+            if raw.remaining() < 4 {
+                return Err("record wire format: truncated field count".into());
+            }
+            let declared = raw.get_i32();
+            if declared < 0 {
+                return Err("record wire format: negative field count".into());
+            }
+            Ok(RecordReader {
+                buf: raw,
+                declared: declared as usize,
+                consumed: 0,
+            })
+        }
+
+        /// Decode the next field as `T`, reconstructing its PG type from the
+        /// OID carried inline. A user-defined OID with no built-in mapping
+        /// falls back to [`Type::RECORD`] — harmless, since the synthesized
+        /// nested structs ignore the passed type and re-read the inline OIDs.
+        pub fn read_field<T: FromSql<'a>>(&mut self) -> Result<T, BoxError> {
+            self.read_field_inner(None)
+        }
+
+        /// Decode the next field as `T`, decoding it as `expected` rather than
+        /// the type reconstructed from the inline OID.
+        ///
+        /// Needed for types whose `FromSql` impl is type-sensitive (notably
+        /// `serde_json::Value`, which strips a version byte only for `JSONB`)
+        /// when the inline OID is a user type — e.g. a domain over `jsonb` —
+        /// that does not resolve back to a built-in.
+        pub fn read_field_with<T: FromSql<'a>>(&mut self, expected: &Type) -> Result<T, BoxError> {
+            self.read_field_inner(Some(expected))
+        }
+
+        fn read_field_inner<T: FromSql<'a>>(
+            &mut self,
+            expected: Option<&Type>,
+        ) -> Result<T, BoxError> {
+            if self.consumed >= self.declared {
+                return Err(format!(
+                    "record wire format: tried to read field {} but only {} present",
+                    self.consumed + 1,
+                    self.declared,
+                )
+                .into());
+            }
+            if self.buf.remaining() < 8 {
+                return Err("record wire format: truncated field header".into());
+            }
+            let oid = self.buf.get_u32();
+            let len = self.buf.get_i32();
+            let field_ty = match expected {
+                Some(ty) => ty.clone(),
+                None => Type::from_oid(oid).unwrap_or(Type::RECORD),
+            };
+            let body = if len < 0 {
+                None
+            } else {
+                let len = len as usize;
+                if self.buf.remaining() < len {
+                    return Err("record wire format: truncated field body".into());
+                }
+                let (head, tail) = self.buf.split_at(len);
+                self.buf = tail;
+                Some(head)
+            };
+            self.consumed += 1;
+            T::from_sql_nullable(&field_ty, body)
+        }
+
+        /// Assert the record carried exactly `expected` fields. Generated
+        /// code passes its statically known field count.
+        pub fn finish(self, expected: usize) -> Result<(), BoxError> {
+            if self.declared != expected {
+                return Err(format!(
+                    "record wire format: expected {expected} fields, got {}",
+                    self.declared,
+                )
+                .into());
+            }
+            Ok(())
+        }
+    }
+
+    /// Write the leading `i32` field count of a record value.
+    pub fn write_record_header(out: &mut BytesMut, field_count: usize) -> Result<(), BoxError> {
+        let n = i32::try_from(field_count)
+            .map_err(|_| "record wire format: too many fields to encode")?;
+        out.put_i32(n);
+        Ok(())
+    }
+
+    /// Encode one composite field: its type OID followed by a length-prefixed
+    /// body, with a `-1` length signalling SQL NULL.
+    pub fn write_record_field<T: ToSql>(
+        field_ty: &Type,
+        value: &T,
+        out: &mut BytesMut,
+    ) -> Result<(), BoxError> {
+        out.put_u32(field_ty.oid());
+        let len_at = out.len();
+        out.put_i32(0); // length placeholder, backfilled below
+        let len = match value.to_sql(field_ty, out)? {
+            IsNull::Yes => -1,
+            IsNull::No => i32::try_from(out.len() - len_at - 4)
+                .map_err(|_| "record wire format: field body exceeds i32::MAX")?,
+        };
+        out[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod record_tests {
+        use super::*;
+
+        /// Build a record wire payload from `(oid, body)` field tuples;
+        /// `body = None` encodes a SQL NULL field.
+        fn encode(fields: &[(u32, Option<&[u8]>)]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(fields.len() as i32).to_be_bytes());
+            for (oid, body) in fields {
+                buf.extend_from_slice(&oid.to_be_bytes());
+                match body {
+                    Some(b) => {
+                        buf.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                        buf.extend_from_slice(b);
+                    }
+                    None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+                }
+            }
+            buf
+        }
+
+        #[test]
+        fn reads_scalar_fields() {
+            // (int4 = 7, text = "hi")
+            let wire = encode(&[
+                (Type::INT4.oid(), Some(&7i32.to_be_bytes())),
+                (Type::TEXT.oid(), Some(b"hi")),
+            ]);
+            let mut r = RecordReader::new(&wire).unwrap();
+            let a: i32 = r.read_field().unwrap();
+            let b: String = r.read_field().unwrap();
+            r.finish(2).unwrap();
+            assert_eq!(a, 7);
+            assert_eq!(b, "hi");
+        }
+
+        #[test]
+        fn reads_null_field_into_option() {
+            let wire = encode(&[(Type::INT4.oid(), None)]);
+            let mut r = RecordReader::new(&wire).unwrap();
+            let v: Option<i32> = r.read_field().unwrap();
+            r.finish(1).unwrap();
+            assert!(v.is_none());
+        }
+
+        #[test]
+        fn null_field_into_non_option_errors() {
+            let wire = encode(&[(Type::INT4.oid(), None)]);
+            let mut r = RecordReader::new(&wire).unwrap();
+            assert!(r.read_field::<i32>().is_err());
+        }
+
+        #[test]
+        fn finish_rejects_field_count_mismatch() {
+            let wire = encode(&[(Type::INT4.oid(), Some(&1i32.to_be_bytes()))]);
+            let mut r = RecordReader::new(&wire).unwrap();
+            let _: i32 = r.read_field().unwrap();
+            assert!(r.finish(2).is_err());
+        }
+
+        #[test]
+        fn reading_past_declared_count_errors() {
+            let wire = encode(&[(Type::INT4.oid(), Some(&1i32.to_be_bytes()))]);
+            let mut r = RecordReader::new(&wire).unwrap();
+            let _: i32 = r.read_field().unwrap();
+            assert!(r.read_field::<i32>().is_err());
+        }
+
+        #[test]
+        fn truncated_count_errors() {
+            assert!(RecordReader::new(&[0u8, 0]).is_err());
+        }
+
+        #[test]
+        fn truncated_body_errors() {
+            // declares one int4 field but the body claims 8 bytes, supplies 2
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&1i32.to_be_bytes());
+            wire.extend_from_slice(&Type::INT4.oid().to_be_bytes());
+            wire.extend_from_slice(&8i32.to_be_bytes());
+            wire.extend_from_slice(&[0u8, 0]);
+            let mut r = RecordReader::new(&wire).unwrap();
+            assert!(r.read_field::<i32>().is_err());
+        }
+
+        #[test]
+        fn write_then_read_roundtrip() {
+            // Encode (int4, text, nullable int4 = NULL) field-by-field, then
+            // decode it back through RecordReader.
+            let mut out = BytesMut::new();
+            write_record_header(&mut out, 3).unwrap();
+            write_record_field(&Type::INT4, &42i32, &mut out).unwrap();
+            write_record_field(&Type::TEXT, &"hello".to_string(), &mut out).unwrap();
+            write_record_field(&Type::INT4, &Option::<i32>::None, &mut out).unwrap();
+
+            let mut r = RecordReader::new(&out).unwrap();
+            assert_eq!(r.read_field::<i32>().unwrap(), 42);
+            assert_eq!(r.read_field::<String>().unwrap(), "hello");
+            assert!(r.read_field::<Option<i32>>().unwrap().is_none());
+            r.finish(3).unwrap();
+        }
+
+        #[test]
+        fn record_accepts_matches_record_and_composite() {
+            assert!(record_accepts(&Type::RECORD));
+            assert!(!record_accepts(&Type::INT4));
+        }
     }
 }

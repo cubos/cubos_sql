@@ -24,8 +24,7 @@ libc = "0.2"
 [package.metadata.cubos_sql.database]
 migrations = "./migrations"
 
-[package.metadata.cubos_sql.domains]
+[package.metadata.cubos_sql.types]
 user_preferences = "::cubos_sql_e2e::UserPreferences"
-
-[package.metadata.cubos_sql.enums]
 post_status = "::cubos_sql_e2e::PostStatus"
+"public.geo_point" = "::cubos_sql_e2e::GeoPoint"

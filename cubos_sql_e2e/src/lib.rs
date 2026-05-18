@@ -55,3 +55,17 @@ impl FromStr for PostStatus {
         }
     }
 }
+
+/// Rust struct pointed at the `geo_point` composite type via
+/// `[package.metadata.cubos_sql.types]`. When a `[types]` override exists for
+/// a composite, the `sql!` macro decodes the row into its synthesized record
+/// struct and then rebuilds *this* struct field-by-field — the field names
+/// must match the composite's attributes (`x`, `y`).
+///
+/// Composite-type attributes are always nullable in PostgreSQL (there is no
+/// per-attribute `NOT NULL`), so each field is an `Option`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoPoint {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+}
