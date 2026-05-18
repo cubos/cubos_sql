@@ -36,6 +36,34 @@ impl QualifiedName {
             name: name.into(),
         }
     }
+
+    /// Parse a name that *may* be schema-qualified, following PostgreSQL
+    /// identifier rules.
+    ///
+    /// Unlike [`FromStr`], a bare (single-part) name is accepted and placed in
+    /// `default_schema` rather than rejected. Quoting is honoured, so a quoted
+    /// identifier containing a `.` stays a single part — `"foo.bar"` parses as
+    /// the name `foo.bar` in `default_schema`, not as schema `foo` / name
+    /// `bar`. Unquoted identifiers are case-folded to lowercase, as PG does.
+    pub fn parse_in_schema(s: &str, default_schema: &str) -> Result<Self, ParseQualifiedNameError> {
+        let mut parser = Parser::new(s);
+        let first = parser.read_ident()?;
+        if parser.peek() == Some('.') {
+            parser.bump();
+            let name = parser.read_ident()?;
+            parser.expect_end()?;
+            Ok(QualifiedName {
+                schema: first,
+                name,
+            })
+        } else {
+            parser.expect_end()?;
+            Ok(QualifiedName {
+                schema: default_schema.to_string(),
+                name: first,
+            })
+        }
+    }
 }
 
 impl fmt::Display for QualifiedName {
@@ -271,6 +299,50 @@ mod tests {
     fn parse_missing_schema_errors() {
         let err = "users".parse::<QualifiedName>().unwrap_err();
         assert!(matches!(err, ParseQualifiedNameError::ExpectedDot(_)));
+    }
+
+    #[test]
+    fn parse_in_schema_bare_name_uses_default() {
+        let q = QualifiedName::parse_in_schema("user_role", "public").unwrap();
+        assert_eq!(q, QualifiedName::new("public", "user_role"));
+    }
+
+    #[test]
+    fn parse_in_schema_qualified_name() {
+        let q = QualifiedName::parse_in_schema("geo.polygon", "public").unwrap();
+        assert_eq!(q, QualifiedName::new("geo", "polygon"));
+    }
+
+    #[test]
+    fn parse_in_schema_quoted_name_with_dot_is_one_part() {
+        // A quoted identifier containing a `.` is a single name, not a
+        // schema-qualified pair.
+        let q = QualifiedName::parse_in_schema("\"foo.bar\"", "public").unwrap();
+        assert_eq!(q, QualifiedName::new("public", "foo.bar"));
+    }
+
+    #[test]
+    fn parse_in_schema_quoted_schema_with_dot() {
+        let q = QualifiedName::parse_in_schema("\"foo.bar\".baz", "public").unwrap();
+        assert_eq!(q, QualifiedName::new("foo.bar", "baz"));
+    }
+
+    #[test]
+    fn parse_in_schema_folds_unquoted_case() {
+        let q = QualifiedName::parse_in_schema("MyType", "public").unwrap();
+        assert_eq!(q, QualifiedName::new("public", "mytype"));
+    }
+
+    #[test]
+    fn parse_in_schema_preserves_quoted_case() {
+        let q = QualifiedName::parse_in_schema("\"MyType\"", "public").unwrap();
+        assert_eq!(q, QualifiedName::new("public", "MyType"));
+    }
+
+    #[test]
+    fn parse_in_schema_rejects_trailing_garbage() {
+        assert!(QualifiedName::parse_in_schema("a.b.c", "public").is_err());
+        assert!(QualifiedName::parse_in_schema("", "public").is_err());
     }
 
     #[test]

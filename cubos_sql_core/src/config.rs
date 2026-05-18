@@ -421,24 +421,24 @@ pub struct ResolvedConfig<'a> {
 
 /// Parse type-mapping keys into [`QualifiedName`]s.
 ///
-/// Respects PostgreSQL quoting rules (`"My Schema"."My Type"`). Bare names
-/// without a dot are interpreted as living in the `public` schema.
+/// Keys follow PostgreSQL identifier syntax: an optional `schema.` prefix and
+/// quoting (`"My Schema"."My Type"`). A bare, single-part name lands in the
+/// `public` schema — and because parsing is quote-aware, a quoted identifier
+/// containing a `.` (e.g. `"odd.name"`) stays a single name rather than being
+/// split on the dot. Unquoted identifiers are case-folded, as PG does.
 fn qualify_keys(
     map: &HashMap<String, String>,
     section: &'static str,
 ) -> Result<HashMap<QualifiedName, String>, ConfigError> {
     map.iter()
         .map(|(k, v)| {
-            let key = if k.contains('.') {
-                k.parse::<QualifiedName>()
-                    .map_err(|source| ConfigError::InvalidQualifiedName {
-                        section,
-                        key: k.clone(),
-                        source,
-                    })?
-            } else {
-                QualifiedName::new("public", k.clone())
-            };
+            let key = QualifiedName::parse_in_schema(k, "public").map_err(|source| {
+                ConfigError::InvalidQualifiedName {
+                    section,
+                    key: k.clone(),
+                    source,
+                }
+            })?;
             Ok((key, v.clone()))
         })
         .collect()
@@ -876,6 +876,34 @@ point = "crate::Point"
                 .get(&QualifiedName::new("geo", "polygon"))
                 .unwrap(),
             "crate::Polygon"
+        );
+    }
+
+    #[test]
+    fn resolve_quoted_type_key_with_embedded_dot() {
+        // A quoted identifier containing a `.` is one name in `public`, not a
+        // schema-qualified pair — the key parses with PG identifier rules,
+        // not a naïve split on the first dot.
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cubos_sql.database]
+migrations = "./migrations"
+
+[package.metadata.cubos_sql.types]
+'"odd.name"' = "crate::Odd"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        let resolved = config.resolve(None).unwrap();
+        assert_eq!(
+            resolved
+                .types
+                .get(&QualifiedName::new("public", "odd.name"))
+                .unwrap(),
+            "crate::Odd"
         );
     }
 
