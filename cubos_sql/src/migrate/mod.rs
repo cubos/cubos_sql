@@ -21,7 +21,7 @@
 //! # Transaction behavior
 //!
 //! By default, each migration runs inside a transaction. You can disable
-//! transactions globally via [`MigrationsConfig::use_transaction`](cubos_sql_core::config::MigrationsConfig),
+//! transactions globally via [`MigrationsConfig::use_transaction`],
 //! or per-migration by adding `-- no-transaction` as the first line of the SQL file
 //! (useful for `CREATE INDEX CONCURRENTLY` and similar statements).
 //!
@@ -33,8 +33,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use cubos_sql::migrate::{MigrationSource, run, status};
-//! use cubos_sql_core::config::MigrationsConfig;
+//! use cubos_sql::migrate::{MigrationSource, MigrationsConfig, run, status};
 //! use std::path::Path;
 //!
 //! # async fn example() -> Result<(), cubos_sql::Error> {
@@ -62,3 +61,8 @@ mod source;
 
 pub use runner::{MigrationStatus, revert, run, status};
 pub use source::{Migration, MigrationSource};
+
+/// Migration runner settings (tracking table, advisory lock id, transaction
+/// behavior). Re-exported from `cubos_sql_core` so consumers of the runtime
+/// crate don't need to depend on `cubos_sql_core` directly.
+pub use cubos_sql_core::config::{ConfigError, MigrationsConfig};

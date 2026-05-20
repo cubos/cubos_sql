@@ -258,8 +258,7 @@
 //! Use the [`migrate`] module to run migrations at application startup:
 //!
 //! ```rust,no_run
-//! use cubos_sql::migrate::{MigrationSource, run};
-//! use cubos_sql_core::config::MigrationsConfig;
+//! use cubos_sql::migrate::{MigrationSource, MigrationsConfig, run};
 //! use std::path::Path;
 //!
 //! # async fn example() -> Result<(), cubos_sql::Error> {

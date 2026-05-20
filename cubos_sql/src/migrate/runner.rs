@@ -1,6 +1,6 @@
-use cubos_sql_core::config::MigrationsConfig;
 use tokio_postgres::Client;
 
+use super::MigrationsConfig;
 use super::source::MigrationSource;
 
 /// Computes the MD5 hex digest of a migration's SQL content.
@@ -50,7 +50,7 @@ fn format_pg_error(e: &tokio_postgres::Error) -> String {
 /// ```rust,no_run
 /// # async fn example(client: &tokio_postgres::Client,
 /// #     source: &cubos_sql::migrate::MigrationSource,
-/// #     config: &cubos_sql_core::config::MigrationsConfig) -> Result<(), cubos_sql::Error> {
+/// #     config: &cubos_sql::migrate::MigrationsConfig) -> Result<(), cubos_sql::Error> {
 /// let statuses = cubos_sql::migrate::status(client, source, config).await?;
 /// for s in &statuses {
 ///     if !s.applied {
@@ -79,7 +79,7 @@ pub struct MigrationStatus {
 /// The lock is released when the function returns, even on failure.
 ///
 /// By default each migration runs inside a transaction. This can be configured
-/// globally via [`MigrationsConfig::use_transaction`](cubos_sql_core::config::MigrationsConfig),
+/// globally via [`MigrationsConfig::use_transaction`],
 /// or disabled per-migration with `-- no-transaction` on the first line of the SQL file.
 ///
 /// Returns the list of migration names that were applied in this run. If all
@@ -93,8 +93,7 @@ pub struct MigrationStatus {
 /// # Example
 ///
 /// ```rust,no_run
-/// use cubos_sql::migrate::{MigrationSource, run};
-/// use cubos_sql_core::config::MigrationsConfig;
+/// use cubos_sql::migrate::{MigrationSource, MigrationsConfig, run};
 /// use std::path::Path;
 ///
 /// # async fn example() -> Result<(), cubos_sql::Error> {
@@ -227,8 +226,7 @@ async fn run_inner(
 /// # Example
 ///
 /// ```rust,no_run
-/// use cubos_sql::migrate::{MigrationSource, status};
-/// use cubos_sql_core::config::MigrationsConfig;
+/// use cubos_sql::migrate::{MigrationSource, MigrationsConfig, status};
 /// use std::path::Path;
 ///
 /// # async fn example(client: &tokio_postgres::Client) -> Result<(), cubos_sql::Error> {
@@ -324,8 +322,7 @@ pub async fn status(
 /// # Example
 ///
 /// ```rust,no_run
-/// use cubos_sql::migrate::{MigrationSource, revert};
-/// use cubos_sql_core::config::MigrationsConfig;
+/// use cubos_sql::migrate::{MigrationSource, MigrationsConfig, revert};
 /// use std::path::Path;
 ///
 /// # async fn example(client: &mut tokio_postgres::Client) -> Result<(), cubos_sql::Error> {
