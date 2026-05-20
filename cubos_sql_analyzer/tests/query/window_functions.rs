@@ -302,3 +302,25 @@ fn frame_with_exclude_group() {
         .unwrap();
     assert_cols(&s, vec![cn("s", int8())]);
 }
+
+// ── OVER (...) must resolve column refs against the FROM scope ───────────────
+
+#[test]
+fn window_partition_by_unknown_column_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT rank() OVER (PARTITION BY ghost) FROM posts"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn window_order_by_unknown_column_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT rank() OVER (ORDER BY ghost) FROM posts"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}

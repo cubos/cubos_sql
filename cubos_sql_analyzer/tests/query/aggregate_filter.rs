@@ -131,6 +131,29 @@ fn array_agg_with_filter_and_order_by() {
     assert_cols(&s, vec![cn("top", array_of(text()))]);
 }
 
+#[test]
+fn filter_unknown_column_rejected() {
+    // FILTER's predicate must type-check against the FROM scope; typos
+    // were historically swallowed because the modifier walk used
+    // `let _ = infer_expr(...)`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT count(*) FILTER (WHERE ghost > 0) FROM posts"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn agg_order_by_unknown_column_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT array_agg(title ORDER BY ghost) FROM posts"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
 // ── WITHIN GROUP — ordered-set aggregates ────────────────────────────────────
 
 #[test]

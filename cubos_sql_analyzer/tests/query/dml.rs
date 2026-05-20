@@ -513,6 +513,36 @@ fn insert_on_conflict_do_update_with_param_expression() {
     assert_params(&s, vec![p(text()), p(text()), pn(int4()), p(int4())]);
 }
 
+#[test]
+fn insert_on_conflict_do_update_set_unknown_column_in_value_rejected() {
+    // A typo on the right-hand side of `ON CONFLICT ... DO UPDATE SET`
+    // used to be swallowed by `let _ = infer_expr(...)`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) \
+             ON CONFLICT (email) DO UPDATE SET name = ghost",
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn insert_on_conflict_do_update_where_unknown_column_rejected() {
+    // A typo in the `ON CONFLICT ... WHERE` predicate used to be
+    // swallowed by `let _ = infer_expr(...)`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) \
+             ON CONFLICT (email) DO UPDATE SET name = 'x' WHERE ghost",
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
 // ── ON CONFLICT target validation — `pg_constraint` / `pg_index` not modeled ─
 //
 // In PG, `ON CONFLICT (col)` requires `col` to be covered by a UNIQUE or

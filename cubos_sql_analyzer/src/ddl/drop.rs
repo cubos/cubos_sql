@@ -10,6 +10,7 @@ use crate::pg_catalog::{
     PG_CAST_RELID, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_NAMESPACE_RELID, PG_OPERATOR_RELID,
     PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, PgProc, ProKind, RelKind,
 };
+use crate::qualified_name::QualifiedName;
 
 pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlError> {
     let obj_type = ObjectType::try_from(stmt.remove_type).unwrap_or(ObjectType::Undefined);
@@ -133,7 +134,7 @@ fn drop_relation(
             .filter_map(|&v| {
                 let c = interp.pg_class.get(&v)?;
                 let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
-                Some(format!("{nsname}.{}", c.relname))
+                Some(QualifiedName::new(nsname, &c.relname).to_string())
             })
             .collect();
         return Err(DdlError::DependencyError(format!(
@@ -156,7 +157,10 @@ fn drop_relation(
         .filter_map(|c| {
             let owner = interp.pg_class.get(&c.conrelid)?;
             let nsname = interp.namespace_name(owner.relnamespace)?;
-            Some((c.clone(), format!("{nsname}.{}", owner.relname)))
+            Some((
+                c.clone(),
+                QualifiedName::new(nsname, &owner.relname).to_string(),
+            ))
         })
         .collect();
     if !dependent_fks.is_empty() && !cascade {
@@ -304,13 +308,17 @@ fn drop_type(
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(format!("{schema}.{name}")));
+        return Err(DdlError::TypeNotFound(
+            QualifiedName::new(schema, name).to_string(),
+        ));
     };
     let Some(type_oid) = interp.type_by_qname.get(&(nsoid, name.clone())).copied() else {
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(format!("{schema}.{name}")));
+        return Err(DdlError::TypeNotFound(
+            QualifiedName::new(schema, name).to_string(),
+        ));
     };
     let array_oid = interp.array_type_of(type_oid);
 
@@ -332,7 +340,7 @@ fn drop_type(
             .filter_map(|&v| {
                 let c = interp.pg_class.get(&v)?;
                 let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
-                Some(format!("{nsname}.{}", c.relname))
+                Some(QualifiedName::new(nsname, &c.relname).to_string())
             })
             .collect();
         return Err(DdlError::DependencyError(format!(
@@ -550,7 +558,7 @@ fn format_view_list(snapshot: &PgCatalog, view_oids: &[PgClassOid]) -> String {
         .filter_map(|&v| {
             let c = snapshot.pg_class.get(&v)?;
             let nsname = snapshot.namespace_name(c.relnamespace).unwrap_or("?");
-            Some(format!("{nsname}.{}", c.relname))
+            Some(QualifiedName::new(nsname, &c.relname).to_string())
         })
         .collect::<Vec<_>>()
         .join(", ")

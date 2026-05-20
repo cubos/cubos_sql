@@ -343,3 +343,30 @@ fn window_function_in_aggregate_argument_rejected() {
         "aggregate function calls cannot contain window function calls",
     );
 }
+
+// ── GROUP BY column validation + select-alias fallback ───────────────────────
+
+#[test]
+fn group_by_unknown_column_rejected() {
+    // A typo in GROUP BY used to be silently accepted — the walker
+    // discarded `infer_expr`'s error to preserve "param coverage". Now
+    // we propagate the error, but with a fallback for select aliases.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT count(*) FROM users GROUP BY ghost"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn group_by_resolves_select_alias() {
+    // PG accepts `GROUP BY <select_alias>` even though the alias isn't
+    // in the FROM scope. The fallback in walk_group_clause_node makes
+    // this still work after the propagation fix.
+    let db = setup();
+    let s = db
+        .analyze("SELECT name AS author, count(*) AS posts FROM users GROUP BY author")
+        .unwrap();
+    assert_cols(&s, vec![c("author", text()), c("posts", int8())]);
+}

@@ -80,6 +80,45 @@ fn where_is_null() {
     assert_cols(&s, vec![c("id", int8()), c("name", text())]);
 }
 
+#[test]
+fn where_is_null_unknown_column_rejected() {
+    // `IS NULL` / `IS NOT NULL` / `IS [NOT] TRUE|FALSE` must still resolve
+    // their argument against the scope — historically the analyzer treated
+    // these nodes as opaque booleans and silently accepted typo'd columns.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE ghost IS NULL"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn where_is_not_false_unknown_column_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE ghost IS NOT FALSE"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn where_is_not_false_unknown_column_in_subquery_rejected() {
+    // The original report: a typo'd column inside a scalar subquery's
+    // `IS NOT FALSE` was silently accepted because the BooleanTest arm
+    // never descended into its arg.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "SELECT id FROM users u \
+             WHERE EXISTS (SELECT 1 FROM users x WHERE x.ghost IS NOT FALSE)",
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "column x.ghost does not exist",
+    );
+}
+
 // ── AND / OR / NOT ───────────────────────────────────────────────────────────
 
 #[test]

@@ -174,11 +174,12 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
         return name.to_string();
     }
     // Non-aliased types: PG omits the `pg_catalog.` schema prefix for
-    // built-ins, but qualifies user types.
+    // built-ins, but qualifies user types. Identifier quoting per PG
+    // rules is delegated to `QualifiedName::Display`.
     if let Some(ns) = snapshot.namespace_name(t.typnamespace)
         && ns != "pg_catalog"
     {
-        return format!("{ns}.{}", t.typname);
+        return QualifiedName::new(ns, &t.typname).to_string();
     }
     t.typname.clone()
 }

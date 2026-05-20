@@ -12,6 +12,7 @@ use super::util::{ensure_namespace, node_string, resolve_type_name};
 use super::views;
 use crate::oid::{PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{PgCatalog, PgProc, ProKind};
+use crate::qualified_name::QualifiedName;
 
 // ─── ALTER ... RENAME TO ────────────────────────────────────────────────────
 
@@ -46,7 +47,9 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!("{schema_name}.{relname}")));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&schema_name, &relname).to_string(),
+        ));
     };
     let Some(class_oid) = interp
         .class_by_qname
@@ -56,7 +59,9 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!("{schema_name}.{relname}")));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&schema_name, &relname).to_string(),
+        ));
     };
 
     // PG (RENAME CONSTRAINT) emits `constraint "x" for table "t" does not
@@ -117,10 +122,9 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!(
-            "{schema_name}.{}",
-            rv.relname
-        )));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&schema_name, &rv.relname).to_string(),
+        ));
     };
     let Some(class_oid) = interp
         .class_by_qname
@@ -130,10 +134,9 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!(
-            "{schema_name}.{}",
-            rv.relname
-        )));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&schema_name, &rv.relname).to_string(),
+        ));
     };
 
     let old_name = rv.relname.clone();
@@ -172,10 +175,9 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!(
-            "{schema_name}.{}",
-            rv.relname
-        )));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&schema_name, &rv.relname).to_string(),
+        ));
     };
     let Some(relid) = interp
         .class_by_qname
@@ -185,10 +187,9 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!(
-            "{schema_name}.{}",
-            rv.relname
-        )));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&schema_name, &rv.relname).to_string(),
+        ));
     };
 
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
@@ -270,13 +271,17 @@ fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(format!("{schema_name}.{old_name}")));
+        return Err(DdlError::TypeNotFound(
+            QualifiedName::new(&schema_name, &old_name).to_string(),
+        ));
     };
     let Some(&type_oid) = interp.type_by_qname.get(&(nsoid, old_name.clone())) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(format!("{schema_name}.{old_name}")));
+        return Err(DdlError::TypeNotFound(
+            QualifiedName::new(&schema_name, &old_name).to_string(),
+        ));
     };
 
     let new_name = stmt.newname.clone();
@@ -352,10 +357,9 @@ fn set_relation_schema(
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!(
-            "{old_schema}.{}",
-            rv.relname
-        )));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&old_schema, &rv.relname).to_string(),
+        ));
     };
     let Some(class_oid) = interp
         .class_by_qname
@@ -365,10 +369,9 @@ fn set_relation_schema(
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!(
-            "{old_schema}.{}",
-            rv.relname
-        )));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(&old_schema, &rv.relname).to_string(),
+        ));
     };
 
     let name = rv.relname.clone();
@@ -459,13 +462,17 @@ fn set_type_schema(
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(format!("{old_schema}.{name}")));
+        return Err(DdlError::TypeNotFound(
+            QualifiedName::new(&old_schema, &name).to_string(),
+        ));
     };
     let Some(&type_oid) = interp.type_by_qname.get(&(old_nsoid, name.clone())) else {
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(format!("{old_schema}.{name}")));
+        return Err(DdlError::TypeNotFound(
+            QualifiedName::new(&old_schema, &name).to_string(),
+        ));
     };
 
     interp.rename_pg_type(type_oid, name.clone(), new_nsoid);

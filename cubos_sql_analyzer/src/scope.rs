@@ -156,8 +156,13 @@ impl Scope {
                     "invalid reference to FROM-clause entry for table \"{t}\""
                 )));
             }
+            // PG formats qualified missing columns through identifier
+            // quoting rules (`column t.col does not exist`, but
+            // `column "T".col does not exist` when `T` needs quoting).
+            // Bare names use the simple `"col"` form just below.
             return Err(AnalyzeError::UndefinedColumn(format!(
-                "column \"{t}.{column}\" does not exist"
+                "column {} does not exist",
+                QualifiedName::new(t, column),
             )));
         }
 

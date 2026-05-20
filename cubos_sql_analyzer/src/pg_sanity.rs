@@ -34,6 +34,7 @@ use postgres::types::{IsNull, ToSql, Type as PgType};
 use postgres::{Client, NoTls};
 
 use crate::error::AnalyzeError;
+use crate::qualified_name::QualifiedName;
 use crate::resolve::AnalyzedQuery;
 use crate::types::Type;
 
@@ -352,7 +353,7 @@ impl PgSanityServer {
             let elem_qname = self.qualified_type_name(typelem)?;
             format!("{elem_qname}[]")
         } else {
-            format!("{schema}.{name}")
+            QualifiedName::new(schema, name).to_string()
         };
         self.type_name_cache.insert(oid, qualified.clone());
         Ok(qualified)
@@ -487,7 +488,7 @@ fn qualified_type_name_for_compare(ty: &Type) -> String {
         Type::Basic { schema, name, .. }
         | Type::Enum { schema, name, .. }
         | Type::Range { schema, name, .. }
-        | Type::Composite { schema, name, .. } => format!("{schema}.{name}"),
+        | Type::Composite { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
         Type::Array { element } => format!("{}[]", qualified_type_name_for_compare(element)),
         Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),
     }

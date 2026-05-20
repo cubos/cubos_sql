@@ -330,18 +330,27 @@ pub(crate) fn infer_expr(
         node::Node::GroupingFunc(g) => {
             // `GROUPING(expr, …)` — returns int4 indicating which of the
             // listed expressions are *missing* from the current grouping
-            // set. Always defined → NOT NULL. We walk the args so any
-            // params they contain still get typed, even though the result
-            // type is fixed.
+            // set. Always defined → NOT NULL. Walk the args so params get
+            // typed and column refs / typos surface as errors.
             for arg in &g.args {
-                let _ = infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+                infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
             }
             Ok(ExprType::scalar(oid::INT4, false))
         }
         node::Node::AExpr(expr) => infer_a_expr(expr, scope, null_ctx, snapshot, params),
         node::Node::BoolExpr(expr) => infer_bool_expr(expr, scope, null_ctx, snapshot, params),
-        node::Node::NullTest(_) => Ok(ExprType::scalar(oid::BOOL, false)),
-        node::Node::BooleanTest(_) => Ok(ExprType::scalar(oid::BOOL, false)),
+        node::Node::NullTest(t) => {
+            if let Some(arg) = &t.arg {
+                infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            }
+            Ok(ExprType::scalar(oid::BOOL, false))
+        }
+        node::Node::BooleanTest(t) => {
+            if let Some(arg) = &t.arg {
+                infer_expr(arg, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            }
+            Ok(ExprType::scalar(oid::BOOL, false))
+        }
         node::Node::CoalesceExpr(expr) => infer_coalesce(expr, scope, null_ctx, snapshot, params),
         node::Node::CaseExpr(expr) => infer_case(expr, scope, null_ctx, snapshot, params),
         node::Node::SubLink(sub) => infer_sublink(sub, scope, null_ctx, snapshot, params),
@@ -964,10 +973,7 @@ fn infer_indirection(
                     if type_entry.typcategory != TypCategory::Array {
                         return Err(AnalyzeError::Unsupported(format!(
                             "cannot subscript type {} because it does not support subscripting",
-                            crate::ddl::util::format_type_for_message(
-                                snapshot,
-                                current.type_oid,
-                            )
+                            crate::ddl::util::format_type_for_message(snapshot, current.type_oid,)
                         )));
                     }
                     // `arr[lo:hi]` keeps the array type. Result is NULL iff
@@ -1135,7 +1141,10 @@ fn resolve_composite_field(
         .find(|f| f.attname == field_name)
         .ok_or_else(|| {
             let msg = if let Some(alias) = relation_alias {
-                format!("column {alias}.{field_name} does not exist")
+                format!(
+                    "column {} does not exist",
+                    crate::qualified_name::QualifiedName::new(alias, field_name),
+                )
             } else {
                 format!(
                     "column \"{field_name}\" not found in data type {}",
@@ -1454,47 +1463,52 @@ fn infer_func_call(
     }
 
     // Walk aggregate modifiers so any `$N` placeholders they contain get
-    // their types inferred. FILTER must be bool (like a WHERE clause),
-    // per-aggregate ORDER BY items have no specific goal, and the WINDOW
-    // `OVER (…)` clause is walked separately below.
+    // their types inferred and any column refs are validated. FILTER must
+    // be bool (like a WHERE clause), per-aggregate ORDER BY items have no
+    // specific goal, and the WINDOW `OVER (…)` clause is walked separately
+    // below. None of these positions can reference a select-list alias —
+    // they're all row-level — so propagating errors here matches PG.
     if let Some(filter) = &func.agg_filter {
-        let _ = infer_expr(
+        infer_expr(
             filter,
             scope,
             null_ctx,
             snapshot,
             params,
             TypeGoal::implicit(oid::BOOL),
-        );
+        )?;
     }
-    // Per-aggregate `ORDER BY` (e.g. `array_agg(x ORDER BY y)`) — walked here
-    // for param coverage. For ordered-set aggregates (`WITHIN GROUP`) the
-    // sort expressions were already inferred above as part of the arg list,
-    // so skip to avoid double inference / param recording.
+    // Per-aggregate `ORDER BY` (e.g. `array_agg(x ORDER BY y)`). For
+    // ordered-set aggregates (`WITHIN GROUP`) the sort expressions were
+    // already inferred above as part of the arg list, so skip to avoid
+    // double inference / param recording. Items are `SortBy` nodes —
+    // unwrap to the inner expression before inferring.
     if !func.agg_within_group {
         for order_item in &func.agg_order {
-            let _ = infer_expr(
-                order_item,
-                scope,
-                null_ctx,
-                snapshot,
-                params,
-                TypeGoal::NONE,
-            );
+            if let Some(node::Node::SortBy(sb)) = order_item.node.as_ref()
+                && let Some(inner) = sb.node.as_deref()
+            {
+                infer_expr(inner, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            }
         }
     }
     if let Some(over) = &func.over {
         for item in &over.partition_clause {
-            let _ = infer_expr(item, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+            infer_expr(item, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
         }
         for item in &over.order_clause {
-            let _ = infer_expr(item, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+            // Window `ORDER BY` items are also `SortBy` nodes; unwrap.
+            if let Some(node::Node::SortBy(sb)) = item.node.as_ref()
+                && let Some(inner) = sb.node.as_deref()
+            {
+                infer_expr(inner, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
+            }
         }
         if let Some(start) = &over.start_offset {
-            let _ = infer_expr(start, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+            infer_expr(start, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
         }
         if let Some(end) = &over.end_offset {
-            let _ = infer_expr(end, scope, null_ctx, snapshot, params, TypeGoal::NONE);
+            infer_expr(end, scope, null_ctx, snapshot, params, TypeGoal::NONE)?;
         }
     }
 

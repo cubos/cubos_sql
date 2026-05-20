@@ -515,3 +515,43 @@ fn select_from_child_table_sees_inherited_columns() {
         vec![c("name", text()), c("sound", text()), c("breed", text())],
     );
 }
+
+// ── ORDER BY column validation + select-alias fallback ───────────────────────
+
+#[test]
+fn order_by_unknown_column_rejected() {
+    // A typo in ORDER BY used to pass silently — the walker discarded
+    // `infer_expr`'s error. Now it propagates, with a fallback for
+    // select aliases (see `order_by_resolves_select_alias`).
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users ORDER BY ghost"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}
+
+#[test]
+fn order_by_resolves_select_alias() {
+    // PG accepts `ORDER BY <select_alias>` even though the alias isn't
+    // in the FROM scope. The fallback in the sort_clause walk keeps
+    // this working after the propagation fix.
+    let db = setup();
+    let s = db
+        .analyze("SELECT name AS author FROM users ORDER BY author")
+        .unwrap();
+    assert_cols(&s, vec![c("author", text())]);
+}
+
+#[test]
+fn order_by_complex_expression_with_unknown_column_rejected() {
+    // The alias fallback only applies to BARE column refs — a typo
+    // inside a wider expression (e.g. `ORDER BY ghost + 1`) must still
+    // surface as an error.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT name AS ghost FROM users ORDER BY ghost + 1"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"ghost\" does not exist",
+    );
+}

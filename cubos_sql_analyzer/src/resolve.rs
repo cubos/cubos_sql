@@ -539,26 +539,6 @@ fn check_no_aggregates_or_windows(
     Ok(())
 }
 
-fn infer_expr_propagate_mismatch(
-    node: &protobuf::Node,
-    scope: &Scope,
-    null_ctx: &NullabilityContext,
-    snapshot: &PgCatalog,
-    params: &mut ParamCollector,
-    goal: TypeGoal,
-) -> Result<(), AnalyzeError> {
-    match expr::infer_expr(node, scope, null_ctx, snapshot, params, goal) {
-        Ok(_) => Ok(()),
-        Err(
-            e @ (AnalyzeError::TypeMismatch { .. }
-            | AnalyzeError::UndefinedOperator(_)
-            | AnalyzeError::IndeterminateType(_)
-            | AnalyzeError::Invalid(_)),
-        ) => Err(e),
-        Err(_) => Ok(()), // Swallow non-user-facing errors.
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Raw output types (before Rust type mapping)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -724,7 +704,7 @@ fn analyze_select_with_ctes_and_outer(
         // (they reference the post-aggregation row, not the pre-aggregation
         // one). Catch these statically before the type pass runs.
         check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
-        if let Err(e) = infer_expr_propagate_mismatch(
+        if let Err(e) = expr::infer_expr(
             where_clause,
             &scope,
             &null_ctx,
@@ -757,18 +737,40 @@ fn analyze_select_with_ctes_and_outer(
         }
     }
 
+    // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
+    // them when a bare identifier doesn't resolve against the FROM scope.
+    // PG accepts `SELECT name AS n FROM t GROUP BY n ORDER BY n`; without
+    // this fallback, propagating errors from those walks would regress
+    // legitimate queries.
+    let select_aliases: std::collections::HashSet<String> = sel
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref()? {
+            node::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     // Process GROUP BY expressions — no type expectation, but we still need
-    // to walk them so any parameters referenced are collected and typed.
-    // `GroupingSet` nodes (`GROUPING SETS`/`ROLLUP`/`CUBE`) are not real
-    // expressions; recurse into their `content` to reach the underlying
-    // column references and aggregate-rejection checks.
+    // to walk them so any parameters referenced are collected and typed
+    // and column refs validated. `GroupingSet` nodes (`GROUPING SETS` /
+    // `ROLLUP` / `CUBE`) are not real expressions; recurse into their
+    // `content` to reach the underlying column references and
+    // aggregate-rejection checks.
     for group_node in &sel.group_clause {
-        walk_group_clause_node(group_node, &scope, &null_ctx, snapshot, params)?;
+        walk_group_clause_node(
+            group_node,
+            &scope,
+            &null_ctx,
+            snapshot,
+            params,
+            &select_aliases,
+        )?;
     }
 
     // Process HAVING clause — same boolean goal as WHERE.
     if let Some(having) = &sel.having_clause {
-        infer_expr_propagate_mismatch(
+        expr::infer_expr(
             having,
             &scope,
             &null_ctx,
@@ -781,12 +783,18 @@ fn analyze_select_with_ctes_and_outer(
     // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes
     // — we walk the inner expression so parameters referenced there (e.g.
     // `ORDER BY embedding <=> $embedding`) get their types inferred from
-    // operator context.
+    // operator context and any column refs are validated. A bare
+    // identifier may name a select-list alias that isn't in the FROM
+    // scope (PG resolution rule); suppress `UndefinedColumn` only in that
+    // exact shape so typos still surface.
     for sort_node in &sel.sort_clause {
         if let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref()
             && let Some(inner) = sb.node.as_deref()
+            && let Err(e) =
+                expr::infer_expr(inner, &scope, &null_ctx, snapshot, params, TypeGoal::NONE)
+            && !is_select_alias_reference(inner, &select_aliases, &e)
         {
-            let _ = expr::infer_expr(inner, &scope, &null_ctx, snapshot, params, TypeGoal::NONE);
+            return Err(e);
         }
     }
 
@@ -802,7 +810,7 @@ fn analyze_select_with_ctes_and_outer(
         // Run the inference; on a coerce-to-int8 mismatch, rewrite to PG's
         // wording. Other errors (undefined column, etc.) propagate
         // verbatim — only TypeMismatch maps to `argument of LIMIT/OFFSET`.
-        if let Err(e) = infer_expr_propagate_mismatch(
+        if let Err(e) = expr::infer_expr(
             limit_node,
             &scope,
             &null_ctx,
@@ -847,23 +855,53 @@ fn walk_group_clause_node(
     null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
+    select_aliases: &std::collections::HashSet<String>,
 ) -> Result<(), AnalyzeError> {
     if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref() {
         for inner in &gs.content {
-            walk_group_clause_node(inner, scope, null_ctx, snapshot, params)?;
+            walk_group_clause_node(inner, scope, null_ctx, snapshot, params, select_aliases)?;
         }
         return Ok(());
     }
     check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
-    let _ = expr::infer_expr(
+    if let Err(e) = expr::infer_expr(
         group_node,
         scope,
         null_ctx,
         snapshot,
         params,
         TypeGoal::NONE,
-    );
+    ) && !is_select_alias_reference(group_node, select_aliases, &e)
+    {
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Returns `true` when `node` is a bare unqualified `ColumnRef` whose name
+/// matches one of `aliases` AND the error that infer_expr raised was an
+/// `UndefinedColumn`. Used by GROUP BY / ORDER BY to honor PG's rule that
+/// a bare identifier in those clauses may reference a select-list alias
+/// that isn't visible in the FROM scope. Any other error (type mismatch,
+/// undefined function, etc.) is left to propagate.
+fn is_select_alias_reference(
+    node: &protobuf::Node,
+    aliases: &std::collections::HashSet<String>,
+    err: &AnalyzeError,
+) -> bool {
+    if !matches!(err, AnalyzeError::UndefinedColumn(_)) {
+        return false;
+    }
+    let Some(node::Node::ColumnRef(cr)) = node.node.as_ref() else {
+        return false;
+    };
+    if cr.fields.len() != 1 {
+        return false;
+    }
+    let Some(node::Node::String(s)) = cr.fields[0].node.as_ref() else {
+        return false;
+    };
+    aliases.contains(&s.sval)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1160,25 +1198,25 @@ fn analyze_insert(
                     .find(|c| c.attname == rt.name)
                     .map(|tc| TypeGoal::assignment(tc.atttypid))
                     .unwrap_or(TypeGoal::NONE);
-                let _ = expr::infer_expr(
+                expr::infer_expr(
                     val,
                     &conflict_scope,
                     &conflict_null_ctx,
                     snapshot,
                     params,
                     goal,
-                );
+                )?;
             }
         }
         if let Some(where_clause) = &on_conflict.where_clause {
-            let _ = expr::infer_expr(
+            expr::infer_expr(
                 where_clause,
                 &conflict_scope,
                 &conflict_null_ctx,
                 snapshot,
                 params,
                 TypeGoal::implicit(oid::BOOL),
-            );
+            )?;
         }
     }
 
@@ -1336,7 +1374,7 @@ fn analyze_update(
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &upd.where_clause {
-        infer_expr_propagate_mismatch(
+        expr::infer_expr(
             where_clause,
             &scope,
             &null_ctx,
@@ -1408,7 +1446,7 @@ fn analyze_delete(
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {
-        infer_expr_propagate_mismatch(
+        expr::infer_expr(
             where_clause,
             &scope,
             &null_ctx,
@@ -1500,7 +1538,7 @@ fn analyze_merge(
     }
 
     if let Some(join_condition) = &merge.join_condition {
-        infer_expr_propagate_mismatch(
+        expr::infer_expr(
             join_condition,
             &scope,
             &null_ctx,
@@ -1551,7 +1589,7 @@ fn walk_merge_when_clause(
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
     if let Some(condition) = &when.condition {
-        infer_expr_propagate_mismatch(
+        expr::infer_expr(
             condition,
             scope,
             null_ctx,
@@ -2118,7 +2156,7 @@ fn process_from_item(
             // reports a spurious "parameter gap".
             if let Some(quals) = &join.quals {
                 check_no_aggregates_or_windows(quals, snapshot, "JOIN/ON")?;
-                infer_expr_propagate_mismatch(
+                expr::infer_expr(
                     quals,
                     scope,
                     null_ctx,

@@ -17,6 +17,7 @@ use super::util::{
 };
 use super::views;
 use crate::pg_catalog::PgCatalog;
+use crate::qualified_name::QualifiedName;
 
 /// Pending `pg_constraint` row built up while walking a `CreateStmt`:
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
@@ -445,8 +446,9 @@ fn resolve_fk_target(
     let (target_schema, target_name) = range_var_names(pkrv, interp);
     let target_nsoid = interp.namespace_oid(&target_schema).ok_or_else(|| {
         DdlError::TableNotFound(format!(
-            "relation \"{target_schema}.{target_name}\" does not exist (referenced \
-             by foreign key constraint \"{fk_name}\")"
+            "relation \"{}\" does not exist (referenced \
+             by foreign key constraint \"{fk_name}\")",
+            QualifiedName::new(&target_schema, &target_name),
         ))
     })?;
     let target_oid = interp
@@ -639,16 +641,16 @@ fn validate_constraint_expressions(
                             // does not exist`); append the constraint
                             // location as supplementary detail.
                             DdlError::UnsupportedDdl(format!(
-                                "{e} (in CHECK constraint on \"{relname}\".\"{}\")",
-                                cd.colname
+                                "{e} (in CHECK constraint on {})",
+                                QualifiedName::new(relname, &cd.colname),
                             ))
                         })?;
                         if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
                             let typname = format_type_for_message(interp, result.type_oid);
                             return Err(DdlError::UnsupportedDdl(format!(
                                 "argument of CHECK must be type boolean, not type {typname} \
-                                 (CHECK constraint on \"{relname}\".\"{}\")",
-                                cd.colname
+                                 (CHECK constraint on {})",
+                                QualifiedName::new(relname, &cd.colname),
                             )));
                         }
                     }
@@ -680,8 +682,8 @@ fn validate_constraint_expressions(
                         )
                         .map_err(|e| {
                             DdlError::UnsupportedDdl(format!(
-                                "{e} (in GENERATED expression on \"{relname}\".\"{}\")",
-                                cd.colname
+                                "{e} (in GENERATED expression on {})",
+                                QualifiedName::new(relname, &cd.colname),
                             ))
                         })?;
                         if interp.unwrap_domain(result.type_oid) != interp.unwrap_domain(col_type)
@@ -745,9 +747,9 @@ fn apply_inherits(
         };
         let (parent_schema, parent_name) = range_var_names(rv, interp);
         let Some(parent_nsoid) = interp.namespace_oid(&parent_schema) else {
-            return Err(DdlError::TableNotFound(format!(
-                "{parent_schema}.{parent_name}"
-            )));
+            return Err(DdlError::TableNotFound(
+                QualifiedName::new(&parent_schema, &parent_name).to_string(),
+            ));
         };
         let parent_oid = interp
             .class_by_qname
@@ -973,7 +975,9 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+        return Err(DdlError::TableNotFound(
+            QualifiedName::new(schema, name).to_string(),
+        ));
     };
     let class_oid = match interp.class_by_qname.get(&(nsoid, name.clone())).copied() {
         Some(oid) => oid,
@@ -981,7 +985,9 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
             if stmt.missing_ok {
                 return Ok(());
             }
-            return Err(DdlError::TableNotFound(format!("{schema}.{name}")));
+            return Err(DdlError::TableNotFound(
+                QualifiedName::new(schema, name).to_string(),
+            ));
         }
     };
 
@@ -1280,7 +1286,7 @@ fn drop_column(
             .filter_map(|&v| {
                 let c = interp.pg_class.get(&v)?;
                 let nsname = interp.namespace_name(c.relnamespace)?;
-                Some(format!("{nsname}.{}", c.relname))
+                Some(QualifiedName::new(nsname, &c.relname).to_string())
             })
             .collect();
         let relname = interp
@@ -1515,7 +1521,7 @@ fn alter_column_type(
             .filter_map(|&v| {
                 let c = interp.pg_class.get(&v)?;
                 let nsname = interp.namespace_name(c.relnamespace)?;
-                Some(format!("{nsname}.{}", c.relname))
+                Some(QualifiedName::new(nsname, &c.relname).to_string())
             })
             .collect();
         let relname = interp
