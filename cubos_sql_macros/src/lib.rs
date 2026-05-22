@@ -264,7 +264,94 @@ pub fn sql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as query_macro::QueryInput);
     match query_macro::expand(input) {
         Ok(ts) => ts.into(),
-        Err(e) => e.to_compile_error().into(),
+        Err(e) => error_placeholder(e).into(),
+    }
+}
+
+/// Build the token stream returned by `sql!` when analysis fails.
+///
+/// The naive approach — `e.to_compile_error()` alone — expands to
+/// `::core::compile_error!("...")`. Rust-analyzer's hover on the failing
+/// `sql!(...)` then follows that expansion into `core` and shows the
+/// docs for the `core` crate itself, which is useless to the user.
+///
+/// To keep IDE support meaningful, we emit a stub block with the same
+/// shape as the normal `sql!` expansion: a `__sql_output` struct and a
+/// `__cubos_sql_query` builder with all the usual `fetch_*` /
+/// `execute` / `fetch_*_as` methods. Their bodies are `unreachable!()` —
+/// the build fails on the preceding `compile_error!`, so they are never
+/// run. With this stub:
+///
+/// 1. `compile_error!` still fires; the user sees the SQL error.
+/// 2. Hover on `sql!(...)` lands on the stub builder (defined in the
+///    expansion site), not on `core::compile_error!`.
+/// 3. Chained `.fetch_one().await?` etc. type-check enough for the IDE
+///    to keep going past the failed `sql!`, so secondary diagnostics
+///    (e.g. `user.id`) are about the missing field, not about a
+///    type-annotation failure that masks the real error.
+///
+/// The stub's `__sql_output` has no fields, so `user.field` on a failing
+/// query will surface as an unknown-field error. That's an acceptable
+/// secondary symptom — the user is going to fix the SQL, and the field
+/// errors evaporate once the macro succeeds again.
+fn error_placeholder(e: syn::Error) -> proc_macro2::TokenStream {
+    let compile_err = e.to_compile_error();
+    quote::quote! {
+        {
+            #compile_err
+
+            #[allow(non_camel_case_types, dead_code)]
+            struct __sql_output;
+
+            #[allow(non_camel_case_types)]
+            struct __cubos_sql_query<__E: cubos_sql::Executor>(
+                ::std::marker::PhantomData<__E>,
+            );
+
+            #[allow(dead_code, unused_variables, clippy::unused_async)]
+            impl<__E: cubos_sql::Executor> __cubos_sql_query<__E> {
+                async fn fetch_all(
+                    self,
+                ) -> ::std::result::Result<::std::vec::Vec<__sql_output>, cubos_sql::Error> {
+                    ::std::unreachable!()
+                }
+                async fn fetch_one(
+                    self,
+                ) -> ::std::result::Result<__sql_output, cubos_sql::Error> {
+                    ::std::unreachable!()
+                }
+                async fn fetch_optional(
+                    self,
+                ) -> ::std::result::Result<::std::option::Option<__sql_output>, cubos_sql::Error>
+                {
+                    ::std::unreachable!()
+                }
+                async fn execute(self) -> ::std::result::Result<u64, cubos_sql::Error> {
+                    ::std::unreachable!()
+                }
+                async fn fetch_value<__T>(self) -> ::std::result::Result<__T, cubos_sql::Error> {
+                    ::std::unreachable!()
+                }
+                async fn fetch_all_as<__T: cubos_sql::FromRow>(
+                    self,
+                ) -> ::std::result::Result<::std::vec::Vec<__T>, cubos_sql::Error> {
+                    ::std::unreachable!()
+                }
+                async fn fetch_one_as<__T: cubos_sql::FromRow>(
+                    self,
+                ) -> ::std::result::Result<__T, cubos_sql::Error> {
+                    ::std::unreachable!()
+                }
+                async fn fetch_optional_as<__T: cubos_sql::FromRow>(
+                    self,
+                ) -> ::std::result::Result<::std::option::Option<__T>, cubos_sql::Error>
+                {
+                    ::std::unreachable!()
+                }
+            }
+
+            __cubos_sql_query::<_>(::std::marker::PhantomData)
+        }
     }
 }
 
