@@ -1,0 +1,31 @@
+[package]
+name = "pgsafe_e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pgsafe = { path = "../pgsafe" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+pgvector = { version = "0.4", features = ["postgres"] }
+
+[dev-dependencies]
+pgsafe_core = { path = "../pgsafe_core" }
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+deadpool-postgres = "0.14"
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+libc = "0.2"
+
+[package.metadata.pgsafe.database]
+migrations = "./migrations"
+
+[package.metadata.pgsafe.types]
+user_preferences = "::pgsafe_e2e::UserPreferences"
+post_status = "::pgsafe_e2e::PostStatus"
+"public.geo_point" = "::pgsafe_e2e::GeoPoint"

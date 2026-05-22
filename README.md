@@ -1,4 +1,4 @@
-# cubos_sql
+# pgsafe
 
 Compile-time verified PostgreSQL queries for Rust. **PostgreSQL only** -- no abstraction layer, no lowest-common-denominator SQL.
 
@@ -7,7 +7,7 @@ Write plain SQL, get full type safety. The `sql!` macro statically analyzes ever
 ## Features
 
 - **Compile-time checked** -- every query is validated against your actual schema. Typos in column names, wrong parameter types, invalid SQL, and type mismatches are all compiler errors. The analyzer reads your migrations and builds the schema in-memory -- no external process needed.
-- **Real SQL** -- any syntax PostgreSQL accepts, `cubos_sql` accepts. CTEs, window functions, lateral joins, `DISTINCT ON`, `RETURNING`, `FOR UPDATE` -- if Postgres can parse and execute it, the macro will verify it. No restricted SQL subset, no Rust DSL.
+- **Real SQL** -- any syntax PostgreSQL accepts, `pgsafe` accepts. CTEs, window functions, lateral joins, `DISTINCT ON`, `RETURNING`, `FOR UPDATE` -- if Postgres can parse and execute it, the macro will verify it. No restricted SQL subset, no Rust DSL.
 - **Nullability-aware** -- the analyzer tracks nullability through JOINs, COALESCE, CASE, subqueries, and aggregates. `NOT NULL` columns become `T`, nullable columns become `Option<T>`.
 - **Static type analysis** -- parameter types are inferred following PostgreSQL's own type resolution rules (operator/function resolution, implicit/assignment casts, common-type resolution). Type mismatches produce clear errors at compile time.
 - **Zero runtime overhead** -- the macro generates concrete Rust structs with named fields. No runtime reflection, no `Box<dyn Any>`, no string-based column access.
@@ -19,12 +19,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cubos_sql = "0.1"
+pgsafe = "0.1"
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 tokio = { version = "1", features = ["full"] }
 
-[package.metadata.cubos_sql.database]
+[package.metadata.pgsafe.database]
 migrations = "./migrations"
 ```
 
@@ -57,12 +57,12 @@ for user in &users {
 
 The macro reads your migration files, builds the schema in memory, and type-checks the query. The generated struct has correctly typed fields with proper nullability.
 
-**Optional:** add a `build.rs` (with `cubos_sql` also under `[build-dependencies]`) so `cargo` re-runs `sql!` automatically whenever a migration file changes:
+**Optional:** add a `build.rs` (with `pgsafe` also under `[build-dependencies]`) so `cargo` re-runs `sql!` automatically whenever a migration file changes:
 
 ```rust
 // build.rs
 fn main() {
-    cubos_sql::build::track_migrations();
+    pgsafe::build::track_migrations();
 }
 ```
 
@@ -171,13 +171,13 @@ The analyzer tracks nullability precisely through the entire query:
 // NOT NULL columns → plain types
 let user = sql!(pool, "SELECT id, name FROM users WHERE id = $id", id = 1)
     .fetch_one().await?;
-// user.id   : i64
+// user.id   : i32
 // user.name : String
 
 // Nullable columns → Option
 let user = sql!(pool, "SELECT id, age, bio FROM users WHERE id = $id", id = 1)
     .fetch_one().await?;
-// user.id  : i64
+// user.id  : i32
 // user.age : Option<i32>   (age is nullable)
 // user.bio : Option<String> (bio is nullable)
 
@@ -298,7 +298,7 @@ sql!(pool, "UPDATE users SET role = $role WHERE id = $id", role = "editor", id =
 To get type-safe enum values instead of raw strings, map them in `Cargo.toml`:
 
 ```toml
-[package.metadata.cubos_sql.enums]
+[package.metadata.pgsafe.enums]
 user_role = "crate::UserRole"
 ```
 
@@ -328,7 +328,7 @@ let profile = sql!(pool, "SELECT user_id, preferences FROM profiles WHERE user_i
 With configuration, the macro automatically serializes/deserializes through your Rust type:
 
 ```toml
-[package.metadata.cubos_sql.domains]
+[package.metadata.pgsafe.domains]
 user_preferences = "crate::domains::UserPreferences"
 ```
 
@@ -396,7 +396,7 @@ The analyzer knows the `<=>`, `<->`, and `<#>` operators (and the matching index
 For extension types without a built-in mapping (e.g. `citext`, `hstore`), point them at the Rust type in `Cargo.toml`:
 
 ```toml
-[package.metadata.cubos_sql.types]
+[package.metadata.pgsafe.types]
 "public.citext" = "String"
 "public.hstore" = "::std::collections::HashMap<String, Option<String>>"
 ```
@@ -426,9 +426,65 @@ The `Executor` trait is implemented for:
 |------|---------|----------|
 | `deadpool_postgres::Pool` | `deadpool` (default) | Acquires a connection per query |
 | `deadpool_postgres::Object` | `deadpool` (default) | Uses the pooled connection |
-| `bb8::Pool<PostgresConnectionManager>` | `bb8` | Acquires a connection per query |
+| `bb8::Pool<PostgresConnectionManager<Tls>>` | `bb8` | Acquires a connection per query |
 | `tokio_postgres::Client` | always | Uses the raw client directly |
 | `tokio_postgres::Transaction<'_>` | always | Executes within the transaction |
+
+## Mapping rows to your own structs
+
+By default `sql!` synthesises an anonymous result struct per query. When you want to return a struct you already own — say a domain type shared across several queries — derive `FromRow` and use the `fetch_*_as::<T>` methods:
+
+```rust
+#[derive(pgsafe::FromRow)]
+struct User {
+    id: i32,
+    name: String,
+    email: Option<String>,
+}
+
+let user: User = sql!(pool, "SELECT id, name, email FROM users WHERE id = $id", id = 1)
+    .fetch_one_as::<User>()
+    .await?;
+
+let users: Vec<User> = sql!(pool, "SELECT id, name, email FROM users")
+    .fetch_all_as::<User>()
+    .await?;
+
+let maybe: Option<User> = sql!(pool, "SELECT id, name, email FROM users WHERE id = $id", id = 42)
+    .fetch_optional_as::<User>()
+    .await?;
+```
+
+Field names must match the query's output column names. `Option<T>` fields receive nullable columns. Field types still have to match what the analyzer infers — the macro's compile-time type check runs against the SQL, not against `T`.
+
+## Multiple databases
+
+When a single crate talks to more than one database, declare each one under `[package.metadata.pgsafe.databases.<name>]` and pick which to use at the `sql!` site with a `db = <name>` prefix:
+
+```toml
+# Default database (used when `db = ...` is omitted)
+[package.metadata.pgsafe.database]
+migrations = "./migrations"
+
+# A second database, e.g. an analytics warehouse with its own schema
+[package.metadata.pgsafe.databases.analytics.database]
+migrations = "./analytics/migrations"
+
+[package.metadata.pgsafe.databases.analytics.types]
+"public.metric_kind" = "crate::analytics::MetricKind"
+```
+
+```rust
+// Default database — schema comes from `./migrations`
+let users = sql!(app_pool, "SELECT id, name FROM users")
+    .fetch_all().await?;
+
+// `db = analytics` switches the schema source to the named entry
+let metrics = sql!(db = analytics, warehouse_pool, "SELECT kind, total FROM daily_metrics")
+    .fetch_all().await?;
+```
+
+Each named entry is independent: its own migrations, its own `[migrations]` runner settings, its own `[types]` map. The runtime executor (`app_pool` / `warehouse_pool` above) is still passed by the caller — `pgsafe` does not multiplex pools, it only points the compile-time analyzer at the right schema.
 
 ## Migrations
 
@@ -437,7 +493,7 @@ The `Executor` trait is implemented for:
 Install the CLI and manage migrations from the terminal:
 
 ```bash
-cargo install cubos_sql_cli
+cargo install pgsafe_cli
 ```
 
 ```bash
@@ -460,17 +516,30 @@ cargo sql migrate down 20260406120000_add_posts_table
 cargo sql migrate down --force
 ```
 
-The CLI reads configuration from `[package.metadata.cubos_sql]` in your `Cargo.toml` and connects using the `DATABASE_URL` environment variable (supports `.env` files).
+The CLI reads configuration from `[package.metadata.pgsafe]` in your `Cargo.toml` and connects using the `DATABASE_URL` environment variable (supports `.env` files).
 
 ### Programmatic
 
 You can also run migrations programmatically at application startup:
 
 ```rust
-use cubos_sql::migrate::{MigrationSource, run};
-use cubos_sql_core::config::MigrationsConfig;
+use pgsafe::migrate::{MigrationSource, MigrationsConfig, run};
+use std::path::Path;
 
 let source = MigrationSource::from_dir(Path::new("./migrations"))?;
+let config = MigrationsConfig::default();
+let applied = run(&mut client, &source, &config).await?;
+```
+
+For binaries that should ship without their migration files on disk, use the `embed_migrations!` macro to bake them into the binary at compile time:
+
+```rust
+use pgsafe::migrate::{MigrationsConfig, run};
+
+// Path is resolved relative to the invoking crate's CARGO_MANIFEST_DIR,
+// like `include_str!`. The SQL contents land in the final binary as &'static str;
+// editing a migration file re-triggers a rebuild automatically.
+let source = pgsafe::embed_migrations!("./migrations");
 let config = MigrationsConfig::default();
 let applied = run(&mut client, &source, &config).await?;
 ```
@@ -482,26 +551,29 @@ Migrations use advisory locks for safe concurrent deploys and wrap each migratio
 All configuration lives in your `Cargo.toml`:
 
 ```toml
-[package.metadata.cubos_sql.database]
+[package.metadata.pgsafe.database]
 migrations = "./migrations"        # required — path to migration files
+extra_migrations = ["../shared/migrations"]  # optional — extra migration dirs
+                                             # included in the compile-time
+                                             # schema only (NOT applied at
+                                             # runtime); use when another crate
+                                             # owns shared tables
 
-[package.metadata.cubos_sql.migrations]
+[package.metadata.pgsafe.migrations]
 table = "public._migrations"       # optional — migration tracking table
 lock_id = 713705                   # optional — advisory lock ID
 use_transaction = true             # optional — wrap each migration in a tx
+fail_on_drift = true               # optional — abort if an already-applied
+                                   # migration file has been edited since
 
-[package.metadata.cubos_sql.domains]
+[package.metadata.pgsafe.domains]
 user_preferences = "crate::UserPrefs"  # optional — JSONB domain → Rust struct
 
-[package.metadata.cubos_sql.enums]
+[package.metadata.pgsafe.enums]
 user_role = "crate::UserRole"          # optional — PG enum → Rust enum
 ```
 
-Add `.cubos_sql/` to your `.gitignore`:
-
-```text
-.cubos_sql/
-```
+For projects with more than one database see the [Multiple databases](#multiple-databases) section above.
 
 ## How it works
 

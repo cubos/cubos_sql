@@ -12,12 +12,12 @@ than the extra build time costs).
 
 ```bash
 cargo build                                          # build all crates
-cargo build -p cubos_sql                             # build specific crate
+cargo build -p pgsafe                             # build specific crate
 cargo nextest run --release                          # all tests (no Docker needed)
-cargo nextest run --release -p cubos_sql_core        # core crate only
-cargo nextest run --release -p cubos_sql_macros      # macro crate only
-cargo nextest run --release -p cubos_sql_analyzer    # analyzer crate only
-cargo nextest run --release -p cubos_sql             # runtime crate only
+cargo nextest run --release -p pgsafe_core        # core crate only
+cargo nextest run --release -p pgsafe_macros      # macro crate only
+cargo nextest run --release -p pgsafe_analyzer    # analyzer crate only
+cargo nextest run --release -p pgsafe             # runtime crate only
 cargo nextest run --release --test migrate_integration  # integration tests (requires Docker)
 cargo nextest run --release test_name                # run a single test by name
 ```
@@ -28,13 +28,13 @@ Note: doctests are not supported by nextest — for those, fall back to `cargo t
 
 ## Regenerating `seed.json`
 
-Never hand-migrate `cubos_sql_analyzer/src/seed.json` (e.g. with a Python
+Never hand-migrate `pgsafe_analyzer/src/seed.json` (e.g. with a Python
 script) when changing catalog struct shapes. The seed loader tolerates empty
-or stale seeds — `cubos_sql_seed` exports the catalog from a live PG via
+or stale seeds — `pgsafe_seed` exports the catalog from a live PG via
 testcontainers and overwrites the file. Always regenerate by running:
 
 ```bash
-cargo run -p cubos_sql_seed   # requires Docker; takes ~10 seconds
+cargo run -p pgsafe_seed   # requires Docker; takes ~10 seconds
 ```
 
 Hand-rewriting the seed risks subtle FK drift (e.g. an old aggfinaltype
@@ -46,19 +46,19 @@ are expected).
 Workspace with crates:
 
 ```
-cubos_sql_cli (binary: `cargo sql migrate up/down/status/create`)
-    └── cubos_sql (runtime: Pool, Executor, migrate)
-            ├── cubos_sql_core (shared config only — kept small so runtime does not pull pg_query)
-            └── cubos_sql_macros (proc macro: sql!)
-                    ├── cubos_sql_core
-                    └── cubos_sql_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
+pgsafe_cli (binary: `cargo sql migrate up/down/status/create`)
+    └── pgsafe (runtime: Pool, Executor, migrate)
+            ├── pgsafe_core (shared config only — kept small so runtime does not pull pg_query)
+            └── pgsafe_macros (proc macro: sql!)
+                    ├── pgsafe_core
+                    └── pgsafe_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
 ```
 
 ### Compile-time pipeline (`sql!` macro)
 
 1. Parse macro input: `sql!(executor, "SQL with $params", name = value)`
-2. Lex SQL via `cubos_sql_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
-3. Load config from `[package.metadata.cubos_sql]` in consumer's `Cargo.toml`
+2. Lex SQL via `pgsafe_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
+3. Load config from `[package.metadata.pgsafe]` in consumer's `Cargo.toml`
 4. Build schema snapshot from seed + migrations via DDL interpreter (in-memory, no Docker)
 5. Static analysis: parse SQL with `pg_query`, resolve types and nullability against snapshot
 6. `codegen::generate()` — emit anonymous output struct, typed query builder, `.fetch_all()/.fetch_one()/.fetch_optional()/.execute()` methods
@@ -71,20 +71,20 @@ cubos_sql_cli (binary: `cargo sql migrate up/down/status/create`)
 
 ## Configuration
 
-Users configure via `[package.metadata.cubos_sql]` in their `Cargo.toml`:
+Users configure via `[package.metadata.pgsafe]` in their `Cargo.toml`:
 
 ```toml
-[package.metadata.cubos_sql.database]
+[package.metadata.pgsafe.database]
 migrations = "./migrations"
 
-[package.metadata.cubos_sql.migrations]
+[package.metadata.pgsafe.migrations]
 table = "public._migrations"
 lock_id = 713705
 use_transaction = true
 
 # Single unified type map. The `sql!` macro infers the (de)serialization
 # strategy from each PG type's kind: JSONB domain, enum, composite, or scalar.
-[package.metadata.cubos_sql.types]
+[package.metadata.pgsafe.types]
 user_preferences = "crate::domains::UserPreferences"  # JSONB domain
 post_status = "crate::PostStatus"                     # enum
 "public.address" = "crate::Address"                   # composite type
@@ -104,7 +104,7 @@ Never format a qualified PG identifier with `format!("{schema}.{name}")` or
 loses the round-trip guarantee — `"foo.bar".baz` and `foo."bar.baz"` would
 collide on a plain `format!`.
 
-Always use `cubos_sql_core::QualifiedName::new(schema, name).to_string()`
+Always use `pgsafe_core::QualifiedName::new(schema, name).to_string()`
 (or pass the `QualifiedName` directly to `format!("{}", qn)`). The
 `Display` impl handles the quoting and is the canonical way to render
 these names — including in error messages that must match PG verbatim.

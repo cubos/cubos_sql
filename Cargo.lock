@@ -592,134 +592,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cubos_sql"
-version = "0.1.0"
-dependencies = [
- "bb8",
- "bb8-postgres",
- "bytes",
- "chrono",
- "cubos_sql_core",
- "cubos_sql_macros",
- "deadpool-postgres",
- "libc",
- "md5",
- "rust_decimal",
- "serde",
- "serde_json",
- "tempfile",
- "testcontainers",
- "testcontainers-modules",
- "thiserror 2.0.18",
- "tokio",
- "tokio-postgres",
- "uuid",
-]
-
-[[package]]
-name = "cubos_sql_analyzer"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytes",
- "cubos_sql_analyzer",
- "cubos_sql_core",
- "pg_query",
- "postgres",
- "prost 0.13.5",
- "serde",
- "serde_json",
- "serde_tuple",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "cubos_sql_cli"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "cubos_sql",
- "cubos_sql_core",
- "dotenvy",
- "native-tls",
- "postgres-native-tls",
- "tokio",
- "tokio-postgres",
-]
-
-[[package]]
-name = "cubos_sql_core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
-name = "cubos_sql_e2e"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cubos_sql",
- "cubos_sql_core",
- "deadpool-postgres",
- "libc",
- "pgvector",
- "rust_decimal",
- "serde",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-postgres",
- "uuid",
-]
-
-[[package]]
-name = "cubos_sql_example"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cubos_sql",
- "deadpool-postgres",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "cubos_sql_macros"
-version = "0.1.0"
-dependencies = [
- "cubos_sql_analyzer",
- "cubos_sql_core",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "sha2",
- "syn 2.0.117",
- "tempfile",
-]
-
-[[package]]
-name = "cubos_sql_seed"
-version = "0.1.0"
-dependencies = [
- "cubos_sql_analyzer",
- "postgres",
- "serde",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
-]
-
-[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1947,6 +1819,134 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "pgsafe"
+version = "0.1.0"
+dependencies = [
+ "bb8",
+ "bb8-postgres",
+ "bytes",
+ "chrono",
+ "deadpool-postgres",
+ "libc",
+ "md5",
+ "pgsafe_core",
+ "pgsafe_macros",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
+name = "pgsafe_analyzer"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "pg_query",
+ "pgsafe_analyzer",
+ "pgsafe_core",
+ "postgres",
+ "prost 0.13.5",
+ "serde",
+ "serde_json",
+ "serde_tuple",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pgsafe_cli"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dotenvy",
+ "native-tls",
+ "pgsafe",
+ "pgsafe_core",
+ "postgres-native-tls",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "pgsafe_core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "pgsafe_e2e"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "deadpool-postgres",
+ "libc",
+ "pgsafe",
+ "pgsafe_core",
+ "pgvector",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
+name = "pgsafe_example"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "deadpool-postgres",
+ "pgsafe",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "pgsafe_macros"
+version = "0.1.0"
+dependencies = [
+ "pgsafe_analyzer",
+ "pgsafe_core",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syn 2.0.117",
+ "tempfile",
+]
+
+[[package]]
+name = "pgsafe_seed"
+version = "0.1.0"
+dependencies = [
+ "pgsafe_analyzer",
+ "postgres",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
 ]
 
 [[package]]

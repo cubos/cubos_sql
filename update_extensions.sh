@@ -3,7 +3,7 @@
 # Downloads extension SQL scripts from the PostgreSQL repository.
 #
 # These SQL files define the types, functions, operators, and casts that each
-# extension provides. They are embedded in cubos_sql_analyzer via include_str!
+# extension provides. They are embedded in pgsafe_analyzer via include_str!
 # and processed by the DDL interpreter when a migration contains CREATE EXTENSION.
 #
 # Each extension is defined as a base install script + optional upgrade chain.
@@ -17,20 +17,20 @@
 #   ./update_extensions.sh              # uses master branch (default)
 #   ./update_extensions.sh REL_18_0     # use a specific tag/branch
 #
-# Output: cubos_sql_analyzer/src/extensions/*.sql
+# Output: pgsafe_analyzer/src/extensions/*.sql
 #
 # After running:
 # 1. Review the downloaded files for pg_query compatibility
 #    (remove \echo/\quit, check for reserved-word parameter names)
-# 2. Update the REGISTRY array in cubos_sql_analyzer/src/ddl/extensions.rs
+# 2. Update the REGISTRY array in pgsafe_analyzer/src/ddl/extensions.rs
 #    to include_str! the new files in order
-# 3. Run: cargo test -p cubos_sql_analyzer --test ddl_tests
+# 3. Run: cargo test -p pgsafe_analyzer --test ddl_tests
 
 set -euo pipefail
 
 BRANCH="${1:-master}"
 BASE_URL="https://raw.githubusercontent.com/postgres/postgres/${BRANCH}"
-OUT_DIR="cubos_sql_analyzer/src/extensions"
+OUT_DIR="pgsafe_analyzer/src/extensions"
 
 cd "$(dirname "$0")"
 

@@ -10,12 +10,12 @@
 #
 # Usage:
 #   scripts/run-pg-sanity.sh                 # run the whole analyzer suite
-#   scripts/run-pg-sanity.sh -p cubos_sql_analyzer alter_column   # filter
+#   scripts/run-pg-sanity.sh -p pgsafe_analyzer alter_column   # filter
 
 set -euo pipefail
 
 PG_IMAGE="${PG_IMAGE:-postgres:18}"
-CONTAINER_NAME="cubos-sql-pg-sanity-$$"
+CONTAINER_NAME="pgsafe-pg-sanity-$$"
 PG_USER="postgres"
 PG_PASS="postgres"
 PG_DB="postgres"
@@ -69,7 +69,7 @@ echo "pg_sanity: running tests..."
 # forward `--release` automatically — leave that to the caller (or to
 # nextest's own profile-driven defaults).
 if [[ $# -eq 0 ]]; then
-    set -- --release --features pg_sanity -p cubos_sql_analyzer
+    set -- --release --features pg_sanity -p pgsafe_analyzer
 fi
 
 cargo nextest run "$@"

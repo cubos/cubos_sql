@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Generates cubos_sql_analyzer/src/seed.json from a clean PostgreSQL instance.
+# Generates pgsafe_analyzer/src/seed.json from a clean PostgreSQL instance.
 #
 # This script:
 #   1. Starts a temporary postgres:18 Docker container
@@ -12,13 +12,13 @@
 #   ./generate_seed.sh              # uses postgres:18 (default)
 #   ./generate_seed.sh postgres:17  # use a specific image
 #
-# The seed.json file is written to cubos_sql_analyzer/src/seed.json
+# The seed.json file is written to pgsafe_analyzer/src/seed.json
 # and should be committed to the repository.
 
 set -euo pipefail
 
 PG_IMAGE="${1:-postgres:18}"
-CONTAINER_NAME="cubos_sql_seed_$$"
+CONTAINER_NAME="pgsafe_seed_$$"
 
 cd "$(dirname "$0")"
 
@@ -54,7 +54,7 @@ done
 
 echo "==> Generating seed.json..."
 CONN="host=127.0.0.1 port=${PORT} user=postgres password=postgres dbname=postgres"
-cargo run -p cubos_sql_seed -- "$CONN"
+cargo run -p pgsafe_seed -- "$CONN"
 
 echo "==> Done! seed.json has been updated."
-echo "    Remember to commit cubos_sql_analyzer/src/seed.json"
+echo "    Remember to commit pgsafe_analyzer/src/seed.json"
