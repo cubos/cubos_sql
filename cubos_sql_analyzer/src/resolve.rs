@@ -919,6 +919,19 @@ fn analyze_insert(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
+    analyze_insert_with_outer_ctes(ins, snapshot, params, &HashMap::new())
+}
+
+/// Like [`analyze_insert`] but accepts CTEs that were defined in an
+/// enclosing `WITH` clause (top-level `WITH … INSERT …` mixes them via
+/// [`analyze_cte`]). The outer CTEs are merged into the INSERT's local
+/// `cte_scopes` so `INSERT … SELECT … FROM <outer_cte>` resolves.
+fn analyze_insert_with_outer_ctes(
+    ins: &protobuf::InsertStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
     let relation = ins
         .relation
         .as_ref()
@@ -1000,7 +1013,7 @@ fn analyze_insert(
     // `into_sorted` would report a spurious "parameter gap". The resolved
     // CTE columns are also threaded into the inner SELECT's scope so
     // `INSERT … SELECT … FROM cte` resolves the CTE alias.
-    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &ins.with_clause {
         for cte_node in &with.ctes {
             if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
@@ -1107,7 +1120,9 @@ fn analyze_insert(
                             )));
                         }
                         let goal = target_col
-                            .map(|tc| TypeGoal::assignment(tc.atttypid))
+                            .map(|tc| {
+                                TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname)
+                            })
                             .unwrap_or(TypeGoal::NONE);
                         let goal = match target_loc {
                             Some(s) => goal.with_source(s),
@@ -1166,7 +1181,13 @@ fn analyze_insert(
                     }
                 }
             }
-            let _ = analyze_select_with_ctes(val_sel, snapshot, params, &cte_scopes);
+            // Walk the SELECT side of `INSERT … SELECT` so its params are
+            // registered and any undefined-column / typo errors inside the
+            // SELECT propagate cleanly. Earlier this swallowed the error
+            // with `let _ =`, which masked typos in JOIN ON or in the
+            // SELECT target list as a downstream `param count mismatch`
+            // invariant failure.
+            analyze_select_with_ctes(val_sel, snapshot, params, &cte_scopes)?;
 
             for (i, target) in val_sel.target_list.iter().enumerate() {
                 if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
@@ -1401,7 +1422,7 @@ fn analyze_update(
                     tc.attname, table_relname,
                 )));
             }
-            let goal = TypeGoal::assignment(tc.atttypid);
+            let goal = TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname);
             // Attach the target column's reference span so a TypeMismatch
             // surfaces a secondary label pointing at the `col =` site.
             let goal = if let Some(s) = crate::error::SourceSpan::from_node_qname(rt.location) {
@@ -1994,7 +2015,7 @@ fn analyze_cte(
                 .collect())
         }
         node::Node::InsertStmt(ins) => {
-            let (cols, _) = analyze_insert(ins, snapshot, params)?;
+            let (cols, _) = analyze_insert_with_outer_ctes(ins, snapshot, params, existing_ctes)?;
             Ok(cols
                 .into_iter()
                 .map(|rc| ScopeColumn {
@@ -2487,13 +2508,13 @@ fn process_range_function(
     let mut cols: Vec<ScopeColumn> = if is_pg_unnest && arg_types.len() > 1 {
         let mut col_specs = Vec::with_capacity(arg_types.len());
         for (i, (&type_oid, &nullable)) in arg_types.iter().zip(arg_nullable.iter()).enumerate() {
-            let type_entry =
-                snapshot
-                    .get_type(type_oid)
-                    .ok_or_else(|| AnalyzeError::UndefinedType {
-                        oid: type_oid.get(),
-                        context: format!("unnest argument {}", i + 1),
-                    })?;
+            let type_entry = snapshot.get_type(type_oid).ok_or_else(|| {
+                AnalyzeError::UndefinedType(format!(
+                    "internal: unnest argument {} has unknown type OID {}",
+                    i + 1,
+                    type_oid.get()
+                ))
+            })?;
             let elem = (type_entry.typcategory == TypCategory::Array)
                 .then_some(type_entry.typelem)
                 .flatten()
@@ -3020,9 +3041,11 @@ fn resolve_type(
 
         match te.typtype {
             TypType::Domain => {
-                let base_oid = te.typbasetype.ok_or_else(|| AnalyzeError::UndefinedType {
-                    oid: type_oid.get(),
-                    context: "domain base type".into(),
+                let base_oid = te.typbasetype.ok_or_else(|| {
+                    AnalyzeError::UndefinedType(format!(
+                        "internal: domain (OID {}) has no base type",
+                        type_oid.get()
+                    ))
                 })?;
                 // Domains inherit their base typmod when the column didn't
                 // pin one. Recurse without re-applying so the base sees its
@@ -3117,10 +3140,10 @@ fn resolve_type(
         });
     }
 
-    Err(AnalyzeError::UndefinedType {
-        oid: type_oid.get(),
-        context: format!("OID {}", type_oid.get()),
-    })
+    Err(AnalyzeError::UndefinedType(format!(
+        "internal: unknown type OID {}",
+        type_oid.get()
+    )))
 }
 
 fn parse_nullability_annotation(name: &str, auto_nullable: bool) -> (String, bool) {

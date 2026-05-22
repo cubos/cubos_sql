@@ -93,3 +93,18 @@ post_status = "crate::PostStatus"                     # enum
 ## Implementation Status
 
 The `sql!` macro is wired end-to-end with static analysis (no Docker needed at compile time). For high-level context see `PROJECT_GOAL.md` and `README.md`.
+
+## Coding conventions
+
+### Rendering qualified PostgreSQL names
+
+Never format a qualified PG identifier with `format!("{schema}.{name}")` or
+`format!("\"{schema}\".\"{name}\"")`. PG's quoting rules are non-trivial
+(quoting only when necessary, escaping `"` as `""`), and bare concatenation
+loses the round-trip guarantee — `"foo.bar".baz` and `foo."bar.baz"` would
+collide on a plain `format!`.
+
+Always use `cubos_sql_core::QualifiedName::new(schema, name).to_string()`
+(or pass the `QualifiedName` directly to `format!("{}", qn)`). The
+`Display` impl handles the quoting and is the canonical way to render
+these names — including in error messages that must match PG verbatim.

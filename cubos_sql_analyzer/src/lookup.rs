@@ -255,6 +255,23 @@ impl PgCatalog {
     /// Iterate over function names visible from `schema` (or the full
     /// search path when `schema` is `None`). Used for `did you mean` hints
     /// on `UndefinedFunction`.
+    /// Iterate over type names visible from `schema` (or the search path
+    /// when `schema` is `None`). Used for `did you mean` hints on
+    /// `UndefinedType`.
+    pub fn visible_type_names<'a>(
+        &'a self,
+        schema: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.schemas_for_lookup(schema)
+            .into_iter()
+            .flat_map(move |nsoid| {
+                self.type_by_qname
+                    .iter()
+                    .filter(move |((ns, _), _)| *ns == nsoid)
+                    .map(|((_, name), _)| name.as_str())
+            })
+    }
+
     pub fn visible_function_names<'a>(
         &'a self,
         schema: Option<&'a str>,

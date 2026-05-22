@@ -173,9 +173,89 @@ impl Parse for QueryInput {
 // Orchestration
 // ---------------------------------------------------------------------------
 
+/// Parse a Rust string literal preserving line continuations as newlines.
+///
+/// Rust's normal string processing collapses `\<newline><leading_ws>` to
+/// nothing — so a SQL literal written across multiple source lines arrives
+/// at the analyzer as one long line, and diagnostic snippets can't show
+/// the user's original layout. Here we keep the line break (emitting a
+/// real `\n`) and let the leading whitespace flow through, so the snippet
+/// renders the SQL the way it was written.
+///
+/// All other Rust escapes (`\n`, `\t`, `\x{..}`, `\u{..}`, …) follow the
+/// usual rules. Raw strings (`r"…"`, `r#"…"#`) pass through unchanged
+/// because they have no escapes to begin with.
+fn parse_sql_literal_preserving_linebreaks(lit: &LitStr) -> String {
+    let raw = lit.token().to_string();
+    let bytes = raw.as_bytes();
+    // Detect a raw-string prefix (`r"…"` or `r#…"…"#…`). Those have no
+    // escapes — fall through to LitStr::value().
+    if bytes.first() == Some(&b'r') {
+        return lit.value();
+    }
+    // Regular string: strip surrounding `"` and process escapes.
+    let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+    let Some(inner) = inner else {
+        return lit.value();
+    };
+
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\n') => {
+                // Line continuation. Rust would discard the newline and any
+                // leading whitespace on the next line; we keep the newline
+                // and let the whitespace flow so the original layout
+                // survives in the SQL.
+                out.push('\n');
+            }
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('0') => out.push('\0'),
+            Some('x') => {
+                let hi = chars.next().unwrap_or('0');
+                let lo = chars.next().unwrap_or('0');
+                let h: String = [hi, lo].iter().collect();
+                if let Ok(n) = u8::from_str_radix(&h, 16) {
+                    out.push(n as char);
+                }
+            }
+            Some('u') => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut hex = String::new();
+                    for p in chars.by_ref() {
+                        if p == '}' {
+                            break;
+                        }
+                        hex.push(p);
+                    }
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16)
+                        && let Some(c) = char::from_u32(cp)
+                    {
+                        out.push(c);
+                    }
+                }
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
 /// Execute the full `sql!` pipeline and return the generated `TokenStream`.
 pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let sql_str = input.sql.value();
+    let sql_str = parse_sql_literal_preserving_linebreaks(&input.sql);
 
     // 1. Load project config from Cargo.toml.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
@@ -262,4 +342,153 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
 
     // 6. Generate typed Rust code.
     codegen::generate(&analyzed, &resolved, &input.executor, &input.assignments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sql_literal_preserving_linebreaks;
+    use syn::LitStr;
+
+    /// Parse a Rust source fragment as a string literal so tests can express
+    /// the *exact* token text — including backslash-newline continuations.
+    fn lit(src: &str) -> LitStr {
+        syn::parse_str::<LitStr>(src).expect("test input must be a valid Rust string literal")
+    }
+
+    #[test]
+    fn plain_string_passes_through() {
+        let l = lit("\"SELECT 1\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "SELECT 1");
+    }
+
+    #[test]
+    fn line_continuation_preserved_as_newline() {
+        // Source: "foo \\\n   bar"  →  LitStr::value() would give "foo bar"
+        //                                we want "foo \n   bar"
+        let l = lit("\"foo \\\n   bar\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "foo \n   bar");
+    }
+
+    #[test]
+    fn multiple_continuations_all_preserved() {
+        let l = lit("\"a \\\n b \\\n c\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a \n b \n c");
+    }
+
+    #[test]
+    fn continuation_keeps_indentation() {
+        // Realistic SQL layout: each line continues with eight spaces.
+        let l = lit("\"SELECT id \\\n        FROM users\"");
+        assert_eq!(
+            parse_sql_literal_preserving_linebreaks(&l),
+            "SELECT id \n        FROM users",
+        );
+    }
+
+    #[test]
+    fn standard_escape_n_still_works() {
+        let l = lit("\"a\\nb\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\nb");
+    }
+
+    #[test]
+    fn standard_escape_t_still_works() {
+        let l = lit("\"a\\tb\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\tb");
+    }
+
+    #[test]
+    fn escape_backslash() {
+        let l = lit(r#""a\\b""#);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\\b");
+    }
+
+    #[test]
+    fn escape_double_quote() {
+        let l = lit(r#""he said \"hi\"""#);
+        assert_eq!(
+            parse_sql_literal_preserving_linebreaks(&l),
+            "he said \"hi\"",
+        );
+    }
+
+    #[test]
+    fn escape_single_quote() {
+        let l = lit(r#""it\'s ok""#);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "it's ok");
+    }
+
+    #[test]
+    fn escape_null_byte() {
+        let l = lit(r#""a\0b""#);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\0b");
+    }
+
+    #[test]
+    fn escape_hex_byte() {
+        // \x41 = 'A'
+        let l = lit(r#""\x41BC""#);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "ABC");
+    }
+
+    #[test]
+    fn escape_unicode() {
+        // \u{4E2D} = '中'
+        let l = lit(r#""\u{4E2D}""#);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "中");
+    }
+
+    #[test]
+    fn escape_carriage_return() {
+        let l = lit(r#""a\rb""#);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\rb");
+    }
+
+    #[test]
+    fn raw_string_passes_through_lit_value() {
+        // Raw strings have no escapes; backslashes are literal. The
+        // function detects this and falls back to LitStr::value().
+        let l = lit(r##"r"a\nb""##);
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\\nb");
+    }
+
+    #[test]
+    fn raw_string_with_hashes_passes_through() {
+        let l = lit(r###"r#"with "quotes" inside"#"###);
+        assert_eq!(
+            parse_sql_literal_preserving_linebreaks(&l),
+            r#"with "quotes" inside"#,
+        );
+    }
+
+    #[test]
+    fn continuation_at_start_of_line() {
+        // Continuation right after the opening quote.
+        let l = lit("\"\\\n  hello\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "\n  hello");
+    }
+
+    #[test]
+    fn continuation_mixed_with_escape_n() {
+        // Continuation + an explicit \n on the same line.
+        let l = lit("\"a\\nb \\\n  c\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "a\nb \n  c");
+    }
+
+    #[test]
+    fn empty_string() {
+        let l = lit("\"\"");
+        assert_eq!(parse_sql_literal_preserving_linebreaks(&l), "");
+    }
+
+    #[test]
+    fn realistic_multiline_sql_matches_visual_layout() {
+        // The kind of literal that originally collapsed onto a single
+        // line in the diagnostic snippet (the bug this function fixes).
+        let l = lit("\"SELECT id, name \\\n   FROM users \\\n  WHERE id = $id\"");
+        assert_eq!(
+            parse_sql_literal_preserving_linebreaks(&l),
+            "SELECT id, name \n   FROM users \n  WHERE id = $id",
+        );
+    }
 }

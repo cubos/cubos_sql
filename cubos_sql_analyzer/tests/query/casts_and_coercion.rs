@@ -314,3 +314,43 @@ fn varchar_typmod_string_literal_too_long_should_be_rejected() {
         "value too long for type character varying(3)",
     );
 }
+
+// ── UndefinedType: typo in `::type` produces snippet + hint ────────────────
+
+#[test]
+fn cast_to_unknown_type_renders_snippet_and_hint() {
+    // `int32` doesn't exist in PG (it's `int4`). Caret points at the type
+    // name and the hint suggests the nearest real type.
+    let db = PgCatalog::new().unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT 1::int32"),
+        AnalyzeError::UndefinedType(_),
+        "\
+type \"int32\" does not exist
+  ╭────
+1 │ SELECT 1::int32
+  ·           ──┬──
+  ·             ╰─ type does not exist
+  ╰────
+  help: did you mean \"int2\"?
+",
+    );
+}
+
+#[test]
+fn cast_to_unrelated_type_has_no_hint() {
+    // `xyzabc` is too far from any catalog type — no hint.
+    let db = PgCatalog::new().unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT 1::xyzabc"),
+        AnalyzeError::UndefinedType(_),
+        "\
+type \"xyzabc\" does not exist
+  ╭────
+1 │ SELECT 1::xyzabc
+  ·           ───┬──
+  ·              ╰─ type does not exist
+  ╰────
+",
+    );
+}

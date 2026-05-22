@@ -608,7 +608,7 @@ fn undefined_table_schema_qualified_caret_covers_full_name() {
         db.analyze("SELECT id FROM public.userz"),
         AnalyzeError::UndefinedTable(_),
         "\
-relation \"userz\" does not exist
+relation \"public.userz\" does not exist
   ╭────
 1 │ SELECT id FROM public.userz
   ·                ──────┬─────
@@ -749,7 +749,7 @@ fn undefined_function_with_hint() {
         db.analyze("SELECT lengt(name) FROM users"),
         AnalyzeError::UndefinedFunction(_),
         "\
-function lengt() does not exist
+function lengt(text) does not exist
   ╭────
 1 │ SELECT lengt(name) FROM users
   ·        ──┬──
@@ -768,7 +768,7 @@ fn undefined_function_schema_qualified() {
         db.analyze("SELECT pg_catalog.nonexisting() FROM users"),
         AnalyzeError::UndefinedFunction(_),
         "\
-function nonexisting() does not exist
+function pg_catalog.nonexisting() does not exist
   ╭────
 1 │ SELECT pg_catalog.nonexisting() FROM users
   ·        ───────────┬──────────
@@ -810,7 +810,7 @@ fn lex_unclosed_string_locates_opening_quote() {
         db.analyze("SELECT id FROM users WHERE name = 'oops"),
         AnalyzeError::Lex(_),
         "\
-unclosed string literal at byte 34
+unterminated quoted string at or near \"'oops\"
   ╭────
 1 │ SELECT id FROM users WHERE name = 'oops
   ·                                   ─
@@ -826,7 +826,7 @@ fn lex_unclosed_block_comment_locates_opening_slash_star() {
         db.analyze("SELECT 1 /* unterminated"),
         AnalyzeError::Lex(_),
         "\
-unclosed block comment at byte 9
+unterminated /* comment at or near \"/* unterminated\"
   ╭────
 1 │ SELECT 1 /* unterminated
   ·          ─

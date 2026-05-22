@@ -81,6 +81,20 @@ pub(crate) fn resolve_function(
         .copied()
         .filter(|f| !matches!(f.prokind, ProKind::Procedure))
         .collect();
+    // PG's wording keeps the user's schema qualifier — match it so the
+    // sanity-check prefix passes. `QualifiedName::Display` handles
+    // identifier quoting (and round-trips through PG's rules).
+    let qualified = match schema {
+        Some(s) => crate::qualified_name::QualifiedName::new(s, name).to_string(),
+        None => name.to_string(),
+    };
+    // Render the call's actual arg types in PG-style names (int4 → integer,
+    // …) so the message matches PG verbatim.
+    let arg_list_actual = arg_types
+        .iter()
+        .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
+        .collect::<Vec<_>>()
+        .join(", ");
     if candidates.is_empty() {
         // PG distinguishes "function not found at all" from "the name
         // resolves but only to a procedure" (SQLSTATE 42809). Mirror that
@@ -112,7 +126,7 @@ pub(crate) fn resolve_function(
                 snapshot,
                 schema,
                 name,
-                format!("{name}({arg_list}) is a procedure"),
+                format!("{qualified}({arg_list}) is a procedure"),
                 span,
             ));
         }
@@ -120,7 +134,7 @@ pub(crate) fn resolve_function(
             snapshot,
             schema,
             name,
-            format!("function {name}() does not exist"),
+            format!("function {qualified}({arg_list_actual}) does not exist"),
             span,
         ));
     }

@@ -146,15 +146,37 @@ fn normalize_type_name(name: &str) -> &str {
     }
 }
 
-/// Render a type OID into PG's user-facing name for diagnostic messages —
-/// e.g. `int2` → `smallint`, `pg_catalog.int4` → `integer`. Mirrors PG's
-/// `format_type_be(oid)` for the SQL standard aliases. Used to align our
-/// error messages with PG's so the `pglite_sanity` cross-check passes.
+/// Render a type OID into PG's user-facing name for diagnostic messages.
+///
+/// Mirrors `format_type_extended` in `src/backend/utils/adt/format_type.c`
+/// (PG 18) with `flags = 0` (no typmod, no force-qualify):
+///
+/// 1. Arrays: when the type's `typelem` points at a real array element
+///    type, render as `<element>[]` (skipping pseudo-arrays / plain-storage
+///    arrays like `oidvector`, same check PG does).
+/// 2. Special-case the SQL-standard built-ins (`BOOL` → `boolean`,
+///    `INT4` → `integer`, `TIMESTAMP` → `timestamp without time zone`, etc.).
+/// 3. Otherwise: render the catalog name, qualified with the schema if the
+///    type isn't visible on the search path (`pg_catalog` builtins stay
+///    unqualified). `QualifiedName::Display` handles the PG identifier
+///    quoting rules.
 pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     let Some(t) = snapshot.pg_type.get(&oid) else {
         return format!("oid={oid}");
     };
-    // Built-ins that PG renames in user-facing output.
+
+    // Array deconstruction. PG checks `IsTrueArrayType(typeform) &&
+    // typeform->typstorage != TYPSTORAGE_PLAIN` — we approximate with
+    // `typcategory == Array` and a present `typelem`, which excludes
+    // `oidvector`/`int2vector` (plain-storage pseudo-arrays).
+    if t.typcategory == crate::pg_catalog::TypCategory::Array
+        && let Some(elem_oid) = t.typelem
+    {
+        return format!("{}[]", format_type_for_message(snapshot, elem_oid));
+    }
+
+    // Special-case the SQL-standard built-ins. Mirrors the big `switch
+    // (type_oid)` block in `format_type_extended`.
     let aliased = match t.typname.as_str() {
         "bool" => Some("boolean"),
         "int2" => Some("smallint"),
@@ -164,21 +186,29 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
         "float8" => Some("double precision"),
         "bpchar" => Some("character"),
         "varchar" => Some("character varying"),
+        "varbit" => Some("bit varying"),
+        "bit" => Some("bit"),
         "timestamp" => Some("timestamp without time zone"),
         "timestamptz" => Some("timestamp with time zone"),
         "time" => Some("time without time zone"),
         "timetz" => Some("time with time zone"),
+        "interval" => Some("interval"),
+        "numeric" => Some("numeric"),
+        "json" => Some("json"),
         _ => None,
     };
     if let Some(name) = aliased {
         return name.to_string();
     }
-    // Non-aliased types: PG omits the `pg_catalog.` schema prefix for
-    // built-ins, but qualifies user types. Identifier quoting per PG
-    // rules is delegated to `QualifiedName::Display`.
-    if let Some(ns) = snapshot.namespace_name(t.typnamespace)
-        && ns != "pg_catalog"
-    {
+
+    // Default handling: catalog name, qualified iff the type isn't visible
+    // on the search path. `pg_catalog` types are always visible without
+    // qualification; for everything else we ask the lookup.
+    let visible = snapshot
+        .resolve_type_by_name(None, &t.typname)
+        .map(|found| found.oid == oid)
+        .unwrap_or(false);
+    if !visible && let Some(ns) = snapshot.namespace_name(t.typnamespace) {
         return QualifiedName::new(ns, &t.typname).to_string();
     }
     t.typname.clone()

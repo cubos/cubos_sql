@@ -32,7 +32,7 @@ use crate::scope::Scope;
 /// Mirrors PostgreSQL's approach where each clause (`WHERE`, `LIMIT`, `INSERT
 /// VALUES`, …) tells the parser "I expect this expression to produce type X
 /// with coercion level Y".
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct TypeGoal {
     pub type_oid: PgTypeOid,
     pub coercion: CoercionContext,
@@ -41,6 +41,10 @@ pub(crate) struct TypeGoal {
     /// comparison, etc. When present, surfaces as a secondary label in
     /// `TypeMismatch` diagnostics ("expected here").
     pub source_span: Option<crate::error::SourceSpan>,
+    /// When the expectation comes from a named column (INSERT VALUES,
+    /// UPDATE SET), the column's name. Used to produce PG's exact wording:
+    /// `column "X" is of type Y but expression is of type Z`.
+    pub source_col_name: Option<String>,
 }
 
 impl TypeGoal {
@@ -49,6 +53,7 @@ impl TypeGoal {
         type_oid: oid::UNKNOWN,
         coercion: CoercionContext::Implicit,
         source_span: None,
+        source_col_name: None,
     };
 
     /// Expression context — only implicit casts allowed
@@ -58,6 +63,7 @@ impl TypeGoal {
             type_oid,
             coercion: CoercionContext::Implicit,
             source_span: None,
+            source_col_name: None,
         }
     }
 
@@ -68,6 +74,7 @@ impl TypeGoal {
             type_oid,
             coercion: CoercionContext::Assignment,
             source_span: None,
+            source_col_name: None,
         }
     }
 
@@ -76,6 +83,14 @@ impl TypeGoal {
     /// secondary label in type-mismatch diagnostics.
     pub fn with_source(mut self, span: crate::error::SourceSpan) -> Self {
         self.source_span = Some(span);
+        self
+    }
+
+    /// Attach the name of the column whose type drove this goal. Used by
+    /// `check_goal_compatibility` to render PG's exact wording for
+    /// INSERT/UPDATE assignments.
+    pub fn with_source_column(mut self, name: impl Into<String>) -> Self {
+        self.source_col_name = Some(name.into());
         self
     }
 
@@ -632,9 +647,27 @@ fn check_goal_compatibility(
             target_te.typname
         )));
     }
+    // PG's user-facing type names (e.g. `int4` → `integer`, `bool` →
+    // `boolean`) — these appear verbatim in the message so the sanity
+    // prefix match works.
+    let actual_pg = crate::ddl::util::format_type_for_message(snapshot, result.type_oid);
+    let expected_pg = crate::ddl::util::format_type_for_message(snapshot, goal.type_oid);
+
+    // Internal short forms kept around so the introspection-style
+    // `actual`/`expected` fields on `TypeMismatch` still carry the OID's
+    // type name (what tests/macros use).
     let actual = type_display_name(result.type_oid, snapshot);
     let expected = type_display_name(goal.type_oid, snapshot);
-    let context = format!("cannot coerce {actual} to {expected}");
+
+    // PG-verbatim message. When the expectation comes from a named column
+    // (INSERT VALUES, UPDATE SET), use PG's exact wording so pg_sanity
+    // passes; otherwise fall back to the generic `cannot coerce` form.
+    let context = match &goal.source_col_name {
+        Some(col) => format!(
+            "column \"{col}\" is of type {expected_pg} but expression is of type {actual_pg}"
+        ),
+        None => format!("cannot coerce {actual_pg} to {expected_pg}"),
+    };
 
     let primary_span = location.and_then(|loc| {
         // `from_node_token` covers identifiers, numeric literals, and
@@ -648,11 +681,13 @@ fn check_goal_compatibility(
     // so the diagnostic shows both sides.
     let secondary = goal
         .source_span
-        .map(|s| crate::error::DiagnosticLabel::new(s, format!("expected {expected} here")));
+        .map(|s| crate::error::DiagnosticLabel::new(s, format!("expected {expected_pg} here")));
 
     Err(crate::error::RawError::type_mismatch(
         actual,
         expected,
+        &actual_pg,
+        &expected_pg,
         context,
         primary_span,
         secondary,
@@ -815,9 +850,10 @@ fn infer_star_ref(
                     .get(&(nsoid, qn.name.clone()))
                     .copied()
             })
-            .ok_or_else(|| AnalyzeError::UndefinedType {
-                oid: 0,
-                context: format!("composite type for {qn}"),
+            .ok_or_else(|| {
+                AnalyzeError::UndefinedType(format!(
+                    "internal: no composite type registered for relation {qn}"
+                ))
             })?;
         return Ok(ExprType::scalar(composite_oid, false));
     }
@@ -1005,10 +1041,10 @@ fn infer_indirection(
 
                 if ai.is_slice {
                     let type_entry = snapshot.get_type(current.type_oid).ok_or_else(|| {
-                        AnalyzeError::UndefinedType {
-                            oid: current.type_oid.get(),
-                            context: "array slice".into(),
-                        }
+                        AnalyzeError::UndefinedType(format!(
+                            "internal: array slice over unknown type OID {}",
+                            current.type_oid.get()
+                        ))
                     })?;
                     if type_entry.typcategory != TypCategory::Array {
                         return Err(AnalyzeError::Unsupported(format!(
@@ -1155,12 +1191,12 @@ fn resolve_composite_field(
 
     // Domain-over-composite needs unwrapping to see the composite fields.
     let base_oid = snapshot.unwrap_domain(current.type_oid);
-    let type_entry = snapshot
-        .get_type(base_oid)
-        .ok_or_else(|| AnalyzeError::UndefinedType {
-            oid: base_oid.get(),
-            context: format!("composite field access .{field_name}"),
-        })?;
+    let type_entry = snapshot.get_type(base_oid).ok_or_else(|| {
+        AnalyzeError::UndefinedType(format!(
+            "internal: composite field access .{field_name} over unknown type OID {}",
+            base_oid.get()
+        ))
+    })?;
 
     let pg_type_name = crate::ddl::util::format_type_for_message(snapshot, base_oid);
     let Some(relid) = type_entry.typrelid else {
@@ -1274,13 +1310,12 @@ fn resolve_array_element(
     current: &ExprType,
     snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {
-    let type_entry =
-        snapshot
-            .get_type(current.type_oid)
-            .ok_or_else(|| AnalyzeError::UndefinedType {
-                oid: current.type_oid.get(),
-                context: "array subscript".into(),
-            })?;
+    let type_entry = snapshot.get_type(current.type_oid).ok_or_else(|| {
+        AnalyzeError::UndefinedType(format!(
+            "internal: array subscript over unknown type OID {}",
+            current.type_oid.get()
+        ))
+    })?;
     // PG (SQLSTATE 42804) rejects subscripting a type with no subscript
     // handler with this verbatim wording; keep it exact for the sanity
     // prefix match. `jsonb` is handled before reaching here.
@@ -1829,7 +1864,7 @@ fn infer_a_expr(
                 TypeGoal::NONE
             };
             for item in &list.items {
-                let t = infer_expr(item, scope, null_ctx, snapshot, params, goal)?;
+                let t = infer_expr(item, scope, null_ctx, snapshot, params, goal.clone())?;
                 any_bound_nullable = any_bound_nullable || t.nullable;
             }
         }
@@ -1864,7 +1899,7 @@ fn infer_a_expr(
                 TypeGoal::NONE
             };
             for item in &list.items {
-                let t = infer_expr(item, scope, null_ctx, snapshot, params, goal)?;
+                let t = infer_expr(item, scope, null_ctx, snapshot, params, goal.clone())?;
                 any_right_nullable = any_right_nullable || t.nullable;
             }
         }
@@ -2628,13 +2663,20 @@ fn resolve_type_name(
 
     let is_array = !tn.array_bounds.is_empty();
 
-    let type_entry =
-        snapshot
-            .resolve_type_by_name(schema, name)
-            .ok_or_else(|| AnalyzeError::UndefinedType {
-                oid: 0,
-                context: format!("type name: {}", parts.join(".")),
-            })?;
+    let type_entry = snapshot.resolve_type_by_name(schema, name).ok_or_else(|| {
+        // Build a snippet + "did you mean" hint for the unknown type name.
+        let hint = crate::suggest::suggest_similar(name, snapshot.visible_type_names(schema))
+            .map(|c| format!("did you mean \"{c}\"?"));
+        let span = crate::error::SourceSpan::from_node_qname(tn.location);
+        let qualified = parts.join(".");
+        crate::error::RawError {
+            kind: AnalyzeError::UndefinedType(format!("type \"{qualified}\" does not exist")),
+            primary: span.map(|s| crate::error::DiagnosticLabel::new(s, "type does not exist")),
+            secondaries: Vec::new(),
+            hint,
+        }
+        .finalize_implicit()
+    })?;
 
     if is_array {
         let array_name = format!("_{name}");

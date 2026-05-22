@@ -1664,12 +1664,12 @@ fn type_mismatch_insert_int_into_bool_column() {
         db.analyze("INSERT INTO users (name, email, flag) VALUES ('a', 'b', 42)"),
         AnalyzeError::TypeMismatch { .. },
         "\
-cannot coerce int4 to bool
+column \"flag\" is of type boolean but expression is of type integer
   ╭────
 1 │ INSERT INTO users (name, email, flag) VALUES ('a', 'b', 42)
   ·                                 ──┬─                    ─┬
-  ·                                   │                      ╰─ expected bool, found int4
-  ·                                   ╰─ expected bool here
+  ·                                   │                      ╰─ expected boolean, found integer
+  ·                                   ╰─ expected boolean here
   ╰────
 ",
     );
@@ -1683,13 +1683,68 @@ fn type_mismatch_insert_bool_into_bigint_column() {
         db.analyze("INSERT INTO posts (user_id, title) VALUES (true, 'hi')"),
         AnalyzeError::TypeMismatch { .. },
         "\
-cannot coerce bool to int8
+column \"user_id\" is of type bigint but expression is of type boolean
   ╭────
 1 │ INSERT INTO posts (user_id, title) VALUES (true, 'hi')
   ·                    ───┬───                 ──┬─
-  ·                       │                      ╰─ expected int8, found bool
-  ·                       ╰─ expected int8 here
+  ·                       │                      ╰─ expected bigint, found boolean
+  ·                       ╰─ expected bigint here
   ╰────
+",
+    );
+}
+
+// ── INSERT … SELECT propagates errors from inside the SELECT ───────────────
+//
+// Earlier the analyzer swallowed errors raised inside an `INSERT … SELECT`
+// SELECT (typos in JOIN ON, typos in the target list, …). The downstream
+// invariant `param count mismatch` would then fire because the lexer had
+// seen `$N` placeholders that the swallowed walk never registered.
+
+#[test]
+fn insert_select_typo_in_join_on_propagates() {
+    let db = setup();
+    // `p.user_idz` doesn't exist on `posts`; the analyzer must surface the
+    // UndefinedColumn rather than failing the param-count invariant later.
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO comments (post_id, author_name, content) \
+             SELECT p.id, u.name, 'hi' FROM posts p JOIN users u ON u.id = p.user_idz \
+             WHERE p.id = $pid",
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column p.user_idz does not exist
+  ╭────
+1 │ INSERT INTO comments (post_id, author_name, content) SELECT p.id, u.name, 'hi' FROM posts p JOIN users u ON u.id = p.user_idz WHERE p.id = $pid
+  ·                                                                                                                    ─────┬────
+  ·                                                                                                                         ╰─ column does not exist
+  ╰────
+  help: did you mean \"user_id\"?
+",
+    );
+}
+
+#[test]
+fn insert_select_typo_in_select_list_propagates() {
+    // Typo in the SELECT target list (`p.user_idz` instead of `p.user_id`)
+    // must reach the user as UndefinedColumn — previously silently aliased
+    // to text via the UNKNOWN fallback.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "INSERT INTO comments (post_id, author_name, content) \
+             SELECT p.id, p.user_idz::text, 'hi' FROM posts p",
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column p.user_idz does not exist
+  ╭────
+1 │ INSERT INTO comments (post_id, author_name, content) SELECT p.id, p.user_idz::text, 'hi' FROM posts p
+  ·                                                                   ─────┬────
+  ·                                                                        ╰─ column does not exist
+  ╰────
+  help: did you mean \"user_id\"?
 ",
     );
 }

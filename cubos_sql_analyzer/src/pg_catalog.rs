@@ -1255,6 +1255,43 @@ impl PgCatalog {
     /// static pass — used by [`Self::analyze`] to mirror the same string on
     /// PG sanity under `pg_sanity`.
     fn analyze_with_sql(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
+        // PG's wording for each lex-level failure — kept verbatim so the
+        // `pg_sanity` prefix check matches. `at or near "..."` echoes a
+        // snippet of the offending token; we approximate that by taking
+        // ~24 bytes starting at the LexError's reported position.
+        fn format_lex_error_pg(e: &crate::lexer::LexError, sql: &str) -> String {
+            use crate::lexer::LexError as L;
+            let near = |pos: usize| -> String {
+                let bytes = sql.as_bytes();
+                let mut end = (pos + 24).min(bytes.len());
+                // Don't slice mid-char.
+                while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+                    end += 1;
+                }
+                let slice = &sql[pos..end];
+                // Stop at the first newline if any — PG's `at or near`
+                // typically shows a short, single-line snippet.
+                let slice = slice.split('\n').next().unwrap_or(slice);
+                slice.to_string()
+            };
+            match e {
+                L::UnclosedString { position } => format!(
+                    "unterminated quoted string at or near \"{}\"",
+                    near(*position)
+                ),
+                L::UnclosedBlockComment { position } => {
+                    format!("unterminated /* comment at or near \"{}\"", near(*position))
+                }
+                L::UnclosedDollarQuote { tag: _, position } => format!(
+                    "unterminated dollar-quoted string at or near \"{}\"",
+                    near(*position)
+                ),
+                L::UnclosedQuotedIdentifier { position } => format!(
+                    "unterminated quoted identifier at or near \"{}\"",
+                    near(*position)
+                ),
+            }
+        }
         let lex_output = match lex(sql) {
             Ok(l) => l,
             Err(e) => {
@@ -1271,7 +1308,8 @@ impl PgCatalog {
                 let _guard = crate::error::DiagContextGuard::install(sql, &empty_lex);
                 let position = e.position();
                 let span = crate::error::SourceSpan::one_char_at(position);
-                let raw = crate::error::RawError::lex(e.to_string(), Some(span));
+                let message = format_lex_error_pg(&e, sql);
+                let raw = crate::error::RawError::lex(message, Some(span));
                 return (sql.to_string(), Err(raw.finalize_implicit()));
             }
         };

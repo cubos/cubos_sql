@@ -33,9 +33,13 @@ pub enum AnalyzeError {
     #[error("{0}")]
     UndefinedColumn(String),
 
-    /// A type OID was not found in the schema snapshot or type map.
-    #[error("unknown type OID {oid} for {context}")]
-    UndefinedType { oid: u32, context: String },
+    /// A type referenced in the query is not in the catalog. Equivalent to
+    /// PG `undefined_object` (SQLSTATE 42704) when the lookup was by name,
+    /// or surfaces an internal OID mismatch when the lookup was by OID.
+    /// The payload carries the PG-verbatim wording (`type "x" does not
+    /// exist`) plus any extra context appended by the caller.
+    #[error("{0}")]
+    UndefinedType(String),
 
     /// A function does not exist for the given argument types. Equivalent to
     /// PG `undefined_function` (SQLSTATE 42883). In PG the same SQLSTATE covers
@@ -509,14 +513,17 @@ impl RawError {
     }
 
     /// Construct an `UndefinedTable` raw error with optional span and hint.
+    /// `qualified` is the relation name as the user wrote it
+    /// (`schema.name` when qualified, bare `name` otherwise) — PG's error
+    /// message keeps the schema prefix, so we must too for the prefix check.
     pub(crate) fn undefined_table(
-        relname: &str,
+        qualified: &str,
         span: Option<SourceSpan>,
         hint: Option<String>,
     ) -> Self {
         let primary = span.map(|s| DiagnosticLabel::new(s, "relation does not exist"));
         Self {
-            kind: AnalyzeError::UndefinedTable(format!("relation \"{relname}\" does not exist")),
+            kind: AnalyzeError::UndefinedTable(format!("relation \"{qualified}\" does not exist")),
             primary,
             secondaries: Vec::new(),
             hint,
@@ -583,16 +590,19 @@ impl RawError {
     /// of the mismatch: `primary` on the offending expression, `secondary`
     /// on whatever sets the expectation (column being assigned, expression
     /// on the other side of a comparison, etc.).
+    #[allow(clippy::too_many_arguments)] // builder for a structured diagnostic
     pub(crate) fn type_mismatch(
         actual: String,
         expected: String,
+        actual_pg: &str,
+        expected_pg: &str,
         context: String,
         primary_span: Option<SourceSpan>,
         secondary: Option<DiagnosticLabel>,
         hint: Option<String>,
     ) -> Self {
         let primary = primary_span
-            .map(|s| DiagnosticLabel::new(s, format!("expected {expected}, found {actual}")));
+            .map(|s| DiagnosticLabel::new(s, format!("expected {expected_pg}, found {actual_pg}")));
         let secondaries = secondary.into_iter().collect();
         Self {
             kind: AnalyzeError::TypeMismatch {
@@ -738,6 +748,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::IndeterminateType(_) => AnalyzeError::IndeterminateType(rendered),
         AnalyzeError::Unsupported(_) => AnalyzeError::Unsupported(rendered),
         AnalyzeError::Invalid(_) => AnalyzeError::Invalid(rendered),
+        AnalyzeError::UndefinedType(_) => AnalyzeError::UndefinedType(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

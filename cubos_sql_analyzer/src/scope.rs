@@ -66,7 +66,14 @@ pub(crate) fn undefined_table_error(
 ) -> AnalyzeError {
     let hint = suggest_similar(name, snapshot.visible_relnames(schema))
         .map(|c| format!("did you mean \"{c}\"?"));
-    RawError::undefined_table(name, span, hint).finalize_implicit()
+    // Match PG's wording: when the user qualified the relation, the
+    // schema prefix shows up in the error too. `QualifiedName::Display`
+    // handles identifier quoting for us.
+    let qualified = match schema {
+        Some(s) => QualifiedName::new(s, name).to_string(),
+        None => name.to_string(),
+    };
+    RawError::undefined_table(&qualified, span, hint).finalize_implicit()
 }
 
 /// Build an `UndefinedColumn` error for a DML target column (INSERT col
