@@ -70,6 +70,25 @@ pub(crate) struct SpreadParam {
     pub offset: usize,
 }
 
+/// A token the lexer rewrote (or removed) while producing the post-lex SQL.
+///
+/// Used to translate byte offsets from the post-lex SQL — which is what the
+/// parser sees and what AST nodes' `location` field refers to — back to the
+/// original SQL the user wrote. That mapping is what lets diagnostics
+/// pinpoint the offending text inside the Rust `sql!` literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rewrite {
+    /// Byte offset in the **original** SQL where the rewritten token begins.
+    pub original_at: usize,
+    /// Byte offset in the **post-lex** SQL where the rewritten token begins.
+    pub post_lex_at: usize,
+    /// Length in bytes the token had in the original SQL.
+    pub original_len: usize,
+    /// Length in bytes the token has in the post-lex SQL (0 when removed,
+    /// e.g. a `$..spread`).
+    pub post_lex_len: usize,
+}
+
 /// The result of lexing a SQL template via [`crate::lexer::lex`].
 ///
 /// Contains the rewritten SQL (with positional placeholders), the list of
@@ -87,4 +106,38 @@ pub(crate) struct LexOutput {
     pub params: Vec<Param>,
     /// Spread parameters in order of appearance in the SQL.
     pub spreads: Vec<SpreadParam>,
+    /// Rewrites applied by the lexer, in post-lex order. Used to translate
+    /// AST `location` offsets (post-lex) back into the original SQL for
+    /// diagnostics.
+    pub rewrites: Vec<Rewrite>,
+}
+
+impl LexOutput {
+    /// Translate a byte offset from the post-lex SQL back into the original
+    /// SQL. If `post_lex` falls inside a removed/rewritten token, returns the
+    /// start of that token in the original SQL.
+    pub(crate) fn original_offset(&self, post_lex: usize) -> usize {
+        let mut original = post_lex;
+        for rw in &self.rewrites {
+            let rw_end_post_lex = rw.post_lex_at + rw.post_lex_len;
+            if rw_end_post_lex <= post_lex {
+                // Rewrite is entirely before `post_lex` — apply its delta.
+                let delta = rw.original_len as isize - rw.post_lex_len as isize;
+                original = (original as isize + delta) as usize;
+            } else if rw.post_lex_at <= post_lex {
+                // `post_lex` falls inside the rewritten token. Map to the
+                // start of the original token.
+                return rw.original_at;
+            } else {
+                // Past the relevant rewrites (they are stored in order).
+                break;
+            }
+        }
+        original
+    }
+
+    /// Translate a byte span from the post-lex SQL back into the original SQL.
+    pub(crate) fn original_span(&self, start: usize, end: usize) -> (usize, usize) {
+        (self.original_offset(start), self.original_offset(end))
+    }
 }

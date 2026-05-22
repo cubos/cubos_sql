@@ -91,9 +91,14 @@ impl ParamCollector {
         indeterminate.sort_unstable();
         for num in indeterminate {
             if !self.constraints.contains_key(&num) {
-                return Err(AnalyzeError::IndeterminateType(format!(
-                    "could not determine data type of parameter ${num}"
-                )));
+                return Err(crate::error::RawError::indeterminate_type(
+                    format!("could not determine data type of parameter ${num}"),
+                    None,
+                    Some(format!(
+                        "add an explicit cast to the parameter, e.g. `${num}::int4`"
+                    )),
+                )
+                .finalize_implicit());
             }
         }
 

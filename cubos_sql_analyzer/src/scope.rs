@@ -1,9 +1,10 @@
 //! Scope tracking for table aliases, columns, and CTEs.
 
-use crate::error::AnalyzeError;
+use crate::error::{AnalyzeError, RawError, SourceSpan};
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgAttribute, PgCatalog};
 use crate::qualified_name::QualifiedName;
+use crate::suggest::suggest_similar;
 
 /// A resolved column with its type and base nullability (from table definition).
 #[derive(Debug, Clone)]
@@ -50,18 +51,85 @@ pub(crate) struct Scope {
     pub shadowed_sources: Vec<TableSource>,
 }
 
+/// Build the public-facing `UndefinedTable` error for a missing relation,
+/// picking up the snippet location from TLS and computing a "did you mean"
+/// hint against the catalog's visible relations.
+///
+/// Used by `Scope::add_table` and by the DML statement handlers in
+/// `resolve.rs` (INSERT/UPDATE/DELETE/MERGE) so the error rendering is
+/// consistent across all sites.
+pub(crate) fn undefined_table_error(
+    snapshot: &PgCatalog,
+    schema: Option<&str>,
+    name: &str,
+    span: Option<SourceSpan>,
+) -> AnalyzeError {
+    let hint = suggest_similar(name, snapshot.visible_relnames(schema))
+        .map(|c| format!("did you mean \"{c}\"?"));
+    RawError::undefined_table(name, span, hint).finalize_implicit()
+}
+
+/// Build an `UndefinedColumn` error for a DML target column (INSERT col
+/// list, UPDATE SET col). Uses the table's attributes for the suggestion
+/// rather than a `Scope` (no scope exists yet during DML target validation).
+pub(crate) fn undefined_dml_column_error(
+    column: &str,
+    table_relname: &str,
+    table_attrs: &[crate::pg_catalog::PgAttribute],
+    span: Option<SourceSpan>,
+) -> AnalyzeError {
+    let hint = suggest_similar(column, table_attrs.iter().map(|a| a.attname.as_str()))
+        .map(|c| format!("did you mean \"{c}\"?"));
+    RawError::undefined_column(
+        format!("column \"{column}\" of relation \"{table_relname}\" does not exist"),
+        span,
+        hint,
+    )
+    .finalize_implicit()
+}
+
+/// Build the public-facing `UndefinedColumn` error.
+///
+/// `message` is the PG-verbatim first line — callers pick the wording
+/// matching PG's behavior (bare column, qualified column, ambiguous, or
+/// "invalid reference to FROM-clause entry"). `column` is the bare column
+/// name used for the "did you mean" suggestion; `scope` is searched for
+/// candidate column names.
+pub(crate) fn undefined_column_error(
+    scope: &Scope,
+    column: &str,
+    message: String,
+    span: Option<SourceSpan>,
+) -> AnalyzeError {
+    let candidates: Vec<&str> = scope
+        .all_columns()
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    let hint = suggest_similar(column, candidates.iter().copied())
+        .map(|c| format!("did you mean \"{c}\"?"));
+    RawError::undefined_column(message, span, hint).finalize_implicit()
+}
+
 impl Scope {
     /// Add a table from the catalog.
+    ///
+    /// `span` covers the relation reference in the original SQL — usually
+    /// produced by `SourceSpan::from_node_qname(RangeVar.location)`. Pass
+    /// `None` when no AST location is available; the resulting
+    /// `UndefinedTable` error then carries no snippet (but `did you mean`
+    /// still works).
     pub fn add_table(
         &mut self,
         snapshot: &PgCatalog,
         schema: Option<&str>,
         name: &str,
         alias: &str,
+        span: Option<SourceSpan>,
     ) -> Result<(), AnalyzeError> {
-        let table = snapshot.resolve_table(schema, name).ok_or_else(|| {
-            AnalyzeError::UndefinedTable(format!("relation \"{name}\" does not exist"))
-        })?;
+        let table = snapshot
+            .resolve_table(schema, name)
+            .ok_or_else(|| undefined_table_error(snapshot, schema, name, span))?;
         let table_oid = table.oid;
         let nspname = snapshot
             .namespace_name(table.relnamespace)
@@ -138,6 +206,7 @@ impl Scope {
         &self,
         table: Option<&str>,
         column: &str,
+        span: Option<SourceSpan>,
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
             for source in self.sources.iter().chain(self.outer_sources.iter()) {
@@ -152,18 +221,23 @@ impl Scope {
             // at the FROM-clause-entry visibility rule rather than the
             // generic missing-column message. The hint mirrors PG's HINT.
             if self.shadowed_sources.iter().any(|s| s.alias == t) {
-                return Err(AnalyzeError::UndefinedColumn(format!(
-                    "invalid reference to FROM-clause entry for table \"{t}\""
-                )));
+                return Err(undefined_column_error(
+                    self,
+                    column,
+                    format!("invalid reference to FROM-clause entry for table \"{t}\""),
+                    span,
+                ));
             }
             // PG formats qualified missing columns through identifier
             // quoting rules (`column t.col does not exist`, but
             // `column "T".col does not exist` when `T` needs quoting).
             // Bare names use the simple `"col"` form just below.
-            return Err(AnalyzeError::UndefinedColumn(format!(
-                "column {} does not exist",
-                QualifiedName::new(t, column),
-            )));
+            return Err(undefined_column_error(
+                self,
+                column,
+                format!("column {} does not exist", QualifiedName::new(t, column)),
+                span,
+            ));
         }
 
         for tier in [&self.sources, &self.outer_sources] {
@@ -179,17 +253,23 @@ impl Scope {
                     .map(|c| QualifiedName::new(&c.table_alias, column).to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Err(AnalyzeError::UndefinedColumn(format!(
-                    "column reference \"{column}\" is ambiguous (could be: {candidates})"
-                )));
+                return Err(undefined_column_error(
+                    self,
+                    column,
+                    format!("column reference \"{column}\" is ambiguous (could be: {candidates})"),
+                    span,
+                ));
             }
             if let Some(col) = matches.first() {
                 return Ok(col);
             }
         }
-        Err(AnalyzeError::UndefinedColumn(format!(
-            "column \"{column}\" does not exist"
-        )))
+        Err(undefined_column_error(
+            self,
+            column,
+            format!("column \"{column}\" does not exist"),
+            span,
+        ))
     }
 
     pub fn all_columns(&self) -> Vec<&ScopeColumn> {

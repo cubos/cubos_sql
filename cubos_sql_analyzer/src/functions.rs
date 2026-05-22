@@ -61,12 +61,19 @@ const NULLABLE_STRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
 const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &["->", "->>", "#>", "#>>"];
 
 /// Resolve a function call by name and argument types.
+///
+/// `span` covers the function reference in the original SQL — usually
+/// produced by `SourceSpan::from_node_qname(FuncCall.location)`. When
+/// provided, `UndefinedFunction` errors emerge with a snippet pointing at
+/// the call and a "did you mean" hint computed against the catalog's
+/// visible functions.
 pub(crate) fn resolve_function(
     snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,
     arg_types: &[PgTypeOid],
     _is_agg_star: bool,
+    span: Option<crate::error::SourceSpan>,
 ) -> Result<ResolvedFunction, AnalyzeError> {
     let all_matches = snapshot.find_functions(schema, name);
     let candidates: Vec<&PgProc> = all_matches
@@ -101,13 +108,21 @@ pub(crate) fn resolve_function(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(AnalyzeError::UndefinedFunction(format!(
-                "{name}({arg_list}) is a procedure"
-            )));
+            return Err(undefined_function_error(
+                snapshot,
+                schema,
+                name,
+                format!("{name}({arg_list}) is a procedure"),
+                span,
+            ));
         }
-        return Err(AnalyzeError::UndefinedFunction(format!(
-            "function {name}() does not exist"
-        )));
+        return Err(undefined_function_error(
+            snapshot,
+            schema,
+            name,
+            format!("function {name}() does not exist"),
+            span,
+        ));
     }
 
     if let Some(f) = find_exact_match(&candidates, arg_types) {
@@ -150,10 +165,29 @@ pub(crate) fn resolve_function(
         .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(AnalyzeError::UndefinedFunction(format!(
-        "function {name}({arg_list}) does not exist (found {} candidate(s))",
-        candidates.len()
-    )))
+    Err(undefined_function_error(
+        snapshot,
+        schema,
+        name,
+        format!(
+            "function {name}({arg_list}) does not exist (found {} candidate(s))",
+            candidates.len()
+        ),
+        span,
+    ))
+}
+
+/// Build the public-facing `UndefinedFunction` error with snippet + hint.
+pub(crate) fn undefined_function_error(
+    snapshot: &PgCatalog,
+    schema: Option<&str>,
+    name: &str,
+    message: String,
+    span: Option<crate::error::SourceSpan>,
+) -> AnalyzeError {
+    let hint = crate::suggest::suggest_similar(name, snapshot.visible_function_names(schema))
+        .map(|c| format!("did you mean \"{c}\"?"));
+    crate::error::RawError::undefined_function(message, span, hint).finalize_implicit()
 }
 
 fn find_unknown_compatible_match<'a>(

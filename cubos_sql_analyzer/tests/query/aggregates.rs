@@ -355,7 +355,7 @@ fn group_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users GROUP BY ghost"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT count(*) FROM users GROUP BY ghost\n  ·                                     ──┬──\n  ·                                       ╰─ column does not exist\n  ╰────\n",
     );
 }
 

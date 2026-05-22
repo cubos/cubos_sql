@@ -36,6 +36,11 @@ use crate::scope::Scope;
 pub(crate) struct TypeGoal {
     pub type_oid: PgTypeOid,
     pub coercion: CoercionContext,
+    /// Optional byte range (post-lex SQL) covering the *source* of this
+    /// expectation — the column being assigned, the other side of a
+    /// comparison, etc. When present, surfaces as a secondary label in
+    /// `TypeMismatch` diagnostics ("expected here").
+    pub source_span: Option<crate::error::SourceSpan>,
 }
 
 impl TypeGoal {
@@ -43,6 +48,7 @@ impl TypeGoal {
     pub const NONE: Self = Self {
         type_oid: oid::UNKNOWN,
         coercion: CoercionContext::Implicit,
+        source_span: None,
     };
 
     /// Expression context — only implicit casts allowed
@@ -51,6 +57,7 @@ impl TypeGoal {
         Self {
             type_oid,
             coercion: CoercionContext::Implicit,
+            source_span: None,
         }
     }
 
@@ -60,7 +67,16 @@ impl TypeGoal {
         Self {
             type_oid,
             coercion: CoercionContext::Assignment,
+            source_span: None,
         }
+    }
+
+    /// Attach a `source_span` (the range that establishes this expectation,
+    /// e.g. the column reference being assigned to). Used to render a
+    /// secondary label in type-mismatch diagnostics.
+    pub fn with_source(mut self, span: crate::error::SourceSpan) -> Self {
+        self.source_span = Some(span);
+        self
     }
 
     pub fn has_expectation(&self) -> bool {
@@ -564,8 +580,9 @@ pub(crate) fn infer_expr(
         ))),
     }?;
 
-    // Verify result is compatible with the goal type.
-    check_goal_compatibility(&result, &goal, snapshot)?;
+    // Verify result is compatible with the goal type. Pass the location
+    // of the offending expression so a `TypeMismatch` carries a snippet.
+    check_goal_compatibility(&result, &goal, snapshot, crate::error::node_location(node))?;
 
     Ok(result)
 }
@@ -585,6 +602,7 @@ fn check_goal_compatibility(
     result: &ExprType,
     goal: &TypeGoal,
     snapshot: &PgCatalog,
+    location: Option<i32>,
 ) -> Result<(), AnalyzeError> {
     if !goal.has_expectation() {
         return Ok(());
@@ -614,15 +632,33 @@ fn check_goal_compatibility(
             target_te.typname
         )));
     }
-    Err(AnalyzeError::TypeMismatch {
-        actual: type_display_name(result.type_oid, snapshot),
-        expected: type_display_name(goal.type_oid, snapshot),
-        context: format!(
-            "cannot coerce {} to {}",
-            type_display_name(result.type_oid, snapshot),
-            type_display_name(goal.type_oid, snapshot),
-        ),
-    })
+    let actual = type_display_name(result.type_oid, snapshot);
+    let expected = type_display_name(goal.type_oid, snapshot);
+    let context = format!("cannot coerce {actual} to {expected}");
+
+    let primary_span = location.and_then(|loc| {
+        // `from_node_token` covers identifiers, numeric literals, and
+        // quoted strings — TypeMismatch can fire on any of those.
+        crate::error::SourceSpan::from_node_token(loc)
+            .or_else(|| crate::error::SourceSpan::from_location(loc))
+    });
+
+    // When the goal carries a `source_span` (the column being assigned, the
+    // operand setting the expectation, …), surface it as a secondary label
+    // so the diagnostic shows both sides.
+    let secondary = goal
+        .source_span
+        .map(|s| crate::error::DiagnosticLabel::new(s, format!("expected {expected} here")));
+
+    Err(crate::error::RawError::type_mismatch(
+        actual,
+        expected,
+        context,
+        primary_span,
+        secondary,
+        None,
+    )
+    .finalize_implicit())
 }
 
 fn type_display_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
@@ -693,7 +729,11 @@ fn infer_column_ref(
         }
     };
 
-    match scope.resolve_column(table, column) {
+    match scope.resolve_column(
+        table,
+        column,
+        crate::error::SourceSpan::from_node_qname(col_ref.location),
+    ) {
         Ok(col) => {
             let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
             Ok(ExprType {
@@ -1027,7 +1067,7 @@ fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<V
         [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
         _ => return None,
     };
-    let col = scope.resolve_column(table, column).ok()?;
+    let col = scope.resolve_column(table, column, None).ok()?;
     col.record_fields.clone()
 }
 
@@ -1063,7 +1103,7 @@ fn resolve_funccall_out_args(
     }
 
     let resolved =
-        match crate::functions::resolve_function(snapshot, schema, name, &arg_types, false) {
+        match crate::functions::resolve_function(snapshot, schema, name, &arg_types, false, None) {
             Ok(r) => r,
             Err(_) => return Ok(None),
         };
@@ -1417,7 +1457,14 @@ fn infer_func_call(
     }
 
     // Resolve function with inferred arg types (UNKNOWN treated as wildcard).
-    let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, func.agg_star)?;
+    let resolved = functions::resolve_function(
+        snapshot,
+        schema,
+        name,
+        &arg_types,
+        func.agg_star,
+        crate::error::SourceSpan::from_node_qname(func.location),
+    )?;
 
     // PG forbids aggregates / window functions nested inside aggregate
     // arguments (`SUM(COUNT(*))`). We catch it here, after resolution,
@@ -2104,9 +2151,14 @@ fn infer_a_expr(
     let left_unknown = left_oid_resolved.map(|o| o == oid::UNKNOWN).unwrap_or(true);
     let right_unknown = right_oid_resolved == oid::UNKNOWN;
     if left_unknown && right_unknown {
-        return Err(AnalyzeError::IndeterminateType(format!(
-            "could not determine data type of operator {op_name}"
-        )));
+        let span = (expr.location >= 0)
+            .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
+        return Err(crate::error::RawError::indeterminate_type(
+            format!("could not determine data type of operator {op_name}"),
+            span,
+            Some("add an explicit type cast to one side, e.g. `expr::int4`".into()),
+        )
+        .finalize_implicit());
     }
     // PG (SQLSTATE 42883): `operator does not exist: <left> <op> <right>`.
     // Use PG's user-facing type names (`integer`, `bigint`, …) so the
@@ -2116,9 +2168,16 @@ fn infer_a_expr(
         left_oid_resolved.unwrap_or(oid::UNKNOWN),
     );
     let right_pg = crate::ddl::util::format_type_for_message(snapshot, right_oid_resolved);
-    Err(AnalyzeError::UndefinedOperator(format!(
-        "operator does not exist: {left_pg} {op_name} {right_pg}"
-    )))
+    // `AExpr.location` points at the operator token; cover its length
+    // so the caret spans the operator symbol/name.
+    let span = (expr.location >= 0)
+        .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
+    Err(crate::error::RawError::undefined_operator(
+        format!("operator does not exist: {left_pg} {op_name} {right_pg}"),
+        span,
+        None,
+    )
+    .finalize_implicit())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

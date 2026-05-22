@@ -140,7 +140,7 @@ fn filter_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*) FILTER (WHERE ghost > 0) FROM posts"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT count(*) FILTER (WHERE ghost > 0) FROM posts\n  ·                               ──┬──\n  ·                                 ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -150,7 +150,7 @@ fn agg_order_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT array_agg(title ORDER BY ghost) FROM posts"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT array_agg(title ORDER BY ghost) FROM posts\n  ·                                 ──┬──\n  ·                                   ╰─ column does not exist\n  ╰────\n",
     );
 }
 

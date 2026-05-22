@@ -33,6 +33,7 @@
 
 mod coerce;
 mod ddl;
+mod diagnostic;
 mod error;
 mod expr;
 mod functions;
@@ -49,6 +50,7 @@ mod pg_sanity;
 mod resolve;
 mod scope;
 mod seed;
+mod suggest;
 mod types;
 mod typmod;
 

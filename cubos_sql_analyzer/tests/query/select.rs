@@ -44,7 +44,7 @@ fn limit_bool_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT true"),
         AnalyzeError::Invalid(_),
-        "argument of LIMIT must be type bigint, not type boolean",
+        "argument of LIMIT must be type bigint, not type boolean\n  ╭────\n1 │ SELECT id FROM users LIMIT true\n  ·                            ────\n  ╰────\n",
     );
 }
 
@@ -54,7 +54,7 @@ fn limit_text_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT name"),
         AnalyzeError::Invalid(_),
-        "argument of LIMIT must be type bigint, not type text",
+        "argument of LIMIT must be type bigint, not type text\n  ╭────\n1 │ SELECT id FROM users LIMIT name\n  ·                            ────\n  ╰────\n",
     );
 }
 
@@ -64,7 +64,7 @@ fn limit_timestamptz_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT created_at"),
         AnalyzeError::Invalid(_),
-        "argument of LIMIT must be type bigint, not type timestamp with time zone",
+        "argument of LIMIT must be type bigint, not type timestamp with time zone\n  ╭────\n1 │ SELECT id FROM users LIMIT created_at\n  ·                            ──────────\n  ╰────\n",
     );
 }
 
@@ -74,7 +74,7 @@ fn offset_bool_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users OFFSET false"),
         AnalyzeError::Invalid(_),
-        "argument of OFFSET must be type bigint, not type boolean",
+        "argument of OFFSET must be type bigint, not type boolean\n  ╭────\n1 │ SELECT id FROM users OFFSET false\n  ·                             ─────\n  ╰────\n",
     );
 }
 
@@ -322,7 +322,7 @@ fn err_ambiguous_column_lists_candidate_tables() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "column reference \"id\" is ambiguous (could be: u.id, p.id)",
+        "column reference \"id\" is ambiguous (could be: u.id, p.id)\n  ╭────\n1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id\n  ·        ─┬\n  ·         ╰─ column does not exist\n  ╰────\n  help: did you mean \"id\"?\n",
     );
 }
 
@@ -336,7 +336,7 @@ fn err_ambiguous_column_lists_three_candidates() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "column reference \"id\" is ambiguous (could be: u.id, p.id, c.id)",
+        "column reference \"id\" is ambiguous (could be: u.id, p.id, c.id)\n  ╭────\n1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id INNER JOIN comments c ON c.post_id = p.id\n  ·        ─┬\n  ·         ╰─ column does not exist\n  ╰────\n  help: did you mean \"id\"?\n",
     );
 }
 
@@ -527,7 +527,7 @@ fn order_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users ORDER BY ghost"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT id FROM users ORDER BY ghost\n  ·                               ──┬──\n  ·                                 ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -552,6 +552,285 @@ fn order_by_complex_expression_with_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT name AS ghost FROM users ORDER BY ghost + 1"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT name AS ghost FROM users ORDER BY ghost + 1\n  ·                                          ──┬──\n  ·                                            ╰─ column does not exist\n  ╰────\n",
+    );
+}
+
+// ── UndefinedTable: full rendered diagnostic ────────────────────────────────
+//
+// The analyzer renders `UndefinedTable` with a `rustc`-style snippet that
+// pinpoints the offending token in the SQL and (when possible) suggests a
+// closely-named relation. The first line is the PostgreSQL-verbatim
+// message — `pg_sanity`'s prefix check still passes — and the rest is
+// extra context.
+
+#[test]
+fn undefined_table_in_from_renders_snippet_and_hint() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM userz WHERE id = 1"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ SELECT id FROM userz WHERE id = 1
+  ·                ──┬──
+  ·                  ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_with_no_close_match_omits_hint() {
+    // `xyzabc` is too distant from any visible relation — no `did you mean`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM xyzabc"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"xyzabc\" does not exist
+  ╭────
+1 │ SELECT id FROM xyzabc
+  ·                ───┬──
+  ·                   ╰─ relation does not exist
+  ╰────\n",
+    );
+}
+
+#[test]
+fn undefined_table_schema_qualified_caret_covers_full_name() {
+    // `public.userz` — caret underlines the qualified form (12 chars), not
+    // just the relation name. `at_qualified_name` walks the `schema.name`
+    // form when the AST `location` points at the start of `public`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM public.userz"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ SELECT id FROM public.userz
+  ·                ──────┬─────
+  ·                      ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_multiline_sql_locates_offending_line() {
+    // Multi-line SQL: line/column point at the correct line, snippet shows
+    // only that line, gutter widens to the largest displayed line number.
+    let db = setup();
+    let sql = "SELECT id\nFROM userz\nWHERE id = 1";
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+2 │ FROM userz
+  ·      ──┬──
+  ·        ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_with_named_param_keeps_original_offsets() {
+    // The lexer rewrites `$id` to `$1` before parsing, but the diagnostic
+    // points at the relation in the ORIGINAL SQL — so the column stays
+    // aligned with what the user wrote, not with the rewritten form.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM userz WHERE id = $id"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ SELECT * FROM userz WHERE id = $id
+  ·               ──┬──
+  ·                 ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_in_join_locates_second_relation() {
+    // The first relation exists; only the JOIN's right side is bad. The
+    // caret must point at the second relation, not the first.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT u.id FROM users u JOIN postz p ON p.user_id = u.id"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"postz\" does not exist
+  ╭────
+1 │ SELECT u.id FROM users u JOIN postz p ON p.user_id = u.id
+  ·                               ──┬──
+  ·                                 ╰─ relation does not exist
+  ╰────
+  help: did you mean \"posts\"?\n",
+    );
+}
+
+// ── UndefinedColumn: full rendered diagnostic ──────────────────────────────
+
+#[test]
+fn undefined_column_bare_with_hint() {
+    // `nme` is one edit away from `name` — the snippet should point at the
+    // typo and offer a hint.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT nme FROM users"),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column \"nme\" does not exist
+  ╭────
+1 │ SELECT nme FROM users
+  ·        ─┬─
+  ·         ╰─ column does not exist
+  ╰────
+  help: did you mean \"name\"?
+",
+    );
+}
+
+#[test]
+fn undefined_column_qualified_caret_covers_full_ref() {
+    // `u.nme` — caret covers the qualified column reference.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT u.nme FROM users u"),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column u.nme does not exist
+  ╭────
+1 │ SELECT u.nme FROM users u
+  ·        ──┬──
+  ·          ╰─ column does not exist
+  ╰────
+  help: did you mean \"name\"?
+",
+    );
+}
+
+#[test]
+fn undefined_column_in_where_locates_correct_token() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE ema = 'x'"),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column \"ema\" does not exist
+  ╭────
+1 │ SELECT id FROM users WHERE ema = 'x'
+  ·                            ─┬─
+  ·                             ╰─ column does not exist
+  ╰────
+  help: did you mean \"email\"?
+",
+    );
+}
+
+// ── UndefinedFunction: full rendered diagnostic ────────────────────────────
+
+#[test]
+fn undefined_function_with_hint() {
+    // `lengt(name)` — analyzer's first-pass overload lookup finds no name
+    // match at all, so the wording stays in the `function name() does not
+    // exist` form (no arg-types interpolation). The caret + hint still
+    // point at the typo.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT lengt(name) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "\
+function lengt() does not exist
+  ╭────
+1 │ SELECT lengt(name) FROM users
+  ·        ──┬──
+  ·          ╰─ function does not exist
+  ╰────
+  help: did you mean \"length\"?
+",
+    );
+}
+
+#[test]
+fn undefined_function_schema_qualified() {
+    // `pg_catalog.nonexisting()` — caret covers the qualified name.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT pg_catalog.nonexisting() FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "\
+function nonexisting() does not exist
+  ╭────
+1 │ SELECT pg_catalog.nonexisting() FROM users
+  ·        ───────────┬──────────
+  ·                   ╰─ function does not exist
+  ╰────
+",
+    );
+}
+
+#[test]
+fn undefined_column_ambiguous_lists_candidates() {
+    // `id` exists in both `users` and `posts` — the diagnostic lists both
+    // qualified candidates in the message body. The hint still surfaces
+    // `did you mean "id"` because the suggester sees a perfect match (the
+    // column DOES exist, it just needs qualification) — acceptable noise
+    // until we tighten the hint logic for the ambiguous case.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users u JOIN posts p ON p.user_id = u.id"),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column reference \"id\" is ambiguous (could be: u.id, p.id)
+  ╭────
+1 │ SELECT id FROM users u JOIN posts p ON p.user_id = u.id
+  ·        ─┬
+  ·         ╰─ column does not exist
+  ╰────
+  help: did you mean \"id\"?
+",
+    );
+}
+
+// ── Lex errors: snippet points at the unclosed token start ─────────────────
+
+#[test]
+fn lex_unclosed_string_locates_opening_quote() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE name = 'oops"),
+        AnalyzeError::Lex(_),
+        "\
+unclosed string literal at byte 34
+  ╭────
+1 │ SELECT id FROM users WHERE name = 'oops
+  ·                                   ─
+  ╰────
+",
+    );
+}
+
+#[test]
+fn lex_unclosed_block_comment_locates_opening_slash_star() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT 1 /* unterminated"),
+        AnalyzeError::Lex(_),
+        "\
+unclosed block comment at byte 9
+  ╭────
+1 │ SELECT 1 /* unterminated
+  ·          ─
+  ╰────
+",
     );
 }

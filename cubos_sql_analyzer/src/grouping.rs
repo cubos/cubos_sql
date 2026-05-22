@@ -199,7 +199,7 @@ fn singleton_set(node: &protobuf::Node, scope: &Scope) -> HashSet<(String, Strin
         [_schema, tbl, col] => (Some(*tbl), *col),
         _ => return out,
     };
-    if let Ok(col) = scope.resolve_column(table, column) {
+    if let Ok(col) = scope.resolve_column(table, column, None) {
         out.insert((col.table_alias.clone(), col.name.clone()));
     }
     out

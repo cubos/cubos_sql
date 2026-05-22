@@ -49,7 +49,7 @@ fn insert_into_nonexistent_column_errors() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (nonexistent) VALUES ($p1)"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nonexistent\" of relation \"users\" does not exist",
+        "column \"nonexistent\" of relation \"users\" does not exist\n  ╭────\n1 │ INSERT INTO users (nonexistent) VALUES ($p1)\n  ·                    ─────┬─────\n  ·                         ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -59,7 +59,7 @@ fn update_set_nonexistent_column_errors() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET nonexistent = $p1 WHERE id = $p2"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nonexistent\" of relation \"users\" does not exist",
+        "column \"nonexistent\" of relation \"users\" does not exist\n  ╭────\n1 │ UPDATE users SET nonexistent = $p1 WHERE id = $p2\n  ·                  ─────┬─────\n  ·                       ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -524,7 +524,7 @@ fn insert_on_conflict_do_update_set_unknown_column_in_value_rejected() {
              ON CONFLICT (email) DO UPDATE SET name = ghost",
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) ON CONFLICT (email) DO UPDATE SET name = ghost\n  ·                                                                                                      ──┬──\n  ·                                                                                                        ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -539,7 +539,7 @@ fn insert_on_conflict_do_update_where_unknown_column_rejected() {
              ON CONFLICT (email) DO UPDATE SET name = 'x' WHERE ghost",
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist",
+        "column \"ghost\" does not exist\n  ╭────\n1 │ INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) ON CONFLICT (email) DO UPDATE SET name = 'x' WHERE ghost\n  ·                                                                                                                ──┬──\n  ·                                                                                                                  ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -1258,7 +1258,7 @@ fn merge_update_unknown_column_errors() {
              WHEN MATCHED THEN UPDATE SET ghost = 'x'"
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" of relation \"users\" does not exist",
+        "column \"ghost\" of relation \"users\" does not exist\n  ╭────\n1 │ MERGE INTO users u USING (SELECT $p1::bigint AS id) src ON u.id = src.id WHEN MATCHED THEN UPDATE SET ghost = 'x'\n  ·                                                                                                       ──┬──\n  ·                                                                                                         ╰─ column does not exist\n  ╰────\n",
     );
 }
 
@@ -1529,4 +1529,167 @@ fn can_run_as_subquery_with_delete_cte_select_body() {
         )
         .unwrap();
     assert!(!s.can_run_as_subquery);
+}
+
+// ── UndefinedTable in DML statements ────────────────────────────────────────
+//
+// Each DML statement type (INSERT, UPDATE, DELETE, MERGE) carries its target
+// relation on its own AST node, with a separate analyzer code path. The
+// diagnostic must point at the exact relation reference regardless of which
+// statement kind is failing.
+
+#[test]
+fn undefined_table_in_insert_renders_snippet_and_hint() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO userz (name, email) VALUES ('a', 'b')"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ INSERT INTO userz (name, email) VALUES ('a', 'b')
+  ·             ──┬──
+  ·               ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_in_update_renders_snippet_and_hint() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("UPDATE userz SET name = 'y' WHERE id = 1"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ UPDATE userz SET name = 'y' WHERE id = 1
+  ·        ──┬──
+  ·          ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_in_delete_renders_snippet_and_hint() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("DELETE FROM userz WHERE id = 1"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ DELETE FROM userz WHERE id = 1
+  ·             ──┬──
+  ·               ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_in_merge_renders_snippet_and_hint() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze(
+            "MERGE INTO userz AS t USING posts p ON t.id = p.user_id \
+             WHEN MATCHED THEN DELETE"
+        ),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"userz\" does not exist
+  ╭────
+1 │ MERGE INTO userz AS t USING posts p ON t.id = p.user_id WHEN MATCHED THEN DELETE
+  ·            ──┬──
+  ·              ╰─ relation does not exist
+  ╰────
+  help: did you mean \"users\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_in_update_from_locates_secondary_relation() {
+    // `UPDATE ... FROM <bad>` — the target exists, but the FROM list adds a
+    // missing relation. Hits the `process_from_item` → `add_table` path
+    // inside the UPDATE analyzer rather than the target check.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("UPDATE users SET name = p.title FROM postz p WHERE p.user_id = users.id"),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"postz\" does not exist
+  ╭────
+1 │ UPDATE users SET name = p.title FROM postz p WHERE p.user_id = users.id
+  ·                                      ──┬──
+  ·                                        ╰─ relation does not exist
+  ╰────
+  help: did you mean \"posts\"?\n",
+    );
+}
+
+#[test]
+fn undefined_table_multiline_update_from_locates_offending_line() {
+    // A real-world-looking multi-line UPDATE with the failure on a line
+    // far from the start. Confirms that line/column pin to the right line
+    // and the snippet shows only that line (the rest of the SQL is elided).
+    let db = setup();
+    let sql = "UPDATE users\n   SET name = p.title\n  FROM postz p\n WHERE p.user_id = users.id";
+    assert_analyze_err!(
+        db.analyze(sql),
+        AnalyzeError::UndefinedTable(_),
+        "\
+relation \"postz\" does not exist
+  ╭────
+3 │   FROM postz p
+  ·        ──┬──
+  ·          ╰─ relation does not exist
+  ╰────
+  help: did you mean \"posts\"?\n",
+    );
+}
+
+// ── TypeMismatch: full rendered diagnostic ─────────────────────────────────
+
+#[test]
+fn type_mismatch_insert_int_into_bool_column() {
+    // Adding a BOOL column to `users` and supplying an integer literal —
+    // the snippet pinpoints the literal and the caret label spells out
+    // the actual vs expected types.
+    let mut db = setup();
+    db.apply_sql("ALTER TABLE users ADD COLUMN flag BOOLEAN NOT NULL DEFAULT false")
+        .unwrap();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (name, email, flag) VALUES ('a', 'b', 42)"),
+        AnalyzeError::TypeMismatch { .. },
+        "\
+cannot coerce int4 to bool
+  ╭────
+1 │ INSERT INTO users (name, email, flag) VALUES ('a', 'b', 42)
+  ·                                 ──┬─                    ─┬
+  ·                                   │                      ╰─ expected bool, found int4
+  ·                                   ╰─ expected bool here
+  ╰────
+",
+    );
+}
+
+#[test]
+fn type_mismatch_insert_bool_into_bigint_column() {
+    // Reverse direction: BOOL literal where BIGINT is expected.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO posts (user_id, title) VALUES (true, 'hi')"),
+        AnalyzeError::TypeMismatch { .. },
+        "\
+cannot coerce bool to int8
+  ╭────
+1 │ INSERT INTO posts (user_id, title) VALUES (true, 'hi')
+  ·                    ───┬───                 ──┬─
+  ·                       │                      ╰─ expected int8, found bool
+  ·                       ╰─ expected int8 here
+  ╰────
+",
+    );
 }

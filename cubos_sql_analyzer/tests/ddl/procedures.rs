@@ -36,7 +36,15 @@ fn procedure_is_not_callable_in_expressions() {
     assert_analyze_err!(
         db.analyze("SELECT do_thing(1)"),
         AnalyzeError::UndefinedFunction(_),
-        "do_thing(integer) is a procedure",
+        "\
+do_thing(integer) is a procedure
+  ╭────
+1 │ SELECT do_thing(1)
+  ·        ────┬───
+  ·            ╰─ function does not exist
+  ╰────
+  help: did you mean \"do_thing\"?
+",
     );
 }
 

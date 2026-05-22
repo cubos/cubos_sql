@@ -142,6 +142,7 @@ pub(crate) fn fuse(
         sql,
         params: lex_params,
         spreads: lex_spreads,
+        rewrites: _,
     } = lex_output;
 
     let num_regular = lex_params.len();
@@ -833,9 +834,14 @@ fn analyze_select_with_ctes_and_outer(
             .map(|t| t.type_oid)
             .unwrap_or(oid::UNKNOWN);
             let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-            return Err(AnalyzeError::Invalid(format!(
-                "argument of {label} must be type bigint, not type {actual_pg}"
-            )));
+            let span = crate::error::node_location(limit_node)
+                .and_then(crate::error::SourceSpan::from_node_qname);
+            return Err(crate::error::RawError::invalid(
+                format!("argument of {label} must be type bigint, not type {actual_pg}"),
+                span,
+                None,
+            )
+            .finalize_implicit());
         }
     }
 
@@ -928,10 +934,16 @@ fn analyze_insert(
             &relation.relname,
         )
         .ok_or_else(|| {
-            AnalyzeError::UndefinedTable(format!(
-                "relation \"{}\" does not exist",
-                relation.relname
-            ))
+            crate::scope::undefined_table_error(
+                snapshot,
+                if relation.schemaname.is_empty() {
+                    None
+                } else {
+                    Some(relation.schemaname.as_str())
+                },
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
         })?;
 
     // Infer param types from column positions in INSERT ... VALUES.
@@ -960,12 +972,17 @@ fn analyze_insert(
     // this check the analyzer would silently treat the corresponding `$N`
     // parameter as text via the UNKNOWN fallback, masking a real bug in the
     // caller's SQL.
-    for col in &col_names {
-        if !table_attrs.iter().any(|c| &c.attname == col) {
-            return Err(AnalyzeError::UndefinedColumn(format!(
-                "column \"{col}\" of relation \"{}\" does not exist",
-                table_relname,
-            )));
+    for n in &ins.cols {
+        let Some(node::Node::ResTarget(rt)) = n.node.as_ref() else {
+            continue;
+        };
+        if !table_attrs.iter().any(|c| c.attname == rt.name) {
+            return Err(crate::scope::undefined_dml_column_error(
+                &rt.name,
+                &table_relname,
+                &table_attrs,
+                crate::error::SourceSpan::from_node_qname(rt.location),
+            ));
         }
     }
 
@@ -1039,6 +1056,17 @@ fn analyze_insert(
                                 .get(i)
                                 .and_then(|cn| table_attrs.iter().find(|c| &c.attname == cn))
                         };
+                        // The matching `ResTarget` in `ins.cols` for column
+                        // `i` — used to build a `source_span` so a type
+                        // mismatch surfaces a secondary label at the
+                        // column reference (not just at the value).
+                        let target_loc = ins.cols.get(i).and_then(|n| {
+                            if let Some(node::Node::ResTarget(rt)) = n.node.as_ref() {
+                                crate::error::SourceSpan::from_node_qname(rt.location)
+                            } else {
+                                None
+                            }
+                        });
                         if let Some(tc) = target_col
                             && is_sql_null_literal(val)
                             && let Some(err) =
@@ -1081,6 +1109,10 @@ fn analyze_insert(
                         let goal = target_col
                             .map(|tc| TypeGoal::assignment(tc.atttypid))
                             .unwrap_or(TypeGoal::NONE);
+                        let goal = match target_loc {
+                            Some(s) => goal.with_source(s),
+                            None => goal,
+                        };
                         expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
                         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
@@ -1261,10 +1293,16 @@ fn analyze_update(
             &relation.relname,
         )
         .ok_or_else(|| {
-            AnalyzeError::UndefinedTable(format!(
-                "relation \"{}\" does not exist",
-                relation.relname
-            ))
+            crate::scope::undefined_table_error(
+                snapshot,
+                if relation.schemaname.is_empty() {
+                    None
+                } else {
+                    Some(relation.schemaname.as_str())
+                },
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
         })?;
 
     let table_oid = table.oid;
@@ -1325,10 +1363,12 @@ fn analyze_update(
                 .iter()
                 .find(|c| c.attname == rt.name)
                 .ok_or_else(|| {
-                    AnalyzeError::UndefinedColumn(format!(
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        rt.name, table_relname,
-                    ))
+                    crate::scope::undefined_dml_column_error(
+                        &rt.name,
+                        &table_relname,
+                        &table_attrs,
+                        crate::error::SourceSpan::from_node_qname(rt.location),
+                    )
                 })?;
             // Catch `UPDATE … SET not_null_col = NULL` statically — PG
             // raises a runtime `null value in column … violates not-null
@@ -1362,6 +1402,13 @@ fn analyze_update(
                 )));
             }
             let goal = TypeGoal::assignment(tc.atttypid);
+            // Attach the target column's reference span so a TypeMismatch
+            // surfaces a secondary label pointing at the `col =` site.
+            let goal = if let Some(s) = crate::error::SourceSpan::from_node_qname(rt.location) {
+                goal.with_source(s)
+            } else {
+                goal
+            };
             expr::infer_expr(val, &scope, &null_ctx, snapshot, params, goal)?;
 
             if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
@@ -1408,10 +1455,16 @@ fn analyze_delete(
             &relation.relname,
         )
         .ok_or_else(|| {
-            AnalyzeError::UndefinedTable(format!(
-                "relation \"{}\" does not exist",
-                relation.relname
-            ))
+            crate::scope::undefined_table_error(
+                snapshot,
+                if relation.schemaname.is_empty() {
+                    None
+                } else {
+                    Some(relation.schemaname.as_str())
+                },
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
         })?;
 
     let table_relname = table.relname.clone();
@@ -1484,10 +1537,16 @@ fn analyze_merge(
             &relation.relname,
         )
         .ok_or_else(|| {
-            AnalyzeError::UndefinedTable(format!(
-                "relation \"{}\" does not exist",
-                relation.relname
-            ))
+            crate::scope::undefined_table_error(
+                snapshot,
+                if relation.schemaname.is_empty() {
+                    None
+                } else {
+                    Some(relation.schemaname.as_str())
+                },
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
         })?;
 
     let table_oid = table.oid;
@@ -1614,10 +1673,12 @@ fn walk_merge_when_clause(
                     .iter()
                     .find(|c| c.attname == rt.name)
                     .ok_or_else(|| {
-                        AnalyzeError::UndefinedColumn(format!(
-                            "column \"{}\" of relation \"{}\" does not exist",
-                            rt.name, table_relname,
-                        ))
+                        crate::scope::undefined_dml_column_error(
+                            &rt.name,
+                            table_relname,
+                            table_attrs,
+                            crate::error::SourceSpan::from_node_qname(rt.location),
+                        )
                     })?;
                 if is_sql_null_literal(val)
                     && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "assign")
@@ -1666,28 +1727,30 @@ fn walk_merge_when_clause(
             // column names (each as a `ResTarget` with `name`), `values`
             // holds the parallel value expressions. When `target_list` is
             // empty PG implies the full attribute list.
-            let col_names: Vec<String> = when
+            let res_targets: Vec<&protobuf::ResTarget> = when
                 .target_list
                 .iter()
                 .filter_map(|n| match n.node.as_ref()? {
-                    node::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
+                    node::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.as_ref()),
                     _ => None,
                 })
                 .collect();
-            let target_attrs: Vec<&crate::pg_catalog::PgAttribute> = if col_names.is_empty() {
+            let target_attrs: Vec<&crate::pg_catalog::PgAttribute> = if res_targets.is_empty() {
                 table_attrs.iter().collect()
             } else {
-                col_names
+                res_targets
                     .iter()
-                    .map(|name| {
+                    .map(|rt| {
                         table_attrs
                             .iter()
-                            .find(|c| &c.attname == name)
+                            .find(|c| c.attname == rt.name)
                             .ok_or_else(|| {
-                                AnalyzeError::UndefinedColumn(format!(
-                                    "column \"{}\" of relation \"{}\" does not exist",
-                                    name, table_relname,
-                                ))
+                                crate::scope::undefined_dml_column_error(
+                                    &rt.name,
+                                    table_relname,
+                                    table_attrs,
+                                    crate::error::SourceSpan::from_node_qname(rt.location),
+                                )
                             })
                     })
                     .collect::<Result<_, _>>()?
@@ -2133,7 +2196,13 @@ fn process_from_item(
             } else {
                 Some(rv.schemaname.as_str())
             };
-            scope.add_table(snapshot, schema, &rv.relname, alias)?;
+            scope.add_table(
+                snapshot,
+                schema,
+                &rv.relname,
+                alias,
+                crate::error::SourceSpan::from_node_qname(rv.location),
+            )?;
         }
         node::Node::JoinExpr(join) => {
             // Process left and right sides.
@@ -2435,11 +2504,17 @@ fn process_range_function(
                     // searches for a single-arg overload of the offending
                     // type). Mirror that and append our richer detail.
                     let typname = type_entry.typname.clone();
-                    AnalyzeError::UndefinedFunction(format!(
-                        "function pg_catalog.unnest({typname}) does not exist \
-                         (unnest argument {} is not an array)",
-                        i + 1,
-                    ))
+                    crate::functions::undefined_function_error(
+                        snapshot,
+                        Some("pg_catalog"),
+                        "unnest",
+                        format!(
+                            "function pg_catalog.unnest({typname}) does not exist \
+                             (unnest argument {} is not an array)",
+                            i + 1,
+                        ),
+                        crate::error::SourceSpan::from_node_qname(func_call.location),
+                    )
                 })?;
             // Multi-arg unnest is strict: each output column is NOT NULL iff
             // the corresponding input array is NOT NULL (a NULL array yields
@@ -2460,7 +2535,14 @@ fn process_range_function(
         }
         col_specs
     } else {
-        let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, false)?;
+        let resolved = functions::resolve_function(
+            snapshot,
+            schema,
+            name,
+            &arg_types,
+            false,
+            crate::error::SourceSpan::from_node_qname(func_call.location),
+        )?;
 
         // Build the scope columns.
         if !resolved.out_args.is_empty() {
@@ -2757,7 +2839,8 @@ fn resolve_funccall_record_fields(
         .unwrap_or(oid::UNKNOWN);
         arg_types.push(t);
     }
-    let resolved = functions::resolve_function(snapshot, schema, name, &arg_types, false).ok()?;
+    let resolved =
+        functions::resolve_function(snapshot, schema, name, &arg_types, false, None).ok()?;
     if resolved.out_args.is_empty() {
         None
     } else {

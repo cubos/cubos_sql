@@ -83,6 +83,23 @@ impl PgCatalog {
         None
     }
 
+    /// Iterate over `relname`s for tables/views/sequences visible in
+    /// `schema` (or in the search path when `schema` is `None`). Used to
+    /// produce "did you mean ..." hints for `UndefinedTable`.
+    pub fn visible_relnames<'a>(
+        &'a self,
+        schema: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.schemas_for_lookup(schema)
+            .into_iter()
+            .flat_map(move |nsoid| {
+                self.class_by_qname
+                    .iter()
+                    .filter(move |((ns, _), _)| *ns == nsoid)
+                    .map(|((_, name), _)| name.as_str())
+            })
+    }
+
     /// Look up a type by name, walking the search path when `schema` is
     /// `None`.
     pub fn resolve_type_by_name(&self, schema: Option<&str>, name: &str) -> Option<&PgType> {
@@ -233,6 +250,23 @@ impl PgCatalog {
             ),
             None => false,
         }
+    }
+
+    /// Iterate over function names visible from `schema` (or the full
+    /// search path when `schema` is `None`). Used for `did you mean` hints
+    /// on `UndefinedFunction`.
+    pub fn visible_function_names<'a>(
+        &'a self,
+        schema: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.schemas_for_lookup(schema)
+            .into_iter()
+            .flat_map(move |nsoid| {
+                self.proc_by_qname
+                    .iter()
+                    .filter(move |((ns, _), _)| *ns == nsoid)
+                    .map(|((_, name), _)| name.as_str())
+            })
     }
 
     /// Find all functions matching a name, walking the search path when

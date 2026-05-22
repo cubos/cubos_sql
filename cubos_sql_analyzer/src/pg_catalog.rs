@@ -1257,7 +1257,23 @@ impl PgCatalog {
     fn analyze_with_sql(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
         let lex_output = match lex(sql) {
             Ok(l) => l,
-            Err(e) => return (sql.to_string(), Err(e.into())),
+            Err(e) => {
+                // The lexer's own errors carry a `position` in the original
+                // SQL — render them with a snippet so the user sees the
+                // offending location. Install a guard with an empty
+                // `LexOutput` so offset translation is the identity.
+                let empty_lex = crate::param::LexOutput {
+                    sql: sql.to_string(),
+                    params: Vec::new(),
+                    spreads: Vec::new(),
+                    rewrites: Vec::new(),
+                };
+                let _guard = crate::error::DiagContextGuard::install(sql, &empty_lex);
+                let position = e.position();
+                let span = crate::error::SourceSpan::one_char_at(position);
+                let raw = crate::error::RawError::lex(e.to_string(), Some(span));
+                return (sql.to_string(), Err(raw.finalize_implicit()));
+            }
         };
 
         // Collect explicit nullability annotations from the lexer, ordered by
@@ -1286,11 +1302,25 @@ impl PgCatalog {
             }
         };
 
-        let (columns, mut info_params, can_run_as_subquery) =
+        // Install the diagnostic context so that error sites deep in the
+        // analyzer can render snippet + caret + hint against the original
+        // SQL. When the query has spreads, `analysis_sql` differs from
+        // `lex_output.sql` (the lexer-rewritten form the post-lex offsets
+        // refer to) — falling back to no context yields flat error messages
+        // for those queries, which is acceptable until we extend the offset
+        // map across spread expansion.
+        let (columns, mut info_params, can_run_as_subquery) = if lex_output.spreads.is_empty() {
+            let _guard = crate::error::DiagContextGuard::install(sql, &lex_output);
             match analyze_static(self, &analysis_sql, &param_nullability) {
                 Ok(p) => p,
                 Err(e) => return (analysis_sql, Err(e)),
-            };
+            }
+        } else {
+            match analyze_static(self, &analysis_sql, &param_nullability) {
+                Ok(p) => p,
+                Err(e) => return (analysis_sql, Err(e)),
+            }
+        };
 
         // Invariant: the analyzer must produce exactly one param entry per
         // positional placeholder the lexer extracted. Surface a mismatch as

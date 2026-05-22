@@ -11,7 +11,7 @@
 //! extracted in normal context -- `$name` inside a string literal or comment
 //! is left untouched.
 
-use crate::param::{LexOutput, Param, SpreadField, SpreadParam};
+use crate::param::{LexOutput, Param, Rewrite, SpreadField, SpreadParam};
 
 /// An error produced when the lexer encounters invalid SQL syntax.
 ///
@@ -29,6 +29,18 @@ pub(crate) enum LexError {
     UnclosedDollarQuote { tag: String, position: usize },
     /// A double-quoted identifier (`"..."`) was opened but never closed.
     UnclosedQuotedIdentifier { position: usize },
+}
+
+impl LexError {
+    /// The byte offset in the original SQL where the unclosed token started.
+    pub(crate) fn position(&self) -> usize {
+        match self {
+            Self::UnclosedString { position }
+            | Self::UnclosedBlockComment { position }
+            | Self::UnclosedDollarQuote { position, .. }
+            | Self::UnclosedQuotedIdentifier { position } => *position,
+        }
+    }
 }
 
 impl std::fmt::Display for LexError {
@@ -109,6 +121,7 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
     let mut out = String::with_capacity(sql.len());
     let mut params: Vec<Param> = Vec::new();
     let mut spreads: Vec<SpreadParam> = Vec::new();
+    let mut rewrites: Vec<Rewrite> = Vec::new();
     // Map from param name to its 1-based positional index
     let mut param_indices: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -192,6 +205,14 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                     }
                                 }
                                 // Don't emit spread token — just record the offset
+                                let original_at = byte_offset_of(i, &char_byte_lens);
+                                let original_end = byte_offset_of(fi, &char_byte_lens);
+                                rewrites.push(Rewrite {
+                                    original_at,
+                                    post_lex_at: out_offset,
+                                    original_len: original_end - original_at,
+                                    post_lex_len: 0,
+                                });
                                 spreads.push(SpreadParam {
                                     name,
                                     fields: Some(fields),
@@ -199,6 +220,14 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                 });
                                 i = fi;
                             } else {
+                                let original_at = byte_offset_of(i, &char_byte_lens);
+                                let original_end = byte_offset_of(after_ident, &char_byte_lens);
+                                rewrites.push(Rewrite {
+                                    original_at,
+                                    post_lex_at: out_offset,
+                                    original_len: original_end - original_at,
+                                    post_lex_len: 0,
+                                });
                                 spreads.push(SpreadParam {
                                     name,
                                     fields: None,
@@ -250,8 +279,17 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                                 });
                                 idx
                             };
+                            let original_at = byte_offset_of(i, &char_byte_lens);
+                            let original_end = byte_offset_of(consume_to, &char_byte_lens);
+                            let post_lex_at = out.len();
                             let placeholder = format!("${next_idx}");
                             out.push_str(&placeholder);
+                            rewrites.push(Rewrite {
+                                original_at,
+                                post_lex_at,
+                                original_len: original_end - original_at,
+                                post_lex_len: placeholder.len(),
+                            });
                             // Record the byte offset right after this placeholder.
                             params[next_idx - 1].sql_offsets.push(out.len());
                             i = consume_to;
@@ -410,6 +448,7 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
         sql: out,
         params,
         spreads,
+        rewrites,
     })
 }
 
@@ -664,5 +703,52 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert!(fields[0].nullable);
         assert!(fields[1].nullable);
+    }
+
+    #[test]
+    fn rewrites_translate_named_param_offset() {
+        // `$name` (5 chars) becomes `$1` (2 chars) — delta is +3 on offsets
+        // after the rewrite when going post-lex -> original.
+        let out = lex("SELECT * FROM users WHERE id = $name AND age > 0").unwrap();
+        assert_eq!(out.sql, "SELECT * FROM users WHERE id = $1 AND age > 0");
+        assert_eq!(out.rewrites.len(), 1);
+
+        // Offset 0 (before rewrite): unchanged.
+        assert_eq!(out.original_offset(0), 0);
+        // Offset of "FROM" — also before the rewrite.
+        let from_post = out.sql.find("FROM").unwrap();
+        assert_eq!(
+            out.original_offset(from_post),
+            "SELECT * FROM users WHERE id = ".find("FROM").unwrap()
+        );
+        // Offset of "AND" — *after* the rewrite; should map back to the
+        // matching position in the original string.
+        let and_post = out.sql.find(" AND ").unwrap();
+        let and_orig = "SELECT * FROM users WHERE id = $name AND age > 0"
+            .find(" AND ")
+            .unwrap();
+        assert_eq!(out.original_offset(and_post), and_orig);
+    }
+
+    #[test]
+    fn rewrites_translate_spread_removal() {
+        // `$..items { a }` is removed entirely from the post-lex SQL.
+        let out = lex("INSERT INTO t VALUES $..items { a }").unwrap();
+        // Offset after the removed token should map back to its original position.
+        let post_end = out.sql.len();
+        let orig_end = "INSERT INTO t VALUES $..items { a }".len();
+        assert_eq!(out.original_offset(post_end), orig_end);
+    }
+
+    #[test]
+    fn rewrites_translate_multiple_params() {
+        // Multiple $name rewrites accumulate.
+        let out = lex("SELECT $first, $second_one, FROM_BIG_TABLE WHERE x = 1").unwrap();
+        // Find offset of "FROM_BIG_TABLE" in both forms.
+        let post = out.sql.find("FROM_BIG_TABLE").unwrap();
+        let orig = "SELECT $first, $second_one, FROM_BIG_TABLE WHERE x = 1"
+            .find("FROM_BIG_TABLE")
+            .unwrap();
+        assert_eq!(out.original_offset(post), orig);
     }
 }
