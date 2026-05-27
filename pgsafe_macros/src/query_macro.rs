@@ -229,21 +229,19 @@ fn parse_sql_literal_preserving_linebreaks(lit: &LitStr) -> String {
                     out.push(n as char);
                 }
             }
-            Some('u') => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let mut hex = String::new();
-                    for p in chars.by_ref() {
-                        if p == '}' {
-                            break;
-                        }
-                        hex.push(p);
+            Some('u') if chars.peek() == Some(&'{') => {
+                chars.next();
+                let mut hex = String::new();
+                for p in chars.by_ref() {
+                    if p == '}' {
+                        break;
                     }
-                    if let Ok(cp) = u32::from_str_radix(&hex, 16)
-                        && let Some(c) = char::from_u32(cp)
-                    {
-                        out.push(c);
-                    }
+                    hex.push(p);
+                }
+                if let Ok(cp) = u32::from_str_radix(&hex, 16)
+                    && let Some(c) = char::from_u32(cp)
+                {
+                    out.push(c);
                 }
             }
             Some(other) => out.push(other),
