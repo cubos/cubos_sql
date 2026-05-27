@@ -3,6 +3,7 @@ use pgsafe_core::config::MigrationsConfig;
 use std::fs;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use testcontainers::core::Mount;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -51,9 +52,14 @@ fn track_container(id: String) {
 /// Start a throwaway Postgres container on the latest tag with Docker's
 /// `--rm` flag set, so the container is deleted as soon as it exits — even
 /// when the Ryuk reaper is unavailable or a test panics before Drop runs.
+///
+/// PGDATA is mounted as tmpfs so Postgres runs entirely in RAM: no anonymous
+/// volume is created, so nothing is left behind on OrbStack/Docker after
+/// teardown. Also speeds up the test cycle (initdb + fsync go through memory).
 async fn start_postgres() -> ContainerAsync<Postgres> {
     let container = Postgres::default()
         .with_tag("latest")
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
         .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
         .start()
         .await

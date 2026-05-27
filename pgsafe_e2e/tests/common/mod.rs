@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 use deadpool_postgres::{Config, Pool, Runtime};
 use pgsafe::migrate::MigrationSource;
 use pgsafe_core::config::MigrationsConfig;
+use testcontainers::core::Mount;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -84,9 +85,15 @@ pub async fn setup() -> Pool {
             // deletes the container as soon as it exits — the fallback for
             // environments where the Ryuk reaper isn't running and would
             // otherwise leak containers on panic or abort.
+            //
+            // PGDATA is mounted as tmpfs so Postgres runs entirely in RAM:
+            // no anonymous volume gets created, so nothing is left behind on
+            // OrbStack/Docker after the container is removed. Also speeds up
+            // the test cycle (initdb + fsync go through memory).
             let container = Postgres::default()
                 .with_name("pgvector/pgvector")
                 .with_tag("pg18")
+                .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
                 .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
                 .start()
                 .await

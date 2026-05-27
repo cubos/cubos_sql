@@ -20,6 +20,7 @@ use pgsafe_analyzer::{
     QualifiedName, RelKind, TypCategory, TypType,
 };
 use testcontainers::ImageExt;
+use testcontainers::core::Mount;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -27,6 +28,7 @@ fn main() {
     eprintln!("Pulling postgres:latest from registry...");
     let request = Postgres::default()
         .with_tag("latest")
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
         .pull_image()
         .expect("failed to pull postgres:latest");
 
