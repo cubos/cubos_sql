@@ -2,9 +2,24 @@
 
 use crate::error::{AnalyzeError, RawError, SourceSpan};
 use crate::oid::PgTypeOid;
-use crate::pg_catalog::{PgAttribute, PgCatalog};
+use crate::pg_catalog::{PgAttribute, PgCatalog, SYSTEM_COLUMNS};
 use crate::qualified_name::QualifiedName;
 use crate::suggest::suggest_similar;
+
+fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
+    SYSTEM_COLUMNS
+        .iter()
+        .map(|&(name, type_oid, _attnum)| ScopeColumn {
+            name: name.to_owned(),
+            type_oid,
+            base_not_null: true,
+            typmod: None,
+            collation: None,
+            table_alias: alias.to_owned(),
+            record_fields: None,
+        })
+        .collect()
+}
 
 /// A resolved column with its type and base nullability (from table definition).
 #[derive(Debug, Clone)]
@@ -33,6 +48,11 @@ pub(crate) struct ScopeColumn {
 pub(crate) struct TableSource {
     pub alias: String,
     pub columns: Vec<ScopeColumn>,
+    /// PG's hidden columns (`tableoid`, `xmin`, ...) for real relations.
+    /// Kept separate so `SELECT *` expansion and ambiguity checks ignore them,
+    /// while explicit `t.tableoid` references still resolve. Empty for CTEs
+    /// and subqueries (PG doesn't expose system columns through those).
+    pub system_columns: Vec<ScopeColumn>,
     /// Qualified name of the backing relation, or `None` for derived sources
     /// (CTE, subquery). Set for real tables/views so that `alias.*` in an
     /// expression context can look up the composite type of the relation.
@@ -161,6 +181,7 @@ impl Scope {
         self.sources.push(TableSource {
             alias: alias.to_owned(),
             columns,
+            system_columns: system_columns_for(alias),
             source_qn: Some(QualifiedName::new(nspname, relname)),
         });
         Ok(())
@@ -171,6 +192,7 @@ impl Scope {
         self.sources.push(TableSource {
             alias: alias.to_owned(),
             columns,
+            system_columns: Vec::new(),
             source_qn: None,
         });
     }
@@ -198,6 +220,7 @@ impl Scope {
         self.sources.push(TableSource {
             alias: alias.to_owned(),
             columns: cols,
+            system_columns: system_columns_for(alias),
             source_qn: Some(qn),
         });
     }
@@ -218,7 +241,11 @@ impl Scope {
         if let Some(t) = table {
             for source in self.sources.iter().chain(self.outer_sources.iter()) {
                 if source.alias == t
-                    && let Some(col) = source.columns.iter().find(|c| c.name == column)
+                    && let Some(col) = source
+                        .columns
+                        .iter()
+                        .chain(source.system_columns.iter())
+                        .find(|c| c.name == column)
                 {
                     return Ok(col);
                 }

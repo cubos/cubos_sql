@@ -42,6 +42,10 @@ pub(crate) mod oid {
     pub const INT2: PgTypeOid = PgTypeOid::from_raw(21);
     pub const INT4: PgTypeOid = PgTypeOid::from_raw(23);
     pub const TEXT: PgTypeOid = PgTypeOid::from_raw(25);
+    pub const OID: PgTypeOid = PgTypeOid::from_raw(26);
+    pub const TID: PgTypeOid = PgTypeOid::from_raw(27);
+    pub const XID: PgTypeOid = PgTypeOid::from_raw(28);
+    pub const CID: PgTypeOid = PgTypeOid::from_raw(29);
     pub const FLOAT4: PgTypeOid = PgTypeOid::from_raw(700);
     pub const FLOAT8: PgTypeOid = PgTypeOid::from_raw(701);
     pub const UNKNOWN: PgTypeOid = PgTypeOid::from_raw(705);
@@ -50,6 +54,18 @@ pub(crate) mod oid {
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
 }
+
+/// PG's hidden system columns, present on every table/view. Negative attnums
+/// match PG's `pg_attribute` convention. Excluded from `SELECT *` expansion
+/// and from "did you mean" suggestions, but resolvable when named explicitly.
+pub const SYSTEM_COLUMNS: &[(&str, PgTypeOid, i16)] = &[
+    ("tableoid", oid::OID, -6),
+    ("cmax", oid::CID, -5),
+    ("xmax", oid::XID, -4),
+    ("cmin", oid::CID, -3),
+    ("xmin", oid::XID, -2),
+    ("ctid", oid::TID, -1),
+];
 
 // ─── Catalog table OIDs ────────────────────────────────────────────────────
 //

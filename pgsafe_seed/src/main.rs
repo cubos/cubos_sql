@@ -778,7 +778,7 @@ fn export_view_definitions(
 /// empty for those, but the rest of the seed is still produced.
 fn populate_view_defs(seed: PgCatalogSeed, defs: Vec<(String, String, String)>) -> PgCatalogSeed {
     let mut db = PgCatalog::from_seed(seed);
-    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
 
     for (schema, name, definition) in &defs {
         let qn = QualifiedName::new(schema.clone(), name.clone());
@@ -801,7 +801,7 @@ fn populate_view_defs(seed: PgCatalogSeed, defs: Vec<(String, String, String)>) 
 
         if let Err(err) = db.apply_sql(&sql) {
             log_view_failure(&qn, &err.to_string(), &sql);
-            skipped.push(qn.to_string());
+            failed.push(qn.to_string());
             continue;
         }
 
@@ -817,18 +817,22 @@ fn populate_view_defs(seed: PgCatalogSeed, defs: Vec<(String, String, String)>) 
 
         if let Some(drift) = describe_column_drift(&before, &after) {
             log_view_failure(&qn, &format!("column drift: {drift}"), &sql);
-            skipped.push(qn.to_string());
+            failed.push(qn.to_string());
         }
     }
 
-    if !skipped.is_empty() {
+    if !failed.is_empty() {
         eprintln!(
-            "Skipped {} view(s) that the analyzer couldn't reanalyze:",
-            skipped.len()
+            "\n{} view(s) failed to reanalyze (see errors above):",
+            failed.len()
         );
-        for s in &skipped {
+        for s in &failed {
             eprintln!("  - {s}");
         }
+        panic!(
+            "refusing to emit incomplete seed.json: {} view(s) did not round-trip through the analyzer",
+            failed.len()
+        );
     }
 
     db.to_seed()
