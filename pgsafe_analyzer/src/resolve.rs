@@ -3215,18 +3215,44 @@ fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
             }
         }
         node::Node::CoalesceExpr(_) => (2, Some("coalesce".to_string())),
-        // `EXISTS (SELECT …)` is named `exists` by PG.
-        node::Node::SubLink(sl)
-            if sl.sub_link_type == protobuf::SubLinkType::ExistsSublink as i32 =>
-        {
-            (2, Some("exists".to_string()))
-        }
+        node::Node::SubLink(sl) => match protobuf::SubLinkType::try_from(sl.sub_link_type) {
+            // `EXISTS (…)` / `ARRAY(…)` are named after the construct.
+            Ok(protobuf::SubLinkType::ExistsSublink) => (2, Some("exists".to_string())),
+            Ok(protobuf::SubLinkType::ArraySublink) => (2, Some("array".to_string())),
+            // A scalar subquery `(SELECT expr …)` is named after its single
+            // output column, e.g. `(SELECT count(*) …)` → `count`.
+            Ok(protobuf::SubLinkType::ExprSublink) => sublink_target_colname(sl),
+            _ => (0, None),
+        },
         node::Node::MinMaxExpr(m) => match protobuf::MinMaxOp::try_from(m.op) {
             Ok(protobuf::MinMaxOp::IsLeast) => (2, Some("least".to_string())),
             _ => (2, Some("greatest".to_string())),
         },
         node::Node::NullIfExpr(_) => (2, Some("nullif".to_string())),
         node::Node::RowExpr(_) => (2, Some("row".to_string())),
+        _ => (0, None),
+    }
+}
+
+/// Name an `EXPR_SUBLINK` scalar subquery after its single output column —
+/// PG's `FigureColname` recurses into the subquery's first target (honouring
+/// an explicit alias, else the target expression's own name). Returns strength
+/// `2` when the target has a name, `(0, None)` otherwise (the subquery is then
+/// `?column?`, exactly as a bare expression would be).
+fn sublink_target_colname(sl: &protobuf::SubLink) -> (i32, Option<String>) {
+    let Some(node::Node::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
+    else {
+        return (0, None);
+    };
+    let Some(node::Node::ResTarget(rt)) = sel.target_list.first().and_then(|t| t.node.as_ref())
+    else {
+        return (0, None);
+    };
+    if !rt.name.is_empty() {
+        return (2, Some(rt.name.clone()));
+    }
+    match rt.val.as_deref() {
+        Some(val) if figure_colname(val).0 > 0 => (2, figure_colname(val).1),
         _ => (0, None),
     }
 }

@@ -405,3 +405,24 @@ fn torture_union_in_subquery_in_from() {
     // Both NOT NULL → union NOT NULL → subquery NOT NULL.
     assert_cols(&info, vec![c("val", text())]);
 }
+
+// ── Implicit column name of a scalar subquery (PG FigureColname) ─────────────
+
+#[test]
+fn scalar_subquery_named_after_its_output_column() {
+    // PG names an unaliased `(SELECT count(*) …)` after the subquery's single
+    // output column (`count`), not `?column?`.
+    let db = setup();
+    let s = db.analyze("SELECT (SELECT count(*) FROM users)").unwrap();
+    assert_eq!(col(&s, "count").name, "count");
+}
+
+#[test]
+fn scalar_subquery_without_named_output_is_question_column() {
+    // An unnamed output expression leaves the subquery as `?column?`.
+    let db = setup();
+    let s = db
+        .analyze("SELECT (SELECT id + 1 FROM users LIMIT 1)")
+        .unwrap();
+    assert_eq!(s.columns[0].name, "?column?");
+}
