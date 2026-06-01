@@ -307,8 +307,8 @@ fn random_col<'a>(table: &'a Table, rng: &mut StdRng) -> &'a Col {
 /// Generate an expression. `depth` bounds recursion. The generator is only
 /// loosely type-aware: it freely mixes types so the oracle sees both
 /// well-typed queries (type-inference bugs) and ill-typed ones (error-message
-/// bugs).
-fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng) -> String {
+/// bugs). `np` is the running parameter counter (see [`next_param`]).
+fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String {
     if depth == 0 || rng.gen_bool(0.35) {
         // Leaf: column ref or literal.
         return if rng.gen_bool(0.6) {
@@ -322,6 +322,15 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng) -> String {
                 Ty::Float,
                 Ty::Timestamptz,
             ][rng.gen_range(0..6)];
+            // ~15% of leaves are a query parameter rather than a column /
+            // literal, so the oracle's input-parameter-type comparison gets
+            // exercised. A bare `$pN` has no type context (PG reports it as
+            // `unknown`/`text`); pin it with an explicit cast so PG infers a
+            // concrete type we can check against.
+            if rng.gen_bool(0.15) {
+                let t = BASE_TYPE_NAMES[rng.gen_range(0..BASE_TYPE_NAMES.len())];
+                return format!("(${}::{t})", next_param(np));
+            }
             literal_for(ty, rng)
         };
     }
@@ -331,55 +340,74 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng) -> String {
             let op = OPERATORS[rng.gen_range(0..OPERATORS.len())];
             format!(
                 "({} {} {})",
-                gen_expr(table, depth - 1, rng),
+                gen_expr(table, depth - 1, rng, np),
                 op,
-                gen_expr(table, depth - 1, rng)
+                gen_expr(table, depth - 1, rng, np)
             )
         }
         7 => {
-            // Type-aware comparison: a column against a literal of its own
-            // type. Mostly well-typed, so it stresses type *inference* rather
-            // than error wording.
+            // Type-aware comparison: a column against a literal — or a bare
+            // parameter — of its own type. The parameter form stresses param
+            // type *inference* from operator context (PG should report the
+            // param as the column's type), the highest-value param case.
             let col = random_col(table, rng);
             let op = ["=", "<>", "<", ">", "<=", ">="][rng.gen_range(0..6)];
-            format!("({} {} {})", col.name, op, literal_for(col.ty, rng))
+            let rhs = if rng.gen_bool(0.4) {
+                format!("${}", next_param(np))
+            } else {
+                literal_for(col.ty, rng)
+            };
+            format!("({} {} {})", col.name, op, rhs)
         }
         1 => {
             // Function call with 0..3 args.
             let f = FUNCTIONS[rng.gen_range(0..FUNCTIONS.len())];
             let nargs = rng.gen_range(0..3);
             let args: Vec<String> = (0..nargs)
-                .map(|_| gen_expr(table, depth - 1, rng))
+                .map(|_| gen_expr(table, depth - 1, rng, np))
                 .collect();
             format!("{}({})", f, args.join(", "))
         }
         2 => {
             // Cast.
             let t = BASE_TYPE_NAMES[rng.gen_range(0..BASE_TYPE_NAMES.len())];
-            format!("({})::{}", gen_expr(table, depth - 1, rng), t)
+            format!("({})::{}", gen_expr(table, depth - 1, rng, np), t)
         }
         3 => format!(
             "COALESCE({}, {})",
-            gen_expr(table, depth - 1, rng),
-            gen_expr(table, depth - 1, rng)
+            gen_expr(table, depth - 1, rng, np),
+            gen_expr(table, depth - 1, rng, np)
         ),
         4 => format!(
             "CASE WHEN {} THEN {} ELSE {} END",
-            gen_expr(table, depth - 1, rng),
-            gen_expr(table, depth - 1, rng),
-            gen_expr(table, depth - 1, rng)
+            gen_expr(table, depth - 1, rng, np),
+            gen_expr(table, depth - 1, rng, np),
+            gen_expr(table, depth - 1, rng, np)
         ),
         5 => {
             // Aggregate (valid only with/without GROUP BY; the oracle judges).
             let agg = ["count", "sum", "avg", "min", "max"][rng.gen_range(0..5)];
-            format!("{}({})", agg, gen_expr(table, depth - 1, rng))
+            format!("{}({})", agg, gen_expr(table, depth - 1, rng, np))
         }
-        _ => format!("(NOT {})", gen_expr(table, depth - 1, rng)),
+        _ => format!("(NOT {})", gen_expr(table, depth - 1, rng, np)),
     }
+}
+
+/// Allocate the next positional parameter name (`p0`, `p1`, …). Names are
+/// handed out left-to-right as the query string is built, so first-occurrence
+/// order matches the `$1, $2, …` numbering PG assigns — keeping the analyzer's
+/// and PG's parameter lists index-aligned for the oracle's comparison.
+fn next_param(np: &mut u32) -> String {
+    let name = format!("p{}", *np);
+    *np += 1;
+    name
 }
 
 fn gen_query(rng: &mut StdRng) -> String {
     let table = &TABLES[rng.gen_range(0..TABLES.len())];
+    // Parameter counter, threaded through every expression so `$pN` names are
+    // unique and allocated in textual order.
+    let np = &mut 0u32;
     let mut sql = String::from("SELECT ");
 
     if rng.gen_bool(0.15) {
@@ -390,7 +418,7 @@ fn gen_query(rng: &mut StdRng) -> String {
     let n = rng.gen_range(1..4);
     let projs: Vec<String> = (0..n)
         .map(|i| {
-            let e = gen_expr(table, 3, rng);
+            let e = gen_expr(table, 3, rng, np);
             if rng.gen_bool(0.4) {
                 format!("{} AS c{}", e, i)
             } else {
@@ -408,12 +436,12 @@ fn gen_query(rng: &mut StdRng) -> String {
         sql.push_str(&format!(
             " JOIN {} AS j ON {}",
             other.name,
-            gen_expr(table, 2, rng)
+            gen_expr(table, 2, rng, np)
         ));
     }
 
     if rng.gen_bool(0.6) {
-        sql.push_str(&format!(" WHERE {}", gen_expr(table, 3, rng)));
+        sql.push_str(&format!(" WHERE {}", gen_expr(table, 3, rng, np)));
     }
 
     if rng.gen_bool(0.2) {
@@ -422,15 +450,16 @@ fn gen_query(rng: &mut StdRng) -> String {
     }
 
     if rng.gen_bool(0.2) {
-        sql.push_str(&format!(" ORDER BY {}", gen_expr(table, 2, rng)));
+        sql.push_str(&format!(" ORDER BY {}", gen_expr(table, 2, rng, np)));
     }
 
     if rng.gen_bool(0.2) {
-        // Sometimes a wrong-typed LIMIT to exercise error wording.
-        let lim = if rng.gen_bool(0.5) {
-            rng.gen_range(0..100).to_string()
-        } else {
-            gen_expr(table, 1, rng)
+        // A literal, a (sometimes wrong-typed) expression, or a bare param —
+        // PG infers a LIMIT parameter as int8, which the oracle checks.
+        let lim = match rng.gen_range(0..3) {
+            0 => rng.gen_range(0..100).to_string(),
+            1 => format!("${}", next_param(np)),
+            _ => gen_expr(table, 1, rng, np),
         };
         sql.push_str(&format!(" LIMIT {}", lim));
     }
@@ -755,8 +784,15 @@ fn fuzz_analyze_against_pg() {
 
         let (_result, divergence) = db.analyze_checked(&sql);
         // Grow the valid-base pool with cleanly-analyzing queries we generate,
-        // so single-fault has fresh material beyond the static seeds.
-        if _result.is_ok() && divergence.is_none() && valid_seeds.len() < 400 {
+        // so single-fault has fresh material beyond the static seeds. Require
+        // pg_query to parse it too: the AST mutator re-parses these and only
+        // understands positional `$N`, not the `$pN` named params the template
+        // generator emits — so a parametrized query would just be skipped.
+        if _result.is_ok()
+            && divergence.is_none()
+            && valid_seeds.len() < 400
+            && pg_query::parse(&sql).is_ok()
+        {
             valid_seeds.push(sql.clone());
         }
         if let Some(div) = divergence {
