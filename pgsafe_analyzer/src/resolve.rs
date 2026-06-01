@@ -2871,41 +2871,88 @@ fn resolve_funccall_record_fields(
 
 /// Try to infer a default column name from an expression (for unaliased columns).
 fn infer_column_name(node: &protobuf::Node) -> Option<String> {
-    match node.node.as_ref()? {
-        node::Node::ColumnRef(cr) => {
-            // Last string field is the column name.
-            expr::extract_string_fields(&cr.fields).pop()
+    figure_colname(node).1
+}
+
+/// Mirror PostgreSQL's `FigureColnameInternal` (`parse_target.c`): derive the
+/// implicit output-column name for an unaliased target, returning the chosen
+/// name together with PG's *strength*.
+///
+/// Strength encodes how confident the name is: `2` = a strong name (a column
+/// reference, function call, …), `1` = a weak fallback (a cast's target type
+/// name, the literal `case`), `0` = no name at all (the caller substitutes
+/// `?column?`). The strength is what makes `col::type` resolve to `col` while
+/// `1::int` resolves to `int4`: a cast keeps its argument's name only when the
+/// argument produced a strong one, otherwise it falls back to the type name.
+/// The same rule lets `CASE … ELSE col END` be named after the `ELSE` branch
+/// and `arr[1]` after the subscripted array.
+fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
+    let Some(inner) = node.node.as_ref() else {
+        return (0, None);
+    };
+    match inner {
+        node::Node::ColumnRef(cr) => match expr::extract_string_fields(&cr.fields).pop() {
+            // Last string field is the column name (ignoring a trailing `.*`).
+            Some(name) => (2, Some(name)),
+            None => (0, None),
+        },
+        node::Node::AIndirection(ind) => {
+            // A trailing field access (`(x).field`) names the column after the
+            // field; a pure subscript (`arr[1]`, `data['k']`) inherits the
+            // argument's name.
+            if let Some(field) = expr::extract_string_fields(&ind.indirection).pop() {
+                (2, Some(field))
+            } else if let Some(arg) = ind.arg.as_deref() {
+                figure_colname(arg)
+            } else {
+                (0, None)
+            }
         }
-        node::Node::FuncCall(fc) => {
+        node::Node::FuncCall(fc) => match expr::extract_string_fields(&fc.funcname).pop() {
             // Function name.
-            expr::extract_string_fields(&fc.funcname).pop()
+            Some(name) => (2, Some(name)),
+            None => (0, None),
+        },
+        // A `::T` / `CAST(… AS T)` keeps its argument's name when the argument
+        // yielded a strong one; otherwise it falls back to the target type's
+        // (last) name with the weak strength `1`.
+        node::Node::TypeCast(tc) => {
+            let arg = tc.arg.as_deref().map_or((0, None), figure_colname);
+            if arg.0 <= 1
+                && let Some(ty) = tc
+                    .type_name
+                    .as_ref()
+                    .and_then(|tn| expr::extract_string_fields(&tn.names).pop())
+            {
+                return (1, Some(ty));
+            }
+            arg
         }
-        // PG names CASE / COALESCE / NULLIF / GREATEST / LEAST / ROW
-        // expressions after the construct itself (lowercased) when there's
-        // no alias, e.g. `SELECT CASE … END` produces a column named
-        // `case`. Match that so `pglite_sanity` column-name compares pass.
-        node::Node::CaseExpr(_) => Some("case".to_string()),
-        node::Node::CoalesceExpr(_) => Some("coalesce".to_string()),
-        // `EXISTS (SELECT …)` is named `exists` by PG; same shape for the
-        // boolean-coalesce variants below.
+        node::Node::CollateClause(cc) => cc.arg.as_deref().map_or((0, None), figure_colname),
+        // PG names a CASE after its `ELSE` branch when that branch has a strong
+        // name, else after the construct itself (lowercased `case`).
+        node::Node::CaseExpr(case) => {
+            let els = case.defresult.as_deref().map_or((0, None), figure_colname);
+            if els.0 <= 1 {
+                (1, Some("case".to_string()))
+            } else {
+                els
+            }
+        }
+        node::Node::CoalesceExpr(_) => (2, Some("coalesce".to_string())),
+        // `EXISTS (SELECT …)` is named `exists` by PG.
         node::Node::SubLink(sl)
             if sl.sub_link_type == protobuf::SubLinkType::ExistsSublink as i32 =>
         {
-            Some("exists".to_string())
+            (2, Some("exists".to_string()))
         }
         node::Node::MinMaxExpr(m) => match protobuf::MinMaxOp::try_from(m.op) {
-            Ok(protobuf::MinMaxOp::IsLeast) => Some("least".to_string()),
-            _ => Some("greatest".to_string()),
+            Ok(protobuf::MinMaxOp::IsLeast) => (2, Some("least".to_string())),
+            _ => (2, Some("greatest".to_string())),
         },
-        node::Node::NullIfExpr(_) => Some("nullif".to_string()),
-        node::Node::RowExpr(_) => Some("row".to_string()),
-        // PG names a `::T` cast result after the target type (last name
-        // component of the TypeName, lower-cased).
-        node::Node::TypeCast(tc) => tc
-            .type_name
-            .as_ref()
-            .and_then(|tn| expr::extract_string_fields(&tn.names).pop()),
-        _ => None,
+        node::Node::NullIfExpr(_) => (2, Some("nullif".to_string())),
+        node::Node::RowExpr(_) => (2, Some("row".to_string())),
+        _ => (0, None),
     }
 }
 

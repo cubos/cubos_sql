@@ -801,6 +801,35 @@ column reference \"id\" is ambiguous (could be: u.id, p.id)
     );
 }
 
+// ── Implicit output-column naming (PG FigureColname) ────────────────────────
+
+#[test]
+fn cast_of_column_keeps_column_name() {
+    let db = setup();
+    // PG names a cast after its argument when the argument has a strong name,
+    // so `age::text` (no alias) is named `age`, not `text`.
+    let s = db.analyze("SELECT age::text FROM users").unwrap();
+    assert_cols(&s, vec![cn("age", text())]);
+}
+
+#[test]
+fn cast_of_literal_falls_back_to_type_name() {
+    let db = setup();
+    // A constant has no strong name, so the cast falls back to the target
+    // type's name: `1::int4` is named `int4`.
+    let s = db.analyze("SELECT 1::int4").unwrap();
+    assert_cols(&s, vec![c("int4", int4())]);
+}
+
+#[test]
+fn cast_of_function_call_keeps_function_name() {
+    let db = setup();
+    // A function call is a strong name, so it survives the cast: `upper(name)
+    // ::text` is named `upper`.
+    let s = db.analyze("SELECT upper(name)::text FROM users").unwrap();
+    assert_cols(&s, vec![c("upper", text())]);
+}
+
 // ── Lex errors: snippet points at the unclosed token start ─────────────────
 
 #[test]

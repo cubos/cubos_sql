@@ -57,6 +57,15 @@ fn array_element_access_not_null_array() {
     assert_cols(&s, vec![cn("first", int4())]);
 }
 
+#[test]
+fn array_element_access_implicit_name_is_array_column() {
+    let db = setup();
+    // PG's FigureColname rule: a pure subscript inherits the subscripted
+    // array's name, so `tags[1]` (no alias) is named `tags`, not `?column?`.
+    let s = db.analyze("SELECT tags[1] FROM users").unwrap();
+    assert_cols(&s, vec![cn("tags", text())]);
+}
+
 // ── Slice `arr[lo:hi]` ───────────────────────────────────────────────────────
 
 #[test]
