@@ -15,8 +15,11 @@
 //!     asymmetries.
 //!
 //! Query generation uses two strategies:
-//!   1. a schema-driven **template generator** (random SELECTs over a fixed
-//!      schema, with mistypes deliberately allowed), and
+//!   1. a schema-driven **template generator** (`gen_statement`) that emits
+//!      SELECTs (with joins, subquery predicates, scalar subqueries, GROUP BY,
+//!      DISTINCT [ON], …), set operations, CTEs, and DML
+//!      (INSERT/UPDATE/DELETE with RETURNING) — mistypes deliberately allowed,
+//!      and `$pN` parameters threaded through typed contexts; and
 //!   2. an **AST mutator** that parses a seed with `pg_query`, tweaks leaf
 //!      nodes in the protobuf tree (constants, column refs, operators,
 //!      function names, cast targets), and deparses back to SQL — which keeps
@@ -35,7 +38,9 @@
 //!
 //! Knobs (env vars): `FUZZ_ITERS` (default 2000), `FUZZ_SEED` (default
 //! 0xC0FFEE), `FUZZ_OUT` (output dir), `FUZZ_STRICT` (panic at the end if any
-//! finding was discovered).
+//! finding was discovered), `FUZZ_DUMP=N` (print N generated statements and a
+//! shape histogram, then exit — no DB needed; for inspecting what the
+//! generators produce).
 #![cfg(feature = "pg_sanity")]
 
 use std::collections::BTreeMap;
@@ -1013,6 +1018,39 @@ fn fuzz_analyze_against_pg() {
     let out_dir = std::env::var("FUZZ_OUT").unwrap_or_else(|_| "target/fuzz-findings".to_string());
 
     let mut rng = StdRng::seed_from_u64(seed);
+
+    // Diagnostic: `FUZZ_DUMP=N` prints N generated statements (and a shape
+    // histogram) without touching the DB, so you can see what the generators
+    // actually produce. Returns before any Postgres connection is needed.
+    if let Ok(n) = std::env::var("FUZZ_DUMP").map(|s| s.parse::<u32>().unwrap_or(20)) {
+        let mut shapes: BTreeMap<&str, u32> = BTreeMap::new();
+        for _ in 0..n {
+            let sql = gen_statement(&mut rng);
+            let shape = if sql.starts_with("INSERT") {
+                "INSERT"
+            } else if sql.starts_with("UPDATE") {
+                "UPDATE"
+            } else if sql.starts_with("DELETE") {
+                "DELETE"
+            } else if sql.starts_with("WITH") {
+                "CTE"
+            } else if sql.contains(" UNION ")
+                || sql.contains(" INTERSECT ")
+                || sql.contains(" EXCEPT ")
+            {
+                "SET-OP"
+            } else {
+                "SELECT"
+            };
+            *shapes.entry(shape).or_default() += 1;
+            eprintln!("[{shape}] {sql}");
+        }
+        eprintln!("\n── shape histogram ({n}) ──");
+        for (s, c) in &shapes {
+            eprintln!("  {s:<8} {c}");
+        }
+        return;
+    }
 
     let mut db = PgCatalog::new().expect("PgCatalog::new (pg_sanity must spawn the mirror)");
     db.apply_sql(SETUP_SQL)
