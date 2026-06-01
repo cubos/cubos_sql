@@ -1400,6 +1400,17 @@ fn infer_type_cast(
         params.record(p.number, target_oid);
     }
 
+    // PG rejects an explicit cast with no legal path (e.g. boolean → double
+    // precision) at parse time — `cannot cast type X to Y`. Mirror that, but
+    // only after the inner expression's own type is known.
+    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot) {
+        let from = crate::ddl::util::format_type_for_message(snapshot, inner_type.type_oid);
+        let to = crate::ddl::util::format_type_for_message(snapshot, target_oid);
+        return Err(AnalyzeError::Invalid(format!(
+            "cannot cast type {from} to {to}"
+        )));
+    }
+
     // PG: an explicit cast `x::T(n)` carries the target's typmod through.
     // When the cast omits typmods (`x::T`), keep the operand's typmod only
     // when the type OID is unchanged — coercing across types strips it.

@@ -1,7 +1,7 @@
 //! Type coercion and common-type resolution.
 
 use crate::oid::PgTypeOid;
-use crate::pg_catalog::{CastContext, PgCatalog, oid};
+use crate::pg_catalog::{CastContext, PgCatalog, TypCategory, oid};
 
 /// Describes the level of implicit coercion allowed in a given context.
 ///
@@ -46,6 +46,71 @@ pub(crate) fn can_coerce(
         }
         _ => false,
     }
+}
+
+/// Whether an *explicit* cast (`x::T` / `CAST(x AS T)`) from `source` to
+/// `target` is legal, mirroring PostgreSQL's `can_coerce_type` under
+/// `COERCION_EXPLICIT`. Deliberately more permissive than [`can_coerce`]: in
+/// addition to any registered `pg_cast` entry, PG allows an explicit I/O cast
+/// whenever either side is a string-category type, and relabels freely between
+/// domains/base, composites/record, and element-castable arrays.
+///
+/// Errs toward allowing: it returns `false` only for clear-cut scalar
+/// refusals (e.g. `boolean → double precision`), so callers never reject a
+/// cast PG would have accepted.
+pub(crate) fn can_cast_explicit(
+    source: PgTypeOid,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    if source == target {
+        return true;
+    }
+    let s = snapshot.unwrap_domain(source);
+    let t = snapshot.unwrap_domain(target);
+    if s == t {
+        return true;
+    }
+    // Untyped literals (`unknown`) coerce to anything; a pseudo `any`-style
+    // target accepts anything.
+    if s == oid::UNKNOWN || t == oid::UNKNOWN {
+        return true;
+    }
+    // Any registered cast — implicit, assignment, explicit, or
+    // binary-coercible — makes it legal (`cast_by_pair` is keyed by pair,
+    // independent of context).
+    if snapshot.cast_by_pair.contains_key(&(s, t)) {
+        return true;
+    }
+    let scat = snapshot.get_type(s).map(|ty| ty.typcategory);
+    let tcat = snapshot.get_type(t).map(|ty| ty.typcategory);
+    // Explicit I/O cast: PG allows casting to or from any string-category type.
+    if scat == Some(TypCategory::String) || tcat == Some(TypCategory::String) {
+        return true;
+    }
+    // Cases whose legality is structural rather than a simple pair lookup —
+    // pseudo-types, composites/`record`, and unknowns. Mis-allowing here is
+    // harmless (PG accepts most); we only aim to catch clear scalar refusals.
+    let structural = |cat: Option<TypCategory>| {
+        matches!(
+            cat,
+            Some(TypCategory::Pseudo) | Some(TypCategory::Composite) | Some(TypCategory::Unknown)
+        )
+    };
+    if structural(scat) || structural(tcat) {
+        return true;
+    }
+    // Array → array: legal when the element types are themselves castable.
+    if scat == Some(TypCategory::Array) && tcat == Some(TypCategory::Array) {
+        return match (
+            snapshot.get_type(s).and_then(|ty| ty.typelem),
+            snapshot.get_type(t).and_then(|ty| ty.typelem),
+        ) {
+            (Some(se), Some(te)) => can_cast_explicit(se, te, snapshot),
+            _ => true,
+        };
+    }
+    false
 }
 
 /// Numeric type promotion order (lower index = less preferred).

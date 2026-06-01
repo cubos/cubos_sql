@@ -354,3 +354,47 @@ type \"xyzabc\" does not exist
 ",
     );
 }
+
+// ── Illegal explicit casts (no pg_cast path, neither side a string) ─────────
+
+#[test]
+fn cast_bool_to_float8_rejected() {
+    let db = PgCatalog::new().unwrap();
+    // There is no cast path boolean → double precision, and neither side is a
+    // string type, so PG rejects it at parse time. The analyzer used to accept
+    // any explicit cast.
+    assert_analyze_err!(
+        db.analyze("SELECT true::float8"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type boolean to double precision",
+    );
+}
+
+#[test]
+fn cast_timestamptz_to_bytea_rejected() {
+    let db = PgCatalog::new().unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT now()::bytea"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type timestamp with time zone to bytea",
+    );
+}
+
+#[test]
+fn cast_date_to_bool_rejected() {
+    let db = PgCatalog::new().unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT '2020-01-01'::date::bool"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type date to boolean",
+    );
+}
+
+#[test]
+fn cast_bool_to_int4_still_allowed() {
+    // Guard against over-rejection: bool → int4 has a real pg_cast entry, so
+    // it must keep working.
+    let db = PgCatalog::new().unwrap();
+    let s = db.analyze("SELECT true::int4 AS n").unwrap();
+    assert_cols(&s, vec![c("n", int4())]);
+}
