@@ -259,6 +259,18 @@ fn case_without_else_is_nullable() {
     assert_cols(&info, vec![cn("category", text())]);
 }
 
+#[test]
+fn case_when_condition_must_be_boolean() {
+    let db = setup();
+    // A non-boolean WHEN condition is rejected with PG's exact wording. The
+    // analyzer previously discarded this check and accepted the query.
+    assert_analyze_err!(
+        db.analyze("SELECT CASE WHEN age THEN 1 ELSE 0 END FROM users"),
+        AnalyzeError::Invalid(_),
+        "argument of CASE/WHEN must be type boolean, not type integer",
+    );
+}
+
 // ── Boolean / NULL tests ─────────────────────────────────────────────────────
 
 #[test]

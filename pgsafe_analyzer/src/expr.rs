@@ -2344,16 +2344,38 @@ fn infer_case(
 
     for arg in &expr.args {
         if let Some(node::Node::CaseWhen(when)) = arg.node.as_ref() {
-            // WHEN condition must be boolean.
-            if let Some(cond) = &when.expr {
-                let _ = infer_expr(
+            // WHEN condition must be boolean. On a coerce-to-bool mismatch,
+            // rewrite to PG's exact wording (`argument of CASE/WHEN must be
+            // type boolean, not type X`) the same way the WHERE clause does;
+            // other errors carry their own message and propagate as-is.
+            if let Some(cond) = &when.expr
+                && let Err(e) = infer_expr(
                     cond,
                     scope,
                     null_ctx,
                     snapshot,
                     params,
                     TypeGoal::assignment(oid::BOOL),
-                );
+                )
+            {
+                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                    return Err(e);
+                }
+                let mut params2 = params.clone();
+                let actual_oid = infer_expr(
+                    cond,
+                    scope,
+                    null_ctx,
+                    snapshot,
+                    &mut params2,
+                    TypeGoal::NONE,
+                )
+                .map(|t| t.type_oid)
+                .unwrap_or(oid::UNKNOWN);
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "argument of CASE/WHEN must be type boolean, not type {actual_pg}"
+                )));
             }
             // THEN result. Untyped string literals are reinterpreted as
             // `text` for branch reconciliation — PG's common-type rules
