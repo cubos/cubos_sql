@@ -839,3 +839,17 @@ fn concat_unknown_literal_with_int_resolves_to_text() {
     let s = db.analyze("SELECT 'n=' || age AS c FROM users").unwrap();
     assert_cols(&s, vec![cn("c", text())]);
 }
+
+#[test]
+fn concat_function_result_int_with_unknown_literal_resolves_to_text() {
+    // Like `age || '!'`, but the left side is an int-returning *function*
+    // result (`length(name)`) rather than a column. Both are `int4`, so the
+    // `anynonarray || text` resolution must fire identically — guards against
+    // an `operator does not exist: integer || unknown` regression.
+    let db = setup();
+    // `name` is NOT NULL → `length(name)` and the strict `||` stay NOT NULL.
+    let s = db
+        .analyze("SELECT length(name) || '!' AS c FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("c", text())]);
+}
