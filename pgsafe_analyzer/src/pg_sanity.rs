@@ -16,8 +16,9 @@
 //! assert that:
 //!
 //! - the *outcome* matches (both succeed or both fail), and
-//! - on success, every output column's name + qualified type name matches
-//!   exactly between our static analyzer and PG's wire-protocol Describe.
+//! - on success, every output column's name + qualified type name and every
+//!   input parameter's qualified type name match exactly between our static
+//!   analyzer and PG's wire-protocol Describe.
 //!
 //! Error message contract: when both fail, our analyzer's message must
 //! *start with* PG's server-side message verbatim (the `DbError.message`
@@ -243,6 +244,65 @@ impl PgSanityServer {
                              SQL:\n---\n{analysis_sql}\n---\n\
                              analyzer: {our_qname} (Type::{:?})\nPG:       {pg_qname} (oid {pg_oid})",
                             our_col.name, our_col.pg_type,
+                        );
+                    }
+                }
+
+                // --- Input parameter types ---
+                // PG's Describe also reports the inferred type of each
+                // positional placeholder ($1, $2, …). The analyzer's
+                // positional ordering is regular params first, then each
+                // spread's fields in order — exactly how `analysis_sql` was
+                // built — so the two lists line up index-for-index. Compare
+                // them the same way we compared output columns above.
+                let our_params: Vec<(&str, &Type)> = ours
+                    .params
+                    .iter()
+                    .map(|p| (p.name.as_str(), &p.pg_type))
+                    .chain(
+                        ours.spreads
+                            .iter()
+                            .flat_map(|s| s.fields.iter().map(|f| (f.name.as_str(), &f.pg_type))),
+                    )
+                    .collect();
+                let pg_params = stmt.params();
+
+                if our_params.len() != pg_params.len() {
+                    panic!(
+                        "pg_sanity: parameter count mismatch.\n\
+                         SQL:\n---\n{analysis_sql}\n---\n\
+                         analyzer: {} params ({:?})\n\
+                         PG:       {} params",
+                        our_params.len(),
+                        our_params.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                        pg_params.len(),
+                    );
+                }
+
+                for (i, ((our_name, our_ty), pg_ty)) in
+                    our_params.iter().zip(pg_params.iter()).enumerate()
+                {
+                    let pg_oid = pg_ty.oid();
+                    // PG reports oid 0 ("unknown") when it genuinely couldn't
+                    // pin down a parameter's type during Describe. There's
+                    // nothing meaningful to compare against there, so skip.
+                    if pg_oid == 0 {
+                        continue;
+                    }
+                    let pg_qname = self.qualified_type_name(pg_oid).unwrap_or_else(|e| {
+                        panic!(
+                            "pg_sanity: failed to resolve type oid {pg_oid} for parameter \
+                             ${} ('{our_name}'): {e}",
+                            i + 1,
+                        )
+                    });
+                    let our_qname = qualified_param_type_name_for_compare(our_ty);
+                    if our_qname != pg_qname {
+                        panic!(
+                            "pg_sanity: parameter ${} ('{our_name}') type mismatch.\n\
+                             SQL:\n---\n{analysis_sql}\n---\n\
+                             analyzer: {our_qname} (Type::{our_ty:?})\nPG:       {pg_qname} (oid {pg_oid})",
+                            i + 1,
                         );
                     }
                 }
@@ -490,6 +550,26 @@ fn qualified_type_name_for_compare(ty: &Type) -> String {
         | Type::Range { schema, name, .. }
         | Type::Composite { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
         Type::Array { element } => format!("{}[]", qualified_type_name_for_compare(element)),
+        Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),
+    }
+}
+
+/// Like [`qualified_type_name_for_compare`] but for *input parameters*.
+///
+/// The one difference is domains: PG's wire-level Describe collapses a domain
+/// *output column* to its base OID, but reports an *input parameter*'s type as
+/// the domain itself. So here we render a [`Type::Domain`] by its own
+/// qualified name rather than unwrapping to the base type.
+fn qualified_param_type_name_for_compare(ty: &Type) -> String {
+    match ty {
+        Type::Basic { schema, name, .. }
+        | Type::Enum { schema, name, .. }
+        | Type::Range { schema, name, .. }
+        | Type::Composite { schema, name, .. }
+        | Type::Domain { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
+        Type::Array { element } => {
+            format!("{}[]", qualified_param_type_name_for_compare(element))
+        }
         Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),
     }
 }
