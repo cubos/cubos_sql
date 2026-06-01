@@ -801,3 +801,22 @@ fn floor_of_integer_resolves_to_double_precision() {
         .unwrap();
     assert_cols(&s, vec![c("fb", float8()), cn("fa", float8())]);
 }
+
+#[test]
+fn single_overload_function_with_non_coercible_arg_rejected() {
+    // `jsonb_typeof` has one overload, `jsonb_typeof(jsonb)`. An integer
+    // argument has no implicit cast to jsonb, so PG rejects it — the analyzer
+    // used to accept any single-overload function whose argument *count* lined
+    // up, regardless of type.
+    let db = setup();
+    let err = db.analyze("SELECT jsonb_typeof(42)").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedFunction(_)),
+        "expected UndefinedFunction, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("function jsonb_typeof(integer) does not exist"),
+        "message should start with PG's wording, got: {err}"
+    );
+}

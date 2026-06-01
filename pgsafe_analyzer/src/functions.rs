@@ -175,9 +175,29 @@ pub(crate) fn resolve_function(
         return Ok(make_resolved(agg_candidates[0], snapshot));
     }
 
+    // Last-resort single-candidate match. Accept when the lone candidate is
+    // variadic (variadic coercion isn't fully modeled, so err toward
+    // acceptance) or when every parameter either is a pseudo-type that accepts
+    // anything (`"any"` for `count(x)`, `anyelement`, …) or the actual coerces
+    // to it. A concrete parameter with a non-coercible actual is NOT accepted
+    // — that's a genuine `does not exist`, e.g. `jsonb_typeof(numeric)`, which
+    // PG rejects.
     let count_matches: Vec<_> = candidates
         .iter()
-        .filter(|f| f.proargtypes.len() == arg_types.len() || f.provariadic.is_some())
+        .filter(|f| {
+            if f.provariadic.is_some() {
+                return true;
+            }
+            f.proargtypes.len() == arg_types.len()
+                && f.proargtypes.iter().zip(arg_types).all(|(&p, &a)| {
+                    p == a
+                        || a == oid::UNKNOWN
+                        || snapshot
+                            .get_type(p)
+                            .is_some_and(|t| t.typtype == TypType::Pseudo)
+                        || casts_implicitly(a, p, snapshot)
+                })
+        })
         .collect();
     if count_matches.len() == 1 {
         return Ok(make_resolved(count_matches[0], snapshot));
