@@ -168,31 +168,54 @@ pub(crate) fn resolve_function(
         return Ok(make_resolved_polymorphic(f, match_types, snapshot));
     }
 
-    // Whether `f`'s parameters can plausibly accept the actual `arg_types`.
-    // Accept when the candidate is variadic (variadic coercion isn't fully
-    // modeled, so err toward acceptance) or when every parameter either is a
-    // pseudo-type that accepts the actual or the actual coerces to it. A
+    // Whether a single declared parameter `p` plausibly accepts actual `a`. A
+    // polymorphic pseudo-type (anyarray, anyenum, …) only accepts actuals that
+    // satisfy its shape constraint — `array_ndims(integer)` must NOT match
+    // `anyarray`. Other pseudo-types (`"any"` for `count(x)`, the `"any"`
+    // element of a `VARIADIC "any"`, …) accept anything.
+    let param_accepts = |p: PgTypeOid, a: PgTypeOid| {
+        p == a
+            || a == oid::UNKNOWN
+            || (is_polymorphic(p) && matches_polymorphic(p, a, snapshot))
+            || (!is_polymorphic(p)
+                && snapshot
+                    .get_type(p)
+                    .is_some_and(|t| t.typtype == TypType::Pseudo))
+            || casts_implicitly(a, p, snapshot)
+    };
+
+    // Whether `f`'s parameters can plausibly accept the actual `arg_types`. A
     // concrete parameter with a non-coercible actual is NOT accepted — that's a
     // genuine `does not exist`, e.g. `jsonb_typeof(numeric)`, which PG rejects.
     let args_fit = |f: &PgProc| {
-        if f.provariadic.is_some() {
-            return true;
+        if let Some(var_elem) = f.provariadic {
+            // Variadic: the first N-1 declared params are fixed and the trailing
+            // slot absorbs zero-or-more args of the variadic element type
+            // (`provariadic`). The fixed params must still match — so
+            // `concat_ws(integer)` is rejected (its `text` separator can't take
+            // an int), while `concat_ws(text, int, …)` is accepted.
+            let n = f.proargtypes.len();
+            if n == 0 {
+                return true;
+            }
+            let fixed = n - 1;
+            if arg_types.len() < fixed {
+                return false;
+            }
+            let fixed_ok = f.proargtypes[..fixed]
+                .iter()
+                .zip(arg_types)
+                .all(|(&p, &a)| param_accepts(p, a));
+            let tail_ok = arg_types[fixed..]
+                .iter()
+                .all(|&a| param_accepts(var_elem, a));
+            return fixed_ok && tail_ok;
         }
         f.proargtypes.len() == arg_types.len()
-            && f.proargtypes.iter().zip(arg_types).all(|(&p, &a)| {
-                p == a
-                    || a == oid::UNKNOWN
-                    // A *polymorphic* pseudo-type (anyarray, anyenum, …) only
-                    // accepts actuals that satisfy its shape constraint —
-                    // `array_ndims(integer)` must NOT match `anyarray`. Other
-                    // pseudo-types (`"any"` for `count(x)`, …) accept anything.
-                    || (is_polymorphic(p) && matches_polymorphic(p, a, snapshot))
-                    || (!is_polymorphic(p)
-                        && snapshot
-                            .get_type(p)
-                            .is_some_and(|t| t.typtype == TypType::Pseudo))
-                    || casts_implicitly(a, p, snapshot)
-            })
+            && f.proargtypes
+                .iter()
+                .zip(arg_types)
+                .all(|(&p, &a)| param_accepts(p, a))
     };
 
     // A lone aggregate candidate is accepted only when its parameters actually

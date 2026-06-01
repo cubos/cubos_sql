@@ -853,3 +853,33 @@ fn concat_function_result_int_with_unknown_literal_resolves_to_text() {
         .unwrap();
     assert_cols(&s, vec![c("c", text())]);
 }
+
+#[test]
+fn variadic_concat_ws_rejects_non_text_separator() {
+    // `concat_ws(sep text, VARIADIC "any")` — the *fixed* separator must be
+    // text. A lone `integer` arg binds to it and doesn't coerce, so the call
+    // doesn't resolve. The variadic short-circuit used to accept any args.
+    // PG: `function concat_ws(integer) does not exist`.
+    let db = setup();
+    let err = db.analyze("SELECT concat_ws(age) FROM users").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedFunction(_)),
+        "expected UndefinedFunction, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("function concat_ws(integer) does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn variadic_concat_ws_with_text_separator_accepted() {
+    // A text separator with a non-text variadic tail is valid — the `"any"`
+    // variadic element accepts the `int`. Guards against over-rejection.
+    let db = setup();
+    let s = db
+        .analyze("SELECT concat_ws(name, age) AS c FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("c", text())]);
+}
