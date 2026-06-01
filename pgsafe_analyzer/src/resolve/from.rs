@@ -1,0 +1,546 @@
+use super::*;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FROM clause processing
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn process_from_clause(
+    from_clause: &[protobuf::Node],
+    scope: &mut Scope,
+    null_ctx: &mut NullabilityContext,
+    snapshot: &PgCatalog,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    for node in from_clause {
+        process_from_item(node, scope, null_ctx, snapshot, cte_scopes, params)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn process_from_item(
+    node: &protobuf::Node,
+    scope: &mut Scope,
+    null_ctx: &mut NullabilityContext,
+    snapshot: &PgCatalog,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let inner = node
+        .node
+        .as_ref()
+        .ok_or_else(|| AnalyzeError::Unsupported("empty FROM item".into()))?;
+
+    match inner {
+        node::Node::RangeVar(rv) => {
+            let alias = rv
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.as_str())
+                .unwrap_or(&rv.relname);
+
+            // Check CTEs first.
+            if rv.schemaname.is_empty()
+                && let Some(cte_cols) = cte_scopes.get(&rv.relname)
+            {
+                let cols: Vec<ScopeColumn> = cte_cols
+                    .iter()
+                    .cloned()
+                    .map(|mut c| {
+                        c.table_alias = alias.to_owned();
+                        c
+                    })
+                    .collect();
+                scope.add_virtual_table(alias, cols);
+                return Ok(());
+            }
+
+            let schema = if rv.schemaname.is_empty() {
+                None
+            } else {
+                Some(rv.schemaname.as_str())
+            };
+            scope.add_table(
+                snapshot,
+                schema,
+                &rv.relname,
+                alias,
+                crate::error::SourceSpan::from_node_qname(rv.location),
+            )?;
+        }
+        node::Node::JoinExpr(join) => {
+            // Process left and right sides.
+            let left_start = scope.sources.len();
+            if let Some(larg) = &join.larg {
+                process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params)?;
+            }
+            let left_end = scope.sources.len();
+
+            if let Some(rarg) = &join.rarg {
+                process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params)?;
+            }
+            let right_end = scope.sources.len();
+
+            // Walk the ON clause *before* applying outer-join nullability:
+            // PG evaluates `ON` on paired rows where right-side columns are
+            // still NOT NULL (for LEFT JOIN), and only null-pads non-matches
+            // afterwards. Without this walk, `$N` parameters used only in
+            // `ON` are never registered with the collector and `into_sorted`
+            // reports a spurious "parameter gap".
+            if let Some(quals) = &join.quals {
+                check_no_aggregates_or_windows(quals, snapshot, "JOIN/ON")?;
+                expr::infer_expr(
+                    quals,
+                    expr::Ctx::new(scope, null_ctx, snapshot),
+                    params,
+                    TypeGoal::assignment(oid::BOOL),
+                )?;
+            }
+
+            // Apply JOIN nullability. Fail loudly on unknown join kinds rather
+            // than defaulting to INNER, which would silently produce wrong
+            // nullability for outer joins the parser couldn't classify.
+            let join_type = JoinType::try_from(join.jointype)
+                .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
+
+            match join_type {
+                JoinType::JoinLeft => {
+                    let right_aliases =
+                        nullability::collect_aliases(&scope.sources[left_end..right_end]);
+                    null_ctx.mark_all_nullable(&right_aliases);
+                }
+                JoinType::JoinRight => {
+                    let left_aliases =
+                        nullability::collect_aliases(&scope.sources[left_start..left_end]);
+                    null_ctx.mark_all_nullable(&left_aliases);
+                }
+                JoinType::JoinFull => {
+                    let all_aliases =
+                        nullability::collect_aliases(&scope.sources[left_start..right_end]);
+                    null_ctx.mark_all_nullable(&all_aliases);
+                }
+                JoinType::JoinInner => {} // No nullability change.
+                other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
+            }
+        }
+        node::Node::RangeSubselect(sub) => {
+            let alias = sub
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.as_str())
+                .unwrap_or("_subquery");
+
+            // `AS foo(a, b, c)` overrides the subquery's own output names.
+            // Common in information_schema views that rename columns at the
+            // FROM boundary instead of in the SELECT list.
+            let col_aliases: Vec<String> = sub
+                .alias
+                .as_ref()
+                .map(|a| {
+                    a.colnames
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref()? {
+                            node::Node::String(s) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(subquery) = &sub.subquery
+                && let Some(node::Node::SelectStmt(sel)) = subquery.node.as_ref()
+            {
+                // A LATERAL subquery inherits the visible FROM items to its
+                // left — including the enclosing SELECT's scope we already
+                // built — so column refs like `s.oid` inside
+                // `JOIN LATERAL (… s.oid …)` resolve properly. Without
+                // LATERAL the same aliases are *shadowed*: not resolvable,
+                // but tracked so a stray reference produces PG's exact
+                // `invalid reference to FROM-clause entry for table "x"`
+                // diagnostic instead of a generic missing-column message.
+                let (lateral_sources, shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
+                    (scope.sources.clone(), Vec::new())
+                } else {
+                    (Vec::new(), scope.sources.clone())
+                };
+                let (cols, _) = analyze_select_with_ctes_and_outer(
+                    sel,
+                    snapshot,
+                    params,
+                    cte_scopes,
+                    &lateral_sources,
+                    &[],
+                    &shadowed_sources,
+                )?;
+                let mut scope_cols: Vec<ScopeColumn> = cols
+                    .into_iter()
+                    .map(|rc| ScopeColumn {
+                        name: rc.name,
+                        type_oid: rc.type_oid,
+                        base_not_null: !rc.nullable,
+                        table_alias: alias.to_owned(),
+                        typmod: rc.typmod,
+                        collation: rc.collation,
+                        record_fields: rc.record_fields,
+                    })
+                    .collect();
+                for (i, alias_name) in col_aliases.iter().enumerate() {
+                    if let Some(c) = scope_cols.get_mut(i) {
+                        c.name = alias_name.clone();
+                    }
+                }
+                scope.add_virtual_table(alias, scope_cols);
+            }
+        }
+        node::Node::RangeFunction(rf) => {
+            process_range_function(rf, scope, snapshot, params)?;
+        }
+        node::Node::RangeTableSample(ts) => {
+            // `TABLESAMPLE` only changes how rows are picked at runtime —
+            // it does not affect the relation's column shape or
+            // nullability. Pass through to the wrapped `relation` and
+            // ignore method/args/repeatable.
+            let relation = ts.relation.as_ref().ok_or_else(|| {
+                AnalyzeError::Unsupported("RangeTableSample without relation".into())
+            })?;
+            return process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params);
+        }
+        _ => {
+            return Err(AnalyzeError::Unsupported(format!(
+                "FROM item type: {:?}",
+                std::mem::discriminant(inner)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `FROM func(args)` — resolve the SRF and populate `scope` with its output
+/// columns. Handles three cases:
+/// - Function has `out_args` (TABLE/OUT) → one scope column per out_arg.
+/// - Function returns a registered composite type → expand the composite's
+///   fields as scope columns.
+/// - Otherwise (scalar or plain `record`) → a single scope column named after
+///   the function, typed with its return OID.
+///
+/// Also honors `WITH ORDINALITY` by adding a trailing `ordinality BIGINT NOT NULL`
+/// column when the flag is set.
+pub(crate) fn process_range_function(
+    rf: &protobuf::RangeFunction,
+    scope: &mut Scope,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let _ = rf.lateral;
+    // Each entry in `functions` is a 2-element `List` — [FuncCall, coldeflist].
+    // We support only the simple form: a single function call, no explicit
+    // column definitions. `ROWS FROM (…)` with multiple functions or user-
+    // supplied coldeflists are rarer and fall through to Unsupported so we
+    // don't silently lose column shape.
+    let list = rf
+        .functions
+        .first()
+        .and_then(|n| n.node.as_ref())
+        .and_then(|n| {
+            if let node::Node::List(l) = n {
+                Some(l)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| AnalyzeError::Unsupported("RangeFunction without function call".into()))?;
+
+    let func_call_node = list
+        .items
+        .first()
+        .ok_or_else(|| AnalyzeError::Unsupported("RangeFunction function list is empty".into()))?;
+    let func_call = match func_call_node.node.as_ref() {
+        Some(node::Node::FuncCall(fc)) => fc,
+        _ => {
+            return Err(AnalyzeError::Unsupported(
+                "RangeFunction item is not a FuncCall".into(),
+            ));
+        }
+    };
+
+    // Alias: `FROM f() AS t(col1, col2)` gives aliases both for the relation
+    // and for its columns. Fall back to the function's last name component.
+    let func_name_parts = expr::extract_string_fields(&func_call.funcname);
+    let default_alias = func_name_parts
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "_srf".into());
+    let alias_owned = rf
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .unwrap_or_else(|| default_alias.clone());
+    let alias = alias_owned.as_str();
+    let col_aliases: Vec<String> = rf
+        .alias
+        .as_ref()
+        .map(|a| {
+            a.colnames
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, scope, snapshot, params)?;
+    let any_arg_nullable = arg_nullable.iter().any(|&n| n);
+
+    let (schema, name) = match func_name_parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => {
+            return Err(AnalyzeError::UndefinedFunction(format!(
+                "invalid function name in FROM: {func_name_parts:?}"
+            )));
+        }
+    };
+
+    // `unnest(arr1, arr2, …)` in FROM is a special PG-only multi-array form
+    // (parsed as a regular FuncCall but transformed by PG into ROWS FROM
+    // (unnest(arr1), unnest(arr2), …)). Each argument contributes one column
+    // of its element type, aligned row-wise (zip with NULL-padding).
+    let is_pg_unnest = (schema.is_none() || schema == Some("pg_catalog")) && name == "unnest";
+    let mut cols: Vec<ScopeColumn> = if is_pg_unnest && arg_types.len() > 1 {
+        unnest_multi_arg_columns(&arg_types, &arg_nullable, alias, snapshot, func_call)?
+    } else {
+        srf_function_columns(
+            SrfCall { schema, name },
+            SrfArgs {
+                types: &arg_types,
+                any_nullable: any_arg_nullable,
+            },
+            alias,
+            rf,
+            func_call,
+            snapshot,
+        )?
+    };
+
+    // WITH ORDINALITY appends a trailing BIGINT NOT NULL row number. Do this
+    // before the alias override so `AS t(val, ord)` can rename the ordinality
+    // column too.
+    if rf.ordinality {
+        cols.push(ScopeColumn {
+            name: "ordinality".into(),
+            type_oid: oid::INT8,
+            base_not_null: true,
+            table_alias: alias.to_owned(),
+            typmod: None,
+            collation: None,
+            record_fields: None,
+        });
+    }
+
+    // User-supplied column aliases override the names above, in order.
+    for (i, alias_name) in col_aliases.iter().enumerate() {
+        if let Some(c) = cols.get_mut(i) {
+            c.name = alias_name.clone();
+        }
+    }
+
+    scope.add_virtual_table(alias, cols);
+    Ok(())
+}
+
+/// Infer the SRF's argument types (so overload resolution can pick the right
+/// function) and their nullability.
+///
+/// PG always treats a function-call FROM item as LATERAL: the `LATERAL`
+/// keyword on a `RangeFunction` is a noise word, because the args can already
+/// refer to earlier FROM items implicitly. So we copy the visible sources
+/// unconditionally, not just when `rf.lateral` is set. We also propagate
+/// `outer_sources` so SRF args inside a correlated sublink can reach aliases
+/// bound by the enclosing query (e.g. `pg_stats_ext` does
+/// `(SELECT … FROM unnest(s.stxkeys) …)` where `s` is from the outer FROM).
+fn infer_srf_arg_types(
+    rf: &protobuf::RangeFunction,
+    func_call: &protobuf::FuncCall,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(Vec<PgTypeOid>, Vec<bool>), AnalyzeError> {
+    // Non-LATERAL SRF args can't see the enclosing FROM; LATERAL args can.
+    let mut arg_scope = Scope::default();
+    arg_scope.sources.extend(scope.sources.clone());
+    arg_scope.outer_sources.extend(scope.outer_sources.clone());
+    let empty_null_ctx = NullabilityContext::default();
+    let mut arg_types = Vec::with_capacity(func_call.args.len());
+    let mut arg_nullable = Vec::with_capacity(func_call.args.len());
+    for arg in &func_call.args {
+        let (t, n) = match expr::infer_expr(
+            arg,
+            expr::Ctx::new(&arg_scope, &empty_null_ctx, snapshot),
+            params,
+            crate::expr::TypeGoal::NONE,
+        ) {
+            Ok(e) => (e.type_oid, e.nullable),
+            // `FROM a, f(a.col)` without LATERAL — PG rejects with `invalid
+            // reference to FROM-clause entry for table "a"`. The scope we
+            // built above is empty precisely so this fails; don't let the
+            // old `.unwrap_or(UNKNOWN)` swallow it.
+            Err(e @ AnalyzeError::UndefinedColumn(_)) if !rf.lateral => return Err(e),
+            Err(_) => (oid::UNKNOWN, true),
+        };
+        arg_types.push(t);
+        arg_nullable.push(n);
+    }
+    Ok((arg_types, arg_nullable))
+}
+
+/// Columns for the multi-argument `unnest(arr1, arr2, …)` FROM form: each
+/// argument contributes one column of its element type.
+fn unnest_multi_arg_columns(
+    arg_types: &[PgTypeOid],
+    arg_nullable: &[bool],
+    alias: &str,
+    snapshot: &PgCatalog,
+    func_call: &protobuf::FuncCall,
+) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    let mut col_specs = Vec::with_capacity(arg_types.len());
+    for (i, (&type_oid, &nullable)) in arg_types.iter().zip(arg_nullable.iter()).enumerate() {
+        let type_entry = snapshot.get_type(type_oid).ok_or_else(|| {
+            AnalyzeError::UndefinedType(format!(
+                "internal: unnest argument {} has unknown type OID {}",
+                i + 1,
+                type_oid.get()
+            ))
+        })?;
+        let elem = (type_entry.typcategory == TypCategory::Array)
+            .then_some(type_entry.typelem)
+            .flatten()
+            .ok_or_else(|| {
+                // Match PG's wording: when an `unnest` arg isn't an array, PG's
+                // resolver emits `function pg_catalog.unnest(<type>) does not
+                // exist` (it searches for a single-arg overload of the
+                // offending type). Mirror that and append our richer detail.
+                let typname = type_entry.typname.clone();
+                crate::functions::undefined_function_error(
+                    snapshot,
+                    Some("pg_catalog"),
+                    "unnest",
+                    format!(
+                        "function pg_catalog.unnest({typname}) does not exist \
+                         (unnest argument {} is not an array)",
+                        i + 1,
+                    ),
+                    crate::error::SourceSpan::from_node_qname(func_call.location),
+                )
+            })?;
+        // Multi-arg unnest is strict: each output column is NOT NULL iff the
+        // corresponding input array is NOT NULL (a NULL array yields a single
+        // NULL row, not zero rows). Out-of-bounds positions are padded with
+        // NULLs because the arrays may have different lengths, so each column
+        // is conservatively nullable when any *other* arg is shorter — but we
+        // can only see that at runtime. Match PG's behavior: NOT NULL only
+        // when the array itself is.
+        col_specs.push(ScopeColumn {
+            name: "unnest".to_owned(),
+            type_oid: elem,
+            base_not_null: !nullable,
+            table_alias: alias.to_owned(),
+            typmod: None,
+            collation: None,
+            record_fields: None,
+        });
+    }
+    Ok(col_specs)
+}
+
+/// The resolved name of a function called in FROM.
+struct SrfCall<'a> {
+    schema: Option<&'a str>,
+    name: &'a str,
+}
+
+/// The inferred argument types of an SRF call plus whether any is nullable.
+struct SrfArgs<'a> {
+    types: &'a [PgTypeOid],
+    any_nullable: bool,
+}
+
+/// Columns for an ordinary set-returning / OUT-arg / composite-returning
+/// function in FROM: resolve the overload, then expand its row shape (OUT
+/// args, composite attributes, or a single scalar column).
+fn srf_function_columns(
+    call: SrfCall<'_>,
+    args: SrfArgs<'_>,
+    alias: &str,
+    rf: &protobuf::RangeFunction,
+    func_call: &protobuf::FuncCall,
+    snapshot: &PgCatalog,
+) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    let SrfCall { schema, name } = call;
+    let resolved = functions::resolve_function(
+        snapshot,
+        schema,
+        name,
+        args.types,
+        false,
+        crate::error::SourceSpan::from_node_qname(func_call.location),
+    )?;
+
+    // Build the scope columns.
+    if !resolved.out_args.is_empty() {
+        Ok(resolved
+            .out_args
+            .iter()
+            .map(|f| ScopeColumn {
+                name: f.name.clone(),
+                type_oid: f.type_oid,
+                base_not_null: f.not_null,
+                typmod: None,
+                collation: None,
+                table_alias: alias.to_owned(),
+                record_fields: None,
+            })
+            .collect())
+    } else if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
+        (t.typtype == TypType::Composite)
+            .then_some(t.typrelid)
+            .flatten()
+    }) {
+        Ok(snapshot
+            .attributes_of(typrelid)
+            .iter()
+            .map(|f| ScopeColumn {
+                name: f.attname.clone(),
+                type_oid: f.atttypid,
+                base_not_null: f.attnotnull || snapshot.type_is_not_null(f.atttypid),
+                typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
+                collation: f.attcollation,
+                table_alias: alias.to_owned(),
+                record_fields: None,
+            })
+            .collect())
+    } else if resolved.return_type_oid == oid::RECORD && rf.coldeflist.is_empty() {
+        // `RETURNS RECORD` without OUT args needs a column-definition list at
+        // the call site so PG knows what shape to expose. Mirror PG's exact
+        // wording so the analyzer's diagnostic is pg_sanity-aligned.
+        Err(AnalyzeError::Invalid(
+            "a column definition list is required for functions returning \"record\"".to_owned(),
+        ))
+    } else {
+        // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from their
+        // arguments — `FROM unnest(int4[] NOT NULL)` produces NOT NULL int4
+        // elements, just like `SELECT unnest(arr)` in the projection.
+        let strict_not_null =
+            resolved.is_strict && resolved.schema == "pg_catalog" && !args.any_nullable;
+        Ok(vec![ScopeColumn {
+            name: name.to_owned(),
+            type_oid: resolved.return_type_oid,
+            base_not_null: strict_not_null,
+            table_alias: alias.to_owned(),
+            typmod: None,
+            collation: None,
+            record_fields: None,
+        }])
+    }
+}

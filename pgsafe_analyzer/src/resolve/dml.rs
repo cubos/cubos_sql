@@ -1,0 +1,696 @@
+use super::*;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INSERT / UPDATE / DELETE
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn analyze_insert(
+    ins: &protobuf::InsertStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> AnalyzeResult {
+    analyze_insert_with_outer_ctes(ins, snapshot, params, &HashMap::new())
+}
+
+/// Like [`analyze_insert`] but accepts CTEs that were defined in an
+/// enclosing `WITH` clause (top-level `WITH … INSERT …` mixes them via
+/// [`analyze_cte`]). The outer CTEs are merged into the INSERT's local
+/// `cte_scopes` so `INSERT … SELECT … FROM <outer_cte>` resolves.
+pub(crate) fn analyze_insert_with_outer_ctes(
+    ins: &protobuf::InsertStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
+    let relation = ins
+        .relation
+        .as_ref()
+        .ok_or_else(|| AnalyzeError::Unsupported("INSERT without relation".into()))?;
+
+    let tgt = resolve_insert_target(ins, relation, snapshot)?;
+    let cte_scopes = build_insert_cte_scopes(ins, snapshot, params, outer_ctes)?;
+
+    // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
+    if let Some(select_node) = &ins.select_stmt
+        && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
+    {
+        if !val_sel.values_lists.is_empty() {
+            analyze_insert_values(ins, val_sel, &tgt, snapshot, params)?;
+        } else {
+            analyze_insert_select(val_sel, &tgt, snapshot, params, &cte_scopes)?;
+        }
+    }
+
+    if let Some(on_conflict) = &ins.on_conflict_clause {
+        analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params)?;
+    }
+
+    // Resolve RETURNING list.
+    let mut ret_scope = Scope::default();
+    let ret_null_ctx = NullabilityContext::default();
+    ret_scope.add_dml_target(
+        snapshot,
+        &relation.relname,
+        crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname),
+        &tgt.attrs,
+    );
+
+    let columns = resolve_target_list(
+        &ins.returning_list,
+        expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
+        params,
+    )?;
+
+    Ok((columns, None))
+}
+
+/// The resolved INSERT target: the catalog table plus the data the per-clause
+/// analyzers below all need (the declared column list and the
+/// `OVERRIDING SYSTEM VALUE` flag).
+struct InsertTarget {
+    oid: crate::oid::PgClassOid,
+    relname: String,
+    nsname: String,
+    attrs: Vec<crate::pg_catalog::PgAttribute>,
+    /// Columns named in `INSERT INTO t (a, b, …)`; empty means "all columns".
+    col_names: Vec<String>,
+    /// `OVERRIDING SYSTEM VALUE` was requested.
+    overriding_system: bool,
+}
+
+/// Resolve the INSERT target relation, validate that every column named in the
+/// target list exists, and collect the declared column list + overriding flag.
+fn resolve_insert_target(
+    ins: &protobuf::InsertStmt,
+    relation: &protobuf::RangeVar,
+    snapshot: &PgCatalog,
+) -> Result<InsertTarget, AnalyzeError> {
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+    let table = snapshot
+        .resolve_table(schema, &relation.relname)
+        .ok_or_else(|| {
+            crate::scope::undefined_table_error(
+                snapshot,
+                schema,
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
+        })?;
+
+    let col_names: Vec<String> = ins
+        .cols
+        .iter()
+        .filter_map(|n| {
+            if let Some(node::Node::ResTarget(rt)) = n.node.as_ref() {
+                Some(rt.name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let table_oid = table.oid;
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table_oid).to_vec();
+
+    // Validate every column mentioned in the INSERT target list exists on the
+    // table. PostgreSQL rejects unknown columns with a clear error; without
+    // this check the analyzer would silently treat the corresponding `$N`
+    // parameter as text via the UNKNOWN fallback, masking a real bug in the
+    // caller's SQL.
+    for n in &ins.cols {
+        let Some(node::Node::ResTarget(rt)) = n.node.as_ref() else {
+            continue;
+        };
+        if !table_attrs.iter().any(|c| c.attname == rt.name) {
+            return Err(crate::scope::undefined_dml_column_error(
+                &rt.name,
+                &table_relname,
+                &table_attrs,
+                crate::error::SourceSpan::from_node_qname(rt.location),
+            ));
+        }
+    }
+
+    // PG enum for `Insert.override`:
+    //   1 = OVERRIDING_NOT_SET, 2 = USER_VALUE, 3 = SYSTEM_VALUE.
+    // `OVERRIDING SYSTEM VALUE` on a table without any identity column is a
+    // no-op for PG (silently accepted), so we don't reject the construct
+    // here even though it's almost always a caller mistake — keeping
+    // `pg_sanity` honest matters more than catching the typo statically.
+    Ok(InsertTarget {
+        oid: table_oid,
+        relname: table_relname,
+        nsname: table_nsname,
+        attrs: table_attrs,
+        col_names,
+        overriding_system: ins.r#override == 3,
+    })
+}
+
+/// Walk the optional `WITH` clause so parameters used only inside the CTE are
+/// registered with the collector — without this, `$N` numbers referenced
+/// exclusively in the CTE would be missing from `seen` and `into_sorted`
+/// would report a spurious "parameter gap". The resolved CTE columns are also
+/// threaded into the inner SELECT's scope so `INSERT … SELECT … FROM cte`
+/// resolves the CTE alias.
+fn build_insert_cte_scopes(
+    ins: &protobuf::InsertStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
+    if let Some(with) = &ins.with_clause {
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
+    Ok(cte_scopes)
+}
+
+/// The column targeted by position `i` in a VALUES row / SELECT list, honoring
+/// an explicit column list (`INSERT INTO t (a, b)`) or full table order.
+fn target_col_at(tgt: &InsertTarget, i: usize) -> Option<&crate::pg_catalog::PgAttribute> {
+    if tgt.col_names.is_empty() {
+        tgt.attrs.get(i)
+    } else {
+        tgt.col_names
+            .get(i)
+            .and_then(|cn| tgt.attrs.iter().find(|c| &c.attname == cn))
+    }
+}
+
+/// The number of values each row must supply: the explicit column count, or
+/// the full table width when no column list is given.
+fn insert_arity(tgt: &InsertTarget) -> usize {
+    if tgt.col_names.is_empty() {
+        tgt.attrs.len()
+    } else {
+        tgt.col_names.len()
+    }
+}
+
+/// `INSERT … VALUES (…)`: infer each value with the column's type as goal,
+/// enforcing arity, NOT NULL / typmod literal checks, and the
+/// generated/identity-column restrictions.
+fn analyze_insert_values(
+    ins: &protobuf::InsertStmt,
+    val_sel: &protobuf::SelectStmt,
+    tgt: &InsertTarget,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    // No table in scope for VALUES, but we need scope for possible
+    // subqueries/functions inside an individual value expression.
+    let scope = Scope::default();
+    let null_ctx = NullabilityContext::default();
+    let expected_len = insert_arity(tgt);
+
+    for val_list in &val_sel.values_lists {
+        let Some(node::Node::List(list)) = val_list.node.as_ref() else {
+            continue;
+        };
+        // Arity check: the VALUES row must match the declared column list
+        // (or, when no column list is given, the full table width).
+        if list.items.len() != expected_len {
+            // PG (SQLSTATE 42601) emits one of two messages:
+            // `INSERT has more expressions than target columns` or
+            // `INSERT has more target columns than expressions`. Mirror PG's
+            // wording verbatim and tack on our richer detail behind it.
+            let pg_msg = if list.items.len() > expected_len {
+                "INSERT has more expressions than target columns"
+            } else {
+                "INSERT has more target columns than expressions"
+            };
+            return Err(AnalyzeError::Invalid(format!(
+                "{pg_msg} (table `{}` expects {expected_len}, got {})",
+                tgt.relname,
+                list.items.len(),
+            )));
+        }
+        for (i, val) in list.items.iter().enumerate() {
+            let target_col = target_col_at(tgt, i);
+            // The matching `ResTarget` in `ins.cols` for column `i` — used to
+            // build a `source_span` so a type mismatch surfaces a secondary
+            // label at the column reference (not just at the value).
+            let target_loc = ins.cols.get(i).and_then(|n| {
+                if let Some(node::Node::ResTarget(rt)) = n.node.as_ref() {
+                    crate::error::SourceSpan::from_node_qname(rt.location)
+                } else {
+                    None
+                }
+            });
+            if let Some(tc) = target_col
+                && is_sql_null_literal(val)
+                && let Some(err) = null_assignment_error(tc, snapshot, &tgt.relname, "insert")
+            {
+                return Err(err);
+            }
+            if let Some(tc) = target_col
+                && let Some(err) = crate::typmod::check_literal_assignment(
+                    snapshot,
+                    tc.atttypid,
+                    snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                    val,
+                )
+            {
+                return Err(err);
+            }
+            if let Some(tc) = target_col
+                && tc.attgenerated.is_some()
+                && !is_set_to_default(val)
+            {
+                return Err(AnalyzeError::Invalid(format!(
+                    "cannot insert a non-DEFAULT value into column \"{}\" \
+                     (generated column on `{}`)",
+                    tc.attname, tgt.relname,
+                )));
+            }
+            if let Some(tc) = target_col
+                && tc.attidentity == Some(AttIdentity::Always)
+                && !is_set_to_default(val)
+                && !tgt.overriding_system
+            {
+                return Err(AnalyzeError::Invalid(format!(
+                    "cannot insert a non-DEFAULT value into column \"{}\" \
+                     (identity column on `{}` defined as GENERATED ALWAYS \
+                     — hint: use OVERRIDING SYSTEM VALUE to override)",
+                    tc.attname, tgt.relname,
+                )));
+            }
+            let goal = target_col
+                .map(|tc| TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname))
+                .unwrap_or(TypeGoal::NONE);
+            let goal = match target_loc {
+                Some(s) => goal.with_source(s),
+                None => goal,
+            };
+            expr::infer_expr(
+                val,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                goal,
+            )?;
+
+            if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && let Some(tc) = target_col
+                && !tc.attnotnull
+            {
+                params.infer_nullable(p.number, true);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `INSERT … SELECT …`: enforce arity, reject GENERATED ALWAYS identity
+/// targets (a SELECT can't supply `DEFAULT`), walk the SELECT so its params
+/// register and typos propagate, then pin column types onto bare `$N`
+/// projections.
+fn analyze_insert_select(
+    val_sel: &protobuf::SelectStmt,
+    tgt: &InsertTarget,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+) -> Result<(), AnalyzeError> {
+    let expected_len = insert_arity(tgt);
+    if val_sel.target_list.len() != expected_len {
+        let pg_msg = if val_sel.target_list.len() > expected_len {
+            "INSERT has more expressions than target columns"
+        } else {
+            "INSERT has more target columns than expressions"
+        };
+        return Err(AnalyzeError::Invalid(format!(
+            "{pg_msg} (table `{}` expects {expected_len}, SELECT produces {})",
+            tgt.relname,
+            val_sel.target_list.len(),
+        )));
+    }
+    // INSERT ... SELECT cannot supply `DEFAULT`, so any target column that is
+    // `GENERATED ALWAYS AS IDENTITY` is rejected unless the user requested
+    // OVERRIDING SYSTEM VALUE.
+    if !tgt.overriding_system {
+        for i in 0..val_sel.target_list.len() {
+            if let Some(tc) = target_col_at(tgt, i)
+                && tc.attidentity == Some(AttIdentity::Always)
+            {
+                return Err(AnalyzeError::Invalid(format!(
+                    "cannot insert a non-DEFAULT value into column \"{}\" \
+                     (identity column on `{}` defined as GENERATED ALWAYS \
+                     — hint: use OVERRIDING SYSTEM VALUE to override)",
+                    tc.attname, tgt.relname,
+                )));
+            }
+        }
+    }
+    // Walk the SELECT side of `INSERT … SELECT` so its params are registered
+    // and any undefined-column / typo errors inside the SELECT propagate
+    // cleanly. Earlier this swallowed the error with `let _ =`, which masked
+    // typos in JOIN ON or in the SELECT target list as a downstream
+    // `param count mismatch` invariant failure.
+    analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
+
+    for (i, target) in val_sel.target_list.iter().enumerate() {
+        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+            && let Some(val) = &rt.val
+            && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+            && let Some(col_name) = tgt.col_names.get(i)
+            && let Some(tc) = tgt.attrs.iter().find(|c| &c.attname == col_name)
+        {
+            if params.get(p.number) == oid::UNKNOWN {
+                params.record(p.number, tc.atttypid);
+            }
+            if !tc.attnotnull {
+                params.infer_nullable(p.number, true);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`.
+///
+/// DO UPDATE exposes a virtual `EXCLUDED` relation holding the proposed row.
+/// We model it in scope as a second alias over the target table: the columns
+/// share names and types, and nullability follows the real columns because PG
+/// rejects an INSERT that violates NOT NULL before the conflict handler runs.
+fn analyze_insert_on_conflict(
+    on_conflict: &protobuf::OnConflictClause,
+    relation: &protobuf::RangeVar,
+    tgt: &InsertTarget,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    // Validate the conflict target (`ON CONFLICT (cols)` / `ON CONFLICT ON
+    // CONSTRAINT name`) against pg_constraint. PG rejects targets that don't
+    // match a unique/primary-key index; without this check the analyzer
+    // accepts any column.
+    validate_on_conflict_target(on_conflict, snapshot, tgt.oid, &tgt.relname)?;
+
+    let mut conflict_scope = Scope::default();
+    let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
+    conflict_scope.add_dml_target(snapshot, &relation.relname, target_qn.clone(), &tgt.attrs);
+    conflict_scope.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
+    let conflict_null_ctx = NullabilityContext::default();
+    for set_item in &on_conflict.target_list {
+        if let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            if let Some(tc) = tgt.attrs.iter().find(|c| c.attname == rt.name) {
+                if tc.attgenerated.is_some() && !is_set_to_default(val) {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "column \"{}\" can only be updated to DEFAULT \
+                         (generated column on `{}`)",
+                        tc.attname, tgt.relname,
+                    )));
+                }
+                if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
+                    return Err(AnalyzeError::Invalid(format!(
+                        "column \"{}\" can only be updated to DEFAULT \
+                         (identity column on `{}` defined as GENERATED ALWAYS)",
+                        tc.attname, tgt.relname,
+                    )));
+                }
+            }
+            let goal = tgt
+                .attrs
+                .iter()
+                .find(|c| c.attname == rt.name)
+                .map(|tc| TypeGoal::assignment(tc.atttypid))
+                .unwrap_or(TypeGoal::NONE);
+            expr::infer_expr(
+                val,
+                expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
+                params,
+                goal,
+            )?;
+        }
+    }
+    if let Some(where_clause) = &on_conflict.where_clause {
+        expr::infer_expr(
+            where_clause,
+            expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
+            params,
+            TypeGoal::implicit(oid::BOOL),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn analyze_update(
+    upd: &protobuf::UpdateStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> AnalyzeResult {
+    let relation = upd
+        .relation
+        .as_ref()
+        .ok_or_else(|| AnalyzeError::Unsupported("UPDATE without relation".into()))?;
+
+    let table = snapshot
+        .resolve_table(
+            if relation.schemaname.is_empty() {
+                None
+            } else {
+                Some(&relation.schemaname)
+            },
+            &relation.relname,
+        )
+        .ok_or_else(|| {
+            crate::scope::undefined_table_error(
+                snapshot,
+                if relation.schemaname.is_empty() {
+                    None
+                } else {
+                    Some(relation.schemaname.as_str())
+                },
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
+        })?;
+
+    let table_oid = table.oid;
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table_oid).to_vec();
+
+    // Walk `UPDATE … WITH (cte) …` so parameters inside the CTE are seen by
+    // the collector and the CTE alias is visible to the FROM clause. Same
+    // reasoning as the corresponding block in `analyze_insert`.
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    if let Some(with) = &upd.with_clause {
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
+
+    // Build scope with target table + FROM clause tables.
+    let mut scope = Scope::default();
+    let mut null_ctx = NullabilityContext::default();
+    let alias = relation
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.as_str())
+        .unwrap_or(&relation.relname);
+    scope.add_dml_target(
+        snapshot,
+        alias,
+        crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
+        &table_attrs,
+    );
+
+    // Process FROM clause (UPDATE ... FROM ... WHERE ...).
+    process_from_clause(
+        &upd.from_clause,
+        &mut scope,
+        &mut null_ctx,
+        snapshot,
+        &cte_scopes,
+        params,
+    )?;
+
+    // Infer param types from SET column = expr — assignment context.
+    for target in &upd.target_list {
+        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            // Same reasoning as analyze_insert: reject unknown columns up
+            // front instead of letting the parameter fall back to text via
+            // the UNKNOWN path.
+            let tc = table_attrs
+                .iter()
+                .find(|c| c.attname == rt.name)
+                .ok_or_else(|| {
+                    crate::scope::undefined_dml_column_error(
+                        &rt.name,
+                        &table_relname,
+                        &table_attrs,
+                        crate::error::SourceSpan::from_node_qname(rt.location),
+                    )
+                })?;
+            // Catch `UPDATE … SET not_null_col = NULL` statically — PG
+            // raises a runtime `null value in column … violates not-null
+            // constraint` error, and we can do better by failing the macro
+            // at compile time.
+            if is_sql_null_literal(val)
+                && let Some(err) = null_assignment_error(tc, snapshot, &table_relname, "assign")
+            {
+                return Err(err);
+            }
+            if let Some(err) = crate::typmod::check_literal_assignment(
+                snapshot,
+                tc.atttypid,
+                snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                val,
+            ) {
+                return Err(err);
+            }
+            if tc.attgenerated.is_some() && !is_set_to_default(val) {
+                return Err(AnalyzeError::Invalid(format!(
+                    "column \"{}\" can only be updated to DEFAULT \
+                     (generated column on `{}`)",
+                    tc.attname, table_relname,
+                )));
+            }
+            if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
+                return Err(AnalyzeError::Invalid(format!(
+                    "column \"{}\" can only be updated to DEFAULT \
+                     (identity column on `{}` defined as GENERATED ALWAYS)",
+                    tc.attname, table_relname,
+                )));
+            }
+            let goal = TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname);
+            // Attach the target column's reference span so a TypeMismatch
+            // surfaces a secondary label pointing at the `col =` site.
+            let goal = if let Some(s) = crate::error::SourceSpan::from_node_qname(rt.location) {
+                goal.with_source(s)
+            } else {
+                goal
+            };
+            expr::infer_expr(
+                val,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                goal,
+            )?;
+
+            if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && !tc.attnotnull
+            {
+                params.infer_nullable(p.number, true);
+            }
+        }
+    }
+
+    // WHERE — BOOL goal with assignment coercion.
+    if let Some(where_clause) = &upd.where_clause {
+        coerce_bool_clause(
+            where_clause,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+            "WHERE",
+        )?;
+    }
+
+    let columns = resolve_target_list(
+        &upd.returning_list,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    )?;
+    Ok((columns, None))
+}
+
+pub(crate) fn analyze_delete(
+    del: &protobuf::DeleteStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> AnalyzeResult {
+    let relation = del
+        .relation
+        .as_ref()
+        .ok_or_else(|| AnalyzeError::Unsupported("DELETE without relation".into()))?;
+
+    let table = snapshot
+        .resolve_table(
+            if relation.schemaname.is_empty() {
+                None
+            } else {
+                Some(&relation.schemaname)
+            },
+            &relation.relname,
+        )
+        .ok_or_else(|| {
+            crate::scope::undefined_table_error(
+                snapshot,
+                if relation.schemaname.is_empty() {
+                    None
+                } else {
+                    Some(relation.schemaname.as_str())
+                },
+                &relation.relname,
+                crate::error::SourceSpan::from_node_qname(relation.location),
+            )
+        })?;
+
+    let table_relname = table.relname.clone();
+    let table_nsname = snapshot
+        .namespace_name(table.relnamespace)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let table_attrs = snapshot.attributes_of(table.oid).to_vec();
+
+    // Walk `DELETE … WITH (cte) …` so parameters inside the CTE register
+    // with the collector. CTE visibility inside WHERE sublinks is a
+    // separate concern (subselects don't currently inherit outer CTEs);
+    // this fix is scoped to closing the param-tracking gap.
+    if let Some(with) = &del.with_clause {
+        let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+        for cte_node in &with.ctes {
+            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
+                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+                cte_scopes.insert(cte.ctename.clone(), cte_columns);
+            }
+        }
+    }
+
+    let mut scope = Scope::default();
+    let null_ctx = NullabilityContext::default();
+    scope.add_dml_target(
+        snapshot,
+        &relation.relname,
+        crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
+        &table_attrs,
+    );
+
+    // WHERE — BOOL goal with assignment coercion.
+    if let Some(where_clause) = &del.where_clause {
+        coerce_bool_clause(
+            where_clause,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+            "WHERE",
+        )?;
+    }
+
+    let columns = resolve_target_list(
+        &del.returning_list,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    )?;
+    Ok((columns, None))
+}

@@ -47,6 +47,7 @@ mod param_collector;
 mod pg_catalog;
 #[cfg(feature = "pg_sanity")]
 mod pg_sanity;
+mod polymorphic;
 #[cfg(feature = "pg_sanity")]
 pub use pg_sanity::{Divergence, DivergenceKind};
 mod resolve;

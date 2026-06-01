@@ -407,9 +407,9 @@ impl PgCatalog {
             .filter(|o| {
                 let left_ok = match (op_left(o), left_oid) {
                     (Some(expected), Some(actual))
-                        if crate::functions::is_polymorphic(expected) =>
+                        if crate::polymorphic::is_polymorphic(expected) =>
                     {
-                        crate::functions::matches_polymorphic(expected, actual, self)
+                        crate::polymorphic::matches_polymorphic(expected, actual, self)
                     }
                     (Some(expected), Some(actual)) => {
                         expected == actual || self.has_implicit_cast(actual, expected)
@@ -417,13 +417,13 @@ impl PgCatalog {
                     (None, None) => true,
                     _ => false,
                 };
-                let right_ok = if crate::functions::is_polymorphic(o.oprright) {
-                    crate::functions::matches_polymorphic(o.oprright, right_oid, self)
+                let right_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
+                    crate::polymorphic::matches_polymorphic(o.oprright, right_oid, self)
                 } else {
                     o.oprright == right_oid || self.has_implicit_cast(right_oid, o.oprright)
                 };
-                let has_any_poly = op_left(o).is_some_and(crate::functions::is_polymorphic)
-                    || crate::functions::is_polymorphic(o.oprright);
+                let has_any_poly = op_left(o).is_some_and(crate::polymorphic::is_polymorphic)
+                    || crate::polymorphic::is_polymorphic(o.oprright);
                 has_any_poly && left_ok && right_ok
             })
             .copied()
@@ -433,9 +433,9 @@ impl PgCatalog {
         if !poly_matches.is_empty() {
             let score = |o: &&PgOperator| -> u16 {
                 let l = op_left(o)
-                    .map(crate::functions::polymorphic_specificity)
+                    .map(crate::polymorphic::polymorphic_specificity)
                     .unwrap_or(10) as u16;
-                let r = crate::functions::polymorphic_specificity(o.oprright) as u16;
+                let r = crate::polymorphic::polymorphic_specificity(o.oprright) as u16;
                 l + r
             };
             if let Some(max_score) = poly_matches.iter().map(&score).max() {
@@ -495,9 +495,9 @@ impl PgCatalog {
                 let left_ok = match (op_left(o), left_oid) {
                     (Some(_), Some(actual)) if actual == oid::UNKNOWN => true,
                     (Some(expected), Some(actual))
-                        if crate::functions::is_polymorphic(expected) =>
+                        if crate::polymorphic::is_polymorphic(expected) =>
                     {
-                        crate::functions::matches_polymorphic(expected, actual, self)
+                        crate::polymorphic::matches_polymorphic(expected, actual, self)
                     }
                     (Some(expected), Some(actual)) => self.has_implicit_cast(actual, expected),
                     (None, None) => true,
@@ -505,8 +505,8 @@ impl PgCatalog {
                 };
                 let right_ok = if right_unknown {
                     true
-                } else if crate::functions::is_polymorphic(o.oprright) {
-                    crate::functions::matches_polymorphic(o.oprright, right_oid, self)
+                } else if crate::polymorphic::is_polymorphic(o.oprright) {
+                    crate::polymorphic::matches_polymorphic(o.oprright, right_oid, self)
                 } else {
                     self.has_implicit_cast(right_oid, o.oprright)
                 };
@@ -600,9 +600,9 @@ impl PgCatalog {
                     // is what lets `int || 'x'` resolve via `anynonarray ||
                     // text` once the unknown is resolved to `text`.
                     (Some(expected), Some(actual))
-                        if crate::functions::is_polymorphic(expected) =>
+                        if crate::polymorphic::is_polymorphic(expected) =>
                     {
-                        crate::functions::matches_polymorphic(expected, actual, self)
+                        crate::polymorphic::matches_polymorphic(expected, actual, self)
                     }
                     (Some(expected), Some(actual)) => {
                         expected == actual || self.has_implicit_cast(actual, expected)
@@ -610,8 +610,8 @@ impl PgCatalog {
                     (None, None) => true,
                     _ => false,
                 };
-                let right_ok = if crate::functions::is_polymorphic(o.oprright) {
-                    crate::functions::matches_polymorphic(o.oprright, resolved_right, self)
+                let right_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
+                    crate::polymorphic::matches_polymorphic(o.oprright, resolved_right, self)
                 } else {
                     o.oprright == resolved_right
                         || self.has_implicit_cast(resolved_right, o.oprright)
@@ -887,9 +887,9 @@ fn concretize_operator(
     let mut bound_element: Option<PgTypeOid> = None;
     let mut bound_array: Option<PgTypeOid> = None;
     if let (Some(expected_l), Some(actual_l)) = (op_left, left_actual)
-        && crate::functions::is_polymorphic(expected_l)
+        && crate::polymorphic::is_polymorphic(expected_l)
     {
-        crate::functions::bind_polymorphic_from(
+        crate::polymorphic::bind_polymorphic_from(
             expected_l,
             actual_l,
             db,
@@ -897,8 +897,8 @@ fn concretize_operator(
             &mut bound_array,
         );
     }
-    if crate::functions::is_polymorphic(op.oprright) {
-        crate::functions::bind_polymorphic_from(
+    if crate::polymorphic::is_polymorphic(op.oprright) {
+        crate::polymorphic::bind_polymorphic_from(
             op.oprright,
             right_actual,
             db,
@@ -908,14 +908,14 @@ fn concretize_operator(
     }
     Some(ResolvedOperator {
         left_type_oid: op_left
-            .map(|o| crate::functions::substitute_polymorphic(o, bound_element, bound_array, db)),
-        right_type_oid: crate::functions::substitute_polymorphic(
+            .map(|o| crate::polymorphic::substitute_polymorphic(o, bound_element, bound_array, db)),
+        right_type_oid: crate::polymorphic::substitute_polymorphic(
             op.oprright,
             bound_element,
             bound_array,
             db,
         ),
-        result_type_oid: crate::functions::substitute_polymorphic(
+        result_type_oid: crate::polymorphic::substitute_polymorphic(
             op.oprresult?,
             bound_element,
             bound_array,

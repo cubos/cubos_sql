@@ -1,0 +1,235 @@
+use super::*;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bool expressions (AND, OR, NOT) — PG uses COERCION_ASSIGNMENT for args
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn infer_bool_expr(
+    expr: &protobuf::BoolExpr,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    let Ctx { snapshot, .. } = ctx;
+    // PG names the failing argument after the operator (`argument of NOT must
+    // be type boolean, not type X`, likewise AND / OR).
+    let label = match protobuf::BoolExprType::try_from(expr.boolop) {
+        Ok(protobuf::BoolExprType::NotExpr) => "NOT",
+        Ok(protobuf::BoolExprType::OrExpr) => "OR",
+        _ => "AND",
+    };
+    let mut any_nullable = false;
+    for arg in &expr.args {
+        match infer_expr(arg, ctx, params, TypeGoal::assignment(oid::BOOL)) {
+            Ok(t) => any_nullable = any_nullable || t.nullable,
+            // Rewrite a coerce-to-bool mismatch to PG's exact wording; other
+            // errors keep their own message.
+            Err(e) => {
+                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                    return Err(e);
+                }
+                let mut params2 = params.clone();
+                let actual_oid = infer_expr(arg, ctx, &mut params2, TypeGoal::NONE)
+                    .map(|t| t.type_oid)
+                    .unwrap_or(oid::UNKNOWN);
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "argument of {label} must be type boolean, not type {actual_pg}"
+                )));
+            }
+        }
+    }
+    Ok(ExprType::scalar(oid::BOOL, any_nullable))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// COALESCE — two-pass (PG chapter 10.5)
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn infer_coalesce(
+    expr: &protobuf::CoalesceExpr,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    let Ctx { snapshot, .. } = ctx;
+    // Pass 1: infer all args bottom-up. Bare string literals in UNKNOWN slots
+    // are reinterpreted as `text` so `COALESCE(int_col, 'x')` rejects instead
+    // of silently coercing the literal under the concrete branch's type.
+    let mut types = Vec::new();
+    let mut all_nullable = true;
+
+    for arg in &expr.args {
+        let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+        types.push(unknown_literal_as_text(Some(arg), t.type_oid));
+        if !t.nullable {
+            all_nullable = false;
+        }
+    }
+
+    // All non-UNKNOWN branches must share a common type, otherwise PG
+    // rejects with `could not convert type X to Y`.
+    let concrete_types: Vec<PgTypeOid> = types
+        .iter()
+        .copied()
+        .filter(|&t| t != oid::UNKNOWN)
+        .collect();
+    let type_oid = if concrete_types.is_empty() {
+        // All branches are UNKNOWN → PG §10.5 defaults to the preferred type
+        // of the string category (usually `text`). Derived from the catalog so
+        // we stay honest: no hardcoded OID here.
+        snapshot
+            .preferred_type_in_category(TypCategory::String)
+            .unwrap_or(oid::UNKNOWN)
+    } else {
+        coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
+            // PG (SQLSTATE 42804): `COALESCE types A and B cannot be
+            // matched`. PG reports the COALESCE args in source order
+            // (first then last), the *opposite* of CASE which orders the
+            // last branch first. We use `Invalid` to keep
+            // `TypeMismatch::Display`'s generic prefix from leaking in
+            // front of PG's exact wording.
+            // Report base type names — PG resolves COALESCE over the domain's
+            // base, so its wording says `text`, not the domain `email`.
+            let first = crate::ddl::util::format_type_for_message(
+                snapshot,
+                snapshot.unwrap_domain(concrete_types[0]),
+            );
+            let last = crate::ddl::util::format_type_for_message(
+                snapshot,
+                snapshot.unwrap_domain(concrete_types[concrete_types.len() - 1]),
+            );
+            AnalyzeError::Invalid(format!(
+                "COALESCE types {first} and {last} cannot be matched"
+            ))
+        })?
+    };
+
+    // Pass 2: back-fill UNKNOWN args with the resolved common type.
+    if type_oid != oid::UNKNOWN {
+        for (i, arg) in expr.args.iter().enumerate() {
+            if types[i] == oid::UNKNOWN {
+                let _ = infer_expr(arg, ctx, params, TypeGoal::implicit(type_oid));
+            }
+        }
+    }
+
+    // A `$param` directly inside COALESCE is, by construction, expected to be
+    // nullable — otherwise the COALESCE would be pointless. Override with
+    // `$param!` to force non-null.
+    for arg in &expr.args {
+        if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+            params.infer_nullable(p.number, true);
+        }
+    }
+
+    Ok(ExprType::scalar(type_oid, all_nullable))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CASE — two-pass (PG chapter 10.5)
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn infer_case(
+    expr: &protobuf::CaseExpr,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    let Ctx { snapshot, .. } = ctx;
+    // Pass 1: infer WHEN conditions with BOOL goal, results with NONE.
+    let mut types = Vec::new();
+    let mut any_branch_nullable = false;
+
+    for arg in &expr.args {
+        if let Some(node::Node::CaseWhen(when)) = arg.node.as_ref() {
+            // WHEN condition must be boolean. On a coerce-to-bool mismatch,
+            // rewrite to PG's exact wording (`argument of CASE/WHEN must be
+            // type boolean, not type X`) the same way the WHERE clause does;
+            // other errors carry their own message and propagate as-is.
+            if let Some(cond) = &when.expr
+                && let Err(e) = infer_expr(cond, ctx, params, TypeGoal::assignment(oid::BOOL))
+            {
+                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                    return Err(e);
+                }
+                let mut params2 = params.clone();
+                let actual_oid = infer_expr(cond, ctx, &mut params2, TypeGoal::NONE)
+                    .map(|t| t.type_oid)
+                    .unwrap_or(oid::UNKNOWN);
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "argument of CASE/WHEN must be type boolean, not type {actual_pg}"
+                )));
+            }
+            // THEN result. Untyped string literals are reinterpreted as
+            // `text` for branch reconciliation — PG's common-type rules
+            // compare literal syntax against the concrete branch's type
+            // and reject mismatches like `CASE … THEN 1 ELSE 'x' END`.
+            if let Some(result) = &when.result {
+                let t = infer_expr(result, ctx, params, TypeGoal::NONE)?;
+                types.push(unknown_literal_as_text(Some(result), t.type_oid));
+                any_branch_nullable = any_branch_nullable || t.nullable;
+            }
+        }
+    }
+
+    // ELSE clause.
+    if let Some(defresult) = &expr.defresult {
+        let t = infer_expr(defresult, ctx, params, TypeGoal::NONE)?;
+        types.push(unknown_literal_as_text(Some(defresult), t.type_oid));
+        any_branch_nullable = any_branch_nullable || t.nullable;
+    } else {
+        any_branch_nullable = true;
+    }
+
+    // All non-UNKNOWN branches must share a common type, otherwise PG
+    // rejects with `could not convert type X to Y`.
+    let concrete_types: Vec<PgTypeOid> = types
+        .iter()
+        .copied()
+        .filter(|&t| t != oid::UNKNOWN)
+        .collect();
+    let type_oid = if concrete_types.is_empty() {
+        // All branches are UNKNOWN → PG §10.5 defaults to the preferred type
+        // of the string category (usually `text`). Derived from the catalog so
+        // we stay honest: no hardcoded OID here.
+        snapshot
+            .preferred_type_in_category(TypCategory::String)
+            .unwrap_or(oid::UNKNOWN)
+    } else {
+        coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
+            // PG: `CASE types A and B cannot be matched` — last branch
+            // first, candidate type from prior branches second. Report base
+            // type names (domains are resolved over their base).
+            let last = crate::ddl::util::format_type_for_message(
+                snapshot,
+                snapshot.unwrap_domain(concrete_types[concrete_types.len() - 1]),
+            );
+            let first = crate::ddl::util::format_type_for_message(
+                snapshot,
+                snapshot.unwrap_domain(concrete_types[0]),
+            );
+            AnalyzeError::Invalid(format!("CASE types {last} and {first} cannot be matched"))
+        })?
+    };
+
+    // Pass 2: back-fill UNKNOWN result branches with the common type.
+    if type_oid != oid::UNKNOWN {
+        let mut type_idx = 0;
+        for arg in &expr.args {
+            if let Some(node::Node::CaseWhen(when)) = arg.node.as_ref()
+                && let Some(result) = &when.result
+            {
+                if types.get(type_idx) == Some(&oid::UNKNOWN) {
+                    let _ = infer_expr(result, ctx, params, TypeGoal::implicit(type_oid));
+                }
+                type_idx += 1;
+            }
+        }
+        if let Some(defresult) = &expr.defresult
+            && types.get(type_idx) == Some(&oid::UNKNOWN)
+        {
+            let _ = infer_expr(defresult, ctx, params, TypeGoal::implicit(type_oid));
+        }
+    }
+
+    Ok(ExprType::scalar(type_oid, any_branch_nullable))
+}

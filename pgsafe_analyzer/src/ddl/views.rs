@@ -206,7 +206,15 @@ fn install_relation(
         typcollation: None,
     });
 
-    // Record dependencies in pg_depend.
+    record_view_dependencies(interp, class_oid, &deps);
+    Ok(())
+}
+
+/// Record the view's `pg_depend` edges: one row per column it reads, per whole
+/// relation it reads, per function it calls, and per named type it references.
+/// DROP of any referenced object without CASCADE must reject while the view is
+/// reachable through these edges.
+fn record_view_dependencies(interp: &mut PgCatalog, class_oid: PgClassOid, deps: &ViewDeps) {
     let class_obj = PgGenericOid::from_nonzero(class_oid.into_nonzero());
     let dep = |refclassid: PgClassOid, refobjid: PgGenericOid, refobjsubid: i16| PgDepend {
         classid: PG_CLASS_RELID,
@@ -248,7 +256,6 @@ fn install_relation(
             0,
         ));
     }
-    Ok(())
 }
 
 #[derive(Clone)]

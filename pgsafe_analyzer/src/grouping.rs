@@ -16,6 +16,9 @@ use std::collections::HashSet;
 
 use pg_query::protobuf::{self, GroupingSetKind, node};
 
+use crate::error::AnalyzeError;
+use crate::expr;
+use crate::pg_catalog::{ConType, PgCatalog};
 use crate::scope::Scope;
 
 /// Result of expanding a `GROUP BY` clause that contains
@@ -203,4 +206,278 @@ fn singleton_set(node: &protobuf::Node, scope: &Scope) -> HashSet<(String, Strin
         out.insert((col.table_alias.clone(), col.name.clone()));
     }
     out
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GROUP BY validation (PG's parseCheckAggregates)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// PG's `parseCheckAggregates` (SQLSTATE 42803): in a *grouped* query — one
+/// with `GROUP BY`, `HAVING`, or a plain (non-windowed) aggregate in the
+/// projection / `HAVING` / `ORDER BY` — every column referenced outside an
+/// aggregate must appear in the `GROUP BY`, or be functionally determined by
+/// it via a fully-grouped primary key. Otherwise PG rejects with
+/// `column "rel.col" must appear in the GROUP BY clause or be used in an
+/// aggregate function`.
+///
+/// Deliberately conservative — over-rejecting valid SQL is the worst outcome,
+/// so the check runs only when every `GROUP BY` entry is a plain, resolvable
+/// column (expression grouping like `GROUP BY a+b` is skipped: matching a
+/// target sub-expression against it needs semantic equality we don't model),
+/// it honours the primary-key functional dependency, and it never descends
+/// into subqueries or aggregate/window arguments. Columns resolving to an
+/// outer query level are left to that query's own grouping.
+pub(crate) fn check_grouping(
+    sel: &protobuf::SelectStmt,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    use std::collections::HashSet;
+
+    // Grouped query?
+    let mut grouped = !sel.group_clause.is_empty() || sel.having_clause.is_some();
+    if !grouped {
+        grouped = sel.target_list.iter().any(|t| match t.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => rt
+                .val
+                .as_deref()
+                .is_some_and(|v| expr::detect_func_kinds(v, snapshot).has_aggregate),
+            _ => false,
+        });
+    }
+    if !grouped {
+        return Ok(());
+    }
+
+    // Grouped columns — bail out (lenient) on any non-plain-column entry.
+    let mut grouped_cols: HashSet<(String, String)> = HashSet::new();
+    for g in &sel.group_clause {
+        match resolve_group_column(g, scope) {
+            Some(key) => {
+                grouped_cols.insert(key);
+            }
+            None => return Ok(()),
+        }
+    }
+
+    // Columns of local sources — only these are subject to the check.
+    let mut local_cols: HashSet<(String, String)> = HashSet::new();
+    for src in &scope.sources {
+        for c in &src.columns {
+            local_cols.insert((c.table_alias.clone(), c.name.clone()));
+        }
+    }
+
+    // Primary-key functional dependency: when a table's entire PK is grouped,
+    // all of its columns are functionally determined and need not be grouped.
+    let mut fully_grouped: HashSet<String> = HashSet::new();
+    for src in &scope.sources {
+        let Some(qn) = &src.source_qn else {
+            continue;
+        };
+        let Some(class) = snapshot.resolve_table(Some(&qn.schema), &qn.name) else {
+            continue;
+        };
+        let attrs = snapshot.attributes_of(class.oid);
+        if let Some(pk) = snapshot
+            .pg_constraint_values()
+            .find(|c| c.conrelid == class.oid && matches!(c.contype, ConType::PrimaryKey))
+        {
+            let all_grouped = !pk.conkey.is_empty()
+                && pk.conkey.iter().all(|&attnum| {
+                    attrs.iter().find(|a| a.attnum == attnum).is_some_and(|a| {
+                        grouped_cols.contains(&(src.alias.clone(), a.attname.clone()))
+                    })
+                });
+            if all_grouped {
+                fully_grouped.insert(src.alias.clone());
+            }
+        }
+    }
+
+    // The first ungrouped column in the projection / HAVING / ORDER BY is the
+    // error PG reports.
+    let mut nodes: Vec<&protobuf::Node> = Vec::new();
+    for t in &sel.target_list {
+        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+            && let Some(val) = rt.val.as_deref()
+        {
+            nodes.push(val);
+        }
+    }
+    if let Some(having) = sel.having_clause.as_deref() {
+        nodes.push(having);
+    }
+    for s in &sel.sort_clause {
+        if let Some(node::Node::SortBy(sb)) = s.node.as_ref()
+            && let Some(inner) = sb.node.as_deref()
+        {
+            nodes.push(inner);
+        }
+    }
+    for node in nodes {
+        if let Some((alias, col)) = find_ungrouped(
+            node,
+            scope,
+            snapshot,
+            &grouped_cols,
+            &local_cols,
+            &fully_grouped,
+        ) {
+            return Err(AnalyzeError::Invalid(format!(
+                "column \"{alias}.{col}\" must appear in the GROUP BY clause \
+                 or be used in an aggregate function"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
+/// `(table_alias, column_name)` for a plain `ColumnRef`, or `None` for any
+/// other shape (expression, grouping set, select-list alias, …).
+fn resolve_group_column(node: &protobuf::Node, scope: &Scope) -> Option<(String, String)> {
+    let node::Node::ColumnRef(cr) = node.node.as_ref()? else {
+        return None;
+    };
+    let (table, column) = column_ref_parts(cr)?;
+    scope
+        .resolve_column(table, column, None)
+        .ok()
+        .map(|c| (c.table_alias.clone(), c.name.clone()))
+}
+
+/// Split a `ColumnRef`'s string fields into an optional table qualifier and
+/// the column name. Returns `None` for a bare `*` / qualified `t.*` (no string
+/// column name) or an unexpected shape.
+fn column_ref_parts(cr: &protobuf::ColumnRef) -> Option<(Option<&str>, &str)> {
+    let parts: Vec<&str> = cr
+        .fields
+        .iter()
+        .filter_map(|f| match f.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match parts.as_slice() {
+        [col] => Some((None, *col)),
+        [tbl, col] => Some((Some(*tbl), *col)),
+        [_schema, tbl, col] => Some((Some(*tbl), *col)),
+        _ => None,
+    }
+}
+
+/// Whether a `FuncCall` is an aggregate or a window call — its argument
+/// columns don't need to be grouped, so the grouping walk skips it entirely.
+fn is_aggregate_or_window(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+    if fc.over.is_some() {
+        return true;
+    }
+    let parts = expr::extract_string_fields(&fc.funcname);
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => return false,
+    };
+    snapshot
+        .find_functions(schema, name)
+        .iter()
+        .any(|f| matches!(f.prokind, crate::pg_catalog::ProKind::Aggregate))
+}
+
+/// Find the first column reference in `node` that is local, not grouped, not
+/// functionally determined by a grouped PK, and not inside an aggregate /
+/// window call. Mirrors PG's `check_ungrouped_columns` walk; subqueries are
+/// not descended into (a `SubLink` is its own scope).
+fn find_ungrouped(
+    node: &protobuf::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+    grouped: &std::collections::HashSet<(String, String)>,
+    local: &std::collections::HashSet<(String, String)>,
+    fully_grouped: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    let inner = node.node.as_ref()?;
+    match inner {
+        node::Node::ColumnRef(cr) => {
+            let (table, column) = column_ref_parts(cr)?;
+            let sc = scope.resolve_column(table, column, None).ok()?;
+            let key = (sc.table_alias.clone(), sc.name.clone());
+            if local.contains(&key) && !grouped.contains(&key) && !fully_grouped.contains(&key.0) {
+                Some(key)
+            } else {
+                None
+            }
+        }
+        node::Node::FuncCall(fc) => {
+            if is_aggregate_or_window(fc, snapshot) {
+                return None;
+            }
+            fc.args
+                .iter()
+                .find_map(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped))
+        }
+        node::Node::AExpr(e) => e
+            .lexpr
+            .as_deref()
+            .and_then(|l| find_ungrouped(l, scope, snapshot, grouped, local, fully_grouped))
+            .or_else(|| {
+                e.rexpr
+                    .as_deref()
+                    .and_then(|r| find_ungrouped(r, scope, snapshot, grouped, local, fully_grouped))
+            }),
+        node::Node::BoolExpr(b) => b
+            .args
+            .iter()
+            .find_map(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::CoalesceExpr(c) => c
+            .args
+            .iter()
+            .find_map(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::CaseExpr(c) => c
+            .args
+            .iter()
+            .find_map(|w| find_ungrouped(w, scope, snapshot, grouped, local, fully_grouped))
+            .or_else(|| {
+                c.defresult
+                    .as_deref()
+                    .and_then(|d| find_ungrouped(d, scope, snapshot, grouped, local, fully_grouped))
+            }),
+        node::Node::CaseWhen(w) => w
+            .expr
+            .as_deref()
+            .and_then(|e| find_ungrouped(e, scope, snapshot, grouped, local, fully_grouped))
+            .or_else(|| {
+                w.result
+                    .as_deref()
+                    .and_then(|r| find_ungrouped(r, scope, snapshot, grouped, local, fully_grouped))
+            }),
+        node::Node::TypeCast(c) => c
+            .arg
+            .as_deref()
+            .and_then(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::NullTest(t) => t
+            .arg
+            .as_deref()
+            .and_then(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::BooleanTest(t) => t
+            .arg
+            .as_deref()
+            .and_then(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::AArrayExpr(a) => a
+            .elements
+            .iter()
+            .find_map(|e| find_ungrouped(e, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::AIndirection(ind) => ind
+            .arg
+            .as_deref()
+            .and_then(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::List(l) => l
+            .items
+            .iter()
+            .find_map(|i| find_ungrouped(i, scope, snapshot, grouped, local, fully_grouped)),
+        // A SubLink is its own scope; columns inside it are governed there.
+        node::Node::SubLink(_) => None,
+        _ => None,
+    }
 }
