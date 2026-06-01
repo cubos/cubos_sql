@@ -540,6 +540,49 @@ fn check_no_aggregates_or_windows(
     Ok(())
 }
 
+/// Coerce a clause expression (WHERE / HAVING / DML WHERE) to boolean and, on
+/// a coerce-to-bool mismatch, rewrite to PG's exact wording — `argument of
+/// {label} must be type boolean, not type X` — so the `pg_sanity` prefix check
+/// matches. Errors that aren't a `TypeMismatch` (undefined column, subquery
+/// arity, …) carry their own specific message and propagate unchanged.
+fn coerce_bool_clause(
+    node: &protobuf::Node,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    label: &str,
+) -> Result<(), AnalyzeError> {
+    let Err(e) = expr::infer_expr(
+        node,
+        scope,
+        null_ctx,
+        snapshot,
+        params,
+        TypeGoal::assignment(oid::BOOL),
+    ) else {
+        return Ok(());
+    };
+    if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+        return Err(e);
+    }
+    let mut params2 = params.clone();
+    let actual_oid = expr::infer_expr(
+        node,
+        scope,
+        null_ctx,
+        snapshot,
+        &mut params2,
+        TypeGoal::NONE,
+    )
+    .map(|t| t.type_oid)
+    .unwrap_or(oid::UNKNOWN);
+    let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+    Err(AnalyzeError::Invalid(format!(
+        "argument of {label} must be type boolean, not type {actual_pg}"
+    )))
+}
+
 /// PG's `parseCheckAggregates` (SQLSTATE 42803): in a *grouped* query — one
 /// with `GROUP BY`, `HAVING`, or a plain (non-windowed) aggregate in the
 /// projection / `HAVING` / `ORDER BY` — every column referenced outside an
@@ -975,37 +1018,7 @@ fn analyze_select_with_ctes_and_outer(
         // (they reference the post-aggregation row, not the pre-aggregation
         // one). Catch these statically before the type pass runs.
         check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
-        if let Err(e) = expr::infer_expr(
-            where_clause,
-            &scope,
-            &null_ctx,
-            snapshot,
-            params,
-            TypeGoal::assignment(oid::BOOL),
-        ) {
-            // Only rewrite to PG's `argument of WHERE` wording when the
-            // failure was actually a coerce-to-bool mismatch. Other errors
-            // (subquery arity, undefined column, …) carry their own
-            // specific message we shouldn't shadow.
-            if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
-                return Err(e);
-            }
-            let mut params2 = params.clone();
-            let actual_oid = expr::infer_expr(
-                where_clause,
-                &scope,
-                &null_ctx,
-                snapshot,
-                &mut params2,
-                TypeGoal::NONE,
-            )
-            .map(|t| t.type_oid)
-            .unwrap_or(oid::UNKNOWN);
-            let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-            return Err(AnalyzeError::Invalid(format!(
-                "argument of WHERE must be type boolean, not type {actual_pg}"
-            )));
-        }
+        coerce_bool_clause(where_clause, &scope, &null_ctx, snapshot, params, "WHERE")?;
     }
 
     // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
@@ -1041,14 +1054,7 @@ fn analyze_select_with_ctes_and_outer(
 
     // Process HAVING clause — same boolean goal as WHERE.
     if let Some(having) = &sel.having_clause {
-        expr::infer_expr(
-            having,
-            &scope,
-            &null_ctx,
-            snapshot,
-            params,
-            TypeGoal::assignment(oid::BOOL),
-        )?;
+        coerce_bool_clause(having, &scope, &null_ctx, snapshot, params, "HAVING")?;
     }
 
     // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes
@@ -1717,14 +1723,7 @@ fn analyze_update(
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &upd.where_clause {
-        expr::infer_expr(
-            where_clause,
-            &scope,
-            &null_ctx,
-            snapshot,
-            params,
-            TypeGoal::assignment(oid::BOOL),
-        )?;
+        coerce_bool_clause(where_clause, &scope, &null_ctx, snapshot, params, "WHERE")?;
     }
 
     let columns = resolve_target_list(&upd.returning_list, &scope, &null_ctx, snapshot, params)?;
@@ -1795,14 +1794,7 @@ fn analyze_delete(
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {
-        expr::infer_expr(
-            where_clause,
-            &scope,
-            &null_ctx,
-            snapshot,
-            params,
-            TypeGoal::assignment(oid::BOOL),
-        )?;
+        coerce_bool_clause(where_clause, &scope, &null_ctx, snapshot, params, "WHERE")?;
     }
 
     let columns = resolve_target_list(&del.returning_list, &scope, &null_ctx, snapshot, params)?;

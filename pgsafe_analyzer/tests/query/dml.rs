@@ -1748,3 +1748,25 @@ column p.user_idz does not exist
 ",
     );
 }
+
+// ── Non-boolean WHERE in DML uses PG's wording (SQLSTATE 42804) ──────────────
+
+#[test]
+fn delete_where_non_boolean_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("DELETE FROM users WHERE age"),
+        AnalyzeError::Invalid(_),
+        "argument of WHERE must be type boolean, not type integer",
+    );
+}
+
+#[test]
+fn update_where_non_boolean_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("UPDATE users SET name = 'x' WHERE age"),
+        AnalyzeError::Invalid(_),
+        "argument of WHERE must be type boolean, not type integer",
+    );
+}

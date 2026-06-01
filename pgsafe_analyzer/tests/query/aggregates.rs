@@ -458,3 +458,14 @@ fn window_function_does_not_require_grouping() {
         .unwrap();
     assert_cols(&s, vec![cn("age", int4()), c("rn", int8())]);
 }
+
+#[test]
+fn non_boolean_having_rejected() {
+    // PG: a non-boolean HAVING is `argument of HAVING must be type boolean…`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT count(*) FROM users HAVING age"),
+        AnalyzeError::Invalid(_),
+        "argument of HAVING must be type boolean, not type integer",
+    );
+}
