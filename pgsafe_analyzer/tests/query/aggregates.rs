@@ -496,7 +496,9 @@ fn single_aggregate_overload_rejects_wrong_arity() {
     // A lone aggregate overload must also reject the wrong argument count.
     // PG: `function bool_or(text, integer) does not exist`.
     let db = setup();
-    let err = db.analyze("SELECT bool_or(name, age) FROM users").unwrap_err();
+    let err = db
+        .analyze("SELECT bool_or(name, age) FROM users")
+        .unwrap_err();
     assert!(
         matches!(err, AnalyzeError::UndefinedFunction(_)),
         "expected UndefinedFunction, got {err:?}"
@@ -506,4 +508,51 @@ fn single_aggregate_overload_rejects_wrong_arity() {
             .starts_with("function bool_or(text, integer) does not exist"),
         "got: {err}"
     );
+}
+
+// ── max/min over the `record` pseudo-type only accepts composite actuals ─────
+
+#[test]
+fn max_over_scalar_without_overload_rejected() {
+    // `max(record)` exists, but its `record` parameter accepts only an actual
+    // composite/record value — not an arbitrary scalar. `max(boolean)` must be
+    // rejected (it used to resolve to `record` via the pseudo-type fallback).
+    // PG: `function max(boolean) does not exist`.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (active BOOLEAN, prefs JSONB);")
+        .unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT max(active) FROM t",
+            "function max(boolean) does not exist",
+        ),
+        (
+            "SELECT max(prefs) FROM t",
+            "function max(jsonb) does not exist",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::UndefinedFunction(_)),
+            "expected UndefinedFunction for {sql}, got {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with(expected),
+            "for {sql}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn max_over_composite_column_accepted() {
+    // The `max(record)` overload still resolves for an actual composite value —
+    // guards against over-rejecting after the scalar tightening.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TYPE pt AS (x FLOAT8, y FLOAT8);
+         CREATE TABLE shapes (id BIGINT PRIMARY KEY, p pt NOT NULL);",
+    )
+    .unwrap();
+    let r = db.analyze("SELECT max(p) FROM shapes");
+    assert!(r.is_ok(), "expected max(composite) to resolve, got: {r:?}");
 }

@@ -174,14 +174,31 @@ pub(crate) fn resolve_function(
     // `anyarray`. Other pseudo-types (`"any"` for `count(x)`, the `"any"`
     // element of a `VARIADIC "any"`, …) accept anything.
     let param_accepts = |p: PgTypeOid, a: PgTypeOid| {
-        p == a
-            || a == oid::UNKNOWN
-            || (is_polymorphic(p) && matches_polymorphic(p, a, snapshot))
-            || (!is_polymorphic(p)
-                && snapshot
-                    .get_type(p)
-                    .is_some_and(|t| t.typtype == TypType::Pseudo))
-            || casts_implicitly(a, p, snapshot)
+        if p == a || a == oid::UNKNOWN {
+            return true;
+        }
+        if is_polymorphic(p) {
+            return matches_polymorphic(p, a, snapshot);
+        }
+        // The `record` pseudo-type only accepts an actual composite/record
+        // value — NOT an arbitrary scalar. `max(record)` exists, but
+        // `max(boolean)` must still fail (PG: `function max(boolean) does not
+        // exist`). Other non-polymorphic pseudo-types (`"any"` for `count(x)`,
+        // the `"any"` element of a `VARIADIC "any"`, …) accept anything.
+        if p == oid::RECORD {
+            let base = snapshot.unwrap_domain(a);
+            return base == oid::RECORD
+                || snapshot
+                    .get_type(base)
+                    .is_some_and(|t| t.typtype == TypType::Composite);
+        }
+        if snapshot
+            .get_type(p)
+            .is_some_and(|t| t.typtype == TypType::Pseudo)
+        {
+            return true;
+        }
+        casts_implicitly(a, p, snapshot)
     };
 
     // Whether `f`'s parameters can plausibly accept the actual `arg_types`. A
