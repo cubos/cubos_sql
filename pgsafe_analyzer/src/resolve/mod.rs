@@ -207,12 +207,26 @@ pub(crate) fn fuse(
 ///
 /// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
 /// 1-based positional parameter index minus one.
+/// Extract the PG-verbatim message from a `pg_query` parse failure.
+///
+/// `pg_query::Error::Parse`'s `Display` prepends `"Invalid statement: "` to the
+/// server-side wording (`syntax error at or near "x"`). The error-message
+/// contract requires our message to *start with* PG's verbatim text, so for the
+/// `Parse` variant we return the inner string unwrapped; other variants keep
+/// their full `Display`.
+pub(crate) fn parse_error_message(e: &pg_query::Error) -> String {
+    match e {
+        pg_query::Error::Parse(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn analyze_static(
     snapshot: &PgCatalog,
     sql: &str,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, bool), AnalyzeError> {
-    let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(e.to_string()))?;
+    let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(parse_error_message(&e)))?;
 
     let stmt = parsed
         .protobuf

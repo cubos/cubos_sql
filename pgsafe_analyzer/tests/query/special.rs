@@ -588,3 +588,20 @@ fn stress_annotation_on_left_join_star() {
     let info = db.analyze(sql).unwrap();
     assert!(!col(&info, "title").nullable);
 }
+
+// ── Parse-error message fidelity ─────────────────────────────────────────────
+
+#[test]
+fn syntax_error_message_matches_pg_verbatim() {
+    // `pg_query::Error::Parse`'s Display prepends "Invalid statement: " to the
+    // server-side wording. The error-message contract requires our message to
+    // *start with* PG's verbatim text, so the analyzer must strip that wrapper.
+    // PG: `syntax error at or near "true"` — `EXTRACT(<expr> FROM …)` only
+    // accepts an identifier/string field, so a boolean literal is a syntax error.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT extract(true FROM age) FROM users"),
+        AnalyzeError::Parse(_),
+        "syntax error at or near \"true\"",
+    );
+}
