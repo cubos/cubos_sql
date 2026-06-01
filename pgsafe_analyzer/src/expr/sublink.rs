@@ -80,6 +80,60 @@ pub(crate) fn infer_sublink(
                         cols.len(),
                     )));
                 }
+
+                // Resolve the comparison operator between each LHS expression
+                // and the matching subquery column. PG applies the same
+                // operator-resolution rules here as for a plain `a OP b`, so
+                // `int_col IN (SELECT text_col …)` is rejected with
+                // `operator does not exist: integer = text`. The LHS lives in
+                // `testexpr` and is *only* reachable through this SubLink, so we
+                // must walk it here — that also pins LHS params/columns.
+                let lhs_nodes: Vec<&protobuf::Node> =
+                    match sub.testexpr.as_deref().and_then(|n| n.node.as_ref()) {
+                        Some(node::Node::RowExpr(r)) => r.args.iter().collect(),
+                        _ => sub.testexpr.as_deref().into_iter().collect(),
+                    };
+                // `oper_name` is `=` for `IN`, or the written operator for
+                // `<op> ANY/ALL`. Default to `=` if the parser left it empty.
+                let op_name = {
+                    let joined = extract_string_fields(&sub.oper_name).join(".");
+                    if joined.is_empty() {
+                        "=".to_string()
+                    } else {
+                        joined
+                    }
+                };
+                for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
+                    let lhs = infer_expr(lhs_node, ctx, params, TypeGoal::NONE)?;
+                    let l_oid = lhs.type_oid;
+                    let r_oid = col.type_oid;
+                    // An UNKNOWN side (bare literal / unpinned param) is coerced
+                    // by PG to its peer — pin params and skip the rejection.
+                    if l_oid == oid::UNKNOWN {
+                        if r_oid != oid::UNKNOWN {
+                            let _ = infer_expr(
+                                lhs_node,
+                                ctx,
+                                params,
+                                TypeGoal::implicit(snapshot.unwrap_domain(r_oid)),
+                            );
+                        }
+                        continue;
+                    }
+                    if r_oid == oid::UNKNOWN {
+                        continue;
+                    }
+                    if snapshot
+                        .find_operator(&op_name, Some(l_oid), r_oid)
+                        .is_none()
+                    {
+                        let left_pg = crate::ddl::util::format_type_for_message(snapshot, l_oid);
+                        let right_pg = crate::ddl::util::format_type_for_message(snapshot, r_oid);
+                        return Err(AnalyzeError::UndefinedOperator(format!(
+                            "operator does not exist: {left_pg} {op_name} {right_pg}"
+                        )));
+                    }
+                }
             }
             Ok(ExprType::scalar(oid::BOOL, true))
         }

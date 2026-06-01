@@ -426,3 +426,36 @@ fn scalar_subquery_without_named_output_is_question_column() {
         .unwrap();
     assert_eq!(s.columns[0].name, "?column?");
 }
+
+// ── IN/ANY/ALL subquery: comparison operator must resolve ────────────────────
+
+#[test]
+fn in_subquery_with_incompatible_types_rejected() {
+    // `bigint IN (SELECT text …)` has no `=` operator. PG resolves the IN
+    // comparison the same way as a plain `a = b` and rejects it.
+    // PG: `operator does not exist: bigint = text`.
+    let db = setup();
+    let err = db
+        .analyze("SELECT id FROM posts WHERE user_id IN (SELECT title FROM posts)")
+        .unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedOperator(_)),
+        "expected UndefinedOperator, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("operator does not exist: bigint = text"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn in_subquery_with_castable_types_accepted() {
+    // `integer IN (SELECT bigint …)` is fine — PG's cross-type `int4 = int8`
+    // operator resolves it. Guards against over-rejecting valid IN-subqueries.
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users WHERE age IN (SELECT id FROM users)")
+        .unwrap();
+    assert_eq!(col(&s, "id").pg_type, int8());
+}
