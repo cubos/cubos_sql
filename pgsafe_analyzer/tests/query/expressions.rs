@@ -312,6 +312,48 @@ fn complex_boolean_with_nullable_input() {
     );
 }
 
+#[test]
+fn not_operand_must_be_boolean() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE NOT age"),
+        AnalyzeError::Invalid(_),
+        "argument of NOT must be type boolean, not type integer",
+    );
+}
+
+#[test]
+fn and_operand_must_be_boolean() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE age AND true"),
+        AnalyzeError::Invalid(_),
+        "argument of AND must be type boolean, not type integer",
+    );
+}
+
+#[test]
+fn or_operand_must_be_boolean() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE name OR true"),
+        AnalyzeError::Invalid(_),
+        "argument of OR must be type boolean, not type text",
+    );
+}
+
+#[test]
+fn not_operand_error_propagates_through_case_when() {
+    let db = setup();
+    // The NOT operand error is specific enough that the enclosing CASE/WHEN
+    // does not shadow it with its own boolean-condition wording.
+    assert_analyze_err!(
+        db.analyze("SELECT CASE WHEN NOT age THEN 1 ELSE 0 END FROM users"),
+        AnalyzeError::Invalid(_),
+        "argument of NOT must be type boolean, not type integer",
+    );
+}
+
 // ── Stress: nested COALESCE / CASE / expressions ─────────────────────────────
 
 #[test]

@@ -2226,17 +2226,41 @@ fn infer_bool_expr(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
+    // PG names the failing argument after the operator (`argument of NOT must
+    // be type boolean, not type X`, likewise AND / OR).
+    let label = match protobuf::BoolExprType::try_from(expr.boolop) {
+        Ok(protobuf::BoolExprType::NotExpr) => "NOT",
+        Ok(protobuf::BoolExprType::OrExpr) => "OR",
+        _ => "AND",
+    };
     let mut any_nullable = false;
     for arg in &expr.args {
-        let t = infer_expr(
+        match infer_expr(
             arg,
             scope,
             null_ctx,
             snapshot,
             params,
             TypeGoal::assignment(oid::BOOL),
-        )?;
-        any_nullable = any_nullable || t.nullable;
+        ) {
+            Ok(t) => any_nullable = any_nullable || t.nullable,
+            // Rewrite a coerce-to-bool mismatch to PG's exact wording; other
+            // errors keep their own message.
+            Err(e) => {
+                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                    return Err(e);
+                }
+                let mut params2 = params.clone();
+                let actual_oid =
+                    infer_expr(arg, scope, null_ctx, snapshot, &mut params2, TypeGoal::NONE)
+                        .map(|t| t.type_oid)
+                        .unwrap_or(oid::UNKNOWN);
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "argument of {label} must be type boolean, not type {actual_pg}"
+                )));
+            }
+        }
     }
     Ok(ExprType::scalar(oid::BOOL, any_nullable))
 }
