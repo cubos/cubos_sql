@@ -2099,7 +2099,13 @@ fn infer_a_expr(
     let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
 
     // PG step 2: if one side is unknown and the other is concrete, assume
-    // unknown = the other side's type.  Re-infer to propagate into params.
+    // unknown = the other side's type. Re-infer to propagate into params.
+    //
+    // Smash a domain to its base first: operators resolve against the base
+    // type (`find_operator` unwraps domains), so a parameter compared against
+    // a domain column (`email_col <= $1`) is inferred by PG as the base
+    // (`text`), not the domain. Pinning the param to the raw domain would
+    // diverge from PG's Describe.
     if let (Some(l_oid), true) = (left_oid, right_oid == oid::UNKNOWN)
         && l_oid != oid::UNKNOWN
         && let Some(rexpr) = &expr.rexpr
@@ -2110,7 +2116,7 @@ fn infer_a_expr(
             null_ctx,
             snapshot,
             params,
-            TypeGoal::implicit(l_oid),
+            TypeGoal::implicit(snapshot.unwrap_domain(l_oid)),
         );
     }
     if let Some(r) = &right
@@ -2124,7 +2130,7 @@ fn infer_a_expr(
             null_ctx,
             snapshot,
             params,
-            TypeGoal::implicit(r.type_oid),
+            TypeGoal::implicit(snapshot.unwrap_domain(r.type_oid)),
         );
     }
 

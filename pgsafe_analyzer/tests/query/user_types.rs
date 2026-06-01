@@ -308,6 +308,16 @@ fn scalar_function_over_text_domain_resolves_to_base() {
 }
 
 #[test]
+fn param_compared_against_domain_column_infers_base_type() {
+    // Operators resolve against a domain's base type, so PG's Describe reports
+    // a parameter compared against a domain column as the base (`text`), not
+    // the domain. The analyzer used to pin it to the domain.
+    let db = setup_scalar_domains();
+    let s = db.analyze("SELECT n FROM t WHERE addr <= $p0").unwrap();
+    assert_params(&s, vec![p(text())]);
+}
+
+#[test]
 fn domain_column_surfaces_as_domain_type() {
     // Analyzer surfaces the Domain wrapper with its base type preserved; the
     // macro crate decides whether to treat it as opaque JSONB or unwrap.
