@@ -148,6 +148,29 @@ fn domain_select_preserves_domain_wrapper() {
 }
 
 #[test]
+fn coalesce_domain_and_base_resolves_to_base() {
+    let db = setup_with_domain();
+    // `COALESCE(domain_over_int4, bigint)` — PG smashes the domain to its base
+    // (int4), so the common type is int8. The analyzer used to over-reject it.
+    let s = db
+        .analyze("SELECT COALESCE(balance, id) AS c FROM accounts")
+        .unwrap();
+    assert_cols(&s, vec![c("c", int8())]);
+}
+
+#[test]
+fn coalesce_domain_mismatch_reports_base_type_name() {
+    let db = setup_with_domain();
+    // The "cannot be matched" wording reports the domain's *base* (`integer`),
+    // matching PG, not the domain name `positive_int`.
+    assert_analyze_err!(
+        db.analyze("SELECT COALESCE(balance, true) FROM accounts"),
+        AnalyzeError::Invalid(_),
+        "COALESCE types integer and boolean cannot be matched",
+    );
+}
+
+#[test]
 fn domain_implicit_arithmetic_falls_back_to_base() {
     let db = setup_with_domain();
     // `balance + 1` — the `+` operator is defined on the base int4, so the

@@ -2329,10 +2329,15 @@ fn infer_coalesce(
             // last branch first. We use `Invalid` to keep
             // `TypeMismatch::Display`'s generic prefix from leaking in
             // front of PG's exact wording.
-            let first = crate::ddl::util::format_type_for_message(snapshot, concrete_types[0]);
+            // Report base type names — PG resolves COALESCE over the domain's
+            // base, so its wording says `text`, not the domain `email`.
+            let first = crate::ddl::util::format_type_for_message(
+                snapshot,
+                snapshot.unwrap_domain(concrete_types[0]),
+            );
             let last = crate::ddl::util::format_type_for_message(
                 snapshot,
-                concrete_types[concrete_types.len() - 1],
+                snapshot.unwrap_domain(concrete_types[concrete_types.len() - 1]),
             );
             AnalyzeError::Invalid(format!(
                 "COALESCE types {first} and {last} cannot be matched"
@@ -2456,12 +2461,16 @@ fn infer_case(
     } else {
         coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
             // PG: `CASE types A and B cannot be matched` — last branch
-            // first, candidate type from prior branches second.
+            // first, candidate type from prior branches second. Report base
+            // type names (domains are resolved over their base).
             let last = crate::ddl::util::format_type_for_message(
                 snapshot,
-                concrete_types[concrete_types.len() - 1],
+                snapshot.unwrap_domain(concrete_types[concrete_types.len() - 1]),
             );
-            let first = crate::ddl::util::format_type_for_message(snapshot, concrete_types[0]);
+            let first = crate::ddl::util::format_type_for_message(
+                snapshot,
+                snapshot.unwrap_domain(concrete_types[0]),
+            );
             AnalyzeError::Invalid(format!("CASE types {last} and {first} cannot be matched"))
         })?
     };

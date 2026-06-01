@@ -152,6 +152,20 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         return Some(oid::TEXT);
     }
 
+    // All branches the *same* type (including the same domain) keep that type —
+    // `COALESCE(d, d)` is `d`, not its base.
+    if concrete.iter().all(|&t| t == concrete[0]) {
+        return Some(concrete[0]);
+    }
+
+    // Otherwise PG resolves the common type over the *base* types: a domain
+    // contributes its base, so `COALESCE(email, text)` is `text` and the
+    // "cannot be matched" wording reports base names. Smash domains here.
+    let concrete: Vec<PgTypeOid> = concrete
+        .iter()
+        .map(|&t| snapshot.unwrap_domain(t))
+        .collect();
+
     if concrete.iter().all(|&t| t == concrete[0]) {
         return Some(concrete[0]);
     }
