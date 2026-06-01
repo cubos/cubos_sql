@@ -11,7 +11,7 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
 
     let type_oid = match &a_const.val {
         Some(a_const::Val::Ival(_)) => oid::INT4,
-        Some(a_const::Val::Fval(_)) => oid::NUMERIC,
+        Some(a_const::Val::Fval(f)) => fval_const_type(&f.fval),
         Some(a_const::Val::Boolval(_)) => oid::BOOL,
         Some(a_const::Val::Sval(_)) => oid::UNKNOWN, // untyped string literal
         Some(a_const::Val::Bsval(_)) => oid::BYTEA,
@@ -19,6 +19,21 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
     };
 
     Ok(ExprType::scalar(type_oid, false))
+}
+
+/// Type of an `Fval` (PG `T_Float`) constant, mirroring PG's `make_const`.
+///
+/// libpg_query stores any integer literal too large for a C `int` as a
+/// `Float` (the textual form), so an `Fval` is not necessarily a real float.
+/// PG re-parses it: an all-integer value is `int4`/`int8` (by magnitude, or
+/// `numeric` if it overflows `int8`); anything with a decimal point or
+/// exponent is `numeric`. So `9999999999` is `bigint`, not `numeric`.
+fn fval_const_type(fval: &str) -> PgTypeOid {
+    match fval.parse::<i64>() {
+        Ok(v) if (i32::MIN as i64..=i32::MAX as i64).contains(&v) => oid::INT4,
+        Ok(_) => oid::INT8,
+        Err(_) => oid::NUMERIC,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

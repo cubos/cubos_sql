@@ -883,3 +883,31 @@ fn variadic_concat_ws_with_text_separator_accepted() {
         .unwrap();
     assert_cols(&s, vec![c("c", text())]);
 }
+
+// ── Integer literal magnitude → int4 / int8 / numeric (PG make_const) ────────
+
+#[test]
+fn large_integer_literal_is_bigint() {
+    // libpg_query stores an integer too large for int4 as a `Float` token;
+    // PG re-types it by magnitude. `9999999999` fits int8 → bigint (not numeric).
+    let db = setup();
+    let s = db.analyze("SELECT 9999999999 AS big").unwrap();
+    assert_cols(&s, vec![c("big", int8())]);
+}
+
+#[test]
+fn oversize_integer_literal_is_numeric() {
+    // Beyond int8 range → numeric.
+    let db = setup();
+    let s = db
+        .analyze("SELECT 99999999999999999999999 AS huge")
+        .unwrap();
+    assert_cols(&s, vec![c("huge", numeric())]);
+}
+
+#[test]
+fn small_integer_literal_stays_int4() {
+    let db = setup();
+    let s = db.analyze("SELECT 42 AS small").unwrap();
+    assert_cols(&s, vec![c("small", int4())]);
+}
