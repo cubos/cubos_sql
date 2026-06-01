@@ -14,7 +14,7 @@
 //!     message doesn't start with PG's, plus the `Ok`/`Err` and `Err`/`Ok`
 //!     asymmetries.
 //!
-//! Query generation uses three strategies:
+//! Query generation uses four strategies:
 //!   1. a schema-driven **template generator** (`gen_statement`) that emits
 //!      SELECTs (with joins, subquery predicates, scalar subqueries, GROUP BY,
 //!      DISTINCT [ON], …), set operations, CTEs, and DML
@@ -28,7 +28,16 @@
 //!      indexes every real function/operator by result type and builds
 //!      expressions of a requested type bottom-up, so the query is *valid by
 //!      construction* — this is what lets the oracle compare column/param
-//!      *types* across the whole builtin surface (see `build_typed_cat`).
+//!      *types* across the whole builtin surface (see `build_typed_cat`); and
+//!   4. a **metamorphic** check (`metamorphic_check`) that wraps a valid query
+//!      in a pass-through subquery/CTE and asserts the analyzer reports the same
+//!      column type/nullability shape — the only way to test nullability
+//!      propagation, since PG's wire protocol doesn't expose it.
+//!
+//! It also fuzzes the **schema**: each run extends the fixed base with a seeded
+//! random schema (`gen_random_schema`) — domains, composites, multi-dim arrays,
+//! typmod'd / generated columns, a view, a second schema — applied via the
+//! non-panicking `apply_sql_checked`, so a DDL disagreement is itself a finding.
 //!
 //! Findings are deduplicated by a signature (kind + the message with the SQL
 //! body stripped), minimized via structural reductions, written to
@@ -54,7 +63,8 @@ use std::collections::BTreeMap;
 use pg_query::NodeEnum;
 use pg_query::protobuf::{self, a_const};
 use pgsafe_analyzer::{
-    Divergence, DivergenceKind, PgCatalog, PgTypeOid, ProKind, QualifiedName, TypType,
+    AnalyzedQuery, Divergence, DivergenceKind, PgCatalog, PgTypeOid, ProKind, QualifiedName,
+    TypType, Type,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -1474,6 +1484,7 @@ fn fuzz_analyze_against_pg() {
         .map(|s| s.to_string())
         .collect();
 
+    let mut metamorphic_checks = 0u32;
     for i in 0..iters {
         let roll = rng.gen_range(0..100);
         // `single_fault` marks the high-signal path: exactly one perturbation
@@ -1516,18 +1527,23 @@ fn fuzz_analyze_against_pg() {
             }
         };
 
-        let (_result, divergence) = db.analyze_checked(&sql);
-        // Grow the valid-base pool with cleanly-analyzing queries we generate,
-        // so single-fault has fresh material beyond the static seeds. Require
-        // pg_query to parse it too: the AST mutator re-parses these and only
-        // understands positional `$N`, not the `$pN` named params the template
-        // generator emits — so a parametrized query would just be skipped.
-        if _result.is_ok()
-            && divergence.is_none()
-            && valid_seeds.len() < 400
-            && pg_query::parse(&sql).is_ok()
-        {
-            valid_seeds.push(sql.clone());
+        let (result, divergence) = db.analyze_checked(&sql);
+        if let (Ok(q), None) = (&result, &divergence) {
+            // Grow the valid-base pool with cleanly-analyzing queries we
+            // generate, so single-fault has fresh material beyond the static
+            // seeds. Require pg_query to parse it too: the AST mutator re-parses
+            // these and only understands positional `$N`, not the `$pN` named
+            // params the template generator emits — so a parametrized query
+            // would just be skipped.
+            if valid_seeds.len() < 400 && pg_query::parse(&sql).is_ok() {
+                valid_seeds.push(sql.clone());
+            }
+            // Metamorphic self-consistency (Strategy 4): a pass-through wrap
+            // must preserve the column type/nullability shape.
+            if q.can_run_as_subquery && rng.gen_bool(0.35) {
+                metamorphic_checks += 1;
+                metamorphic_check(&db, &sql, q, &mut rng, &mut findings, i);
+            }
         }
         if let Some(div) = divergence {
             let sig = signature(&div);
@@ -1551,6 +1567,7 @@ fn fuzz_analyze_against_pg() {
         }
     }
 
+    eprintln!("fuzz: ran {metamorphic_checks} metamorphic pass-through checks");
     write_findings(&out_dir, &findings);
     print_summary(iters, &findings);
 
@@ -1559,6 +1576,77 @@ fn fuzz_analyze_against_pg() {
             "fuzz: {} unique divergence(s) found (FUZZ_STRICT). See {out_dir}/",
             findings.len()
         );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Strategy 4 — metamorphic self-consistency.
+//
+// Wrapping a subquery-able query in a *pass-through* subquery / CTE
+// (`SELECT * FROM (<q>) m`, `WITH m AS (<q>) SELECT * FROM m`) preserves every
+// output column's type AND nullability — that's a semantic identity in PG. The
+// wire protocol doesn't expose nullability, so the differential oracle can't
+// check nullability propagation directly; this metamorphic relation is the only
+// way to test it. Any shape change the analyzer reports across the wrap is a
+// genuine self-inconsistency (e.g. losing a PK functional-dependency NOT NULL
+// through a subquery), independent of whether PG agrees.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The positional (type, nullable) shape of a query's output columns — the
+/// invariant a pass-through wrap must preserve.
+fn col_shape(q: &AnalyzedQuery) -> Vec<(Type, bool)> {
+    q.columns
+        .iter()
+        .map(|c| (c.pg_type.clone(), c.nullable))
+        .collect()
+}
+
+/// Check that wrapping `base` (a query that analyzed cleanly and is
+/// subquery-able) in a pass-through subquery/CTE preserves its column shape.
+/// Records a finding on any divergence.
+fn metamorphic_check(
+    db: &PgCatalog,
+    base_sql: &str,
+    base: &AnalyzedQuery,
+    rng: &mut StdRng,
+    findings: &mut BTreeMap<String, Finding>,
+    iter: u32,
+) {
+    let wrapped = if rng.gen_bool(0.5) {
+        format!("SELECT * FROM ({base_sql}) AS _m")
+    } else {
+        format!("WITH _m AS ({base_sql}) SELECT * FROM _m")
+    };
+    // Only the analyzer's *own* result matters here (self-consistency); the
+    // PG cross-check on generated queries is handled by the main loop.
+    let (wrapped_result, _) = db.analyze_checked(&wrapped);
+
+    let base_shape = col_shape(base);
+    let wrapped_shape = wrapped_result.as_ref().ok().map(col_shape);
+    if wrapped_shape.as_ref() == Some(&base_shape) {
+        return; // shape preserved — good
+    }
+
+    let wrapped_desc = match &wrapped_result {
+        Ok(q) => format!("{:?}", col_shape(q)),
+        Err(e) => format!("Err({e})"),
+    };
+    let sig = format!("metamorphic:{base_shape:?}=>{wrapped_desc}");
+    if let std::collections::btree_map::Entry::Vacant(slot) = findings.entry(sig) {
+        eprintln!(
+            "\n[fuzz iter {iter}] NEW [metamorphic] column shape changed under pass-through wrap\n  base: {base_sql}"
+        );
+        slot.insert(Finding {
+            kind: DivergenceKind::ColumnType,
+            example_sql: base_sql.to_string(),
+            message: format!(
+                "metamorphic: wrapping a valid query in a pass-through subquery/CTE changed its \
+                 column type/nullability shape (analyzer self-inconsistency).\n\
+                 base SQL:\n---\n{base_sql}\n---\nwrapped SQL:\n---\n{wrapped}\n---\n\
+                 base shape:    {base_shape:?}\nwrapped shape: {wrapped_desc}"
+            ),
+            single_fault: true,
+        });
     }
 }
 
