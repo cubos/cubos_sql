@@ -217,7 +217,7 @@ pub(crate) fn resolve_function(
         schema,
         name,
         format!(
-            "function {name}({arg_list}) does not exist (found {} candidate(s))",
+            "function {qualified}({arg_list}) does not exist (found {} candidate(s))",
             candidates.len()
         ),
         span,

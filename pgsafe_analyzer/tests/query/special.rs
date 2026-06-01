@@ -605,3 +605,24 @@ fn syntax_error_message_matches_pg_verbatim() {
         "syntax error at or near \"true\"",
     );
 }
+
+#[test]
+fn extract_unresolved_reports_pg_catalog_qualified_name() {
+    // The `EXTRACT(field FROM x)` grammar maps to `pg_catalog.extract`, so when
+    // no overload matches PG reports the schema-qualified name. The analyzer
+    // must keep that qualifier so the error-message prefix matches PG.
+    // PG: `function pg_catalog.extract(unknown, integer) does not exist`.
+    let db = setup();
+    let err = db
+        .analyze("SELECT extract('year' FROM age) FROM users")
+        .unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedFunction(_)),
+        "expected UndefinedFunction, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("function pg_catalog.extract(unknown, integer) does not exist"),
+        "expected pg_catalog-qualified name, got: {err}"
+    );
+}
