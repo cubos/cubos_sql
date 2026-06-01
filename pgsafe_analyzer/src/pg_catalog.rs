@@ -1497,6 +1497,34 @@ impl PgCatalog {
     ) {
         self.with_pg_sanity::<()>(|server| server.assert_analyze_matches(analysis_sql, result));
     }
+
+    /// Analyze `sql` and cross-check the result against the embedded PG
+    /// sanity mirror **without panicking** on divergence. Returns the
+    /// analyzer's own result alongside an optional [`Divergence`] describing
+    /// the first disagreement with PG (`None` when they agree, or when this
+    /// catalog has no live mirror — e.g. built via [`PgCatalog::from_seed`]).
+    ///
+    /// This is the entry point the differential fuzzer drives: unlike
+    /// [`PgCatalog::analyze`], it lets the caller collect many findings
+    /// instead of aborting on the first. The schema stays in sync with the
+    /// mirror exactly as it does for `analyze`, because both go through the
+    /// same `apply_sql` path.
+    pub fn analyze_checked(
+        &self,
+        sql: &str,
+    ) -> (
+        Result<AnalyzedQuery, AnalyzeError>,
+        Option<crate::pg_sanity::Divergence>,
+    ) {
+        let (analysis_sql, result) = self.analyze_with_sql(sql);
+        if self.pg_sanity_tainted || self.pg_sanity_skip {
+            return (result, None);
+        }
+        let divergence = self
+            .with_pg_sanity(|server| server.compare_analyze_matches(&analysis_sql, &result))
+            .flatten();
+        (result, divergence)
+    }
 }
 
 // ─── DDL mutation helpers ──────────────────────────────────────────────────

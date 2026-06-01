@@ -39,6 +39,54 @@ use crate::qualified_name::QualifiedName;
 use crate::resolve::AnalyzedQuery;
 use crate::types::Type;
 
+/// A single way in which the static analyzer disagreed with the live
+/// PostgreSQL server. Produced by the non-panicking `compare_*` methods and
+/// consumed both by the panic-on-divergence `assert_*` wrappers (which the
+/// regular `pg_sanity` test path uses) and by the differential fuzzer, which
+/// collects many of these instead of aborting on the first.
+///
+/// [`Divergence::message`] is the exact human-readable text the `assert_*`
+/// path panics with, so failure output is byte-identical whether a test or
+/// the fuzzer surfaced it. [`Divergence::kind`] is a coarse discriminant used
+/// to bucket / dedup findings by root cause.
+#[derive(Debug, Clone)]
+pub struct Divergence {
+    pub kind: DivergenceKind,
+    pub message: String,
+}
+
+/// Coarse classification of a [`Divergence`], used by the fuzzer to group
+/// findings without parsing the free-text message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DivergenceKind {
+    /// DDL: analyzer accepted but PG rejected.
+    ApplyPgRejected,
+    /// DDL: analyzer rejected but PG accepted.
+    ApplyAnalyzerRejected,
+    /// Query: differing number of output columns.
+    ColumnCount,
+    /// Query: an output column's name differs.
+    ColumnName,
+    /// Query: an output column's type differs.
+    ColumnType,
+    /// Query: differing number of input parameters.
+    ParamCount,
+    /// Query: an input parameter's type differs.
+    ParamType,
+    /// Query: analyzer accepted but PG rejected (at prepare).
+    AnalyzePgRejected,
+    /// Query: analyzer rejected but PG accepted and executed.
+    AnalyzeAcceptedExecuted,
+    /// Both rejected, but the analyzer's message doesn't start with PG's.
+    ErrorPrefix,
+}
+
+impl std::fmt::Display for Divergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// `ToSql` adapter that always serializes as SQL NULL regardless of the
 /// requested PG type. Used by the `(analyzer rejected, PG accepted at
 /// prepare)` execute fallback so we can fire the prepared statement
@@ -132,43 +180,55 @@ impl PgSanityServer {
     }
 
     /// Run `sql` on PG and panic if its outcome diverges from `our_result`.
+    /// Thin wrapper over [`Self::compare_apply_matches`] for the `pg_sanity`
+    /// test path, which wants a hard abort on the first divergence.
     pub(crate) fn assert_apply_matches<E: std::fmt::Display>(
         &mut self,
         sql: &str,
         our_result: &Result<(), E>,
     ) {
+        if let Some(div) = self.compare_apply_matches(sql, our_result) {
+            panic!("{}", div.message);
+        }
+    }
+
+    /// Run `sql` on PG and return a [`Divergence`] if its outcome disagrees
+    /// with `our_result`, or `None` if they're consistent. Non-panicking
+    /// counterpart of [`Self::assert_apply_matches`].
+    pub(crate) fn compare_apply_matches<E: std::fmt::Display>(
+        &mut self,
+        sql: &str,
+        our_result: &Result<(), E>,
+    ) -> Option<Divergence> {
         let pg_result = self.client.batch_execute(sql);
         match (our_result, &pg_result) {
-            (Ok(()), Ok(())) => {}
+            (Ok(()), Ok(())) => None,
             (Err(_), Err(_)) => {
                 let our_msg = format!("{}", our_result.as_ref().unwrap_err());
-                assert_error_prefix_matches(
-                    &our_msg,
-                    pg_result.as_ref().unwrap_err(),
-                    sql,
-                    "apply_sql",
-                );
+                check_error_prefix(&our_msg, pg_result.as_ref().unwrap_err(), sql, "apply_sql")
             }
             (Ok(()), Err(e)) => {
                 // Treat protocol-level errors (no DbError → the postgres-rs
                 // client received a wire frame it couldn't parse) as "PG
                 // couldn't decide" and skip. Real rejections always carry
                 // a SQLSTATE.
-                if e.as_db_error().is_none() {
-                    return;
-                }
-                panic!(
-                    "pg_sanity: analyzer accepted DDL but PG rejected it.\n\
-                     SQL:\n---\n{sql}\n---\nPG error: {}",
-                    render_pg_error(e),
-                );
+                e.as_db_error()?;
+                Some(Divergence {
+                    kind: DivergenceKind::ApplyPgRejected,
+                    message: format!(
+                        "pg_sanity: analyzer accepted DDL but PG rejected it.\n\
+                         SQL:\n---\n{sql}\n---\nPG error: {}",
+                        render_pg_error(e),
+                    ),
+                })
             }
-            (Err(e), Ok(())) => {
-                panic!(
+            (Err(e), Ok(())) => Some(Divergence {
+                kind: DivergenceKind::ApplyAnalyzerRejected,
+                message: format!(
                     "pg_sanity: analyzer rejected DDL but PG accepted it.\n\
                      SQL:\n---\n{sql}\n---\nanalyzer error: {e}"
-                );
-            }
+                ),
+            }),
         }
     }
 
@@ -181,6 +241,24 @@ impl PgSanityServer {
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
     ) {
+        if let Some(div) = self.compare_analyze_matches(analysis_sql, our_result) {
+            panic!("{}", div.message);
+        }
+    }
+
+    /// Non-panicking counterpart of [`Self::assert_analyze_matches`]: returns
+    /// a [`Divergence`] describing the first disagreement found between our
+    /// analyzer and PG's Parse+Describe (or execute-time fallback), or `None`
+    /// when they're consistent.
+    ///
+    /// Harness-internal failures (a type OID PG handed us that we can't
+    /// resolve, a failed `BEGIN` in the execute fallback) still panic — they
+    /// indicate the mirror itself is broken, not an analyzer bug.
+    pub(crate) fn compare_analyze_matches(
+        &mut self,
+        analysis_sql: &str,
+        our_result: &Result<AnalyzedQuery, AnalyzeError>,
+    ) -> Option<Divergence> {
         let pg_result = self.client.prepare(analysis_sql);
 
         match (our_result, &pg_result) {
@@ -192,16 +270,19 @@ impl PgSanityServer {
                     .collect();
 
                 if ours.columns.len() != pg_columns.len() {
-                    panic!(
-                        "pg_sanity: column count mismatch.\n\
-                         SQL:\n---\n{analysis_sql}\n---\n\
-                         analyzer: {} columns ({:?})\n\
-                         PG:       {} columns ({:?})",
-                        ours.columns.len(),
-                        ours.columns.iter().map(|c| &c.name).collect::<Vec<_>>(),
-                        pg_columns.len(),
-                        pg_columns.iter().map(|c| &c.0).collect::<Vec<_>>(),
-                    );
+                    return Some(Divergence {
+                        kind: DivergenceKind::ColumnCount,
+                        message: format!(
+                            "pg_sanity: column count mismatch.\n\
+                             SQL:\n---\n{analysis_sql}\n---\n\
+                             analyzer: {} columns ({:?})\n\
+                             PG:       {} columns ({:?})",
+                            ours.columns.len(),
+                            ours.columns.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                            pg_columns.len(),
+                            pg_columns.iter().map(|c| &c.0).collect::<Vec<_>>(),
+                        ),
+                    });
                 }
 
                 for (i, (our_col, (pg_name, pg_oid))) in
@@ -223,12 +304,15 @@ impl PgSanityServer {
                             .unwrap_or(pg_name)
                     };
                     if our_col.name != pg_name_stripped {
-                        panic!(
-                            "pg_sanity: column {i} name mismatch.\n\
-                             SQL:\n---\n{analysis_sql}\n---\n\
-                             analyzer: {:?}\nPG:       {:?}",
-                            our_col.name, pg_name,
-                        );
+                        return Some(Divergence {
+                            kind: DivergenceKind::ColumnName,
+                            message: format!(
+                                "pg_sanity: column {i} name mismatch.\n\
+                                 SQL:\n---\n{analysis_sql}\n---\n\
+                                 analyzer: {:?}\nPG:       {:?}",
+                                our_col.name, pg_name,
+                            ),
+                        });
                     }
                     let pg_qname = self.qualified_type_name(*pg_oid).unwrap_or_else(|e| {
                         panic!(
@@ -239,12 +323,15 @@ impl PgSanityServer {
                     });
                     let our_qname = qualified_type_name_for_compare(&our_col.pg_type);
                     if our_qname != pg_qname {
-                        panic!(
-                            "pg_sanity: column '{}' type mismatch.\n\
-                             SQL:\n---\n{analysis_sql}\n---\n\
-                             analyzer: {our_qname} (Type::{:?})\nPG:       {pg_qname} (oid {pg_oid})",
-                            our_col.name, our_col.pg_type,
-                        );
+                        return Some(Divergence {
+                            kind: DivergenceKind::ColumnType,
+                            message: format!(
+                                "pg_sanity: column '{}' type mismatch.\n\
+                                 SQL:\n---\n{analysis_sql}\n---\n\
+                                 analyzer: {our_qname} (Type::{:?})\nPG:       {pg_qname} (oid {pg_oid})",
+                                our_col.name, our_col.pg_type,
+                            ),
+                        });
                     }
                 }
 
@@ -268,15 +355,18 @@ impl PgSanityServer {
                 let pg_params = stmt.params();
 
                 if our_params.len() != pg_params.len() {
-                    panic!(
-                        "pg_sanity: parameter count mismatch.\n\
-                         SQL:\n---\n{analysis_sql}\n---\n\
-                         analyzer: {} params ({:?})\n\
-                         PG:       {} params",
-                        our_params.len(),
-                        our_params.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-                        pg_params.len(),
-                    );
+                    return Some(Divergence {
+                        kind: DivergenceKind::ParamCount,
+                        message: format!(
+                            "pg_sanity: parameter count mismatch.\n\
+                             SQL:\n---\n{analysis_sql}\n---\n\
+                             analyzer: {} params ({:?})\n\
+                             PG:       {} params",
+                            our_params.len(),
+                            our_params.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                            pg_params.len(),
+                        ),
+                    });
                 }
 
                 for (i, ((our_name, our_ty), pg_ty)) in
@@ -298,38 +388,43 @@ impl PgSanityServer {
                     });
                     let our_qname = qualified_param_type_name_for_compare(our_ty);
                     if our_qname != pg_qname {
-                        panic!(
-                            "pg_sanity: parameter ${} ('{our_name}') type mismatch.\n\
-                             SQL:\n---\n{analysis_sql}\n---\n\
-                             analyzer: {our_qname} (Type::{our_ty:?})\nPG:       {pg_qname} (oid {pg_oid})",
-                            i + 1,
-                        );
+                        return Some(Divergence {
+                            kind: DivergenceKind::ParamType,
+                            message: format!(
+                                "pg_sanity: parameter ${} ('{our_name}') type mismatch.\n\
+                                 SQL:\n---\n{analysis_sql}\n---\n\
+                                 analyzer: {our_qname} (Type::{our_ty:?})\nPG:       {pg_qname} (oid {pg_oid})",
+                                i + 1,
+                            ),
+                        });
                     }
                 }
+                None
             }
             (Err(_), Err(_)) => {
                 let our_msg = format!("{}", our_result.as_ref().unwrap_err());
-                assert_error_prefix_matches(
+                check_error_prefix(
                     &our_msg,
                     pg_result.as_ref().unwrap_err(),
                     analysis_sql,
                     "analyze",
-                );
+                )
             }
             (Ok(ours), Err(e)) => {
-                if e.as_db_error().is_none() {
-                    return;
-                }
-                panic!(
-                    "pg_sanity: analyzer accepted query but PG rejected it.\n\
-                     SQL:\n---\n{analysis_sql}\n---\n\
-                     analyzer columns: {:?}\nPG error: {}",
-                    ours.columns
-                        .iter()
-                        .map(|c| (c.name.clone(), c.pg_type.clone()))
-                        .collect::<Vec<_>>(),
-                    render_pg_error(e),
-                );
+                e.as_db_error()?;
+                Some(Divergence {
+                    kind: DivergenceKind::AnalyzePgRejected,
+                    message: format!(
+                        "pg_sanity: analyzer accepted query but PG rejected it.\n\
+                         SQL:\n---\n{analysis_sql}\n---\n\
+                         analyzer columns: {:?}\nPG error: {}",
+                        ours.columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.pg_type.clone()))
+                            .collect::<Vec<_>>(),
+                        render_pg_error(e),
+                    ),
+                })
             }
             (Err(_), Ok(stmt)) => {
                 // PG accepted at prepare/parse time, but several checks
@@ -359,25 +454,28 @@ impl PgSanityServer {
                 };
 
                 match exec_result {
-                    Ok(_rows) => panic!(
-                        "pg_sanity: analyzer rejected query but PG accepted AND \
-                         executed it (with all-NULL params).\n\
-                         SQL:\n---\n{analysis_sql}\n---\n\
-                         analyzer error: {}\nPG columns: {:?}",
-                        our_result.as_ref().unwrap_err(),
-                        stmt.columns()
-                            .iter()
-                            .map(|c| (c.name().to_string(), c.type_().oid()))
-                            .collect::<Vec<_>>(),
-                    ),
+                    Ok(_rows) => Some(Divergence {
+                        kind: DivergenceKind::AnalyzeAcceptedExecuted,
+                        message: format!(
+                            "pg_sanity: analyzer rejected query but PG accepted AND \
+                             executed it (with all-NULL params).\n\
+                             SQL:\n---\n{analysis_sql}\n---\n\
+                             analyzer error: {}\nPG columns: {:?}",
+                            our_result.as_ref().unwrap_err(),
+                            stmt.columns()
+                                .iter()
+                                .map(|c| (c.name().to_string(), c.type_().oid()))
+                                .collect::<Vec<_>>(),
+                        ),
+                    }),
                     Err(exec_err) => {
                         let our_msg = format!("{}", our_result.as_ref().unwrap_err());
-                        assert_error_prefix_matches(
+                        check_error_prefix(
                             &our_msg,
                             &exec_err,
                             analysis_sql,
                             "analyze (execute fallback)",
-                        );
+                        )
                     }
                 }
             }
@@ -513,25 +611,33 @@ fn render_pg_error(e: &postgres::Error) -> String {
 /// PG server-side message verbatim. Trailing detail (column names, hints)
 /// is allowed; the SQLSTATE on PG's side is intentionally ignored.
 ///
-/// If PG didn't send a structured `DbError` (a protocol-level issue, not a
-/// real rejection), we can't compare wording meaningfully and skip the
-/// prefix check. The outer success/failure invariant has already fired.
-#[track_caller]
-fn assert_error_prefix_matches(our_msg: &str, pg_err: &postgres::Error, sql: &str, kind: &str) {
-    let Some(db) = pg_err.as_db_error() else {
-        return;
-    };
+/// Returns a [`Divergence`] when the analyzer's message doesn't begin with
+/// PG's server-side message, or `None` when the prefix contract holds. If PG
+/// didn't send a structured `DbError` (a protocol-level issue, not a real
+/// rejection) we can't compare wording meaningfully and return `None` — the
+/// outer success/failure invariant has already been checked by the caller.
+fn check_error_prefix(
+    our_msg: &str,
+    pg_err: &postgres::Error,
+    sql: &str,
+    kind: &str,
+) -> Option<Divergence> {
+    let db = pg_err.as_db_error()?;
     let pg_msg = db.message();
-    if !our_msg.starts_with(pg_msg) {
-        panic!(
+    if our_msg.starts_with(pg_msg) {
+        return None;
+    }
+    Some(Divergence {
+        kind: DivergenceKind::ErrorPrefix,
+        message: format!(
             "pg_sanity: {kind} error must start with PG's message.\n\
              SQL:\n---\n{sql}\n---\n\
              PG (expected prefix): {pg_msg}\n\
              analyzer:             {our_msg}\n\
              PG (with SQLSTATE):   {}",
             render_pg_error(pg_err),
-        );
-    }
+        ),
+    })
 }
 
 /// Render an analyzer [`Type`] into the same `schema.name[]?` shape that
