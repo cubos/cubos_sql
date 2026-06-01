@@ -265,6 +265,48 @@ fn enum_in_update() {
 
 // ── Domain types (CREATE DOMAIN) ─────────────────────────────────────────────
 
+fn setup_scalar_domains() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN email AS TEXT;
+         CREATE DOMAIN pos AS INT;
+         CREATE TABLE t (addr email, n pos);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn aggregate_over_text_domain_resolves_to_base() {
+    // PG smashes a domain to its base type for function resolution, so
+    // `max(email)` resolves to `max(text)` and returns text. The analyzer used
+    // to reject it with "function max(email) does not exist".
+    let db = setup_scalar_domains();
+    let s = db.analyze("SELECT max(addr) AS m FROM t").unwrap();
+    assert_cols(&s, vec![cn("m", text())]);
+}
+
+#[test]
+fn aggregate_over_int_domain_picks_exact_base_overload() {
+    // The base (int4) must win as an *exact* match: `max(pos)` → `max(int4)`
+    // (int4, not some implicit-cast candidate like int8), and `sum(pos)` →
+    // `sum(int4)` → bigint, exactly as for a plain int column.
+    let db = setup_scalar_domains();
+    let s = db
+        .analyze("SELECT max(n) AS mx, sum(n) AS sm FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("mx", int4()), cn("sm", int8())]);
+}
+
+#[test]
+fn scalar_function_over_text_domain_resolves_to_base() {
+    let db = setup_scalar_domains();
+    let s = db
+        .analyze("SELECT upper(addr) AS u, length(addr) AS l FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("u", text()), cn("l", int4())]);
+}
+
 #[test]
 fn domain_column_surfaces_as_domain_type() {
     // Analyzer surfaces the Domain wrapper with its base type preserved; the

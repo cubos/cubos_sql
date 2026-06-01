@@ -139,20 +139,32 @@ pub(crate) fn resolve_function(
         ));
     }
 
-    if let Some(f) = find_exact_match(&candidates, arg_types) {
+    // PG smashes a domain argument to its base type for function/aggregate
+    // overload resolution (so `max(email)` matches `max(text)` exactly and
+    // `sum(pos)` — a domain over int4 — resolves to `sum(int4)` like a plain
+    // int, not to some arbitrary implicit-cast candidate). Match against the
+    // unwrapped types; the original `arg_types` is still used for the
+    // "does not exist" wording so it shows the domain the user wrote.
+    let match_types: Vec<PgTypeOid> = arg_types
+        .iter()
+        .map(|&o| snapshot.unwrap_domain(o))
+        .collect();
+    let match_types = match_types.as_slice();
+
+    if let Some(f) = find_exact_match(&candidates, match_types) {
         return Ok(make_resolved(f, snapshot));
     }
-    if let Some(f) = find_unknown_compatible_match(&candidates, arg_types) {
+    if let Some(f) = find_unknown_compatible_match(&candidates, match_types) {
         return Ok(make_resolved(f, snapshot));
     }
-    if let Some(f) = find_default_args_match(&candidates, arg_types, snapshot) {
+    if let Some(f) = find_default_args_match(&candidates, match_types, snapshot) {
         return Ok(make_resolved(f, snapshot));
     }
-    if let Some(f) = find_cast_match(&candidates, arg_types, snapshot) {
+    if let Some(f) = find_cast_match(&candidates, match_types, snapshot) {
         return Ok(make_resolved(f, snapshot));
     }
-    if let Some(f) = find_polymorphic_match(&candidates, arg_types, snapshot) {
-        return Ok(make_resolved_polymorphic(f, arg_types, snapshot));
+    if let Some(f) = find_polymorphic_match(&candidates, match_types, snapshot) {
+        return Ok(make_resolved_polymorphic(f, match_types, snapshot));
     }
 
     let agg_candidates: Vec<_> = candidates
