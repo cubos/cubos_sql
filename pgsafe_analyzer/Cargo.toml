@@ -31,4 +31,4 @@ pgsafe_analyzer = { path = ".", features = ["internal"] }
 # `pg_sanity` feature): pg_query to parse/mutate/deparse the AST, rand for
 # seeded query generation.
 pg_query = "6"
-rand = "0.8"
+rand = "0.10"
