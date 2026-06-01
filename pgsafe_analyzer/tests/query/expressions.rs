@@ -820,3 +820,22 @@ fn single_overload_function_with_non_coercible_arg_rejected() {
         "message should start with PG's wording, got: {err}"
     );
 }
+
+// ── Concatenation of a non-text value with a string literal ──────────────────
+
+#[test]
+fn concat_int_with_unknown_literal_resolves_to_text() {
+    // `int || 'x'` resolves via PG's polymorphic `anynonarray || text`, with
+    // the unknown literal taken as text → text. The analyzer used to reject it
+    // with "operator does not exist: integer || unknown".
+    let db = setup();
+    let s = db.analyze("SELECT age || '!' AS c FROM users").unwrap();
+    assert_cols(&s, vec![cn("c", text())]);
+}
+
+#[test]
+fn concat_unknown_literal_with_int_resolves_to_text() {
+    let db = setup();
+    let s = db.analyze("SELECT 'n=' || age AS c FROM users").unwrap();
+    assert_cols(&s, vec![cn("c", text())]);
+}

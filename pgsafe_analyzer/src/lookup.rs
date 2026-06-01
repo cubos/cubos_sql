@@ -595,14 +595,27 @@ impl PgCatalog {
             .iter()
             .filter(|o| {
                 let left_ok = match (op_left(o), resolved_left) {
+                    // A polymorphic parameter (`anynonarray` in
+                    // `anynonarray || text`) accepts the resolved actual — this
+                    // is what lets `int || 'x'` resolve via `anynonarray ||
+                    // text` once the unknown is resolved to `text`.
+                    (Some(expected), Some(actual))
+                        if crate::functions::is_polymorphic(expected) =>
+                    {
+                        crate::functions::matches_polymorphic(expected, actual, self)
+                    }
                     (Some(expected), Some(actual)) => {
                         expected == actual || self.has_implicit_cast(actual, expected)
                     }
                     (None, None) => true,
                     _ => false,
                 };
-                let right_ok = o.oprright == resolved_right
-                    || self.has_implicit_cast(resolved_right, o.oprright);
+                let right_ok = if crate::functions::is_polymorphic(o.oprright) {
+                    crate::functions::matches_polymorphic(o.oprright, resolved_right, self)
+                } else {
+                    o.oprright == resolved_right
+                        || self.has_implicit_cast(resolved_right, o.oprright)
+                };
                 left_ok && right_ok
             })
             .copied()
