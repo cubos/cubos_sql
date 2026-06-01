@@ -94,6 +94,34 @@ post_status = "crate::PostStatus"                     # enum
 
 The `sql!` macro is wired end-to-end with static analysis (no Docker needed at compile time). For high-level context see `PROJECT_GOAL.md` and `README.md`.
 
+## Differential testing (`pg_sanity`) & the error-message contract
+
+The `pg_sanity` feature mirrors every `apply_sql` / `analyze` onto a real
+PostgreSQL and asserts they agree (see `pgsafe_analyzer/src/pg_sanity.rs`,
+run via `scripts/run-pg-sanity.sh`). A differential fuzzer
+(`pgsafe_analyzer/tests/fuzz.rs`, `#[ignore]`d) generates queries to surface
+new disagreements automatically.
+
+**Error-message contract — single-error fidelity only.** When the analyzer
+rejects a query, its message must *start with* PG's server-side message
+verbatim (extra trailing detail / hints are fine). This contract applies to
+queries with a **single** error: there, the analyzer must report the *same*
+error PG would.
+
+When a query has **multiple simultaneous errors**, we deliberately do **not**
+require the analyzer to pick the *same* error PG reports first. PG's
+error-reporting order follows its own parse/transform sequence (it resolves an
+expression's functions/operators/types before applying clause-placement rules
+like "aggregate not allowed in WHERE", and processes clauses in its own order),
+and matching that ordering everywhere is neither tractable nor valuable. So:
+
+- A divergence where both sides reject but pick a *different* error on a
+  multi-error query is **not a bug** — don't chase it.
+- The fuzzer encodes this: its **single-fault** mode (one mutation over a
+  known-valid query) produces single-error cases whose reports *must* match —
+  those findings are high-signal. Multi-fault findings are tagged separately
+  and treated as likely error-ordering noise.
+
 ## Coding conventions
 
 ### Rendering qualified PostgreSQL names

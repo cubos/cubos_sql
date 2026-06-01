@@ -467,10 +467,16 @@ fn str_node(s: &str) -> protobuf::Node {
     }
 }
 
-/// Parse `seed`, randomly mutate 1..=3 leaf nodes in the protobuf tree, and
+/// Parse `seed`, mutate exactly `n_edits` leaf nodes in the protobuf tree, and
 /// deparse back to SQL. Returns `None` if parse or deparse fails (some
 /// mutations produce un-deparseable trees — we just skip those).
-fn mutate(seed: &str, rng: &mut StdRng) -> Option<String> {
+///
+/// With `n_edits == 1` over a *valid* seed this is the single-fault mode: the
+/// one perturbation is usually the sole reason the query diverges, which
+/// isolates genuine wording / coverage bugs from the error-ordering noise that
+/// multi-fault queries produce (PG and the analyzer picking different "first"
+/// errors).
+fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<String> {
     let mut parsed = pg_query::parse(seed).ok()?;
 
     // SAFETY: `nodes_mut` hands back raw pointers into `parsed`'s owned
@@ -486,7 +492,6 @@ fn mutate(seed: &str, rng: &mut StdRng) -> Option<String> {
         return None;
     }
 
-    let n_edits = rng.gen_range(1..=3);
     for _ in 0..n_edits {
         let idx = rng.gen_range(0..nodes.len());
         apply_mutation(nodes[idx], rng);
@@ -525,11 +530,11 @@ fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
             }
             NodeMut::ColumnRef(p) if !p.is_null() => {
                 let cr = &mut *p;
-                if let Some(last) = cr.fields.last_mut() {
-                    if matches!(last.node, Some(NodeEnum::String(_))) {
-                        let name = ALL_COLUMN_NAMES[rng.gen_range(0..ALL_COLUMN_NAMES.len())];
-                        *last = str_node(name);
-                    }
+                if let Some(last) = cr.fields.last_mut()
+                    && matches!(last.node, Some(NodeEnum::String(_)))
+                {
+                    let name = ALL_COLUMN_NAMES[rng.gen_range(0..ALL_COLUMN_NAMES.len())];
+                    *last = str_node(name);
                 }
             }
             NodeMut::AExpr(p) if !p.is_null() => {
@@ -633,12 +638,12 @@ fn minimize(db: &PgCatalog, sql: &str, kind: DivergenceKind) -> String {
             if cand.len() >= best.len() {
                 continue;
             }
-            if let (_, Some(div)) = db.analyze_checked(&cand) {
-                if div.kind == kind {
-                    best = cand;
-                    improved = true;
-                    break;
-                }
+            if let (_, Some(div)) = db.analyze_checked(&cand)
+                && div.kind == kind
+            {
+                best = cand;
+                improved = true;
+                break;
             }
         }
     }
@@ -673,6 +678,9 @@ struct Finding {
     kind: DivergenceKind,
     example_sql: String,
     message: String,
+    /// True when surfaced by the single-fault path (high signal — a genuine
+    /// single-error divergence, not error-ordering noise).
+    single_fault: bool,
 }
 
 #[test]
@@ -698,41 +706,77 @@ fn fuzz_analyze_against_pg() {
     // Reusable pool of parseable queries to seed the AST mutator (the static
     // seeds plus generated ones that round-tripped through pg_query).
     let mut live_seeds: Vec<String> = SEEDS.iter().map(|s| s.to_string()).collect();
+    // Pool of queries known to analyze cleanly (Ok, no divergence). The
+    // single-fault mode mutates these with exactly one edit, so any resulting
+    // divergence has a single root cause — much higher signal than a query
+    // riddled with simultaneous errors, where PG and the analyzer merely
+    // disagree on which one to report first.
+    let mut valid_seeds: Vec<String> = SEEDS
+        .iter()
+        .filter(|s| {
+            let (r, d) = db.analyze_checked(s);
+            r.is_ok() && d.is_none()
+        })
+        .map(|s| s.to_string())
+        .collect();
 
     for i in 0..iters {
-        // ~60% template, ~40% AST mutation.
-        let sql = if rng.gen_bool(0.6) {
+        let roll = rng.gen_range(0..100);
+        // `single_fault` marks the high-signal path: exactly one perturbation
+        // of a valid query, so any divergence reflects a single error whose
+        // report should match PG verbatim. Multi-fault queries can diverge
+        // merely on *which* simultaneous error each side reports first — by
+        // design we don't treat that ordering as a bug (see CLAUDE.md), so
+        // those findings are kept separate and de-prioritized.
+        let single_fault = (35..70).contains(&roll) && !valid_seeds.is_empty();
+        let sql = if roll < 35 {
+            // Template generator.
             let q = gen_query(&mut rng);
             if pg_query::parse(&q).is_ok() && live_seeds.len() < 400 {
                 live_seeds.push(q.clone());
             }
             q
+        } else if single_fault {
+            // Single-fault: one edit over a known-valid base.
+            let base = valid_seeds[rng.gen_range(0..valid_seeds.len())].clone();
+            match mutate(&base, &mut rng, 1) {
+                Some(m) => m,
+                None => continue,
+            }
         } else {
+            // Multi-fault: 1..=3 edits over any parseable seed.
             let base = live_seeds[rng.gen_range(0..live_seeds.len())].clone();
-            match mutate(&base, &mut rng) {
+            let n_edits = rng.gen_range(1..=3);
+            match mutate(&base, &mut rng, n_edits) {
                 Some(m) => m,
                 None => continue,
             }
         };
 
         let (_result, divergence) = db.analyze_checked(&sql);
+        // Grow the valid-base pool with cleanly-analyzing queries we generate,
+        // so single-fault has fresh material beyond the static seeds.
+        if _result.is_ok() && divergence.is_none() && valid_seeds.len() < 400 {
+            valid_seeds.push(sql.clone());
+        }
         if let Some(div) = divergence {
             let sig = signature(&div);
-            if !findings.contains_key(&sig) {
+            // Only the first query per signature is minimized + recorded
+            // (minimize is expensive — gate it behind the vacant slot).
+            if let std::collections::btree_map::Entry::Vacant(slot) = findings.entry(sig) {
                 let minimized = minimize(&db, &sql, div.kind);
                 eprintln!(
-                    "\n[fuzz iter {i}] NEW {:?}\n  query: {minimized}\n  {}",
+                    "\n[fuzz iter {i}] NEW {}{:?}\n  query: {minimized}\n  {}",
+                    if single_fault { "[single-fault] " } else { "" },
                     div.kind,
                     div.message.lines().next().unwrap_or("")
                 );
-                findings.insert(
-                    sig,
-                    Finding {
-                        kind: div.kind,
-                        example_sql: minimized,
-                        message: div.message.clone(),
-                    },
-                );
+                slot.insert(Finding {
+                    kind: div.kind,
+                    example_sql: minimized,
+                    message: div.message.clone(),
+                    single_fault,
+                });
             }
         }
     }
@@ -757,10 +801,19 @@ fn write_findings(out_dir: &str, findings: &BTreeMap<String, Finding>) {
         return;
     }
     for (n, f) in findings.values().enumerate() {
-        let path = format!("{out_dir}/{:?}-{n:03}.sql", f.kind);
+        // High-signal single-fault findings get a `single-` prefix so they
+        // sort first and are easy to triage; ordering-prone multi-fault ones
+        // get `multi-`.
+        let tier = if f.single_fault { "single" } else { "multi" };
+        let path = format!("{out_dir}/{tier}-{:?}-{n:03}.sql", f.kind);
         let body = format!(
-            "-- divergence kind: {:?}\n-- {}\n--\n-- full report:\n{}\n\n{};\n",
+            "-- divergence kind: {:?}{}\n-- {}\n--\n-- full report:\n{}\n\n{};\n",
             f.kind,
+            if f.single_fault {
+                " (single-fault, high signal)"
+            } else {
+                " (multi-fault — may be error-ordering, not a bug)"
+            },
             f.message.lines().next().unwrap_or(""),
             f.message
                 .lines()
@@ -774,16 +827,72 @@ fn write_findings(out_dir: &str, findings: &BTreeMap<String, Finding>) {
     eprintln!("\nfuzz: wrote {} finding(s) to {out_dir}/", findings.len());
 }
 
+/// Coarse "family" of a finding for triage: the PG-side message (for
+/// `ErrorPrefix`, the expected prefix; otherwise the first line) with quoted
+/// literals collapsed to `"_"` and digit runs to `N`, so findings that differ
+/// only in identifiers / constants group together.
+fn family(f: &Finding) -> String {
+    let line = f
+        .message
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("PG (expected prefix): "))
+        .or_else(|| f.message.lines().next())
+        .unwrap_or("")
+        .to_string();
+
+    // Collapse "<quoted>" → "_" and runs of digits → N.
+    let mut out = String::with_capacity(line.len());
+    let mut in_quote = false;
+    let mut prev_digit = false;
+    for c in line.chars() {
+        if c == '"' {
+            if !in_quote {
+                out.push_str("\"_\"");
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        if c.is_ascii_digit() {
+            if !prev_digit {
+                out.push('N');
+            }
+            prev_digit = true;
+        } else {
+            prev_digit = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn print_summary(iters: u32, findings: &BTreeMap<String, Finding>) {
     let mut by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut by_family: BTreeMap<String, u32> = BTreeMap::new();
     for f in findings.values() {
         *by_kind.entry(format!("{:?}", f.kind)).or_default() += 1;
+        *by_family.entry(family(f)).or_default() += 1;
     }
+    let single = findings.values().filter(|f| f.single_fault).count();
     eprintln!("\n──── fuzz summary ────");
     eprintln!("iterations:        {iters}");
     eprintln!("unique divergences: {}", findings.len());
+    eprintln!(
+        "  single-fault (high signal): {single}   multi-fault (may be ordering): {}",
+        findings.len() - single
+    );
     for (kind, count) in &by_kind {
         eprintln!("  {kind:<24} {count}");
+    }
+    // Top families (most frequent root-cause messages) to guide triage.
+    let mut fams: Vec<(&String, &u32)> = by_family.iter().collect();
+    fams.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    eprintln!("── top families ──");
+    for (fam, count) in fams.into_iter().take(20) {
+        let fam = if fam.len() > 80 { &fam[..80] } else { fam };
+        eprintln!("  {count:>4}  {fam}");
     }
     eprintln!("──────────────────────");
 }
