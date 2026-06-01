@@ -230,35 +230,102 @@ const ALL_COLUMN_NAMES: &[&str] = &[
 ];
 
 const OPERATORS: &[&str] = &[
-    "=", "<>", "<", ">", "<=", ">=", "+", "-", "*", "/", "%", "||", "->", "->>", "@>", "#>",
+    "=", "<>", "<", ">", "<=", ">=", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>",
+    "@>", "<@", "?", "&&", "|", "&", "#", "<<", ">>", "~", "~~", "!~~", "~*",
 ];
 
 /// Functions with assorted signatures — calling them on the wrong argument
 /// types is exactly what surfaces error-message divergences.
 const FUNCTIONS: &[&str] = &[
+    // string
     "length",
     "upper",
     "lower",
     "char_length",
     "octet_length",
     "trim",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "substr",
+    "substring",
+    "replace",
+    "split_part",
+    "left",
+    "right",
+    "lpad",
+    "rpad",
+    "reverse",
+    "concat",
+    "concat_ws",
+    "format",
+    "md5",
+    "starts_with",
+    "to_char",
+    // numeric
     "abs",
     "round",
     "ceil",
     "floor",
+    "trunc",
     "sqrt",
+    "cbrt",
+    "exp",
+    "ln",
+    "log",
+    "power",
+    "sign",
+    "mod",
+    "div",
+    "gcd",
+    "lcm",
+    "width_bucket",
+    // date/time
+    "date_trunc",
+    "date_part",
+    "extract",
+    "age",
+    "now",
+    "to_timestamp",
+    "to_date",
+    "make_date",
+    // conditional / misc
     "coalesce",
     "nullif",
     "greatest",
     "least",
+    // array
     "cardinality",
     "array_length",
+    "array_upper",
+    "array_lower",
+    "array_ndims",
+    "array_append",
+    "array_cat",
+    "array_remove",
+    "array_position",
+    "array_to_string",
+    "unnest",
+    // json/jsonb
     "jsonb_typeof",
-    "to_char",
-    "date_trunc",
-    "lower",
-    "concat",
-    "now",
+    "json_typeof",
+    "jsonb_array_length",
+    "jsonb_object_keys",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "to_jsonb",
+    "jsonb_strip_nulls",
+    "jsonb_pretty",
+    // aggregates (so grouped queries and misuse get exercised)
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "string_agg",
+    "array_agg",
+    "bool_and",
+    "bool_or",
 ];
 
 const BASE_TYPE_NAMES: &[&str] = &[
@@ -403,45 +470,107 @@ fn next_param(np: &mut u32) -> String {
     name
 }
 
-fn gen_query(rng: &mut StdRng) -> String {
-    let table = &TABLES[rng.gen_range(0..TABLES.len())];
-    // Parameter counter, threaded through every expression so `$pN` names are
-    // unique and allocated in textual order.
+fn pick_table(rng: &mut StdRng) -> &'static Table {
+    &TABLES[rng.gen_range(0..TABLES.len())]
+}
+
+/// A standalone scalar literal of a random type (no column references) — used
+/// in contexts without a FROM scope (INSERT … VALUES).
+fn scalar_literal(rng: &mut StdRng) -> String {
+    let ty = [
+        Ty::Int,
+        Ty::BigInt,
+        Ty::Numeric,
+        Ty::Float,
+        Ty::Text,
+        Ty::Bool,
+        Ty::Timestamptz,
+        Ty::Date,
+        Ty::Uuid,
+        Ty::Jsonb,
+        Ty::Enum,
+        Ty::IntArr,
+        Ty::TextArr,
+    ][rng.gen_range(0..13)];
+    literal_for(ty, rng)
+}
+
+/// Pick `k` distinct columns from `cols` (partial Fisher-Yates).
+fn pick_cols<'a>(cols: &[&'a Col], k: usize, rng: &mut StdRng) -> Vec<&'a Col> {
+    let mut idxs: Vec<usize> = (0..cols.len()).collect();
+    let k = k.min(idxs.len());
+    for i in 0..k {
+        let j = rng.gen_range(i..idxs.len());
+        idxs.swap(i, j);
+    }
+    idxs[..k].iter().map(|&i| cols[i]).collect()
+}
+
+/// Top-level statement dispatcher. Each invocation owns its parameter counter.
+fn gen_statement(rng: &mut StdRng) -> String {
     let np = &mut 0u32;
+    match rng.gen_range(0..100) {
+        0..=54 => gen_select(rng, np),
+        55..=66 => gen_set_op(rng, np),
+        67..=74 => gen_cte(rng, np),
+        _ => gen_dml(rng, np),
+    }
+}
+
+/// Full-featured SELECT: DISTINCT [ON], varied joins, subquery predicates,
+/// scalar subqueries, GROUP BY / ORDER BY / LIMIT.
+fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
+    let table = pick_table(rng);
     let mut sql = String::from("SELECT ");
 
-    if rng.gen_bool(0.15) {
-        sql.push_str("DISTINCT ");
+    match rng.gen_range(0..10) {
+        0 => sql.push_str("DISTINCT "),
+        1 => sql.push_str(&format!("DISTINCT ON ({}) ", gen_expr(table, 2, rng, np))),
+        _ => {}
     }
 
-    // Projection: 1..4 expressions.
+    // Projection: 1..4 expressions, occasionally a scalar subquery.
     let n = rng.gen_range(1..4);
     let projs: Vec<String> = (0..n)
         .map(|i| {
-            let e = gen_expr(table, 3, rng, np);
+            let e = if rng.gen_bool(0.15) {
+                gen_scalar_subquery(rng, np)
+            } else {
+                gen_expr(table, 3, rng, np)
+            };
             if rng.gen_bool(0.4) {
-                format!("{} AS c{}", e, i)
+                format!("{e} AS c{i}")
             } else {
                 e
             }
         })
         .collect();
     sql.push_str(&projs.join(", "));
-
     sql.push_str(&format!(" FROM {}", table.name));
 
-    // Optional self-or-other join.
-    if rng.gen_bool(0.2) {
-        let other = &TABLES[rng.gen_range(0..TABLES.len())];
-        sql.push_str(&format!(
-            " JOIN {} AS j ON {}",
-            other.name,
-            gen_expr(table, 2, rng, np)
-        ));
+    // Optional join — varied type. CROSS JOIN takes no ON clause.
+    if rng.gen_bool(0.25) {
+        let other = pick_table(rng);
+        let jt =
+            ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN"][rng.gen_range(0..5)];
+        if jt == "CROSS JOIN" {
+            sql.push_str(&format!(" CROSS JOIN {} AS j", other.name));
+        } else {
+            sql.push_str(&format!(
+                " {jt} {} AS j ON {}",
+                other.name,
+                gen_expr(table, 2, rng, np)
+            ));
+        }
     }
 
     if rng.gen_bool(0.6) {
-        sql.push_str(&format!(" WHERE {}", gen_expr(table, 3, rng, np)));
+        let pred = if rng.gen_bool(0.25) {
+            gen_subquery_predicate(table, rng, np)
+        } else {
+            gen_expr(table, 3, rng, np)
+        };
+        sql.push_str(&format!(" WHERE {pred}"));
     }
 
     if rng.gen_bool(0.2) {
@@ -454,16 +583,174 @@ fn gen_query(rng: &mut StdRng) -> String {
     }
 
     if rng.gen_bool(0.2) {
-        // A literal, a (sometimes wrong-typed) expression, or a bare param —
-        // PG infers a LIMIT parameter as int8, which the oracle checks.
         let lim = match rng.gen_range(0..3) {
             0 => rng.gen_range(0..100).to_string(),
             1 => format!("${}", next_param(np)),
             _ => gen_expr(table, 1, rng, np),
         };
-        sql.push_str(&format!(" LIMIT {}", lim));
+        sql.push_str(&format!(" LIMIT {lim}"));
     }
 
+    sql
+}
+
+/// `SELECT <projs> FROM <table> [WHERE <expr>]` — no clauses that would be
+/// syntactically awkward inside a set-operation branch / CTE body / subquery.
+fn gen_simple_select(rng: &mut StdRng, np: &mut u32) -> String {
+    let table = pick_table(rng);
+    let n = rng.gen_range(1..3);
+    let projs: Vec<String> = (0..n).map(|_| gen_expr(table, 2, rng, np)).collect();
+    let mut sql = format!("SELECT {} FROM {}", projs.join(", "), table.name);
+    if rng.gen_bool(0.5) {
+        sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
+    }
+    sql
+}
+
+/// `(SELECT <agg>(<col>) FROM <table>)` — a scalar subquery for a projection
+/// slot. Mostly single-column so PG accepts it as a scalar.
+fn gen_scalar_subquery(rng: &mut StdRng, np: &mut u32) -> String {
+    let table = pick_table(rng);
+    let agg = ["count", "sum", "avg", "min", "max"][rng.gen_range(0..5)];
+    let arg = gen_expr(table, 1, rng, np);
+    format!("(SELECT {agg}({arg}) FROM {})", table.name)
+}
+
+/// `col IN (SELECT …)` / `[NOT] EXISTS (SELECT …)` for a WHERE clause.
+fn gen_subquery_predicate(table: &'static Table, rng: &mut StdRng, np: &mut u32) -> String {
+    let other = pick_table(rng);
+    match rng.gen_range(0..3) {
+        0 => {
+            let col = random_col(table, rng);
+            let inner = random_col(other, rng);
+            format!(
+                "{} IN (SELECT {} FROM {})",
+                col.name, inner.name, other.name
+            )
+        }
+        1 => format!(
+            "EXISTS (SELECT 1 FROM {} WHERE {})",
+            other.name,
+            gen_expr(other, 2, rng, np)
+        ),
+        _ => format!(
+            "NOT EXISTS (SELECT 1 FROM {} WHERE {})",
+            other.name,
+            gen_expr(other, 2, rng, np)
+        ),
+    }
+}
+
+/// Two simple selects combined with a set operation — exercises column-count
+/// and common-type reconciliation across the branches.
+fn gen_set_op(rng: &mut StdRng, np: &mut u32) -> String {
+    let op = ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"][rng.gen_range(0..4)];
+    format!(
+        "{} {op} {}",
+        gen_simple_select(rng, np),
+        gen_simple_select(rng, np)
+    )
+}
+
+/// `WITH cte AS (<simple select>) SELECT * FROM cte`.
+fn gen_cte(rng: &mut StdRng, np: &mut u32) -> String {
+    format!(
+        "WITH cte AS ({}) SELECT * FROM cte",
+        gen_simple_select(rng, np)
+    )
+}
+
+// ── DML ──────────────────────────────────────────────────────────────────────
+
+fn gen_dml(rng: &mut StdRng, np: &mut u32) -> String {
+    match rng.gen_range(0..3) {
+        0 => gen_insert(rng, np),
+        1 => gen_update(rng, np),
+        _ => gen_delete(rng, np),
+    }
+}
+
+/// `RETURNING *` or a small projection over the affected table.
+fn gen_returning(table: &'static Table, rng: &mut StdRng, np: &mut u32) -> String {
+    if rng.gen_bool(0.3) {
+        return " RETURNING *".to_string();
+    }
+    let n = rng.gen_range(1..3);
+    let projs: Vec<String> = (0..n).map(|_| gen_expr(table, 2, rng, np)).collect();
+    format!(" RETURNING {}", projs.join(", "))
+}
+
+/// A value for `INSERT … VALUES` — no FROM scope, so column-typed literals,
+/// parameters (inferred by assignment context), NULL, DEFAULT, or a
+/// deliberately mistyped literal.
+fn gen_insert_value(col: &Col, rng: &mut StdRng, np: &mut u32) -> String {
+    match rng.gen_range(0..10) {
+        0..=4 => literal_for(col.ty, rng),
+        5..=6 => format!("${}", next_param(np)),
+        7 => "NULL".to_string(),
+        8 => "DEFAULT".to_string(),
+        _ => scalar_literal(rng),
+    }
+}
+
+fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
+    let table = pick_table(rng);
+    // Skip the identity `id` so most rows are insertable.
+    let cols: Vec<&Col> = table.cols.iter().filter(|c| c.name != "id").collect();
+    let k = rng.gen_range(1..=cols.len().min(4));
+    let chosen = pick_cols(&cols, k, rng);
+    let collist = chosen.iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
+    let vals = chosen
+        .iter()
+        .map(|c| gen_insert_value(c, rng, np))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("INSERT INTO {} ({collist}) VALUES ({vals})", table.name);
+    if rng.gen_bool(0.4) {
+        sql.push_str(&gen_returning(table, rng, np));
+    }
+    sql
+}
+
+fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
+    let table = pick_table(rng);
+    let cols: Vec<&Col> = table.cols.iter().filter(|c| c.name != "id").collect();
+    let k = rng.gen_range(1..=cols.len().min(3));
+    let chosen = pick_cols(&cols, k, rng);
+    // In UPDATE, SET expressions can reference the table's columns.
+    let sets = chosen
+        .iter()
+        .map(|c| {
+            let v = match rng.gen_range(0..10) {
+                0..=4 => literal_for(c.ty, rng),
+                5..=6 => format!("${}", next_param(np)),
+                7 => "NULL".to_string(),
+                8 => "DEFAULT".to_string(),
+                _ => gen_expr(table, 1, rng, np),
+            };
+            format!("{} = {v}", c.name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("UPDATE {} SET {sets}", table.name);
+    if rng.gen_bool(0.6) {
+        sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
+    }
+    if rng.gen_bool(0.3) {
+        sql.push_str(&gen_returning(table, rng, np));
+    }
+    sql
+}
+
+fn gen_delete(rng: &mut StdRng, np: &mut u32) -> String {
+    let table = pick_table(rng);
+    let mut sql = format!("DELETE FROM {}", table.name);
+    if rng.gen_bool(0.7) {
+        sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
+    }
+    if rng.gen_bool(0.3) {
+        sql.push_str(&gen_returning(table, rng, np));
+    }
     sql
 }
 
@@ -759,8 +1046,8 @@ fn fuzz_analyze_against_pg() {
         // those findings are kept separate and de-prioritized.
         let single_fault = (35..70).contains(&roll) && !valid_seeds.is_empty();
         let sql = if roll < 35 {
-            // Template generator.
-            let q = gen_query(&mut rng);
+            // Template generator (SELECT / set-op / CTE / DML).
+            let q = gen_statement(&mut rng);
             if pg_query::parse(&q).is_ok() && live_seeds.len() < 400 {
                 live_seeds.push(q.clone());
             }
