@@ -219,6 +219,11 @@ pub struct PgCatalog {
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
 pub(crate) const USER_OID_START: u32 = 100_000;
 
+/// A relation and its columns — `(relname, [(attname, atttypid, attnotnull)])`
+/// — as surfaced by [`PgCatalog::iter_relations`] for the differential fuzzer.
+#[cfg(any(test, feature = "internal"))]
+pub type FuzzRelation = (String, Vec<(String, PgTypeOid, bool)>);
+
 /// `USER_OID_START` as a [`NonZeroU32`]. Validated at compile time so the
 /// `next_oid` counter can be a `NonZeroU32` from construction onward without
 /// a runtime check at each `alloc_oid` call.
@@ -536,6 +541,66 @@ impl PgCatalog {
     pub fn serialize_expression(&self, expr_sql: &str) -> Result<SerializedAst, DdlError> {
         let select = format!("SELECT {expr_sql}");
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_first_target)
+    }
+
+    // ── Introspection for the differential fuzzer (type-directed generation) ──
+    //
+    // The fuzzer lives in the integration-test crate and can't see `pub(crate)`
+    // catalog fields, so these expose just enough of the live catalog to mine
+    // real functions / operators / types and build a "type → producers" index.
+
+    /// Every `pg_proc` row (functions, aggregates, window functions, procedures).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_procs(&self) -> impl Iterator<Item = &PgProc> {
+        self.pg_proc.values()
+    }
+
+    /// Every `pg_operator` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_operators(&self) -> impl Iterator<Item = &PgOperator> {
+        self.pg_operator.values()
+    }
+
+    /// Every `pg_type` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_types(&self) -> impl Iterator<Item = &PgType> {
+        self.pg_type.values()
+    }
+
+    /// The `pg_type` row for an OID, if present.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn type_row(&self, oid: PgTypeOid) -> Option<&PgType> {
+        self.pg_type.get(&oid)
+    }
+
+    /// User-visible relations (tables/views) with their columns, as
+    /// `(relname, [(attname, atttypid, attnotnull)])`. Skips system catalogs
+    /// (anything in `pg_catalog` / `information_schema`). Reuses the existing
+    /// [`Self::namespace_name`] for the schema filter.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_relations(&self) -> Vec<FuzzRelation> {
+        let mut out = Vec::new();
+        for class in self.pg_class.values() {
+            if !matches!(class.relkind, RelKind::Table | RelKind::View) {
+                continue;
+            }
+            match self.namespace_name(class.relnamespace) {
+                Some("pg_catalog") | Some("information_schema") | None => continue,
+                _ => {}
+            }
+            let cols = self
+                .pg_attribute
+                .get(&class.oid)
+                .map(|atts| {
+                    atts.iter()
+                        .filter(|a| a.attnum > 0)
+                        .map(|a| (a.attname.clone(), a.atttypid, a.attnotnull))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((class.relname.clone(), cols));
+        }
+        out
     }
 
     /// Like [`Self::serialize_expression`] but for partial-index predicates
