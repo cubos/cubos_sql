@@ -27,3 +27,8 @@ bytes = { version = "1", optional = true }
 [dev-dependencies]
 tempfile = "3"
 pgsafe_analyzer = { path = ".", features = ["internal"] }
+# Used by the differential fuzzer (tests/fuzz.rs, only active under the
+# `pg_sanity` feature): pg_query to parse/mutate/deparse the AST, rand for
+# seeded query generation.
+pg_query = "6"
+rand = "0.8"
