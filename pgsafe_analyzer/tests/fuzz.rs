@@ -983,6 +983,113 @@ fn gen_typed_select(cat: &TypedCat, rng: &mut StdRng, np: &mut u32) -> Option<St
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Schema fuzzing — a seeded, additive random schema (valid by construction).
+//
+// Extends the fixed base (users/posts) per run with domains, composites,
+// multi-dimensional arrays, typmod'd columns (`varchar(n)`, `numeric(p,s)`,
+// `char(n)`), generated columns, a view, and a second schema. The type-directed
+// generator picks all of this up automatically via `iter_relations` /
+// `iter_types`, so each seed explores a different type surface — exactly the
+// corners (typmod propagation, composite fields, view nullability,
+// cross-schema resolution) where PG's semantics get hairy. Applied through the
+// non-panicking `apply_sql_checked`, so a DDL disagreement is itself a finding.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Build an additive random schema string. Objects are emitted in dependency
+/// order (enums → domains → composites → tables → views → second schema) and
+/// named with `en_/dom_/cmp_/r_/v_/s1` prefixes so they never collide with the
+/// base `users`/`posts`.
+fn gen_random_schema(rng: &mut StdRng) -> String {
+    const BASES: &[&str] = &[
+        "int4",
+        "int8",
+        "int2",
+        "numeric",
+        "float8",
+        "text",
+        "bool",
+        "timestamptz",
+        "date",
+        "uuid",
+        "jsonb",
+    ];
+    // A scalar type rendering, sometimes with a typmod — the typmod corners
+    // (length/precision propagation) are a rich source of divergences.
+    fn scalar_ty(rng: &mut StdRng) -> String {
+        match rng.gen_range(0..7) {
+            0 => "varchar(8)".into(),
+            1 => "numeric(10, 2)".into(),
+            2 => "char(4)".into(),
+            3 => "varchar".into(),
+            _ => BASES[rng.gen_range(0..BASES.len())].into(),
+        }
+    }
+
+    let mut s = String::new();
+    let n_en = rng.gen_range(0..=2);
+    for i in 0..n_en {
+        s.push_str(&format!("CREATE TYPE en_{i} AS ENUM ('a', 'b', 'c');\n"));
+    }
+    let n_dom = rng.gen_range(0..=2);
+    for i in 0..n_dom {
+        let base = scalar_ty(rng);
+        let extra = if rng.gen_bool(0.4) { " NOT NULL" } else { "" };
+        s.push_str(&format!("CREATE DOMAIN dom_{i} AS {base}{extra};\n"));
+    }
+    let n_cmp = rng.gen_range(0..=2);
+    for i in 0..n_cmp {
+        s.push_str(&format!(
+            "CREATE TYPE cmp_{i} AS (f0 {}, f1 {});\n",
+            scalar_ty(rng),
+            scalar_ty(rng),
+        ));
+    }
+
+    // A column type drawn from the full palette: scalars/typmod, arrays,
+    // multi-dim arrays, and any user types created above.
+    let col_ty = |rng: &mut StdRng| -> String {
+        let mut choices = vec![
+            scalar_ty(rng),
+            format!("{}[]", BASES[rng.gen_range(0..BASES.len())]),
+            "int4[][]".into(),
+        ];
+        if n_en > 0 {
+            choices.push(format!("en_{}", rng.gen_range(0..n_en)));
+        }
+        if n_dom > 0 {
+            choices.push(format!("dom_{}", rng.gen_range(0..n_dom)));
+        }
+        if n_cmp > 0 {
+            choices.push(format!("cmp_{}", rng.gen_range(0..n_cmp)));
+        }
+        choices[rng.gen_range(0..choices.len())].clone()
+    };
+
+    let n_tbl = rng.gen_range(1..=3);
+    for i in 0..n_tbl {
+        let mut cols = vec!["id BIGINT PRIMARY KEY".to_string()];
+        for c in 0..rng.gen_range(2..=5) {
+            let nn = if rng.gen_bool(0.4) { " NOT NULL" } else { "" };
+            cols.push(format!("c{c} {}{nn}", col_ty(rng)));
+        }
+        if rng.gen_bool(0.4) {
+            cols.push("g BIGINT GENERATED ALWAYS AS (id * 2) STORED".into());
+        }
+        s.push_str(&format!(
+            "CREATE TABLE r_{i} (\n  {}\n);\n",
+            cols.join(",\n  ")
+        ));
+    }
+    if n_tbl > 0 && rng.gen_bool(0.6) {
+        s.push_str("CREATE VIEW v_0 AS SELECT id, id + 1 AS idp, c0 FROM r_0;\n");
+    }
+    if rng.gen_bool(0.5) {
+        s.push_str("CREATE SCHEMA s1;\nCREATE TABLE s1.t (id BIGINT PRIMARY KEY, val TEXT);\n");
+    }
+    s
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Strategy 2 — AST mutation via pg_query parse → tweak → deparse.
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -1279,9 +1386,27 @@ fn fuzz_analyze_against_pg() {
     db.apply_sql(SETUP_SQL)
         .expect("setup schema must apply cleanly");
 
+    // Schema fuzzing: extend the base with a seeded random schema, applied via
+    // the non-panicking checked path. A DDL disagreement is itself a finding;
+    // on any non-clean outcome we rebuild a fresh base-only catalog so a
+    // possible analyzer/mirror desync can't poison the query phase.
+    let mut schema_divergence: Option<Divergence> = {
+        let random_schema = gen_random_schema(&mut rng);
+        let (res, div) = db.apply_sql_checked(&random_schema);
+        if res.is_ok() && div.is_none() {
+            eprintln!("fuzz: random schema applied cleanly (extends base)");
+            None
+        } else {
+            eprintln!("fuzz: random schema reverted (DDL divergence or invalid); base only");
+            db = PgCatalog::new().expect("PgCatalog::new");
+            db.apply_sql(SETUP_SQL).expect("base schema reapply");
+            div
+        }
+    };
+
     // Catalog-mined, type-directed generator index (Strategy 3). Built once
     // from the live catalog so it reflects the full builtin surface plus the
-    // user schema above.
+    // (possibly randomized) user schema above.
     let typed_cat = build_typed_cat(&db);
     eprintln!(
         "fuzz: type-directed index — {} producible types, {} relations",
@@ -1314,6 +1439,24 @@ fn fuzz_analyze_against_pg() {
     }
 
     let mut findings: BTreeMap<String, Finding> = BTreeMap::new();
+    // A DDL disagreement from the random schema is a high-signal finding in its
+    // own right — record it before the query loop.
+    if let Some(div) = schema_divergence.take() {
+        eprintln!(
+            "\n[fuzz schema] NEW {:?}\n  {}",
+            div.kind,
+            div.message.lines().next().unwrap_or("")
+        );
+        findings.insert(
+            signature(&div),
+            Finding {
+                kind: div.kind,
+                example_sql: "-- random schema DDL (see message)".to_string(),
+                message: div.message,
+                single_fault: true,
+            },
+        );
+    }
     // Reusable pool of parseable queries to seed the AST mutator (the static
     // seeds plus generated ones that round-tripped through pg_query).
     let mut live_seeds: Vec<String> = SEEDS.iter().map(|s| s.to_string()).collect();

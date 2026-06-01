@@ -886,6 +886,33 @@ impl PgCatalog {
             .flatten();
         (result, divergence)
     }
+
+    /// Apply DDL and cross-check against the mirror **without panicking** —
+    /// the non-aborting counterpart of [`PgCatalog::apply_sql`], mirroring
+    /// [`PgCatalog::analyze_checked`]. Lets the differential fuzzer drive
+    /// randomized schema DDL: a clean `(Ok, None)` means analyzer and PG agree
+    /// (and both now hold the new schema); any [`Divergence`] is a DDL bug.
+    ///
+    /// NOTE: on a divergence the analyzer's catalog and the mirror may have
+    /// applied different amounts of the batch — callers that keep fuzzing
+    /// should rebuild a fresh catalog rather than reuse this one.
+    pub fn apply_sql_checked(
+        &mut self,
+        sql: &str,
+    ) -> (Result<(), DdlError>, Option<crate::pg_sanity::Divergence>) {
+        let result = apply_sql_to(self, sql);
+        if sql_touches_extension(sql) {
+            self.pg_sanity_tainted = true;
+            return (result, None);
+        }
+        if self.pg_sanity_tainted || self.pg_sanity_skip {
+            return (result, None);
+        }
+        let divergence = self
+            .with_pg_sanity(|server| server.compare_apply_matches(sql, &result))
+            .flatten();
+        (result, divergence)
+    }
 }
 
 // ─── DDL mutation helpers ──────────────────────────────────────────────────
