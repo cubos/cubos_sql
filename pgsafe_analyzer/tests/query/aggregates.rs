@@ -370,3 +370,91 @@ fn group_by_resolves_select_alias() {
         .unwrap();
     assert_cols(&s, vec![c("author", text()), c("posts", int8())]);
 }
+
+// ── Ungrouped column in a grouped query (PG SQLSTATE 42803) ──────────────────
+
+#[test]
+fn ungrouped_column_with_aggregate_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT count(*), age FROM users"),
+        AnalyzeError::Invalid(_),
+        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+    );
+}
+
+#[test]
+fn ungrouped_column_inside_expression_rejected() {
+    let db = setup();
+    // The offending column can be nested in an expression, not just bare.
+    assert_analyze_err!(
+        db.analyze("SELECT count(*), age + 1 FROM users"),
+        AnalyzeError::Invalid(_),
+        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+    );
+}
+
+#[test]
+fn ungrouped_column_with_non_pk_group_by_rejected() {
+    let db = setup();
+    // Grouping by `name` doesn't cover `age`.
+    assert_analyze_err!(
+        db.analyze("SELECT name, age FROM users GROUP BY name"),
+        AnalyzeError::Invalid(_),
+        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+    );
+}
+
+#[test]
+fn ungrouped_column_in_having_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT count(*) FROM users HAVING age > 0"),
+        AnalyzeError::Invalid(_),
+        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+    );
+}
+
+#[test]
+fn ungrouped_column_in_order_by_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT count(*) FROM users ORDER BY age"),
+        AnalyzeError::Invalid(_),
+        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+    );
+}
+
+#[test]
+fn grouped_column_accepted() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT age, count(*) AS n FROM users GROUP BY age")
+        .unwrap();
+    assert_cols(&s, vec![cn("age", int4()), c("n", int8())]);
+}
+
+#[test]
+fn non_grouped_columns_ok_when_primary_key_is_grouped() {
+    // Functional dependency: grouping by the PK (`id`) functionally determines
+    // every other column, so `name` and `age` need not be listed. PG accepts.
+    let db = setup();
+    let s = db
+        .analyze("SELECT id, name, age FROM users GROUP BY id")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![c("id", int8()), c("name", text()), cn("age", int4())],
+    );
+}
+
+#[test]
+fn window_function_does_not_require_grouping() {
+    // A window function is not an aggregate — the query isn't grouped, so a
+    // plain column alongside it is fine.
+    let db = setup();
+    let s = db
+        .analyze("SELECT age, row_number() OVER () AS rn FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("age", int4()), c("rn", int8())]);
+}
