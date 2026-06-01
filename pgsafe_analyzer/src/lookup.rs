@@ -457,6 +457,31 @@ impl PgCatalog {
             return None;
         }
 
+        // When exactly one operand is UNKNOWN and the other is a concrete type
+        // `T`, PG resolves the unknown to `T` — so `int4 = NULL`, `bigint > 'x'`
+        // and `int4 + NULL` are all valid. Prefer the homogeneous `T OP T`
+        // overload directly when it exists: without this, a type with
+        // cross-type operators (`int4 = int8`, `int4 = int2`, …) leaves several
+        // candidates that the category/`text` fallback below can't
+        // disambiguate, so the operator is wrongly reported as missing. The
+        // probe is exact (`oprleft == T && oprright == T`), so it only ever
+        // *adds* a resolution PG also makes — never changes an existing one.
+        if left_unknown ^ right_unknown {
+            let known = if right_unknown {
+                left_oid
+            } else {
+                Some(right_oid)
+            };
+            if let Some(t) = known
+                && t != oid::UNKNOWN
+                && let Some(&op) = candidates
+                    .iter()
+                    .find(|o| op_left(o) == Some(t) && o.oprright == t)
+            {
+                return concretize_operator(op, left_oid, right_oid, self);
+            }
+        }
+
         // 3a. Keep candidates where known sides match (exact, implicit cast,
         //     or polymorphic constraint) and UNKNOWN sides are treated as
         //     compatible with anything. Polymorphic positions (`anyenum`,

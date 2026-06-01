@@ -354,6 +354,39 @@ fn not_operand_error_propagates_through_case_when() {
     );
 }
 
+// ── Operator with an UNKNOWN operand (NULL / untyped literal) ────────────────
+// PG resolves the unknown operand to the *other* (concrete) operand's type, so
+// these are all valid. The analyzer used to reject them with a spurious
+// "operator does not exist: integer > unknown".
+
+#[test]
+fn comparison_with_null_resolves_to_column_type() {
+    let db = setup();
+    let s = db.analyze("SELECT age > NULL AS r FROM users").unwrap();
+    assert_cols(&s, vec![cn("r", bool_ty())]);
+}
+
+#[test]
+fn equality_with_null_resolves_to_column_type() {
+    let db = setup();
+    let s = db.analyze("SELECT age = NULL AS r FROM users").unwrap();
+    assert_cols(&s, vec![cn("r", bool_ty())]);
+}
+
+#[test]
+fn arithmetic_with_null_resolves_to_column_type() {
+    let db = setup();
+    let s = db.analyze("SELECT age + NULL AS r FROM users").unwrap();
+    assert_cols(&s, vec![cn("r", int4())]);
+}
+
+#[test]
+fn bigint_comparison_with_null_is_accepted() {
+    let db = setup();
+    let s = db.analyze("SELECT id >= NULL AS r FROM users").unwrap();
+    assert_cols(&s, vec![cn("r", bool_ty())]);
+}
+
 // ── Stress: nested COALESCE / CASE / expressions ─────────────────────────────
 
 #[test]
