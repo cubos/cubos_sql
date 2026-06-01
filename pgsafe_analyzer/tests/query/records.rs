@@ -1837,16 +1837,27 @@ fn insert_composite_column_with_wrong_arity_errors() {
 
 #[test]
 fn update_composite_with_wrong_field_types_errors() {
-    // `address.zip` is TEXT but we feed it an int4 — analyzer rejects
-    // statically. Real PG accepts the UPDATE entirely when the WHERE
-    // matches no rows (the scratch table is empty), so the row-level
-    // composite-cast check never fires. Skip the mirror.
+    // `point2d.x` is FLOAT8 and there is no bool→float8 cast, so the
+    // record→composite coercion fails. (PG's exact wording here is
+    // `cannot cast type record to point2d`; the analyzer surfaces the offending
+    // per-field coercion instead — both reject, so skip the mirror.)
     let mut db = setup();
     db.skip_pg_sanity();
+    let r = db.analyze("UPDATE points SET p = ROW(true, 1.0) WHERE id = 1");
+    assert!(r.is_err(), "expected record-cast error, got: {r:?}");
+}
+
+#[test]
+fn update_composite_with_int_into_text_field_accepted() {
+    // `address.zip` is TEXT and PG coerces any scalar to a string-category
+    // target via its I/O functions in assignment context, so feeding an int4
+    // composite field is valid (`UPDATE 0` with no matching rows). The analyzer
+    // must match: this used to be wrongly rejected.
+    let db = setup();
     let r = db.analyze("UPDATE users SET work = ROW('s'::text, 'c'::text, 1::int4) WHERE id = 1");
     assert!(
-        r.is_err(),
-        "expected type mismatch on zip field, got: {r:?}"
+        r.is_ok(),
+        "expected int→text field to be accepted, got: {r:?}"
     );
 }
 

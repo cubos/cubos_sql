@@ -1770,3 +1770,39 @@ fn update_where_non_boolean_rejected() {
         "argument of WHERE must be type boolean, not type integer",
     );
 }
+
+// ── Assignment coerce-via-I/O to string-category targets (PG asymmetric rule) ─
+
+#[test]
+fn update_int_into_text_column_accepted() {
+    // PG coerces any scalar to a **string-category** target via its I/O
+    // functions in assignment context, so `UPDATE … SET text_col = 780` is
+    // valid. The analyzer used to reject it as a type mismatch.
+    let db = setup();
+    let r = db.analyze("UPDATE posts SET title = 780 WHERE id = 1");
+    assert!(
+        r.is_ok(),
+        "expected int→text assignment to be accepted, got: {r:?}"
+    );
+}
+
+#[test]
+fn update_text_into_int_column_rejected() {
+    // The coerce-via-I/O rule is asymmetric: a string *source* assigned to a
+    // non-string target needs an *explicit* cast, so `int_col = text_col` is
+    // still rejected. PG: `column "age" is of type integer but expression is of
+    // type text`.
+    let db = setup();
+    let err = db
+        .analyze("UPDATE users SET age = name WHERE id = 1")
+        .unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::TypeMismatch { .. }),
+        "expected TypeMismatch, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("column \"age\" is of type integer but expression is of type text"),
+        "got: {err}"
+    );
+}

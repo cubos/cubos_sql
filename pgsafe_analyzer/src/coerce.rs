@@ -44,6 +44,18 @@ pub(crate) fn can_coerce(
         {
             true
         }
+        // PG's coerce-via-I/O fallback (`find_coercion_pathway`): in assignment
+        // context, any type may be coerced to a **string-category** target via
+        // its I/O functions (`UPDATE t SET text_col = 780` is valid). The rule
+        // is asymmetric — a string *source* to a non-string target needs an
+        // *explicit* cast, so we deliberately only check the target side here.
+        (CoercionContext::Assignment, _)
+            if snapshot
+                .get_type(target_unwrapped)
+                .is_some_and(|t| t.typcategory == TypCategory::String) =>
+        {
+            true
+        }
         _ => false,
     }
 }
