@@ -469,3 +469,41 @@ fn non_boolean_having_rejected() {
         "argument of HAVING must be type boolean, not type integer",
     );
 }
+
+// ── Aggregate overload resolution must check arg types and arity ─────────────
+
+#[test]
+fn single_aggregate_overload_rejects_wrong_arg_type() {
+    // `bool_or(boolean)` is the lone `bool_or` overload, but a single
+    // aggregate candidate must still type-check: `integer` is not coercible to
+    // `boolean`, so the call does not resolve.
+    // PG: `function bool_or(integer) does not exist`.
+    let db = setup();
+    let err = db.analyze("SELECT bool_or(age) FROM users").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedFunction(_)),
+        "expected UndefinedFunction, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("function bool_or(integer) does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_aggregate_overload_rejects_wrong_arity() {
+    // A lone aggregate overload must also reject the wrong argument count.
+    // PG: `function bool_or(text, integer) does not exist`.
+    let db = setup();
+    let err = db.analyze("SELECT bool_or(name, age) FROM users").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedFunction(_)),
+        "expected UndefinedFunction, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("function bool_or(text, integer) does not exist"),
+        "got: {err}"
+    );
+}

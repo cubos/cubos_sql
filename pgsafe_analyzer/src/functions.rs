@@ -168,44 +168,47 @@ pub(crate) fn resolve_function(
         return Ok(make_resolved_polymorphic(f, match_types, snapshot));
     }
 
+    // Whether `f`'s parameters can plausibly accept the actual `arg_types`.
+    // Accept when the candidate is variadic (variadic coercion isn't fully
+    // modeled, so err toward acceptance) or when every parameter either is a
+    // pseudo-type that accepts the actual or the actual coerces to it. A
+    // concrete parameter with a non-coercible actual is NOT accepted — that's a
+    // genuine `does not exist`, e.g. `jsonb_typeof(numeric)`, which PG rejects.
+    let args_fit = |f: &PgProc| {
+        if f.provariadic.is_some() {
+            return true;
+        }
+        f.proargtypes.len() == arg_types.len()
+            && f.proargtypes.iter().zip(arg_types).all(|(&p, &a)| {
+                p == a
+                    || a == oid::UNKNOWN
+                    // A *polymorphic* pseudo-type (anyarray, anyenum, …) only
+                    // accepts actuals that satisfy its shape constraint —
+                    // `array_ndims(integer)` must NOT match `anyarray`. Other
+                    // pseudo-types (`"any"` for `count(x)`, …) accept anything.
+                    || (is_polymorphic(p) && matches_polymorphic(p, a, snapshot))
+                    || (!is_polymorphic(p)
+                        && snapshot
+                            .get_type(p)
+                            .is_some_and(|t| t.typtype == TypType::Pseudo))
+                    || casts_implicitly(a, p, snapshot)
+            })
+    };
+
+    // A lone aggregate candidate is accepted only when its parameters actually
+    // fit the call — a single `bool_or(boolean)` overload must still reject
+    // `bool_or(numeric)` and `bool_or(text, timestamptz)` (wrong arity), which
+    // PG reports as `function bool_or(...) does not exist`.
     let agg_candidates: Vec<_> = candidates
         .iter()
         .filter(|f| matches!(f.prokind, ProKind::Aggregate))
         .collect();
-    if agg_candidates.len() == 1 {
+    if agg_candidates.len() == 1 && args_fit(agg_candidates[0]) {
         return Ok(make_resolved(agg_candidates[0], snapshot));
     }
 
-    // Last-resort single-candidate match. Accept when the lone candidate is
-    // variadic (variadic coercion isn't fully modeled, so err toward
-    // acceptance) or when every parameter either is a pseudo-type that accepts
-    // anything (`"any"` for `count(x)`, `anyelement`, …) or the actual coerces
-    // to it. A concrete parameter with a non-coercible actual is NOT accepted
-    // — that's a genuine `does not exist`, e.g. `jsonb_typeof(numeric)`, which
-    // PG rejects.
-    let count_matches: Vec<_> = candidates
-        .iter()
-        .filter(|f| {
-            if f.provariadic.is_some() {
-                return true;
-            }
-            f.proargtypes.len() == arg_types.len()
-                && f.proargtypes.iter().zip(arg_types).all(|(&p, &a)| {
-                    p == a
-                        || a == oid::UNKNOWN
-                        // A *polymorphic* pseudo-type (anyarray, anyenum, …) only
-                        // accepts actuals that satisfy its shape constraint —
-                        // `array_ndims(integer)` must NOT match `anyarray`. Other
-                        // pseudo-types (`"any"` for `count(x)`, …) accept anything.
-                        || (is_polymorphic(p) && matches_polymorphic(p, a, snapshot))
-                        || (!is_polymorphic(p)
-                            && snapshot
-                                .get_type(p)
-                                .is_some_and(|t| t.typtype == TypType::Pseudo))
-                        || casts_implicitly(a, p, snapshot)
-                })
-        })
-        .collect();
+    // Last-resort single-candidate match across all (non-procedure) candidates.
+    let count_matches: Vec<_> = candidates.iter().filter(|f| args_fit(f)).collect();
     if count_matches.len() == 1 {
         return Ok(make_resolved(count_matches[0], snapshot));
     }
