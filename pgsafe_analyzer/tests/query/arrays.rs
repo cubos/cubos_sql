@@ -419,3 +419,22 @@ fn unnest_in_from_multi_arg_non_array_errors() {
         r
     );
 }
+
+#[test]
+fn array_ndims_on_scalar_rejected() {
+    // `array_ndims(anyarray)` is polymorphic: its lone overload only accepts an
+    // array. A scalar `integer` must NOT slip through the single-candidate
+    // fallback (which blanket-accepted any pseudo-type parameter).
+    // PG: `function array_ndims(integer) does not exist`.
+    let db = setup();
+    let err = db.analyze("SELECT array_ndims(7)").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::UndefinedFunction(_)),
+        "expected UndefinedFunction, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("function array_ndims(integer) does not exist"),
+        "got: {err}"
+    );
+}

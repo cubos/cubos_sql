@@ -193,9 +193,15 @@ pub(crate) fn resolve_function(
                 && f.proargtypes.iter().zip(arg_types).all(|(&p, &a)| {
                     p == a
                         || a == oid::UNKNOWN
-                        || snapshot
-                            .get_type(p)
-                            .is_some_and(|t| t.typtype == TypType::Pseudo)
+                        // A *polymorphic* pseudo-type (anyarray, anyenum, …) only
+                        // accepts actuals that satisfy its shape constraint —
+                        // `array_ndims(integer)` must NOT match `anyarray`. Other
+                        // pseudo-types (`"any"` for `count(x)`, …) accept anything.
+                        || (is_polymorphic(p) && matches_polymorphic(p, a, snapshot))
+                        || (!is_polymorphic(p)
+                            && snapshot
+                                .get_type(p)
+                                .is_some_and(|t| t.typtype == TypType::Pseudo))
                         || casts_implicitly(a, p, snapshot)
                 })
         })
