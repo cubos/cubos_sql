@@ -787,3 +787,17 @@ fn nonstrict_random_never_null() {
     let info = db.analyze(sql).unwrap();
     assert_cols(&info, vec![c("r", float8())]);
 }
+
+// ── Function overload resolution: preferred-type tie-break ───────────────────
+
+#[test]
+fn floor_of_integer_resolves_to_double_precision() {
+    // `floor` has only `floor(numeric)` and `floor(double precision)`. For an
+    // integer argument PG picks the preferred numeric type (double precision /
+    // float8), not numeric. The analyzer used to return numeric.
+    let db = setup();
+    let s = db
+        .analyze("SELECT floor(id) AS fb, floor(age) AS fa FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("fb", float8()), cn("fa", float8())]);
+}

@@ -504,7 +504,59 @@ fn find_cast_match<'a>(
     }
 
     if !arg_types.contains(&oid::UNKNOWN) {
-        return matching.into_iter().next();
+        // PG §10.3 step 4c/4d for concretely-typed arguments: keep the
+        // candidates with the most exact type matches, then those accepting
+        // the preferred type of each argument's category at the most
+        // converted positions. This is what makes `floor(bigint)` resolve to
+        // `floor(double precision)` (float8 is the preferred numeric type),
+        // not `floor(numeric)`.
+        let exact = |f: &PgProc| -> usize {
+            f.proargtypes
+                .iter()
+                .zip(arg_types)
+                .filter(|&(p, a)| p == a)
+                .count()
+        };
+        let best_exact = matching.iter().copied().map(exact).max().unwrap_or(0);
+        let mut narrowed: Vec<&PgProc> = matching
+            .iter()
+            .copied()
+            .filter(|f| exact(f) == best_exact)
+            .collect();
+        if narrowed.len() > 1 {
+            // "Accepts the preferred type": the candidate's parameter is, at a
+            // converted position, the preferred type of the argument's
+            // category. Test the parameter's own `typispreferred` flag rather
+            // than asking the catalog for "the" preferred type of a category —
+            // that lookup scans a HashMap and isn't order-deterministic.
+            let preferred_hits = |f: &PgProc| -> usize {
+                f.proargtypes
+                    .iter()
+                    .zip(arg_types)
+                    .filter(|&(&p, &a)| {
+                        p != a
+                            && match (snapshot.get_type(p), snapshot.get_type(a)) {
+                                (Some(pt), Some(at)) => {
+                                    pt.typispreferred && pt.typcategory == at.typcategory
+                                }
+                                _ => false,
+                            }
+                    })
+                    .count()
+            };
+            let best_pref = narrowed
+                .iter()
+                .copied()
+                .map(preferred_hits)
+                .max()
+                .unwrap_or(0);
+            if best_pref > 0 {
+                narrowed.retain(|f| preferred_hits(f) == best_pref);
+            }
+        }
+        // Stable final pick (lowest OID) so resolution is deterministic even
+        // when several candidates remain tied.
+        return narrowed.into_iter().min_by_key(|f| f.oid);
     }
 
     let string_compatible: Vec<&PgProc> = matching
