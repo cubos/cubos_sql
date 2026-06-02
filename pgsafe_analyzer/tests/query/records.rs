@@ -2124,3 +2124,30 @@ fn composite_on_collate_is_rejected() {
         "collations are not supported by type address",
     );
 }
+
+#[test]
+fn cast_scalar_to_composite_rejected() {
+    // PG rejects casting a scalar to a composite type — there's no I/O or
+    // structural path: `cannot cast type numeric to point2d`. The analyzer used
+    // to allow any composite cast target.
+    let db = setup();
+    let err = db.analyze("SELECT (3.14)::point2d AS c").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("cannot cast type numeric to point2d"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn cast_record_and_text_to_composite_accepted() {
+    // Guard against over-rejection: `ROW(...)::composite` (record source) and
+    // `text::composite` (I/O) are both valid.
+    let db = setup();
+    assert!(db.analyze("SELECT ROW(1.0, 2.0)::point2d AS c").is_ok());
+    assert!(db.analyze("SELECT ('(1,2)'::text)::point2d AS c").is_ok());
+}

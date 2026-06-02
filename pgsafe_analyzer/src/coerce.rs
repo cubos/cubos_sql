@@ -100,16 +100,23 @@ pub(crate) fn can_cast_explicit(
     if scat == Some(TypCategory::String) || tcat == Some(TypCategory::String) {
         return true;
     }
-    // Cases whose legality is structural rather than a simple pair lookup —
-    // pseudo-types, composites/`record`, and unknowns. Mis-allowing here is
-    // harmless (PG accepts most); we only aim to catch clear scalar refusals.
-    let structural = |cat: Option<TypCategory>| {
-        matches!(
-            cat,
-            Some(TypCategory::Pseudo) | Some(TypCategory::Composite) | Some(TypCategory::Unknown)
-        )
-    };
-    if structural(scat) || structural(tcat) {
+    // Pseudo-types (incl. `record`, `any*`) and unknowns cast freely — they're
+    // resolved structurally and PG accepts almost anything to/from them.
+    let pseudo_or_unknown =
+        |cat: Option<TypCategory>| matches!(cat, Some(TypCategory::Pseudo | TypCategory::Unknown));
+    if pseudo_or_unknown(scat) || pseudo_or_unknown(tcat) {
+        return true;
+    }
+    // Casting *to* a composite is allowed from `record`/another composite
+    // (a pseudo source, handled above) or a string type (handled above), but
+    // NOT from an arbitrary scalar — `numeric::some_composite` is a clear
+    // refusal PG rejects (`cannot cast type numeric to <composite>`).
+    if tcat == Some(TypCategory::Composite) {
+        return scat == Some(TypCategory::Composite);
+    }
+    // A composite *source* to a non-composite target is rare; err toward
+    // allowing (composite→record/text are already covered above).
+    if scat == Some(TypCategory::Composite) {
         return true;
     }
     // Array → array: legal when the element types are themselves castable.
