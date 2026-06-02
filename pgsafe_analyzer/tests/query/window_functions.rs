@@ -311,7 +311,14 @@ fn window_partition_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT rank() OVER (PARTITION BY ghost) FROM posts"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT rank() OVER (PARTITION BY ghost) FROM posts\n  ·                                  ──┬──\n  ·                                    ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT rank() OVER (PARTITION BY ghost) FROM posts\n",
+            "  ·                                  ──┬──\n",
+            "  ·                                    ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -321,6 +328,13 @@ fn window_order_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT rank() OVER (ORDER BY ghost) FROM posts"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT rank() OVER (ORDER BY ghost) FROM posts\n  ·                              ──┬──\n  ·                                ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT rank() OVER (ORDER BY ghost) FROM posts\n",
+            "  ·                              ──┬──\n",
+            "  ·                                ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }

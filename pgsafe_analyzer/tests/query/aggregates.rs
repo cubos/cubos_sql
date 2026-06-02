@@ -355,7 +355,14 @@ fn group_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users GROUP BY ghost"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT count(*) FROM users GROUP BY ghost\n  ·                                     ──┬──\n  ·                                       ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT count(*) FROM users GROUP BY ghost\n",
+            "  ·                                     ──┬──\n",
+            "  ·                                       ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -379,7 +386,14 @@ fn ungrouped_column_with_aggregate_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*), age FROM users"),
         AnalyzeError::Invalid(_),
-        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+        concat!(
+            "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
+            "  ╭────\n",
+            "1 │ SELECT count(*), age FROM users\n",
+            "  ·                  ───\n",
+            "  ╰────\n",
+            "  help: add `users.age` to the GROUP BY clause, or wrap it in an aggregate like max(age)\n",
+        ),
     );
 }
 
@@ -390,7 +404,14 @@ fn ungrouped_column_inside_expression_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*), age + 1 FROM users"),
         AnalyzeError::Invalid(_),
-        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+        concat!(
+            "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
+            "  ╭────\n",
+            "1 │ SELECT count(*), age + 1 FROM users\n",
+            "  ·                  ───\n",
+            "  ╰────\n",
+            "  help: add `users.age` to the GROUP BY clause, or wrap it in an aggregate like max(age)\n",
+        ),
     );
 }
 
@@ -401,7 +422,14 @@ fn ungrouped_column_with_non_pk_group_by_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT name, age FROM users GROUP BY name"),
         AnalyzeError::Invalid(_),
-        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+        concat!(
+            "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
+            "  ╭────\n",
+            "1 │ SELECT name, age FROM users GROUP BY name\n",
+            "  ·              ───\n",
+            "  ╰────\n",
+            "  help: add `users.age` to the GROUP BY clause, or wrap it in an aggregate like max(age)\n",
+        ),
     );
 }
 
@@ -411,7 +439,14 @@ fn ungrouped_column_in_having_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users HAVING age > 0"),
         AnalyzeError::Invalid(_),
-        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+        concat!(
+            "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
+            "  ╭────\n",
+            "1 │ SELECT count(*) FROM users HAVING age > 0\n",
+            "  ·                                   ───\n",
+            "  ╰────\n",
+            "  help: add `users.age` to the GROUP BY clause, or wrap it in an aggregate like max(age)\n",
+        ),
     );
 }
 
@@ -421,7 +456,14 @@ fn ungrouped_column_in_order_by_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users ORDER BY age"),
         AnalyzeError::Invalid(_),
-        "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function",
+        concat!(
+            "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
+            "  ╭────\n",
+            "1 │ SELECT count(*) FROM users ORDER BY age\n",
+            "  ·                                     ───\n",
+            "  ╰────\n",
+            "  help: add `users.age` to the GROUP BY clause, or wrap it in an aggregate like max(age)\n",
+        ),
     );
 }
 
@@ -482,7 +524,15 @@ fn single_aggregate_overload_rejects_wrong_arg_type() {
     assert_analyze_err!(
         db.analyze("SELECT bool_or(age) FROM users"),
         AnalyzeError::UndefinedFunction(_),
-        "function bool_or(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT bool_or(age) FROM users\n  ·        ───┬───\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"bool_or\"?\n",
+        concat!(
+            "function bool_or(integer) does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT bool_or(age) FROM users\n",
+            "  ·        ───┬───\n",
+            "  ·           ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"bool_or\"?\n",
+        ),
     );
 }
 
@@ -494,7 +544,15 @@ fn single_aggregate_overload_rejects_wrong_arity() {
     assert_analyze_err!(
         db.analyze("SELECT bool_or(name, age) FROM users"),
         AnalyzeError::UndefinedFunction(_),
-        "function bool_or(text, integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT bool_or(name, age) FROM users\n  ·        ───┬───\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"bool_or\"?\n",
+        concat!(
+            "function bool_or(text, integer) does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT bool_or(name, age) FROM users\n",
+            "  ·        ───┬───\n",
+            "  ·           ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"bool_or\"?\n",
+        ),
     );
 }
 
@@ -512,12 +570,28 @@ fn max_over_scalar_without_overload_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT max(active) FROM t"),
         AnalyzeError::UndefinedFunction(_),
-        "function max(boolean) does not exist (found 24 candidate(s))\n  ╭────\n1 │ SELECT max(active) FROM t\n  ·        ─┬─\n  ·         ╰─ function does not exist\n  ╰────\n  help: did you mean \"max\"?\n",
+        concat!(
+            "function max(boolean) does not exist (found 24 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT max(active) FROM t\n",
+            "  ·        ─┬─\n",
+            "  ·         ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"max\"?\n",
+        ),
     );
     assert_analyze_err!(
         db.analyze("SELECT max(prefs) FROM t"),
         AnalyzeError::UndefinedFunction(_),
-        "function max(jsonb) does not exist (found 24 candidate(s))\n  ╭────\n1 │ SELECT max(prefs) FROM t\n  ·        ─┬─\n  ·         ╰─ function does not exist\n  ╰────\n  help: did you mean \"max\"?\n",
+        concat!(
+            "function max(jsonb) does not exist (found 24 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT max(prefs) FROM t\n",
+            "  ·        ─┬─\n",
+            "  ·         ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"max\"?\n",
+        ),
     );
 }
 

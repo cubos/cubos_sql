@@ -415,7 +415,15 @@ fn unnest_in_from_multi_arg_non_array_errors() {
     assert_analyze_err!(
         db.analyze("SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)"),
         AnalyzeError::UndefinedFunction(_),
-        "function pg_catalog.unnest(text) does not exist (unnest argument 2 is not an array)\n  ╭────\n1 │ SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)\n  ·               ───┬──\n  ·                  ╰─ function does not exist\n  ╰────\n  help: did you mean \"unnest\"?\n",
+        concat!(
+            "function pg_catalog.unnest(text) does not exist (unnest argument 2 is not an array)\n",
+            "  ╭────\n",
+            "1 │ SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)\n",
+            "  ·               ───┬──\n",
+            "  ·                  ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"unnest\"?\n",
+        ),
     );
 }
 
@@ -429,6 +437,14 @@ fn array_ndims_on_scalar_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT array_ndims(7)"),
         AnalyzeError::UndefinedFunction(_),
-        "function array_ndims(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT array_ndims(7)\n  ·        ─────┬─────\n  ·             ╰─ function does not exist\n  ╰────\n  help: did you mean \"array_ndims\"?\n",
+        concat!(
+            "function array_ndims(integer) does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT array_ndims(7)\n",
+            "  ·        ─────┬─────\n",
+            "  ·             ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"array_ndims\"?\n",
+        ),
     );
 }

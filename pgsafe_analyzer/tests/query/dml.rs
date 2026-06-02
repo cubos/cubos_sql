@@ -49,7 +49,14 @@ fn insert_into_nonexistent_column_errors() {
     assert_analyze_err!(
         db.analyze("INSERT INTO users (nonexistent) VALUES ($p1)"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nonexistent\" of relation \"users\" does not exist\n  ╭────\n1 │ INSERT INTO users (nonexistent) VALUES ($p1)\n  ·                    ─────┬─────\n  ·                         ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"nonexistent\" of relation \"users\" does not exist\n",
+            "  ╭────\n",
+            "1 │ INSERT INTO users (nonexistent) VALUES ($p1)\n",
+            "  ·                    ─────┬─────\n",
+            "  ·                         ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -59,7 +66,14 @@ fn update_set_nonexistent_column_errors() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET nonexistent = $p1 WHERE id = $p2"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"nonexistent\" of relation \"users\" does not exist\n  ╭────\n1 │ UPDATE users SET nonexistent = $p1 WHERE id = $p2\n  ·                  ─────┬─────\n  ·                       ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"nonexistent\" of relation \"users\" does not exist\n",
+            "  ╭────\n",
+            "1 │ UPDATE users SET nonexistent = $p1 WHERE id = $p2\n",
+            "  ·                  ─────┬─────\n",
+            "  ·                       ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -524,7 +538,14 @@ fn insert_on_conflict_do_update_set_unknown_column_in_value_rejected() {
              ON CONFLICT (email) DO UPDATE SET name = ghost",
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) ON CONFLICT (email) DO UPDATE SET name = ghost\n  ·                                                                                                      ──┬──\n  ·                                                                                                        ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) ON CONFLICT (email) DO UPDATE SET name = ghost\n",
+            "  ·                                                                                                      ──┬──\n",
+            "  ·                                                                                                        ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -539,7 +560,14 @@ fn insert_on_conflict_do_update_where_unknown_column_rejected() {
              ON CONFLICT (email) DO UPDATE SET name = 'x' WHERE ghost",
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) ON CONFLICT (email) DO UPDATE SET name = 'x' WHERE ghost\n  ·                                                                                                                ──┬──\n  ·                                                                                                                  ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ INSERT INTO users (name, email, age) VALUES ($p1, $p2, $p3) ON CONFLICT (email) DO UPDATE SET name = 'x' WHERE ghost\n",
+            "  ·                                                                                                                ──┬──\n",
+            "  ·                                                                                                                  ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1258,7 +1286,14 @@ fn merge_update_unknown_column_errors() {
              WHEN MATCHED THEN UPDATE SET ghost = 'x'"
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" of relation \"users\" does not exist\n  ╭────\n1 │ MERGE INTO users u USING (SELECT $p1::bigint AS id) src ON u.id = src.id WHEN MATCHED THEN UPDATE SET ghost = 'x'\n  ·                                                                                                       ──┬──\n  ·                                                                                                         ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" of relation \"users\" does not exist\n",
+            "  ╭────\n",
+            "1 │ MERGE INTO users u USING (SELECT $p1::bigint AS id) src ON u.id = src.id WHEN MATCHED THEN UPDATE SET ghost = 'x'\n",
+            "  ·                                                                                                       ──┬──\n",
+            "  ·                                                                                                         ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1796,6 +1831,14 @@ fn update_text_into_int_column_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET age = name WHERE id = 1"),
         AnalyzeError::TypeMismatch { .. },
-        "column \"age\" is of type integer but expression is of type text\n  ╭────\n1 │ UPDATE users SET age = name WHERE id = 1\n  ·                  ─┬─   ──┬─\n  ·                   │      ╰─ expected integer, found text\n  ·                   ╰─ expected integer here\n  ╰────\n",
+        concat!(
+            "column \"age\" is of type integer but expression is of type text\n",
+            "  ╭────\n",
+            "1 │ UPDATE users SET age = name WHERE id = 1\n",
+            "  ·                  ─┬─   ──┬─\n",
+            "  ·                   │      ╰─ expected integer, found text\n",
+            "  ·                   ╰─ expected integer here\n",
+            "  ╰────\n",
+        ),
     );
 }

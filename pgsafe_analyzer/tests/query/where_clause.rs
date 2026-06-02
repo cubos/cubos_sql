@@ -89,7 +89,14 @@ fn where_is_null_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE ghost IS NULL"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT id FROM users WHERE ghost IS NULL\n  ·                            ──┬──\n  ·                              ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE ghost IS NULL\n",
+            "  ·                            ──┬──\n",
+            "  ·                              ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -99,7 +106,14 @@ fn where_is_not_false_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE ghost IS NOT FALSE"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT id FROM users WHERE ghost IS NOT FALSE\n  ·                            ──┬──\n  ·                              ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE ghost IS NOT FALSE\n",
+            "  ·                            ──┬──\n",
+            "  ·                              ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -115,7 +129,14 @@ fn where_is_not_false_unknown_column_in_subquery_rejected() {
              WHERE EXISTS (SELECT 1 FROM users x WHERE x.ghost IS NOT FALSE)",
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column x.ghost does not exist\n  ╭────\n1 │ SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users x WHERE x.ghost IS NOT FALSE)\n  ·                                                                  ───┬───\n  ·                                                                     ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column x.ghost does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users x WHERE x.ghost IS NOT FALSE)\n",
+            "  ·                                                                  ───┬───\n",
+            "  ·                                                                     ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -326,7 +347,14 @@ fn text_eq_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name = id"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: text = bigint\n  ╭────\n1 │ SELECT id FROM users WHERE name = id\n  ·                                 ┬\n  ·                                 ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: text = bigint\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE name = id\n",
+            "  ·                                 ┬\n",
+            "  ·                                 ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -336,7 +364,14 @@ fn text_eq_int_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name = 42"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: text = integer\n  ╭────\n1 │ SELECT id FROM users WHERE name = 42\n  ·                                 ┬\n  ·                                 ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: text = integer\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE name = 42\n",
+            "  ·                                 ┬\n",
+            "  ·                                 ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -346,7 +381,14 @@ fn timestamptz_lt_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE created_at < 42"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: timestamp with time zone < integer\n  ╭────\n1 │ SELECT id FROM users WHERE created_at < 42\n  ·                                       ┬\n  ·                                       ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: timestamp with time zone < integer\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE created_at < 42\n",
+            "  ·                                       ┬\n",
+            "  ·                                       ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -358,7 +400,14 @@ fn int_like_text_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE id LIKE '%1%'"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: bigint ~~ unknown\n  ╭────\n1 │ SELECT id FROM users WHERE id LIKE '%1%'\n  ·                               ─┬\n  ·                                ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: bigint ~~ unknown\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE id LIKE '%1%'\n",
+            "  ·                               ─┬\n",
+            "  ·                                ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -371,7 +420,14 @@ fn same_param_with_conflicting_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE age = $p1 AND name = $p1"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: text = integer\n  ╭────\n1 │ SELECT id FROM users WHERE age = $p1 AND name = $p1\n  ·                                               ┬\n  ·                                               ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: text = integer\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE age = $p1 AND name = $p1\n",
+            "  ·                                               ┬\n",
+            "  ·                                               ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 

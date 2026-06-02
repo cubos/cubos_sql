@@ -316,7 +316,7 @@ pub(crate) fn check_grouping(
         }
     }
     for node in nodes {
-        if let Some((alias, col)) = find_ungrouped(
+        if let Some((alias, col, location)) = find_ungrouped(
             node,
             scope,
             snapshot,
@@ -324,10 +324,20 @@ pub(crate) fn check_grouping(
             &local_cols,
             &fully_grouped,
         ) {
-            return Err(AnalyzeError::Invalid(format!(
-                "column \"{alias}.{col}\" must appear in the GROUP BY clause \
-                 or be used in an aggregate function"
-            )));
+            // Point the caret at the offending column reference and hint at the
+            // fix — PG reports the same message but with only a cursor position.
+            let span = crate::error::SourceSpan::from_node_qname(location);
+            return Err(crate::error::RawError::invalid(
+                format!(
+                    "column \"{alias}.{col}\" must appear in the GROUP BY clause \
+                     or be used in an aggregate function"
+                ),
+                span,
+                Some(format!(
+                    "add `{alias}.{col}` to the GROUP BY clause, or wrap it in an aggregate like max({col})"
+                )),
+            )
+            .finalize_implicit());
         }
     }
     Ok(())
@@ -396,7 +406,7 @@ fn find_ungrouped(
     grouped: &std::collections::HashSet<(String, String)>,
     local: &std::collections::HashSet<(String, String)>,
     fully_grouped: &std::collections::HashSet<String>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, i32)> {
     let inner = node.node.as_ref()?;
     match inner {
         node::Node::ColumnRef(cr) => {
@@ -404,7 +414,7 @@ fn find_ungrouped(
             let sc = scope.resolve_column(table, column, None).ok()?;
             let key = (sc.table_alias.clone(), sc.name.clone());
             if local.contains(&key) && !grouped.contains(&key) && !fully_grouped.contains(&key.0) {
-                Some(key)
+                Some((key.0, key.1, cr.location))
             } else {
                 None
             }

@@ -486,7 +486,14 @@ fn non_lateral_subquery_cannot_see_outer_scope() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "invalid reference to FROM-clause entry for table \"u\"\n  ╭────\n1 │ SELECT u.name, s.double_id FROM users u, (SELECT u.id * 2 AS double_id) s\n  ·                                                  ──┬─\n  ·                                                    ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "invalid reference to FROM-clause entry for table \"u\"\n",
+            "  ╭────\n",
+            "1 │ SELECT u.name, s.double_id FROM users u, (SELECT u.id * 2 AS double_id) s\n",
+            "  ·                                                  ──┬─\n",
+            "  ·                                                    ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -616,7 +623,15 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
     assert_analyze_err!(
         db.analyze("SELECT extract('year' FROM age) FROM users"),
         AnalyzeError::UndefinedFunction(_),
-        "function pg_catalog.extract(unknown, integer) does not exist (found 6 candidate(s))\n  ╭────\n1 │ SELECT extract('year' FROM age) FROM users\n  ·        ───┬───\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"extract\"?\n",
+        concat!(
+            "function pg_catalog.extract(unknown, integer) does not exist (found 6 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT extract('year' FROM age) FROM users\n",
+            "  ·        ───┬───\n",
+            "  ·           ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"extract\"?\n",
+        ),
     );
 }
 

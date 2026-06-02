@@ -1669,7 +1669,10 @@ fn param_inside_row_unconsumed_is_indeterminate() {
     assert_analyze_err!(
         db.analyze("SELECT (ROW($p1, 1::int4)).f2 + 1 AS n"),
         AnalyzeError::IndeterminateType(_),
-        "could not determine data type of parameter $1\n  help: add an explicit cast to the parameter, e.g. `$1::int4`\n",
+        concat!(
+            "could not determine data type of parameter $1\n",
+            "  help: add an explicit cast to the parameter, e.g. `$1::int4`\n",
+        ),
     );
 }
 
@@ -1703,7 +1706,10 @@ fn param_in_nested_row_compared_inferred_per_field() {
              WHERE ROW(u.id, ROW(u.name, u.age)) = ROW($p1, ROW($p2, $p3))",
         ),
         AnalyzeError::IndeterminateType(_),
-        "could not determine data type of parameter $2\n  help: add an explicit cast to the parameter, e.g. `$2::int4`\n",
+        concat!(
+            "could not determine data type of parameter $2\n",
+            "  help: add an explicit cast to the parameter, e.g. `$2::int4`\n",
+        ),
     );
 }
 
@@ -1846,7 +1852,14 @@ fn update_composite_with_wrong_field_types_errors() {
     assert_analyze_err!(
         db.analyze("UPDATE points SET p = ROW(true, 1.0) WHERE id = 1"),
         AnalyzeError::TypeMismatch { .. },
-        "cannot coerce boolean to double precision\n  ╭────\n1 │ UPDATE points SET p = ROW(true, 1.0) WHERE id = 1\n  ·                           ──┬─\n  ·                             ╰─ expected double precision, found boolean\n  ╰────\n",
+        concat!(
+            "cannot coerce boolean to double precision\n",
+            "  ╭────\n",
+            "1 │ UPDATE points SET p = ROW(true, 1.0) WHERE id = 1\n",
+            "  ·                           ──┬─\n",
+            "  ·                             ╰─ expected double precision, found boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1871,7 +1884,14 @@ fn row_constructor_in_arithmetic_errors() {
     assert_analyze_err!(
         db.analyze("SELECT ROW(1, 2) + 1 AS bad"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: record + integer\n  ╭────\n1 │ SELECT ROW(1, 2) + 1 AS bad\n  ·                  ┬\n  ·                  ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: record + integer\n",
+            "  ╭────\n",
+            "1 │ SELECT ROW(1, 2) + 1 AS bad\n",
+            "  ·                  ┬\n",
+            "  ·                  ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1882,7 +1902,14 @@ fn record_in_jsonb_minus_op_errors() {
     assert_analyze_err!(
         db.analyze("SELECT '{}'::jsonb - ROW(1, 'x') AS bad"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: jsonb - record\n  ╭────\n1 │ SELECT '{}'::jsonb - ROW(1, 'x') AS bad\n  ·                    ┬\n  ·                    ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: jsonb - record\n",
+            "  ╭────\n",
+            "1 │ SELECT '{}'::jsonb - ROW(1, 'x') AS bad\n",
+            "  ·                    ┬\n",
+            "  ·                    ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1893,7 +1920,14 @@ fn record_compared_to_scalar_errors() {
     assert_analyze_err!(
         db.analyze("SELECT u.id FROM users u WHERE ROW(u.id) = 1"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: record = integer\n  ╭────\n1 │ SELECT u.id FROM users u WHERE ROW(u.id) = 1\n  ·                                          ┬\n  ·                                          ╰─ operator does not exist\n  ╰────\n",
+        concat!(
+            "operator does not exist: record = integer\n",
+            "  ╭────\n",
+            "1 │ SELECT u.id FROM users u WHERE ROW(u.id) = 1\n",
+            "  ·                                          ┬\n",
+            "  ·                                          ╰─ operator does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1916,7 +1950,15 @@ fn select_star_qualifier_without_relation_errors() {
     assert_analyze_err!(
         db.analyze("SELECT row_to_json(*) FROM users u"),
         AnalyzeError::UndefinedFunction(_),
-        "function row_to_json() does not exist (found 2 candidate(s))\n  ╭────\n1 │ SELECT row_to_json(*) FROM users u\n  ·        ─────┬─────\n  ·             ╰─ function does not exist\n  ╰────\n  help: did you mean \"row_to_json\"?\n",
+        concat!(
+            "function row_to_json() does not exist (found 2 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT row_to_json(*) FROM users u\n",
+            "  ·        ─────┬─────\n",
+            "  ·             ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"row_to_json\"?\n",
+        ),
     );
 }
 
@@ -1940,7 +1982,15 @@ fn row_to_json_with_no_args_errors() {
     assert_analyze_err!(
         db.analyze("SELECT row_to_json()"),
         AnalyzeError::UndefinedFunction(_),
-        "function row_to_json() does not exist (found 2 candidate(s))\n  ╭────\n1 │ SELECT row_to_json()\n  ·        ─────┬─────\n  ·             ╰─ function does not exist\n  ╰────\n  help: did you mean \"row_to_json\"?\n",
+        concat!(
+            "function row_to_json() does not exist (found 2 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT row_to_json()\n",
+            "  ·        ─────┬─────\n",
+            "  ·             ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"row_to_json\"?\n",
+        ),
     );
 }
 

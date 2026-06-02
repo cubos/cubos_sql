@@ -44,7 +44,13 @@ fn limit_bool_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT true"),
         AnalyzeError::Invalid(_),
-        "argument of LIMIT must be type bigint, not type boolean\n  ╭────\n1 │ SELECT id FROM users LIMIT true\n  ·                            ────\n  ╰────\n",
+        concat!(
+            "argument of LIMIT must be type bigint, not type boolean\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users LIMIT true\n",
+            "  ·                            ────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -54,7 +60,13 @@ fn limit_text_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT name"),
         AnalyzeError::Invalid(_),
-        "argument of LIMIT must be type bigint, not type text\n  ╭────\n1 │ SELECT id FROM users LIMIT name\n  ·                            ────\n  ╰────\n",
+        concat!(
+            "argument of LIMIT must be type bigint, not type text\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users LIMIT name\n",
+            "  ·                            ────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -64,7 +76,13 @@ fn limit_timestamptz_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT created_at"),
         AnalyzeError::Invalid(_),
-        "argument of LIMIT must be type bigint, not type timestamp with time zone\n  ╭────\n1 │ SELECT id FROM users LIMIT created_at\n  ·                            ──────────\n  ╰────\n",
+        concat!(
+            "argument of LIMIT must be type bigint, not type timestamp with time zone\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users LIMIT created_at\n",
+            "  ·                            ──────────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -74,7 +92,13 @@ fn offset_bool_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users OFFSET false"),
         AnalyzeError::Invalid(_),
-        "argument of OFFSET must be type bigint, not type boolean\n  ╭────\n1 │ SELECT id FROM users OFFSET false\n  ·                             ─────\n  ╰────\n",
+        concat!(
+            "argument of OFFSET must be type bigint, not type boolean\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users OFFSET false\n",
+            "  ·                             ─────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -322,7 +346,15 @@ fn err_ambiguous_column_lists_candidate_tables() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "column reference \"id\" is ambiguous (could be: u.id, p.id)\n  ╭────\n1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id\n  ·        ─┬\n  ·         ╰─ column does not exist\n  ╰────\n  help: did you mean \"id\"?\n",
+        concat!(
+            "column reference \"id\" is ambiguous (could be: u.id, p.id)\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id\n",
+            "  ·        ─┬\n",
+            "  ·         ╰─ column does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"id\"?\n",
+        ),
     );
 }
 
@@ -336,7 +368,15 @@ fn err_ambiguous_column_lists_three_candidates() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedColumn(_),
-        "column reference \"id\" is ambiguous (could be: u.id, p.id, c.id)\n  ╭────\n1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id INNER JOIN comments c ON c.post_id = p.id\n  ·        ─┬\n  ·         ╰─ column does not exist\n  ╰────\n  help: did you mean \"id\"?\n",
+        concat!(
+            "column reference \"id\" is ambiguous (could be: u.id, p.id, c.id)\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id INNER JOIN comments c ON c.post_id = p.id\n",
+            "  ·        ─┬\n",
+            "  ·         ╰─ column does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"id\"?\n",
+        ),
     );
 }
 
@@ -527,7 +567,14 @@ fn order_by_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users ORDER BY ghost"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT id FROM users ORDER BY ghost\n  ·                               ──┬──\n  ·                                 ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users ORDER BY ghost\n",
+            "  ·                               ──┬──\n",
+            "  ·                                 ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -552,7 +599,14 @@ fn order_by_complex_expression_with_unknown_column_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT name AS ghost FROM users ORDER BY ghost + 1"),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist\n  ╭────\n1 │ SELECT name AS ghost FROM users ORDER BY ghost + 1\n  ·                                          ──┬──\n  ·                                            ╰─ column does not exist\n  ╰────\n",
+        concat!(
+            "column \"ghost\" does not exist\n",
+            "  ╭────\n",
+            "1 │ SELECT name AS ghost FROM users ORDER BY ghost + 1\n",
+            "  ·                                          ──┬──\n",
+            "  ·                                            ╰─ column does not exist\n",
+            "  ╰────\n",
+        ),
     );
 }
 

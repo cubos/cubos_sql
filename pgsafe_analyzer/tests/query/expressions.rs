@@ -812,7 +812,15 @@ fn single_overload_function_with_non_coercible_arg_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT jsonb_typeof(42)"),
         AnalyzeError::UndefinedFunction(_),
-        "function jsonb_typeof(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT jsonb_typeof(42)\n  ·        ──────┬─────\n  ·              ╰─ function does not exist\n  ╰────\n  help: did you mean \"jsonb_typeof\"?\n",
+        concat!(
+            "function jsonb_typeof(integer) does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT jsonb_typeof(42)\n",
+            "  ·        ──────┬─────\n",
+            "  ·              ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"jsonb_typeof\"?\n",
+        ),
     );
 }
 
@@ -859,7 +867,15 @@ fn variadic_concat_ws_rejects_non_text_separator() {
     assert_analyze_err!(
         db.analyze("SELECT concat_ws(age) FROM users"),
         AnalyzeError::UndefinedFunction(_),
-        "function concat_ws(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT concat_ws(age) FROM users\n  ·        ────┬────\n  ·            ╰─ function does not exist\n  ╰────\n  help: did you mean \"concat_ws\"?\n",
+        concat!(
+            "function concat_ws(integer) does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT concat_ws(age) FROM users\n",
+            "  ·        ────┬────\n",
+            "  ·            ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"concat_ws\"?\n",
+        ),
     );
 }
 
@@ -911,12 +927,28 @@ fn variadic_any_requires_at_least_one_variadic_arg() {
     assert_analyze_err!(
         db.analyze("SELECT concat_ws(name) FROM users"),
         AnalyzeError::UndefinedFunction(_),
-        "function concat_ws(text) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT concat_ws(name) FROM users\n  ·        ────┬────\n  ·            ╰─ function does not exist\n  ╰────\n  help: did you mean \"concat_ws\"?\n",
+        concat!(
+            "function concat_ws(text) does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT concat_ws(name) FROM users\n",
+            "  ·        ────┬────\n",
+            "  ·            ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"concat_ws\"?\n",
+        ),
     );
     assert_analyze_err!(
         db.analyze("SELECT concat() FROM users"),
         AnalyzeError::UndefinedFunction(_),
-        "function concat() does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT concat() FROM users\n  ·        ───┬──\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"concat\"?\n",
+        concat!(
+            "function concat() does not exist (found 1 candidate(s))\n",
+            "  ╭────\n",
+            "1 │ SELECT concat() FROM users\n",
+            "  ·        ───┬──\n",
+            "  ·           ╰─ function does not exist\n",
+            "  ╰────\n",
+            "  help: did you mean \"concat\"?\n",
+        ),
     );
 }
 
