@@ -421,3 +421,21 @@ fn cast_bool_to_int4_still_allowed() {
     let s = db.analyze("SELECT true::int4 AS n").unwrap();
     assert_cols(&s, vec![c("n", int4())]);
 }
+
+#[test]
+fn internal_char_type_rendered_quoted_in_messages() {
+    // The internal single-byte type (OID 18) must render as `"char"` (quoted)
+    // in error messages, exactly like PG — bare `char` would read as SQL
+    // `char`/`bpchar`. PG: `cannot cast type numeric to "char"`.
+    let db = PgCatalog::new().unwrap();
+    let err = db.analyze("SELECT (3.14)::\"char\"").unwrap_err();
+    assert!(
+        matches!(err, AnalyzeError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("cannot cast type numeric to \"char\""),
+        "got: {err}"
+    );
+}

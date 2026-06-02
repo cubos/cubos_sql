@@ -179,6 +179,9 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     // (type_oid)` block in `format_type_extended`.
     let aliased = match t.typname.as_str() {
         "bool" => Some("boolean"),
+        // The internal single-byte type (OID 18) — PG always renders it
+        // double-quoted as `"char"` to distinguish it from SQL `char`/`bpchar`.
+        "char" => Some("\"char\""),
         "int2" => Some("smallint"),
         "int4" => Some("integer"),
         "int8" => Some("bigint"),
