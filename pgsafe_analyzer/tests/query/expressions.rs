@@ -911,3 +911,55 @@ fn small_integer_literal_stays_int4() {
     let s = db.analyze("SELECT 42 AS small").unwrap();
     assert_cols(&s, vec![c("small", int4())]);
 }
+
+#[test]
+fn variadic_any_requires_at_least_one_variadic_arg() {
+    // `VARIADIC "any"` functions need ≥1 arg in the variadic slot, so
+    // `concat_ws(text)` and `concat()` do not exist — only the fixed params
+    // isn't enough. PG: `function concat_ws(text) does not exist`.
+    let db = setup();
+    for (sql, expected) in [
+        (
+            "SELECT concat_ws(name) FROM users",
+            "function concat_ws(text) does not exist",
+        ),
+        (
+            "SELECT concat() FROM users",
+            "function concat() does not exist",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::UndefinedFunction(_)),
+            "expected UndefinedFunction for {sql}, got {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with(expected),
+            "for {sql}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn variadic_any_with_one_variadic_arg_accepted() {
+    // Guard against over-rejection: one arg in the variadic slot is enough.
+    // `concat(name)` resolves; `format(name)` resolves via the non-variadic
+    // `format(text)` overload.
+    let db = setup();
+    assert_eq!(
+        col(
+            &db.analyze("SELECT concat(name) AS c FROM users").unwrap(),
+            "c"
+        )
+        .pg_type,
+        text()
+    );
+    assert_eq!(
+        col(
+            &db.analyze("SELECT format(name) AS c FROM users").unwrap(),
+            "c"
+        )
+        .pg_type,
+        text()
+    );
+}

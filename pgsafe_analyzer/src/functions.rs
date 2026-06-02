@@ -207,16 +207,25 @@ pub(crate) fn resolve_function(
     let args_fit = |f: &PgProc| {
         if let Some(var_elem) = f.provariadic {
             // Variadic: the first N-1 declared params are fixed and the trailing
-            // slot absorbs zero-or-more args of the variadic element type
-            // (`provariadic`). The fixed params must still match — so
-            // `concat_ws(integer)` is rejected (its `text` separator can't take
-            // an int), while `concat_ws(text, int, …)` is accepted.
+            // slot absorbs args of the variadic element type (`provariadic`).
+            // The fixed params must still match — so `concat_ws(integer)` is
+            // rejected (its `text` separator can't take an int), while
+            // `concat_ws(text, int, …)` is accepted.
             let n = f.proargtypes.len();
             if n == 0 {
                 return true;
             }
             let fixed = n - 1;
-            if arg_types.len() < fixed {
+            // A `VARIADIC "any"` function is NOT expanded like an array
+            // variadic: PG requires at least one argument in the variadic
+            // position, so the minimum call arity is N, not N-1. That's why
+            // `concat()` and `concat_ws('x')` don't exist, while array-element
+            // variadics may take zero trailing args.
+            let var_is_any = snapshot
+                .get_type(var_elem)
+                .is_some_and(|t| t.typname == "any");
+            let min_args = if var_is_any { n } else { fixed };
+            if arg_types.len() < min_args {
                 return false;
             }
             let fixed_ok = f.proargtypes[..fixed]
