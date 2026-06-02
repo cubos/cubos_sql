@@ -683,6 +683,16 @@ impl RawError {
         }
     }
 
+    /// Set the text rendered next to the primary caret (`╰─ <message>`).
+    /// No-op when the error has no primary span (e.g. no source location was
+    /// available). Builder-style.
+    pub(crate) fn with_primary_label(mut self, message: impl Into<String>) -> Self {
+        if let Some(p) = self.primary.as_mut() {
+            p.message = message.into();
+        }
+        self
+    }
+
     /// Attach a secondary label to the error. Returns `self` builder-style.
     #[allow(dead_code)] // infra reserved for diagnostics that need multiple labels
     pub(crate) fn with_secondary(mut self, label: DiagnosticLabel) -> Self {

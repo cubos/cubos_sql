@@ -554,6 +554,7 @@ fn check_no_aggregates_or_windows(
             span,
             hint,
         )
+        .with_primary_label("aggregate not allowed here")
         .finalize_implicit());
     }
     if kinds.has_window {
@@ -565,6 +566,7 @@ fn check_no_aggregates_or_windows(
             span,
             None,
         )
+        .with_primary_label("window function not allowed here")
         .finalize_implicit());
     }
     Ok(())
@@ -615,6 +617,7 @@ fn coerce_bool_clause(
         span,
         None,
     )
+    .with_primary_label(format!("this is {actual_pg}, expected boolean"))
     .finalize_implicit())
 }
 

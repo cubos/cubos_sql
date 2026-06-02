@@ -175,7 +175,8 @@ fn window_function_in_where_rejected() {
             "window functions are not allowed in WHERE\n",
             "  ╭────\n",
             "1 │ SELECT id FROM posts WHERE ROW_NUMBER() OVER () = 1\n",
-            "  ·                            ──────────\n",
+            "  ·                            ─────┬────\n",
+            "  ·                                 ╰─ window function not allowed here\n",
             "  ╰────\n",
         ),
     );
@@ -195,7 +196,8 @@ fn window_function_in_group_by_rejected() {
             "window functions are not allowed in GROUP BY\n",
             "  ╭────\n",
             "1 │ SELECT title, COUNT(*) FROM posts GROUP BY title, ROW_NUMBER() OVER ()\n",
-            "  ·                                                   ──────────\n",
+            "  ·                                                   ─────┬────\n",
+            "  ·                                                        ╰─ window function not allowed here\n",
             "  ╰────\n",
         ),
     );

@@ -39,7 +39,8 @@ fn where_text_column_not_boolean() {
             "argument of WHERE must be type boolean, not type text\n",
             "  ╭────\n",
             "1 │ SELECT id FROM users WHERE name\n",
-            "  ·                            ────\n",
+            "  ·                            ──┬─\n",
+            "  ·                              ╰─ this is text, expected boolean\n",
             "  ╰────\n",
         ),
     );
@@ -55,7 +56,8 @@ fn where_int8_column_not_boolean() {
             "argument of WHERE must be type boolean, not type bigint\n",
             "  ╭────\n",
             "1 │ SELECT name FROM users WHERE id\n",
-            "  ·                              ──\n",
+            "  ·                              ─┬\n",
+            "  ·                               ╰─ this is bigint, expected boolean\n",
             "  ╰────\n",
         ),
     );
@@ -71,7 +73,8 @@ fn where_timestamptz_column_not_boolean() {
             "argument of WHERE must be type boolean, not type timestamp with time zone\n",
             "  ╭────\n",
             "1 │ SELECT id FROM users WHERE created_at\n",
-            "  ·                            ──────────\n",
+            "  ·                            ─────┬────\n",
+            "  ·                                 ╰─ this is timestamp with time zone, expected boolean\n",
             "  ╰────\n",
         ),
     );

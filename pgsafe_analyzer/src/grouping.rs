@@ -337,6 +337,7 @@ pub(crate) fn check_grouping(
                     "add `{alias}.{col}` to the GROUP BY clause, or wrap it in an aggregate like max({col})"
                 )),
             )
+            .with_primary_label("not in GROUP BY")
             .finalize_implicit());
         }
     }

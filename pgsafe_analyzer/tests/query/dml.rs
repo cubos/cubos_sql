@@ -1796,7 +1796,8 @@ fn delete_where_non_boolean_rejected() {
             "argument of WHERE must be type boolean, not type integer\n",
             "  ╭────\n",
             "1 │ DELETE FROM users WHERE age\n",
-            "  ·                         ───\n",
+            "  ·                         ─┬─\n",
+            "  ·                          ╰─ this is integer, expected boolean\n",
             "  ╰────\n",
         ),
     );
@@ -1812,7 +1813,8 @@ fn update_where_non_boolean_rejected() {
             "argument of WHERE must be type boolean, not type integer\n",
             "  ╭────\n",
             "1 │ UPDATE users SET name = 'x' WHERE age\n",
-            "  ·                                   ───\n",
+            "  ·                                   ─┬─\n",
+            "  ·                                    ╰─ this is integer, expected boolean\n",
             "  ╰────\n",
         ),
     );
