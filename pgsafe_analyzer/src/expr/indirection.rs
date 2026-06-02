@@ -392,11 +392,16 @@ pub(crate) fn infer_array_expr(
             // `pglite_sanity` mirror passes; demote to `Invalid` so the
             // generic `type mismatch: …` prefix from `TypeMismatch::Display`
             // doesn't leak in front of it.
-            return Err(AnalyzeError::Invalid(format!(
-                "ARRAY types {} and {} cannot be matched",
-                names.first().map(String::as_str).unwrap_or("?"),
-                names.get(1).map(String::as_str).unwrap_or("?"),
-            )));
+            let a = names.first().map(String::as_str).unwrap_or("?");
+            let b = names.get(1).map(String::as_str).unwrap_or("?");
+            return Err(crate::error::RawError::invalid(
+                format!("ARRAY types {a} and {b} cannot be matched"),
+                None,
+                Some(format!(
+                    "cast the elements to a common type, e.g. `elem::{a}`"
+                )),
+            )
+            .finalize_implicit());
         }
     };
     // PG collapses array dimensions into the same type OID:

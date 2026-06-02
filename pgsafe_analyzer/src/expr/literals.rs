@@ -86,9 +86,17 @@ pub(crate) fn infer_type_cast(
     if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot) {
         let from = crate::ddl::util::format_type_for_message(snapshot, inner_type.type_oid);
         let to = crate::ddl::util::format_type_for_message(snapshot, target_oid);
-        return Err(AnalyzeError::Invalid(format!(
-            "cannot cast type {from} to {to}"
-        )));
+        let span = crate::error::node_location(inner).and_then(|loc| {
+            crate::error::SourceSpan::from_node_qname(loc)
+                .or_else(|| crate::error::SourceSpan::from_node_token(loc))
+        });
+        return Err(crate::error::RawError::invalid(
+            format!("cannot cast type {from} to {to}"),
+            span,
+            None,
+        )
+        .with_primary_label(format!("this is {from}"))
+        .finalize_implicit());
     }
 
     // PG: an explicit cast `x::T(n)` carries the target's typmod through.

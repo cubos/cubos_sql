@@ -43,10 +43,18 @@ pub(crate) fn analyze_set_operation(
                 // `TypeMismatch::Display`'s generic prefix from leaking.
                 let a = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
                 let b = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
-                return Err(AnalyzeError::Invalid(format!(
-                    "UNION types {a} and {b} cannot be matched (column `{}`)",
-                    l.name,
-                )));
+                return Err(crate::error::RawError::invalid(
+                    format!(
+                        "UNION types {a} and {b} cannot be matched (column `{}`)",
+                        l.name,
+                    ),
+                    None,
+                    Some(format!(
+                        "cast both sides to a common type, e.g. `{}::{a}`",
+                        l.name,
+                    )),
+                )
+                .finalize_implicit());
             }
             (None, false) => l.type_oid,
         };

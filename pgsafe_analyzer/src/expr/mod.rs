@@ -706,10 +706,17 @@ fn check_goal_compatibility(
     {
         // PG renders the bare composite name (search-path aware) here, not
         // the schema-qualified form `format_type_for_message` would produce.
-        return Err(AnalyzeError::Invalid(format!(
-            "cannot cast type record to {}",
-            target_te.typname
-        )));
+        let span = location.and_then(crate::error::SourceSpan::from_node_qname);
+        return Err(crate::error::RawError::invalid(
+            format!("cannot cast type record to {}", target_te.typname),
+            span,
+            Some(format!(
+                "the ROW(...) shape doesn't match `{}` — check the field count and types",
+                target_te.typname
+            )),
+        )
+        .with_primary_label("record value")
+        .finalize_implicit());
     }
     // PG's user-facing type names (e.g. `int4` → `integer`, `bool` →
     // `boolean`) — these appear verbatim in the message so the sanity

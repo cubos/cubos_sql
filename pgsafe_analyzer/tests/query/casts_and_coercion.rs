@@ -261,7 +261,10 @@ fn array_literal_incompatible_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT ARRAY['x'::text, 1]"),
         AnalyzeError::Invalid(_),
-        "ARRAY types text and integer cannot be matched",
+        concat!(
+            "ARRAY types text and integer cannot be matched\n",
+            "  help: cast the elements to a common type, e.g. `elem::text`\n",
+        ),
     );
 }
 
@@ -271,7 +274,10 @@ fn array_literal_bool_and_int_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT ARRAY[true, 1]"),
         AnalyzeError::Invalid(_),
-        "ARRAY types boolean and integer cannot be matched",
+        concat!(
+            "ARRAY types boolean and integer cannot be matched\n",
+            "  help: cast the elements to a common type, e.g. `elem::boolean`\n",
+        ),
     );
 }
 
@@ -392,7 +398,14 @@ fn cast_bool_to_float8_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT true::float8"),
         AnalyzeError::Invalid(_),
-        "cannot cast type boolean to double precision",
+        concat!(
+            "cannot cast type boolean to double precision\n",
+            "  ╭────\n",
+            "1 │ SELECT true::float8\n",
+            "  ·        ──┬─\n",
+            "  ·          ╰─ this is boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -402,7 +415,14 @@ fn cast_timestamptz_to_bytea_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT now()::bytea"),
         AnalyzeError::Invalid(_),
-        "cannot cast type timestamp with time zone to bytea",
+        concat!(
+            "cannot cast type timestamp with time zone to bytea\n",
+            "  ╭────\n",
+            "1 │ SELECT now()::bytea\n",
+            "  ·        ─┬─\n",
+            "  ·         ╰─ this is timestamp with time zone\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -434,6 +454,13 @@ fn internal_char_type_rendered_quoted_in_messages() {
     assert_analyze_err!(
         db.analyze("SELECT (3.14)::\"char\""),
         AnalyzeError::Invalid(_),
-        "cannot cast type numeric to \"char\"",
+        concat!(
+            "cannot cast type numeric to \"char\"\n",
+            "  ╭────\n",
+            "1 │ SELECT (3.14)::\"char\"\n",
+            "  ·         ──┬─\n",
+            "  ·           ╰─ this is numeric\n",
+            "  ╰────\n",
+        ),
     );
 }

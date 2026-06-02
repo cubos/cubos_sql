@@ -1837,7 +1837,10 @@ fn insert_composite_column_with_wrong_arity_errors() {
              VALUES ('n', ROW($p1, $p2)) RETURNING id"
         ),
         AnalyzeError::Invalid(_),
-        "cannot cast type record to address",
+        concat!(
+            "cannot cast type record to address\n",
+            "  help: the ROW(...) shape doesn't match `address` — check the field count and types\n",
+        ),
     );
 }
 
@@ -2205,7 +2208,14 @@ fn cast_scalar_to_composite_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT (3.14)::point2d AS c"),
         AnalyzeError::Invalid(_),
-        "cannot cast type numeric to point2d",
+        concat!(
+            "cannot cast type numeric to point2d\n",
+            "  ╭────\n",
+            "1 │ SELECT (3.14)::point2d AS c\n",
+            "  ·         ──┬─\n",
+            "  ·           ╰─ this is numeric\n",
+            "  ╰────\n",
+        ),
     );
 }
 
