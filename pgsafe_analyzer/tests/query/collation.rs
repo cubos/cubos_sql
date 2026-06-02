@@ -84,7 +84,14 @@ fn collate_on_int_column_is_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id COLLATE \"C\" FROM users"),
         AnalyzeError::Invalid(_),
-        "collations are not supported by type bigint",
+        concat!(
+            "collations are not supported by type bigint\n",
+            "  ╭────\n",
+            "1 │ SELECT id COLLATE \"C\" FROM users\n",
+            "  ·        ─┬\n",
+            "  ·         ╰─ this is bigint, not a collatable type\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -96,7 +103,14 @@ fn collate_on_jsonb_column_is_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT meta COLLATE \"C\" FROM t"),
         AnalyzeError::Invalid(_),
-        "collations are not supported by type jsonb",
+        concat!(
+            "collations are not supported by type jsonb\n",
+            "  ╭────\n",
+            "1 │ SELECT meta COLLATE \"C\" FROM t\n",
+            "  ·        ──┬─\n",
+            "  ·          ╰─ this is jsonb, not a collatable type\n",
+            "  ╰────\n",
+        ),
     );
 }
 

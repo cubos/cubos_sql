@@ -2195,7 +2195,14 @@ fn composite_on_collate_is_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT u.work COLLATE \"C\" FROM users u"),
         AnalyzeError::Invalid(_),
-        "collations are not supported by type address",
+        concat!(
+            "collations are not supported by type address\n",
+            "  ╭────\n",
+            "1 │ SELECT u.work COLLATE \"C\" FROM users u\n",
+            "  ·        ───┬──\n",
+            "  ·           ╰─ this is address, not a collatable type\n",
+            "  ╰────\n",
+        ),
     );
 }
 

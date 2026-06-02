@@ -605,9 +605,15 @@ pub(crate) fn infer_expr(
                         Some((_, bare)) => bare.to_owned(),
                         None => formatted,
                     };
-                    return Err(AnalyzeError::Invalid(format!(
-                        "collations are not supported by type {type_name}"
-                    )));
+                    let span = crate::error::node_location(arg)
+                        .and_then(crate::error::SourceSpan::from_node_qname);
+                    return Err(crate::error::RawError::invalid(
+                        format!("collations are not supported by type {type_name}"),
+                        span,
+                        None,
+                    )
+                    .with_primary_label(format!("this is {type_name}, not a collatable type"))
+                    .finalize_implicit());
                 }
             }
             // Explicit COLLATE overrides whatever collation was inherited
