@@ -66,7 +66,11 @@ fn create_sequence_duplicate_without_if_not_exists_errors() {
         ("0002.sql", "CREATE SEQUENCE seq;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "relation \"seq\" already exists"
+    );
 }
 
 // ── DROP SEQUENCE ──────────────────────────────────────────────────────────
@@ -85,15 +89,10 @@ fn drop_sequence_existing_removes_it() {
 fn drop_sequence_missing_errors() {
     let result = try_apply(&[("0001.sql", "DROP SEQUENCE missing;")]);
 
-    assert_ddl_err!(result, DdlError::TableNotFound(_), "does not exist");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("missing"),
-        "error must reference the missing sequence name; got: {err}"
-    );
-    assert!(
-        err.contains("sequence"),
-        "error must say sequence (PG: \"sequence \\\"missing\\\" does not exist\"); got: {err}"
+    assert_ddl_err!(
+        result,
+        DdlError::TableNotFound(_),
+        "sequence \"missing\" does not exist"
     );
 }
 
@@ -110,7 +109,11 @@ fn drop_sequence_against_table_errors() {
         ("0002.sql", "DROP SEQUENCE t;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::TableNotFound(_), "is not a sequence");
+    assert_ddl_err!(
+        result,
+        DdlError::TableNotFound(_),
+        "\"t\" is not a sequence"
+    );
 }
 
 // ── ALTER SEQUENCE ─────────────────────────────────────────────────────────
@@ -130,7 +133,11 @@ fn alter_sequence_with_options_on_existing() {
 fn alter_sequence_missing_errors() {
     let result = try_apply(&[("0001.sql", "ALTER SEQUENCE missing RESTART WITH 1;")]);
 
-    assert_ddl_err!(result, DdlError::TableNotFound(_), "does not exist");
+    assert_ddl_err!(
+        result,
+        DdlError::TableNotFound(_),
+        "relation \"missing\" does not exist"
+    );
 }
 
 #[test]

@@ -154,17 +154,16 @@ fn collate_unknown_collation_should_error() {
     // PG: `collation "definitely_not_a_real_collation" for encoding "UTF8"
     // does not exist`. CREATE TABLE with a bogus column-level COLLATE
     // raises this at apply time; we mirror it.
-    let err = db
-        .apply_sql(
-            "CREATE TABLE t (
+    let result = db.apply_sql(
+        "CREATE TABLE t (
                 id BIGINT PRIMARY KEY,
                 name TEXT COLLATE \"definitely_not_a_real_collation\" NOT NULL
              );",
-        )
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("does not exist"),
-        "expected collation-not-found error, got: {err}"
+    );
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "collation \"definitely_not_a_real_collation\" for encoding \"UTF8\" does not exist"
     );
 }
 
@@ -198,12 +197,11 @@ fn create_collation_from_existing() {
 #[test]
 fn create_collation_from_unknown_errors() {
     let mut db = PgCatalog::new().unwrap();
-    let err = db
-        .apply_sql("CREATE COLLATION my_c FROM \"definitely_not_a_real_one\";")
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("does not exist"),
-        "expected source-not-found error, got: {err}"
+    let result = db.apply_sql("CREATE COLLATION my_c FROM \"definitely_not_a_real_one\";");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "collation \"definitely_not_a_real_one\" for encoding \"UTF8\" does not exist"
     );
 }
 
@@ -212,12 +210,11 @@ fn create_collation_duplicate_name_errors() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE COLLATION my_c (LOCALE = 'C');")
         .unwrap();
-    let err = db
-        .apply_sql("CREATE COLLATION my_c (LOCALE = 'C');")
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("already exists"),
-        "expected duplicate error, got: {err}"
+    let result = db.apply_sql("CREATE COLLATION my_c (LOCALE = 'C');");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "collation \"my_c\" for encoding \"UTF8\" already exists"
     );
 }
 

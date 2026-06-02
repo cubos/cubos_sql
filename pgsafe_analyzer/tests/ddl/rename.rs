@@ -36,7 +36,11 @@ fn rename_table_without_cascade_still_blocks_drop() {
         ("0003.sql", "DROP TABLE t2;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop table t2 because other objects depend on it (view(s) public.v depend on this)"
+    );
 }
 
 // ── AST rewriting on RENAME propagates into dependent view definitions ─────

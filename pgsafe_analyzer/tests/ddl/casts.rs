@@ -98,7 +98,11 @@ fn drop_cast_if_exists_no_error() {
 #[test]
 fn drop_cast_missing_errors_without_if_exists() {
     let result = try_apply(&[("0001.sql", "DROP CAST (int2 AS uuid);")]);
-    assert_ddl_err!(result, DdlError::DependencyError(_), "cast from");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cast from type smallint to type uuid does not exist"
+    );
 }
 
 #[test]

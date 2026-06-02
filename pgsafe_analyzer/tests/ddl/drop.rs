@@ -100,7 +100,11 @@ fn drop_type_with_dependent_column_errors() {
         ("0002.sql", "DROP TYPE status;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop type status because other objects depend on it (table(s) public.t depend on this type)"
+    );
 }
 
 // ── DROP FUNCTION: overload-safe ──────────────────────────────────────────
@@ -143,7 +147,11 @@ fn drop_column_nonexistent_without_if_exists_errors() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN ghost;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::Parse(_), "does not exist");
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "column \"ghost\" of relation \"t\" does not exist"
+    );
 }
 
 #[test]

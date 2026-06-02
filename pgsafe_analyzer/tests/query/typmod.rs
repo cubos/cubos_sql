@@ -252,15 +252,20 @@ fn update_numeric_overflow_rejected() {
 fn varchar_with_invalid_zero_length_rejected_at_ddl() {
     let mut db = PgCatalog::new().unwrap();
     let res = db.apply_sql("CREATE TABLE t (s VARCHAR(0));");
-    assert!(res.is_err(), "VARCHAR(0) must be rejected, got: {res:?}");
+    assert_ddl_err!(
+        res,
+        DdlError::UnsupportedDdl(_),
+        "length for type varchar must be at least 1 (got 0)"
+    );
 }
 
 #[test]
 fn numeric_precision_out_of_range_rejected_at_ddl() {
     let mut db = PgCatalog::new().unwrap();
     let res = db.apply_sql("CREATE TABLE t (a NUMERIC(2000, 2));");
-    assert!(
-        res.is_err(),
-        "NUMERIC(2000, 2) must be rejected, got: {res:?}"
+    assert_ddl_err!(
+        res,
+        DdlError::UnsupportedDdl(_),
+        "NUMERIC precision 2000 must be between 1 and 1000"
     );
 }

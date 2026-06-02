@@ -120,7 +120,7 @@ fn drop_aggregate_missing_errors_without_if_exists() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "aggregate nonexistent",
+        "aggregate nonexistent(integer) does not exist",
     );
 }
 
@@ -302,7 +302,11 @@ fn create_function_duplicate_signature_errors() {
          CREATE FUNCTION foo(x INT) RETURNS INT AS $$ SELECT x + 1 $$ LANGUAGE sql;",
     )]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "function \"foo\" already exists with same argument types"
+    );
 }
 
 // ── Full blog schema: multi-migration integration test ─────────────────────

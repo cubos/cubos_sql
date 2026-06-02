@@ -23,7 +23,11 @@ fn drop_schema_with_objects_fails_without_cascade() {
          CREATE TABLE foo.bar (id INT PRIMARY KEY);
          DROP SCHEMA foo;",
     )]);
-    assert_ddl_err!(result, DdlError::DependencyError(_), "cannot drop schema");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop schema foo because other objects depend on it"
+    );
 }
 
 #[test]
@@ -65,5 +69,9 @@ fn drop_schema_if_exists_no_error() {
 #[test]
 fn drop_schema_missing_errors_without_if_exists() {
     let result = try_apply(&[("0001.sql", "DROP SCHEMA nonexistent;")]);
-    assert_ddl_err!(result, DdlError::DependencyError(_), "nonexistent");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "schema \"nonexistent\" does not exist"
+    );
 }

@@ -35,7 +35,7 @@ fn volatile_function_in_index_expression_should_error() {
             ),
         ]),
         DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
+        "functions in index expression must be marked IMMUTABLE (function \"random\" is not)",
     );
 }
 
@@ -53,7 +53,7 @@ fn nextval_in_index_expression_is_rejected() {
             ),
         ]),
         DdlError::UnsupportedDdl(_),
-        "IMMUTABLE",
+        "functions in index expression must be marked IMMUTABLE (function \"nextval\" is not)",
     );
 }
 
@@ -280,7 +280,7 @@ fn create_index_duplicate_name_in_schema_errors() {
             ("0002.sql", "CREATE INDEX my_idx ON t (name);"),
         ]),
         DdlError::DuplicateObject(_),
-        "already exists",
+        "relation \"my_idx\" already exists",
     );
 }
 
@@ -347,7 +347,7 @@ fn drop_index_missing_without_if_exists_errors() {
     assert_ddl_err!(
         try_apply(&[("0001.sql", "DROP INDEX no_such_idx;")]),
         DdlError::DependencyError(_),
-        "does not exist",
+        "index \"no_such_idx\" does not exist",
     );
 }
 
@@ -366,7 +366,7 @@ fn drop_index_when_target_is_a_table_errors() {
             ("0002.sql", "DROP INDEX t;"),
         ]),
         DdlError::DependencyError(_),
-        "not an index",
+        "\"t\" is not an index",
     );
 }
 

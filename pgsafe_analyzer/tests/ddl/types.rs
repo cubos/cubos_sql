@@ -216,7 +216,11 @@ fn create_enum_duplicate_errors() {
         ("0002.sql", "CREATE TYPE mood AS ENUM ('angry');"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "type \"mood\" already exists"
+    );
 }
 
 #[test]
@@ -227,7 +231,11 @@ fn create_composite_duplicate_errors() {
          CREATE TYPE point2d AS (a int, b int);",
     )]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "type \"point2d\" already exists"
+    );
 }
 
 #[test]
@@ -238,7 +246,11 @@ fn create_range_duplicate_errors() {
          CREATE TYPE floatrange AS RANGE (subtype = float8);",
     )]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "type \"floatrange\" already exists"
+    );
 }
 
 // ── ALTER TYPE ADD VALUE edge cases ────────────────────────────────────────
@@ -250,7 +262,11 @@ fn alter_enum_add_duplicate_value_errors() {
         ("0002.sql", "ALTER TYPE mood ADD VALUE 'happy';"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "enum label \"happy\" already exists"
+    );
 }
 
 #[test]
@@ -260,5 +276,9 @@ fn alter_enum_add_value_if_not_exists_on_missing_type_errors() {
         "ALTER TYPE nonexistent ADD VALUE IF NOT EXISTS 'x';",
     )]);
 
-    assert_ddl_err!(result, DdlError::TypeNotFound(_), "nonexistent");
+    assert_ddl_err!(
+        result,
+        DdlError::TypeNotFound(_),
+        "type \"nonexistent\" does not exist"
+    );
 }

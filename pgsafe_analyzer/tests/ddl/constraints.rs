@@ -96,7 +96,7 @@ fn create_table_references_unknown_table_is_rejected() {
             "CREATE TABLE c (id BIGINT PRIMARY KEY, p_id BIGINT REFERENCES ghost(id));"
         )]),
         DdlError::TableNotFound(_),
-        "ghost",
+        "relation \"ghost\" does not exist (referenced by foreign key constraint \"c_p_id_fkey\")",
     );
 }
 
@@ -112,7 +112,7 @@ fn create_table_references_unknown_column_is_rejected() {
              );"
         )]),
         DdlError::Parse(_),
-        "ghost",
+        "column \"ghost\" referenced in foreign key constraint does not exist on \"p\"",
     );
 }
 
@@ -130,7 +130,7 @@ fn create_table_references_non_unique_target_is_rejected() {
              );"
         )]),
         DdlError::DependencyError(_),
-        "no unique constraint",
+        "there is no unique constraint matching given keys for referenced table \"p\"",
     );
 }
 
@@ -146,7 +146,7 @@ fn create_table_references_with_incompatible_type_is_rejected() {
              );"
         )]),
         DdlError::DependencyError(_),
-        "incompatible types",
+        "foreign key constraint \"c_p_id_fkey\" cannot be implemented (key columns of \"c\" and \"p\" are of incompatible types: text and bigint)",
     );
 }
 
@@ -203,7 +203,7 @@ fn create_table_table_level_foreign_key_arity_mismatch_is_rejected() {
              );"
         )]),
         DdlError::Parse(_),
-        "1 local column",
+        "number of referencing and referenced columns for foreign key disagree (constraint \"c_pa_fkey\": 1 local column(s) vs 2 on \"p\")",
     );
 }
 
@@ -237,7 +237,7 @@ fn alter_table_add_foreign_key_without_target_pk_is_rejected() {
             ),
         ]),
         DdlError::DependencyError(_),
-        "no primary key",
+        "there is no primary key for referenced table \"p\"",
     );
 }
 
@@ -267,7 +267,7 @@ fn alter_table_drop_nonexistent_constraint_errors() {
             ("0002.sql", "ALTER TABLE t DROP CONSTRAINT ghost;"),
         ]),
         DdlError::DependencyError(_),
-        "ghost",
+        "constraint \"ghost\" of relation \"t\" does not exist",
     );
 }
 
@@ -293,7 +293,7 @@ fn drop_pk_referenced_by_fk_without_cascade_is_rejected() {
             ("0002.sql", "ALTER TABLE p DROP CONSTRAINT p_pkey;"),
         ]),
         DdlError::DependencyError(_),
-        "because other objects depend on it",
+        "cannot drop constraint p_pkey on table p because other objects depend on it (foreign key constraint \"c_p_id_fkey\" depends on this)",
     );
 }
 
@@ -344,7 +344,7 @@ fn alter_table_rename_nonexistent_constraint_errors() {
             ),
         ]),
         DdlError::DependencyError(_),
-        "ghost",
+        "constraint \"ghost\" for table \"t\" does not exist",
     );
 }
 
@@ -362,7 +362,7 @@ fn drop_table_referenced_by_fk_without_cascade_is_rejected() {
             ("0002.sql", "DROP TABLE p;"),
         ]),
         DdlError::DependencyError(_),
-        "foreign key",
+        "cannot drop table p because other objects depend on it (foreign key constraint(s) c_p_id_fkey on public.c depend on this)",
     );
 }
 
@@ -431,7 +431,7 @@ fn drop_column_with_fk_target_without_cascade_is_rejected() {
             ("0002.sql", "ALTER TABLE p DROP COLUMN id;"),
         ]),
         DdlError::DependencyError(_),
-        "constraint(s)",
+        "cannot drop column id of table p because other objects depend on it (constraint(s) c_p_id_fkey depend on this column)",
     );
 }
 

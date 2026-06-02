@@ -122,12 +122,7 @@ fn alter_column_type_with_view_fails_even_when_binary_coercible() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot alter type of a column used by a view or rule",
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("drop"),
-        "error should hint at drop-and-recreate: {err}",
+        "cannot alter type of a column used by a view or rule: column t.id is referenced by view(s) public.v (hint: drop the view(s) first, alter the column, then recreate)",
     );
 }
 
@@ -145,12 +140,7 @@ fn alter_column_type_with_view_fails_when_not_binary_coercible() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot alter type of a column used by a view or rule",
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("drop"),
-        "error should hint at drop-and-recreate: {err}",
+        "cannot alter type of a column used by a view or rule: column t.amount is referenced by view(s) public.v (hint: drop the view(s) first, alter the column, then recreate)",
     );
 }
 
@@ -166,7 +156,11 @@ fn alter_table_add_column_duplicate_errors() {
         ("0002.sql", "ALTER TABLE t ADD COLUMN name TEXT;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "column \"name\" of relation \"t\" already exists"
+    );
 }
 
 #[test]
@@ -267,7 +261,11 @@ fn alter_column_set_not_null_on_nonexistent_column_errors() {
         ),
     ]);
 
-    assert_ddl_err!(result, DdlError::Parse(_), "does not exist");
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "column \"nonexistent\" of relation \"t\" does not exist"
+    );
 }
 
 #[test]
@@ -280,7 +278,11 @@ fn alter_column_set_default_on_nonexistent_column_errors() {
         ),
     ]);
 
-    assert_ddl_err!(result, DdlError::Parse(_), "does not exist");
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "column \"ghost\" of relation \"t\" does not exist"
+    );
 }
 
 #[test]
@@ -290,5 +292,9 @@ fn alter_column_type_on_nonexistent_column_errors() {
         ("0002.sql", "ALTER TABLE t ALTER COLUMN ghost TYPE BIGINT;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::Parse(_), "does not exist");
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "column \"ghost\" of relation \"t\" does not exist"
+    );
 }

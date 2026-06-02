@@ -548,14 +548,17 @@ macro_rules! assert_analyze_err {
 }
 
 /// Assert a migration `Result<(), DdlError>` failed with a specific variant
-/// and message substring.
+/// and the **exact, complete** error message (like [`assert_analyze_err!`]) —
+/// so the test pins the full wording and we get visibility into message
+/// quality, not just a substring.
 ///
 /// ```ignore
-/// assert_ddl_err!(try_apply(&[...]), DdlError::DuplicateObject(_), "already exists");
+/// assert_ddl_err!(try_apply(&[...]), DdlError::DuplicateObject(_),
+///                 "column \"name\" of relation \"t\" already exists");
 /// ```
 #[macro_export]
 macro_rules! assert_ddl_err {
-    ($result:expr, $variant:pat, $msg_substring:expr $(,)?) => {{
+    ($result:expr, $variant:pat, $expected_msg:expr $(,)?) => {{
         // Borrow the expression so the macro doesn't consume the caller's
         // binding — callers often inspect the error again afterwards.
         match &$result {
@@ -568,16 +571,17 @@ macro_rules! assert_ddl_err {
                     );
                 }
                 let msg = err.to_string();
-                assert!(
-                    msg.contains($msg_substring),
-                    "DDL error message must contain {:?}\n  got: {msg}",
-                    $msg_substring,
+                let expected: &str = $expected_msg;
+                assert_eq!(
+                    msg, expected,
+                    "DDL error message mismatch\n  expected: {:?}\n       got: {:?}",
+                    expected, msg,
                 );
             }
             Ok(()) => panic!(
-                "expected {} containing {:?}, got Ok(())",
+                "expected {} with message {:?}, got Ok(())",
                 stringify!($variant),
-                $msg_substring,
+                $expected_msg,
             ),
         }
     }};

@@ -1825,13 +1825,13 @@ fn insert_composite_column_with_wrong_arity_errors() {
     let db = setup();
     // `address` has 3 fields; ROW(...) with 2 fields is a clear arity
     // mismatch and must be rejected at the assignment site.
-    assert!(
+    assert_analyze_err!(
         db.analyze(
             "INSERT INTO users (name, work) \
              VALUES ('n', ROW($p1, $p2)) RETURNING id"
-        )
-        .is_err(),
-        "expected arity mismatch error"
+        ),
+        AnalyzeError::Invalid(_),
+        "cannot cast type record to address",
     );
 }
 
@@ -1843,8 +1843,11 @@ fn update_composite_with_wrong_field_types_errors() {
     // per-field coercion instead — both reject, so skip the mirror.)
     let mut db = setup();
     db.skip_pg_sanity();
-    let r = db.analyze("UPDATE points SET p = ROW(true, 1.0) WHERE id = 1");
-    assert!(r.is_err(), "expected record-cast error, got: {r:?}");
+    assert_analyze_err!(
+        db.analyze("UPDATE points SET p = ROW(true, 1.0) WHERE id = 1"),
+        AnalyzeError::TypeMismatch { .. },
+        "cannot coerce boolean to double precision\n  ╭────\n1 │ UPDATE points SET p = ROW(true, 1.0) WHERE id = 1\n  ·                           ──┬─\n  ·                             ╰─ expected double precision, found boolean\n  ╰────\n",
+    );
 }
 
 #[test]
@@ -1865,24 +1868,33 @@ fn update_composite_with_int_into_text_field_accepted() {
 fn row_constructor_in_arithmetic_errors() {
     let db = setup();
     // PG: `record + integer` is undefined.
-    let r = db.analyze("SELECT ROW(1, 2) + 1 AS bad");
-    assert!(r.is_err(), "expected operator-not-found, got Ok: {r:?}");
+    assert_analyze_err!(
+        db.analyze("SELECT ROW(1, 2) + 1 AS bad"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: record + integer\n  ╭────\n1 │ SELECT ROW(1, 2) + 1 AS bad\n  ·                  ┬\n  ·                  ╰─ operator does not exist\n  ╰────\n",
+    );
 }
 
 #[test]
 fn record_in_jsonb_minus_op_errors() {
     let db = setup();
     // jsonb - record is undefined; jsonb_set / etc. take text, not record.
-    let r = db.analyze("SELECT '{}'::jsonb - ROW(1, 'x') AS bad");
-    assert!(r.is_err(), "expected type error, got Ok: {r:?}");
+    assert_analyze_err!(
+        db.analyze("SELECT '{}'::jsonb - ROW(1, 'x') AS bad"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: jsonb - record\n  ╭────\n1 │ SELECT '{}'::jsonb - ROW(1, 'x') AS bad\n  ·                    ┬\n  ·                    ╰─ operator does not exist\n  ╰────\n",
+    );
 }
 
 #[test]
 fn record_compared_to_scalar_errors() {
     let db = setup();
     // `record = int` has no operator. PG rejects with `operator does not exist`.
-    let r = db.analyze("SELECT u.id FROM users u WHERE ROW(u.id) = 1");
-    assert!(r.is_err(), "expected operator-not-found, got: {r:?}");
+    assert_analyze_err!(
+        db.analyze("SELECT u.id FROM users u WHERE ROW(u.id) = 1"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: record = integer\n  ╭────\n1 │ SELECT u.id FROM users u WHERE ROW(u.id) = 1\n  ·                                          ┬\n  ·                                          ╰─ operator does not exist\n  ╰────\n",
+    );
 }
 
 #[test]
@@ -1890,16 +1902,22 @@ fn record_field_chain_on_scalar_errors() {
     let db = setup();
     // Scalar then composite-field access is invalid even when wrapped in
     // an extra parenthesis.
-    let r = db.analyze("SELECT ((u.id)).f1 FROM users u");
-    assert!(r.is_err(), "expected error on scalar.field, got: {r:?}");
+    assert_analyze_err!(
+        db.analyze("SELECT ((u.id)).f1 FROM users u"),
+        AnalyzeError::Unsupported(_),
+        "column notation .f1 applied to type bigint, which is not a composite type",
+    );
 }
 
 #[test]
 fn select_star_qualifier_without_relation_errors() {
     let db = setup();
     // Bare `*` inside an expression has no qualifier — analyzer rejects.
-    let r = db.analyze("SELECT row_to_json(*) FROM users u");
-    assert!(r.is_err(), "expected error for unqualified *: {r:?}");
+    assert_analyze_err!(
+        db.analyze("SELECT row_to_json(*) FROM users u"),
+        AnalyzeError::UndefinedFunction(_),
+        "function row_to_json() does not exist (found 2 candidate(s))\n  ╭────\n1 │ SELECT row_to_json(*) FROM users u\n  ·        ─────┬─────\n  ·             ╰─ function does not exist\n  ╰────\n  help: did you mean \"row_to_json\"?\n",
+    );
 }
 
 #[test]
@@ -1919,8 +1937,11 @@ fn duplicate_field_name_in_row_errors_on_indirection() {
 fn row_to_json_with_no_args_errors() {
     let db = setup();
     // row_to_json requires exactly one argument.
-    let r = db.analyze("SELECT row_to_json()");
-    assert!(r.is_err(), "expected arity error, got: {r:?}");
+    assert_analyze_err!(
+        db.analyze("SELECT row_to_json()"),
+        AnalyzeError::UndefinedFunction(_),
+        "function row_to_json() does not exist (found 2 candidate(s))\n  ╭────\n1 │ SELECT row_to_json()\n  ·        ─────┬─────\n  ·             ╰─ function does not exist\n  ╰────\n  help: did you mean \"row_to_json\"?\n",
+    );
 }
 
 // ── Type::Composite — focused coverage ───────────────────────────────────────
@@ -2131,15 +2152,10 @@ fn cast_scalar_to_composite_rejected() {
     // structural path: `cannot cast type numeric to point2d`. The analyzer used
     // to allow any composite cast target.
     let db = setup();
-    let err = db.analyze("SELECT (3.14)::point2d AS c").unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::Invalid(_)),
-        "expected Invalid, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("cannot cast type numeric to point2d"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT (3.14)::point2d AS c"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type numeric to point2d",
     );
 }
 

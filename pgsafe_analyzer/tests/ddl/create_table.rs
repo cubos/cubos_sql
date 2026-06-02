@@ -133,7 +133,11 @@ fn create_table_duplicate_without_if_not_exists_errors() {
         ("0002.sql", "CREATE TABLE t (name TEXT NOT NULL);"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "relation \"t\" already exists"
+    );
 }
 
 #[test]
@@ -146,7 +150,7 @@ fn create_table_duplicate_column_names_errors() {
     assert_ddl_err!(
         result,
         DdlError::DuplicateObject(_),
-        "specified more than once",
+        "column \"id\" specified more than once",
     );
 }
 
@@ -449,7 +453,7 @@ fn volatile_function_in_generated_stored_column_should_error() {
             );",
         )]),
         DdlError::UnsupportedDdl(_),
-        "not immutable",
+        "generation expression is not immutable: function \"random\" must be marked IMMUTABLE",
     );
 }
 
@@ -533,7 +537,7 @@ fn gen_random_uuid_in_generated_column_is_rejected() {
             );",
         )]),
         DdlError::UnsupportedDdl(_),
-        "not immutable",
+        "generation expression is not immutable: function \"gen_random_uuid\" must be marked IMMUTABLE",
     );
 }
 
@@ -547,7 +551,7 @@ fn check_constraint_returning_int_is_rejected() {
     assert_ddl_err!(
         try_apply(&[("0001.sql", "CREATE TABLE t (id INT NOT NULL CHECK (id));",)]),
         DdlError::UnsupportedDdl(_),
-        "must be type boolean",
+        "argument of CHECK must be type boolean, not type integer (CHECK constraint on t.id)",
     );
 }
 
@@ -559,7 +563,7 @@ fn check_constraint_returning_text_is_rejected() {
             "CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL CHECK (name));",
         )]),
         DdlError::UnsupportedDdl(_),
-        "must be type boolean",
+        "argument of CHECK must be type boolean, not type text (CHECK constraint on t.name)",
     );
 }
 
@@ -575,7 +579,7 @@ fn table_level_check_returning_int_is_rejected() {
             );",
         )]),
         DdlError::UnsupportedDdl(_),
-        "must be type boolean",
+        "argument of CHECK must be type boolean, not type integer (table-level CHECK constraint on \"t\")",
     );
 }
 
@@ -602,7 +606,7 @@ fn alter_table_add_check_returning_int_is_rejected() {
             ("0002.sql", "ALTER TABLE t ADD CONSTRAINT chk CHECK (id);"),
         ]),
         DdlError::UnsupportedDdl(_),
-        "must be type boolean",
+        "argument of CHECK must be type boolean, not type integer (CHECK constraint on \"t\")",
     );
 }
 
@@ -617,7 +621,7 @@ fn check_constraint_referencing_unknown_column_is_rejected() {
             "CREATE TABLE t (id INT NOT NULL CHECK (ghost > 0));",
         )]),
         DdlError::UnsupportedDdl(_),
-        "ghost",
+        "column \"ghost\" does not exist (in CHECK constraint on t.id)",
     );
 }
 
@@ -637,7 +641,7 @@ fn generated_column_with_mismatched_type_is_rejected() {
             );",
         )]),
         DdlError::UnsupportedDdl(_),
-        "GENERATED expression",
+        "column \"bad\" is of type integer but default expression is of type text (in GENERATED expression on \"t\")",
     );
 }
 
@@ -680,7 +684,7 @@ fn generated_column_referencing_unknown_column_is_rejected() {
             );",
         )]),
         DdlError::UnsupportedDdl(_),
-        "ghost",
+        "column \"ghost\" does not exist (in GENERATED expression on t.bad)",
     );
 }
 

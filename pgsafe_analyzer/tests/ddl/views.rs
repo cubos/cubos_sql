@@ -109,7 +109,11 @@ fn view_drop_referenced_column_fails_without_cascade() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN name;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop column name of table t because other objects depend on it (view(s) public.v depend on this column)"
+    );
 }
 
 #[test]
@@ -164,7 +168,7 @@ fn view_alter_type_fails_without_cascade() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot alter type of a column used by a view or rule",
+        "cannot alter type of a column used by a view or rule: column t.amount is referenced by view(s) public.v (hint: drop the view(s) first, alter the column, then recreate)",
     );
 }
 
@@ -223,7 +227,11 @@ fn view_drop_table_fails_without_cascade() {
         ("0002.sql", "DROP TABLE t;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop table t because other objects depend on it (view(s) public.v depend on this)"
+    );
 }
 
 #[test]
@@ -251,7 +259,11 @@ fn view_with_invalid_column_fails_migration() {
          CREATE VIEW bad AS SELECT nao_existe FROM users;",
     )]);
 
-    assert_ddl_err!(result, DdlError::ViewAnalysis { .. }, "bad");
+    assert_ddl_err!(
+        result,
+        DdlError::ViewAnalysis { .. },
+        "column \"nao_existe\" does not exist (while analyzing view 'public.bad')"
+    );
 }
 
 #[test]
@@ -694,7 +706,11 @@ fn drop_column_referenced_by_view_expression_fails() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN id;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop column id of table t because other objects depend on it (view(s) public.v depend on this column)"
+    );
 }
 
 #[test]
@@ -708,7 +724,11 @@ fn drop_column_referenced_in_view_where_fails() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN id;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop column id of table t because other objects depend on it (view(s) public.v depend on this column)"
+    );
 }
 
 #[test]
@@ -723,7 +743,11 @@ fn drop_column_referenced_in_view_join_on_fails() {
         ("0002.sql", "ALTER TABLE t2 DROP COLUMN id;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop column id of table t2 because other objects depend on it (view(s) public.v depend on this column)"
+    );
 }
 
 #[test]
@@ -737,7 +761,11 @@ fn drop_column_referenced_in_view_order_by_fails() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN score;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop column score of table t because other objects depend on it (view(s) public.v depend on this column)"
+    );
 }
 
 #[test]
@@ -751,7 +779,11 @@ fn drop_column_aliased_by_view_fails() {
         ("0002.sql", "ALTER TABLE t DROP COLUMN name;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop column name of table t because other objects depend on it (view(s) public.v depend on this column)"
+    );
 }
 
 #[test]
@@ -785,7 +817,11 @@ fn drop_view_fails_when_another_view_depends_on_it() {
         ("0002.sql", "DROP VIEW v1;"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DependencyError(_), "depend");
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop view v1 because other objects depend on it (view(s) public.v2 depend on this)"
+    );
 }
 
 #[test]
@@ -826,7 +862,7 @@ fn drop_function_referenced_by_view_fails_without_cascade() {
             ("0002.sql", "DROP FUNCTION shout(text);"),
         ]),
         DdlError::DependencyError(_),
-        "depend",
+        "cannot drop function shout(text) because other objects depend on it (view(s) public.v depend on this function)",
     );
 }
 
@@ -862,7 +898,7 @@ fn drop_aggregate_referenced_by_view_fails_without_cascade() {
             ("0002.sql", "DROP AGGREGATE custom_sum(int);"),
         ]),
         DdlError::DependencyError(_),
-        "depend",
+        "cannot drop function custom_sum(integer) because other objects depend on it (view(s) public.v depend on this aggregate)",
     );
 }
 
@@ -881,7 +917,7 @@ fn drop_type_referenced_by_view_cast_fails_without_cascade() {
             ("0002.sql", "DROP DOMAIN positive_int;"),
         ]),
         DdlError::DependencyError(_),
-        "depend",
+        "cannot drop type positive_int because other objects depend on it (table(s) public.v depend on this type)",
     );
 }
 

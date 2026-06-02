@@ -412,11 +412,10 @@ fn unnest_in_from_multi_arg_non_array_errors() {
     let db = setup();
     // A scalar argument to multi-arg unnest must surface as a clear error,
     // not silently produce a column of unknown type.
-    let r = db.analyze("SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)");
-    assert!(
-        r.is_err(),
-        "expected unnest with a non-array argument to error, got {:?}",
-        r
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)"),
+        AnalyzeError::UndefinedFunction(_),
+        "function pg_catalog.unnest(text) does not exist (unnest argument 2 is not an array)\n  ╭────\n1 │ SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)\n  ·               ───┬──\n  ·                  ╰─ function does not exist\n  ╰────\n  help: did you mean \"unnest\"?\n",
     );
 }
 
@@ -427,14 +426,9 @@ fn array_ndims_on_scalar_rejected() {
     // fallback (which blanket-accepted any pseudo-type parameter).
     // PG: `function array_ndims(integer) does not exist`.
     let db = setup();
-    let err = db.analyze("SELECT array_ndims(7)").unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedFunction(_)),
-        "expected UndefinedFunction, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("function array_ndims(integer) does not exist"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT array_ndims(7)"),
+        AnalyzeError::UndefinedFunction(_),
+        "function array_ndims(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT array_ndims(7)\n  ·        ─────┬─────\n  ·             ╰─ function does not exist\n  ╰────\n  help: did you mean \"array_ndims\"?\n",
     );
 }

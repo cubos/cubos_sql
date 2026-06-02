@@ -263,7 +263,11 @@ fn create_extension_duplicate_without_if_not_exists_errors() {
         ("0002.sql", "CREATE EXTENSION \"uuid-ossp\";"),
     ]);
 
-    assert_ddl_err!(result, DdlError::DuplicateObject(_), "already exists");
+    assert_ddl_err!(
+        result,
+        DdlError::DuplicateObject(_),
+        "extension \"uuid-ossp\" already exists"
+    );
 }
 
 #[test]
@@ -275,7 +279,11 @@ fn extension_unknown_is_error() {
         "0001.sql",
         "CREATE EXTENSION IF NOT EXISTS some_unknown_ext;",
     )]);
-    assert_ddl_err!(result, DdlError::ExtensionError(_), "some_unknown_ext");
+    assert_ddl_err!(
+        result,
+        DdlError::ExtensionError(_),
+        "unknown extension 'some_unknown_ext': add a SQL file to pgsafe_analyzer/src/extensions/ to register it for static analysis"
+    );
 }
 
 // ── Param inference over extension-provided types and operators ─────────────
