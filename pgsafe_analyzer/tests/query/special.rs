@@ -613,17 +613,10 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
     // must keep that qualifier so the error-message prefix matches PG.
     // PG: `function pg_catalog.extract(unknown, integer) does not exist`.
     let db = setup();
-    let err = db
-        .analyze("SELECT extract('year' FROM age) FROM users")
-        .unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedFunction(_)),
-        "expected UndefinedFunction, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("function pg_catalog.extract(unknown, integer) does not exist"),
-        "expected pg_catalog-qualified name, got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT extract('year' FROM age) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "function pg_catalog.extract(unknown, integer) does not exist (found 6 candidate(s))\n  ╭────\n1 │ SELECT extract('year' FROM age) FROM users\n  ·        ───┬───\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"extract\"?\n",
     );
 }
 

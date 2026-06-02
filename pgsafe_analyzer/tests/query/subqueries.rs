@@ -435,17 +435,10 @@ fn in_subquery_with_incompatible_types_rejected() {
     // comparison the same way as a plain `a = b` and rejects it.
     // PG: `operator does not exist: bigint = text`.
     let db = setup();
-    let err = db
-        .analyze("SELECT id FROM posts WHERE user_id IN (SELECT title FROM posts)")
-        .unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedOperator(_)),
-        "expected UndefinedOperator, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("operator does not exist: bigint = text"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM posts WHERE user_id IN (SELECT title FROM posts)"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: bigint = text",
     );
 }
 

@@ -1793,16 +1793,9 @@ fn update_text_into_int_column_rejected() {
     // still rejected. PG: `column "age" is of type integer but expression is of
     // type text`.
     let db = setup();
-    let err = db
-        .analyze("UPDATE users SET age = name WHERE id = 1")
-        .unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::TypeMismatch { .. }),
-        "expected TypeMismatch, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("column \"age\" is of type integer but expression is of type text"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("UPDATE users SET age = name WHERE id = 1"),
+        AnalyzeError::TypeMismatch { .. },
+        "column \"age\" is of type integer but expression is of type text\n  ╭────\n1 │ UPDATE users SET age = name WHERE id = 1\n  ·                  ─┬─   ──┬─\n  ·                   │      ╰─ expected integer, found text\n  ·                   ╰─ expected integer here\n  ╰────\n",
     );
 }

@@ -479,15 +479,10 @@ fn single_aggregate_overload_rejects_wrong_arg_type() {
     // `boolean`, so the call does not resolve.
     // PG: `function bool_or(integer) does not exist`.
     let db = setup();
-    let err = db.analyze("SELECT bool_or(age) FROM users").unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedFunction(_)),
-        "expected UndefinedFunction, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("function bool_or(integer) does not exist"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT bool_or(age) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "function bool_or(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT bool_or(age) FROM users\n  ·        ───┬───\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"bool_or\"?\n",
     );
 }
 
@@ -496,17 +491,10 @@ fn single_aggregate_overload_rejects_wrong_arity() {
     // A lone aggregate overload must also reject the wrong argument count.
     // PG: `function bool_or(text, integer) does not exist`.
     let db = setup();
-    let err = db
-        .analyze("SELECT bool_or(name, age) FROM users")
-        .unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedFunction(_)),
-        "expected UndefinedFunction, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("function bool_or(text, integer) does not exist"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT bool_or(name, age) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "function bool_or(text, integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT bool_or(name, age) FROM users\n  ·        ───┬───\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"bool_or\"?\n",
     );
 }
 
@@ -521,26 +509,16 @@ fn max_over_scalar_without_overload_rejected() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (active BOOLEAN, prefs JSONB);")
         .unwrap();
-    for (sql, expected) in [
-        (
-            "SELECT max(active) FROM t",
-            "function max(boolean) does not exist",
-        ),
-        (
-            "SELECT max(prefs) FROM t",
-            "function max(jsonb) does not exist",
-        ),
-    ] {
-        let err = db.analyze(sql).unwrap_err();
-        assert!(
-            matches!(err, AnalyzeError::UndefinedFunction(_)),
-            "expected UndefinedFunction for {sql}, got {err:?}"
-        );
-        assert!(
-            err.to_string().starts_with(expected),
-            "for {sql}, got: {err}"
-        );
-    }
+    assert_analyze_err!(
+        db.analyze("SELECT max(active) FROM t"),
+        AnalyzeError::UndefinedFunction(_),
+        "function max(boolean) does not exist (found 24 candidate(s))\n  ╭────\n1 │ SELECT max(active) FROM t\n  ·        ─┬─\n  ·         ╰─ function does not exist\n  ╰────\n  help: did you mean \"max\"?\n",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT max(prefs) FROM t"),
+        AnalyzeError::UndefinedFunction(_),
+        "function max(jsonb) does not exist (found 24 candidate(s))\n  ╭────\n1 │ SELECT max(prefs) FROM t\n  ·        ─┬─\n  ·         ╰─ function does not exist\n  ╰────\n  help: did you mean \"max\"?\n",
+    );
 }
 
 #[test]

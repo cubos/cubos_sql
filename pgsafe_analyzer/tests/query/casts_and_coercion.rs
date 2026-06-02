@@ -428,14 +428,9 @@ fn internal_char_type_rendered_quoted_in_messages() {
     // in error messages, exactly like PG — bare `char` would read as SQL
     // `char`/`bpchar`. PG: `cannot cast type numeric to "char"`.
     let db = PgCatalog::new().unwrap();
-    let err = db.analyze("SELECT (3.14)::\"char\"").unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::Invalid(_)),
-        "expected Invalid, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("cannot cast type numeric to \"char\""),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT (3.14)::\"char\""),
+        AnalyzeError::Invalid(_),
+        "cannot cast type numeric to \"char\"",
     );
 }

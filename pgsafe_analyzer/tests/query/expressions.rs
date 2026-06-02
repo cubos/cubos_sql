@@ -809,15 +809,10 @@ fn single_overload_function_with_non_coercible_arg_rejected() {
     // used to accept any single-overload function whose argument *count* lined
     // up, regardless of type.
     let db = setup();
-    let err = db.analyze("SELECT jsonb_typeof(42)").unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedFunction(_)),
-        "expected UndefinedFunction, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("function jsonb_typeof(integer) does not exist"),
-        "message should start with PG's wording, got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT jsonb_typeof(42)"),
+        AnalyzeError::UndefinedFunction(_),
+        "function jsonb_typeof(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT jsonb_typeof(42)\n  ·        ──────┬─────\n  ·              ╰─ function does not exist\n  ╰────\n  help: did you mean \"jsonb_typeof\"?\n",
     );
 }
 
@@ -861,15 +856,10 @@ fn variadic_concat_ws_rejects_non_text_separator() {
     // doesn't resolve. The variadic short-circuit used to accept any args.
     // PG: `function concat_ws(integer) does not exist`.
     let db = setup();
-    let err = db.analyze("SELECT concat_ws(age) FROM users").unwrap_err();
-    assert!(
-        matches!(err, AnalyzeError::UndefinedFunction(_)),
-        "expected UndefinedFunction, got {err:?}"
-    );
-    assert!(
-        err.to_string()
-            .starts_with("function concat_ws(integer) does not exist"),
-        "got: {err}"
+    assert_analyze_err!(
+        db.analyze("SELECT concat_ws(age) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "function concat_ws(integer) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT concat_ws(age) FROM users\n  ·        ────┬────\n  ·            ╰─ function does not exist\n  ╰────\n  help: did you mean \"concat_ws\"?\n",
     );
 }
 
@@ -918,26 +908,16 @@ fn variadic_any_requires_at_least_one_variadic_arg() {
     // `concat_ws(text)` and `concat()` do not exist — only the fixed params
     // isn't enough. PG: `function concat_ws(text) does not exist`.
     let db = setup();
-    for (sql, expected) in [
-        (
-            "SELECT concat_ws(name) FROM users",
-            "function concat_ws(text) does not exist",
-        ),
-        (
-            "SELECT concat() FROM users",
-            "function concat() does not exist",
-        ),
-    ] {
-        let err = db.analyze(sql).unwrap_err();
-        assert!(
-            matches!(err, AnalyzeError::UndefinedFunction(_)),
-            "expected UndefinedFunction for {sql}, got {err:?}"
-        );
-        assert!(
-            err.to_string().starts_with(expected),
-            "for {sql}, got: {err}"
-        );
-    }
+    assert_analyze_err!(
+        db.analyze("SELECT concat_ws(name) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "function concat_ws(text) does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT concat_ws(name) FROM users\n  ·        ────┬────\n  ·            ╰─ function does not exist\n  ╰────\n  help: did you mean \"concat_ws\"?\n",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT concat() FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "function concat() does not exist (found 1 candidate(s))\n  ╭────\n1 │ SELECT concat() FROM users\n  ·        ───┬──\n  ·           ╰─ function does not exist\n  ╰────\n  help: did you mean \"concat\"?\n",
+    );
 }
 
 #[test]
