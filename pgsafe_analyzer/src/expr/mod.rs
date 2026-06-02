@@ -613,6 +613,40 @@ pub(crate) fn infer_expr(
                 resolved_collation,
             ));
         }
+        node::Node::SqlvalueFunction(svf) => {
+            // SQL value functions: `CURRENT_DATE`, `CURRENT_TIMESTAMP`,
+            // `CURRENT_USER`, `CURRENT_SCHEMA`, `LOCALTIME`, … pg_query leaves
+            // the result OID at 0 in the raw tree, so map the op ourselves
+            // (PG's gram.y assigns these). All are non-strict and never NULL.
+            use protobuf::SqlValueFunctionOp as Op;
+            let op = protobuf::SqlValueFunctionOp::try_from(svf.op)
+                .unwrap_or(Op::SqlvalueFunctionOpUndefined);
+            let type_oid = match op {
+                Op::SvfopCurrentDate => oid::DATE,
+                Op::SvfopCurrentTime | Op::SvfopCurrentTimeN => oid::TIMETZ,
+                Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN => oid::TIMESTAMPTZ,
+                Op::SvfopLocaltime | Op::SvfopLocaltimeN => oid::TIME,
+                Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN => oid::TIMESTAMP,
+                Op::SvfopCurrentRole
+                | Op::SvfopCurrentUser
+                | Op::SvfopUser
+                | Op::SvfopSessionUser
+                | Op::SvfopCurrentCatalog
+                | Op::SvfopCurrentSchema => oid::NAME,
+                Op::SqlvalueFunctionOpUndefined => {
+                    return Err(AnalyzeError::Unsupported(
+                        "unknown SQL value function".into(),
+                    ));
+                }
+            };
+            // The `(n)` precision variants carry a typmod; the base type is
+            // unchanged. Forward it so e.g. `current_time(3)` keeps its typmod.
+            // (PG additionally range-checks the precision via
+            // `any{time,timestamp}_typmod_check`; we don't — that's the same
+            // per-value validation family we defer elsewhere.)
+            let typmod = (svf.typmod >= 0).then_some(svf.typmod);
+            Ok(ExprType::scalar_with_typmod(type_oid, false, typmod))
+        }
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)

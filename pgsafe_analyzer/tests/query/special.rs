@@ -626,3 +626,49 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
         "expected pg_catalog-qualified name, got: {err}"
     );
 }
+
+// ── SQL value functions (CURRENT_DATE / CURRENT_USER / …) ────────────────────
+
+#[test]
+fn sql_value_functions_infer_types() {
+    // pg_query emits these as `SQLValueFunction` (with a 0 result OID in the raw
+    // tree); the analyzer used to reject every one with "expression node type
+    // not supported". Each maps to a concrete, NOT-NULL type.
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT current_date AS d, current_timestamp AS ts, current_time AS t, \
+                    localtimestamp AS lts, localtime AS lt, current_user AS u, \
+                    current_schema AS sch, current_catalog AS cat, session_user AS su",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("d", date()),
+            c("ts", timestamptz()),
+            c("t", basic("pg_catalog", "timetz")),
+            c("lts", timestamp()),
+            c("lt", time_ty()),
+            c("u", name_ty()),
+            c("sch", name_ty()),
+            c("cat", name_ty()),
+            c("su", name_ty()),
+        ],
+    );
+}
+
+#[test]
+fn sql_value_function_unaliased_column_name_matches_pg() {
+    // PG's FigureColname names an unaliased SQL value function after its keyword
+    // spelling — `RETURNING current_date` → column `current_date` (not `?column?`).
+    let db = setup();
+    let s = db
+        .analyze("DELETE FROM users RETURNING current_date")
+        .unwrap();
+    assert_eq!(s.columns[0].name, "current_date");
+    let s = db
+        .analyze("UPDATE users SET age = 1 RETURNING current_timestamp")
+        .unwrap();
+    assert_eq!(s.columns[0].name, "current_timestamp");
+}

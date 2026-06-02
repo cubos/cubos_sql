@@ -50,6 +50,11 @@ pub(crate) mod oid {
     pub const UNKNOWN: PgTypeOid = PgTypeOid::from_raw(705);
     pub const BPCHAR: PgTypeOid = PgTypeOid::from_raw(1042);
     pub const VARCHAR: PgTypeOid = PgTypeOid::from_raw(1043);
+    pub const DATE: PgTypeOid = PgTypeOid::from_raw(1082);
+    pub const TIME: PgTypeOid = PgTypeOid::from_raw(1083);
+    pub const TIMESTAMP: PgTypeOid = PgTypeOid::from_raw(1114);
+    pub const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
+    pub const TIMETZ: PgTypeOid = PgTypeOid::from_raw(1266);
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
 }

@@ -307,6 +307,26 @@ pub(crate) fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
         },
         node::Node::NullIfExpr(_) => (2, Some("nullif".to_string())),
         node::Node::RowExpr(_) => (2, Some("row".to_string())),
+        // SQL value functions are named after the keyword spelling (PG's
+        // FigureColname): `SELECT current_date` → column `current_date`.
+        node::Node::SqlvalueFunction(svf) => {
+            use protobuf::SqlValueFunctionOp as Op;
+            let name = match protobuf::SqlValueFunctionOp::try_from(svf.op) {
+                Ok(Op::SvfopCurrentDate) => "current_date",
+                Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
+                Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
+                Ok(Op::SvfopLocaltime | Op::SvfopLocaltimeN) => "localtime",
+                Ok(Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN) => "localtimestamp",
+                Ok(Op::SvfopCurrentRole) => "current_role",
+                Ok(Op::SvfopCurrentUser) => "current_user",
+                Ok(Op::SvfopUser) => "user",
+                Ok(Op::SvfopSessionUser) => "session_user",
+                Ok(Op::SvfopCurrentCatalog) => "current_catalog",
+                Ok(Op::SvfopCurrentSchema) => "current_schema",
+                _ => return (0, None),
+            };
+            (2, Some(name.to_string()))
+        }
         _ => (0, None),
     }
 }
