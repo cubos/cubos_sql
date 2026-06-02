@@ -249,6 +249,10 @@ impl ExprType {
 pub(crate) struct FuncKindPresence {
     pub has_aggregate: bool,
     pub has_window: bool,
+    /// Location of the first aggregate / window call seen, so a placement
+    /// error can point its caret at the offending call.
+    pub agg_location: Option<i32>,
+    pub window_location: Option<i32>,
 }
 
 /// Walk an expression AST and report whether it contains aggregate calls
@@ -270,6 +274,7 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
         node::Node::FuncCall(fc) => {
             if fc.over.is_some() {
                 out.has_window = true;
+                out.window_location.get_or_insert(fc.location);
             } else {
                 // Aggregate check via pg_proc.is_aggregate — resolved by name
                 // against the snapshot.
@@ -286,6 +291,7 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                         .any(|f| matches!(f.prokind, crate::pg_catalog::ProKind::Aggregate))
                     {
                         out.has_aggregate = true;
+                        out.agg_location.get_or_insert(fc.location);
                     }
                 }
             }

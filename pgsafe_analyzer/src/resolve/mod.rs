@@ -542,14 +542,30 @@ fn check_no_aggregates_or_windows(
 ) -> Result<(), AnalyzeError> {
     let kinds = expr::detect_func_kinds(node, snapshot);
     if kinds.has_aggregate {
-        return Err(AnalyzeError::Invalid(format!(
-            "aggregate functions are not allowed in {context}"
-        )));
+        let span = kinds
+            .agg_location
+            .and_then(crate::error::SourceSpan::from_node_qname);
+        // The classic fix for an aggregate in WHERE is a HAVING clause; for the
+        // other clauses there's no single rewrite, so just point at the call.
+        let hint = (context == "WHERE")
+            .then(|| "to filter on an aggregate, use a HAVING clause instead of WHERE".to_string());
+        return Err(crate::error::RawError::invalid(
+            format!("aggregate functions are not allowed in {context}"),
+            span,
+            hint,
+        )
+        .finalize_implicit());
     }
     if kinds.has_window {
-        return Err(AnalyzeError::Invalid(format!(
-            "window functions are not allowed in {context}"
-        )));
+        let span = kinds
+            .window_location
+            .and_then(crate::error::SourceSpan::from_node_qname);
+        return Err(crate::error::RawError::invalid(
+            format!("window functions are not allowed in {context}"),
+            span,
+            None,
+        )
+        .finalize_implicit());
     }
     Ok(())
 }

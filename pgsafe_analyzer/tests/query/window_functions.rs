@@ -171,7 +171,13 @@ fn window_function_in_where_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM posts WHERE ROW_NUMBER() OVER () = 1"),
         AnalyzeError::Invalid(_),
-        "window functions are not allowed in WHERE",
+        concat!(
+            "window functions are not allowed in WHERE\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM posts WHERE ROW_NUMBER() OVER () = 1\n",
+            "  ·                            ──────────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -185,7 +191,13 @@ fn window_function_in_group_by_rejected() {
              GROUP BY title, ROW_NUMBER() OVER ()"
         ),
         AnalyzeError::Invalid(_),
-        "window functions are not allowed in GROUP BY",
+        concat!(
+            "window functions are not allowed in GROUP BY\n",
+            "  ╭────\n",
+            "1 │ SELECT title, COUNT(*) FROM posts GROUP BY title, ROW_NUMBER() OVER ()\n",
+            "  ·                                                   ──────────\n",
+            "  ╰────\n",
+        ),
     );
 }
 

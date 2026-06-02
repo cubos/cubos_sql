@@ -305,7 +305,14 @@ fn aggregate_in_where_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE COUNT(*) > 0"),
         AnalyzeError::Invalid(_),
-        "aggregate functions are not allowed in WHERE",
+        concat!(
+            "aggregate functions are not allowed in WHERE\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE COUNT(*) > 0\n",
+            "  ·                            ─────\n",
+            "  ╰────\n",
+            "  help: to filter on an aggregate, use a HAVING clause instead of WHERE\n",
+        ),
     );
 }
 
@@ -316,7 +323,13 @@ fn aggregate_in_group_by_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT age FROM users GROUP BY COUNT(*)"),
         AnalyzeError::Invalid(_),
-        "aggregate functions are not allowed in GROUP BY",
+        concat!(
+            "aggregate functions are not allowed in GROUP BY\n",
+            "  ╭────\n",
+            "1 │ SELECT age FROM users GROUP BY COUNT(*)\n",
+            "  ·                                ─────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
