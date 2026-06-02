@@ -521,7 +521,13 @@ fn non_boolean_having_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users HAVING age"),
         AnalyzeError::Invalid(_),
-        "argument of HAVING must be type boolean, not type integer",
+        concat!(
+            "argument of HAVING must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ SELECT count(*) FROM users HAVING age\n",
+            "  ·                                   ───\n",
+            "  ╰────\n",
+        ),
     );
 }
 

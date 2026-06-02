@@ -35,7 +35,13 @@ fn where_text_column_not_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name"),
         AnalyzeError::Invalid(_),
-        "argument of WHERE must be type boolean, not type text",
+        concat!(
+            "argument of WHERE must be type boolean, not type text\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE name\n",
+            "  ·                            ────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -45,7 +51,13 @@ fn where_int8_column_not_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT name FROM users WHERE id"),
         AnalyzeError::Invalid(_),
-        "argument of WHERE must be type boolean, not type bigint",
+        concat!(
+            "argument of WHERE must be type boolean, not type bigint\n",
+            "  ╭────\n",
+            "1 │ SELECT name FROM users WHERE id\n",
+            "  ·                              ──\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -55,7 +67,13 @@ fn where_timestamptz_column_not_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE created_at"),
         AnalyzeError::Invalid(_),
-        "argument of WHERE must be type boolean, not type timestamp with time zone",
+        concat!(
+            "argument of WHERE must be type boolean, not type timestamp with time zone\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE created_at\n",
+            "  ·                            ──────────\n",
+            "  ╰────\n",
+        ),
     );
 }
 

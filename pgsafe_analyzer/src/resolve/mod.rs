@@ -607,9 +607,15 @@ fn coerce_bool_clause(
     .map(|t| t.type_oid)
     .unwrap_or(oid::UNKNOWN);
     let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-    Err(AnalyzeError::Invalid(format!(
-        "argument of {label} must be type boolean, not type {actual_pg}"
-    )))
+    // Point the caret at the offending clause expression.
+    let span =
+        crate::error::node_location(node).and_then(crate::error::SourceSpan::from_node_qname);
+    Err(crate::error::RawError::invalid(
+        format!("argument of {label} must be type boolean, not type {actual_pg}"),
+        span,
+        None,
+    )
+    .finalize_implicit())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -1792,7 +1792,13 @@ fn delete_where_non_boolean_rejected() {
     assert_analyze_err!(
         db.analyze("DELETE FROM users WHERE age"),
         AnalyzeError::Invalid(_),
-        "argument of WHERE must be type boolean, not type integer",
+        concat!(
+            "argument of WHERE must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ DELETE FROM users WHERE age\n",
+            "  ·                         ───\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -1802,7 +1808,13 @@ fn update_where_non_boolean_rejected() {
     assert_analyze_err!(
         db.analyze("UPDATE users SET name = 'x' WHERE age"),
         AnalyzeError::Invalid(_),
-        "argument of WHERE must be type boolean, not type integer",
+        concat!(
+            "argument of WHERE must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ UPDATE users SET name = 'x' WHERE age\n",
+            "  ·                                   ───\n",
+            "  ╰────\n",
+        ),
     );
 }
 
