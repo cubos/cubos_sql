@@ -32,9 +32,15 @@ pub(crate) fn infer_bool_expr(
                     .map(|t| t.type_oid)
                     .unwrap_or(oid::UNKNOWN);
                 let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-                return Err(AnalyzeError::Invalid(format!(
-                    "argument of {label} must be type boolean, not type {actual_pg}"
-                )));
+                let span = crate::error::node_location(arg)
+                    .and_then(crate::error::SourceSpan::from_node_qname);
+                return Err(crate::error::RawError::invalid(
+                    format!("argument of {label} must be type boolean, not type {actual_pg}"),
+                    span,
+                    None,
+                )
+                .with_primary_label(format!("this is {actual_pg}, expected boolean"))
+                .finalize_implicit());
             }
         }
     }
@@ -97,9 +103,14 @@ pub(crate) fn infer_coalesce(
                 snapshot,
                 snapshot.unwrap_domain(concrete_types[concrete_types.len() - 1]),
             );
-            AnalyzeError::Invalid(format!(
-                "COALESCE types {first} and {last} cannot be matched"
-            ))
+            crate::error::RawError::invalid(
+                format!("COALESCE types {first} and {last} cannot be matched"),
+                None,
+                Some(format!(
+                    "add an explicit cast so the branches share a type, e.g. `expr::{last}`"
+                )),
+            )
+            .finalize_implicit()
         })?
     };
 
@@ -155,9 +166,15 @@ pub(crate) fn infer_case(
                     .map(|t| t.type_oid)
                     .unwrap_or(oid::UNKNOWN);
                 let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-                return Err(AnalyzeError::Invalid(format!(
-                    "argument of CASE/WHEN must be type boolean, not type {actual_pg}"
-                )));
+                let span = crate::error::node_location(cond)
+                    .and_then(crate::error::SourceSpan::from_node_qname);
+                return Err(crate::error::RawError::invalid(
+                    format!("argument of CASE/WHEN must be type boolean, not type {actual_pg}"),
+                    span,
+                    None,
+                )
+                .with_primary_label(format!("this is {actual_pg}, expected boolean"))
+                .finalize_implicit());
             }
             // THEN result. Untyped string literals are reinterpreted as
             // `text` for branch reconciliation — PG's common-type rules
@@ -207,7 +224,14 @@ pub(crate) fn infer_case(
                 snapshot,
                 snapshot.unwrap_domain(concrete_types[0]),
             );
-            AnalyzeError::Invalid(format!("CASE types {last} and {first} cannot be matched"))
+            crate::error::RawError::invalid(
+                format!("CASE types {last} and {first} cannot be matched"),
+                None,
+                Some(format!(
+                    "add an explicit cast so the branches share a type, e.g. `expr::{first}`"
+                )),
+            )
+            .finalize_implicit()
         })?
     };
 

@@ -166,7 +166,10 @@ fn coalesce_domain_mismatch_reports_base_type_name() {
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(balance, true) FROM accounts"),
         AnalyzeError::Invalid(_),
-        "COALESCE types integer and boolean cannot be matched",
+        concat!(
+            "COALESCE types integer and boolean cannot be matched\n",
+            "  help: add an explicit cast so the branches share a type, e.g. `expr::boolean`\n",
+        ),
     );
 }
 

@@ -267,7 +267,14 @@ fn case_when_condition_must_be_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN age THEN 1 ELSE 0 END FROM users"),
         AnalyzeError::Invalid(_),
-        "argument of CASE/WHEN must be type boolean, not type integer",
+        concat!(
+            "argument of CASE/WHEN must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ SELECT CASE WHEN age THEN 1 ELSE 0 END FROM users\n",
+            "  ·                  ─┬─\n",
+            "  ·                   ╰─ this is integer, expected boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -318,7 +325,14 @@ fn not_operand_must_be_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE NOT age"),
         AnalyzeError::Invalid(_),
-        "argument of NOT must be type boolean, not type integer",
+        concat!(
+            "argument of NOT must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE NOT age\n",
+            "  ·                                ─┬─\n",
+            "  ·                                 ╰─ this is integer, expected boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -328,7 +342,14 @@ fn and_operand_must_be_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE age AND true"),
         AnalyzeError::Invalid(_),
-        "argument of AND must be type boolean, not type integer",
+        concat!(
+            "argument of AND must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE age AND true\n",
+            "  ·                            ─┬─\n",
+            "  ·                             ╰─ this is integer, expected boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -338,7 +359,14 @@ fn or_operand_must_be_boolean() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name OR true"),
         AnalyzeError::Invalid(_),
-        "argument of OR must be type boolean, not type text",
+        concat!(
+            "argument of OR must be type boolean, not type text\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE name OR true\n",
+            "  ·                            ──┬─\n",
+            "  ·                              ╰─ this is text, expected boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -350,7 +378,14 @@ fn not_operand_error_propagates_through_case_when() {
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN NOT age THEN 1 ELSE 0 END FROM users"),
         AnalyzeError::Invalid(_),
-        "argument of NOT must be type boolean, not type integer",
+        concat!(
+            "argument of NOT must be type boolean, not type integer\n",
+            "  ╭────\n",
+            "1 │ SELECT CASE WHEN NOT age THEN 1 ELSE 0 END FROM users\n",
+            "  ·                      ─┬─\n",
+            "  ·                       ╰─ this is integer, expected boolean\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -590,7 +625,10 @@ fn case_with_incompatible_concrete_arms_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x'::text END"),
         AnalyzeError::Invalid(_),
-        "CASE types text and integer cannot be matched",
+        concat!(
+            "CASE types text and integer cannot be matched\n",
+            "  help: add an explicit cast so the branches share a type, e.g. `expr::integer`\n",
+        ),
     );
 }
 
@@ -607,7 +645,10 @@ fn case_with_incompatible_unknown_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x' END"),
         AnalyzeError::Invalid(_),
-        "CASE types text and integer cannot be matched",
+        concat!(
+            "CASE types text and integer cannot be matched\n",
+            "  help: add an explicit cast so the branches share a type, e.g. `expr::integer`\n",
+        ),
     );
 }
 
@@ -617,7 +658,10 @@ fn coalesce_with_incompatible_concrete_arms_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(1, 'x'::text)"),
         AnalyzeError::Invalid(_),
-        "COALESCE types integer and text cannot be matched",
+        concat!(
+            "COALESCE types integer and text cannot be matched\n",
+            "  help: add an explicit cast so the branches share a type, e.g. `expr::text`\n",
+        ),
     );
 }
 
@@ -634,7 +678,10 @@ fn coalesce_with_incompatible_unknown_literal_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(1, 'x')"),
         AnalyzeError::Invalid(_),
-        "COALESCE types integer and text cannot be matched",
+        concat!(
+            "COALESCE types integer and text cannot be matched\n",
+            "  help: add an explicit cast so the branches share a type, e.g. `expr::text`\n",
+        ),
     );
 }
 
