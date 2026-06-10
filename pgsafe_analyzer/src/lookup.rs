@@ -415,13 +415,48 @@ impl PgCatalog {
             let right_exact = (o.oprright == right_oid) as u8;
             left_exact + right_exact
         };
-        if let Some(max_score) = cast_matches.iter().map(exact_score).max()
-            && let Some(best) = cast_matches
+        if let Some(max_score) = cast_matches.iter().map(exact_score).max() {
+            let mut best: Vec<&PgOperator> = cast_matches
                 .iter()
-                .find(|o| exact_score(o) == max_score)
+                .filter(|o| exact_score(o) == max_score)
                 .copied()
-        {
-            return op_match(concretize_operator(best, left_oid, right_oid, self));
+                .collect();
+            // PG §10.2 step 3d: among equally-exact candidates, keep those
+            // accepting the *preferred* type of the input's category at the
+            // most coercion-needed positions.
+            if best.len() > 1 {
+                let preferred_hits = |o: &&PgOperator| -> u8 {
+                    let is_pref_for =
+                        |declared: Option<PgTypeOid>, actual: Option<PgTypeOid>| -> u8 {
+                            match (declared, actual) {
+                                (Some(d), Some(a)) if d != a => {
+                                    match (self.get_type(d), self.get_type(a)) {
+                                        (Some(dt), Some(at)) => (dt.typispreferred
+                                            && dt.typcategory == at.typcategory)
+                                            as u8,
+                                        _ => 0,
+                                    }
+                                }
+                                _ => 0,
+                            }
+                        };
+                    is_pref_for(op_left(o), left_oid)
+                        + is_pref_for(Some(o.oprright), Some(right_oid))
+                };
+                if let Some(max_pref) = best.iter().map(preferred_hits).max()
+                    && max_pref > 0
+                {
+                    best.retain(|o| preferred_hits(&o) == max_pref);
+                }
+            }
+            // Several candidates surviving every concrete-args tiebreak is
+            // PG's `operator is not unique` (42725) — picking one would risk
+            // silently mistyping the expression.
+            return match best.len() {
+                1 => op_match(concretize_operator(best[0], left_oid, right_oid, self)),
+                0 => OperatorMatch::NotFound,
+                _ => OperatorMatch::Ambiguous,
+            };
         }
 
         // Step 2b: polymorphic match. Operators declared over pseudo-types
