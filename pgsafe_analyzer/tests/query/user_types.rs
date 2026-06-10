@@ -734,3 +734,22 @@ fn case_without_else_smashes_domain_to_base() {
         .unwrap();
     assert_cols(&s, vec![cn("v", domain("public", "email", text()))]);
 }
+
+#[test]
+fn cross_domain_same_base_coerces_like_pg() {
+    // Two distinct domains over the same base are mutually coercible — PG
+    // reduces the source domain to its base and wraps the target domain's
+    // checks around it (verified on PG 18 with a function taking one domain
+    // called with the other). Both assignment and expression contexts.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN email AS TEXT;
+         CREATE DOMAIN handle AS TEXT;
+         CREATE TABLE t2 (a email, b handle);",
+    )
+    .unwrap();
+    db.analyze("INSERT INTO t2 (a) SELECT b FROM t2").unwrap();
+    db.analyze("UPDATE t2 SET a = b").unwrap();
+    let s = db.analyze("SELECT a = b AS eq FROM t2").unwrap();
+    assert_cols(&s, vec![cn("eq", bool_ty())]);
+}

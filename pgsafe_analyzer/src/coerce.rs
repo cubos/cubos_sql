@@ -28,6 +28,13 @@ pub(crate) fn can_coerce(
     if source == target {
         return true;
     }
+    // Smashing *both* sides to their base types makes two distinct domains
+    // over the same base implicitly coercible to each other. That matches
+    // PG (verified on 18): `find_coercion_pathway` reduces the source
+    // domain to its base, and coercing the base *to* the target domain is
+    // "allowed whenever a coercion to the base type would be" — so a
+    // function taking domain `d2` accepts a `d1` argument when both wrap
+    // the same base.
     let source = snapshot.unwrap_domain(source);
     let target_unwrapped = snapshot.unwrap_domain(target);
     if source == target_unwrapped {
