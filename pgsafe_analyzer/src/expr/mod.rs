@@ -666,16 +666,27 @@ pub(crate) fn infer_expr(
                 Some(r.oid)
             };
             let result = infer_expr(arg, ctx, params, goal)?;
-            // PG rejects `COLLATE` on non-string-category types with
-            // `collations are not supported by type X`. Accept UNKNOWN
-            // (untyped literal/param) — the parser already coerces it
-            // through the surrounding goal.
+            // PG rejects `COLLATE` on non-collatable types with
+            // `collations are not supported by type X`. Collatable means
+            // string-category — or an *array* of a collatable element
+            // (`tags COLLATE "C"` is valid; the collation applies to the
+            // elements). Accept UNKNOWN (untyped literal/param) — the
+            // parser already coerces it through the surrounding goal.
             if result.type_oid != oid::UNKNOWN {
                 let base = snapshot.unwrap_domain(result.type_oid);
-                let category = snapshot
-                    .get_type(base)
-                    .map(|t| t.typcategory)
-                    .unwrap_or(TypCategory::UserDefined);
+                let category_of = |t: PgTypeOid| {
+                    snapshot
+                        .get_type(t)
+                        .map(|ty| ty.typcategory)
+                        .unwrap_or(TypCategory::UserDefined)
+                };
+                let mut effective = base;
+                if category_of(effective) == TypCategory::Array
+                    && let Some(elem) = snapshot.get_type(effective).and_then(|t| t.typelem)
+                {
+                    effective = snapshot.unwrap_domain(elem);
+                }
+                let category = category_of(effective);
                 if category != TypCategory::String {
                     // PG renders the bare type name here (search-path
                     // aware) — keep the SQL-standard aliases for built-ins
