@@ -697,19 +697,21 @@ fn infer_generic_binary_op(
     }
 
     // `find_operator` fails in two semantically different ways:
-    //   * both operand types are UNKNOWN → PG `indeterminate_datatype` (42P18),
-    //     e.g. `$1 + $2` with no context, or `NULL = NULL` where no candidate
-    //     can be picked. The user fix is to cast one side, not to blame the
-    //     operator itself.
+    //   * both operand types are UNKNOWN and several overloads exist → PG
+    //     `ambiguous_operator` (42725): `operator is not unique: unknown +
+    //     unknown` (`$1 + $2`, `NULL + NULL`; the text fallback already
+    //     resolved single-winner cases like `$1 = $2` before we got here).
     //   * at least one side is concrete → PG `undefined_function` / operator
-    //     (42883): the operator really doesn't exist for these types.
+    //     (42883): the operator really doesn't exist for these types. The
+    //     zero-candidate both-unknown case falls through here too — the
+    //     generic message renders the sides as `unknown`, matching PG.
     let left_unknown = left_oid_resolved.map(|o| o == oid::UNKNOWN).unwrap_or(true);
     let right_unknown = right_oid_resolved == oid::UNKNOWN;
-    if left_unknown && right_unknown {
+    if left_unknown && right_unknown && snapshot.operator_name_exists(op_name) {
         let span = (expr.location >= 0)
             .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
-        return Err(crate::error::RawError::indeterminate_type(
-            format!("could not determine data type of operator {op_name}"),
+        return Err(crate::error::RawError::invalid(
+            format!("operator is not unique: unknown {op_name} unknown"),
             span,
             Some("add an explicit type cast to one side, e.g. `expr::int4`".into()),
         )

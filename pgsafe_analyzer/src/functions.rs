@@ -164,8 +164,25 @@ pub(crate) fn resolve_function(
     if let Some(f) = find_default_args_match(&candidates, match_types, snapshot) {
         return Ok(make_resolved(f, snapshot));
     }
-    if let Some(f) = find_cast_match(&candidates, match_types, snapshot) {
-        return Ok(make_resolved(f, snapshot));
+    match find_cast_match(&candidates, match_types, snapshot) {
+        CastMatch::Match(f) => return Ok(make_resolved(f, snapshot)),
+        CastMatch::Ambiguous => {
+            // PG (SQLSTATE 42725): `function name(types) is not unique` —
+            // several candidates survived every tiebreak; choosing one
+            // could silently mistype the call.
+            let arg_list = arg_types
+                .iter()
+                .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(crate::error::RawError::invalid(
+                format!("function {qualified}({arg_list}) is not unique"),
+                span,
+                Some("add explicit type casts to the arguments to select one overload".into()),
+            )
+            .finalize_implicit());
+        }
+        CastMatch::NoMatch => {}
     }
     if let Some(f) = find_polymorphic_match(&candidates, match_types, snapshot) {
         return Ok(make_resolved_polymorphic(f, match_types, snapshot));
@@ -434,11 +451,21 @@ fn find_polymorphic_match<'a>(
     if lax.len() == 1 { Some(lax[0]) } else { None }
 }
 
+/// Outcome of the implicit-cast overload filter: a unique winner, no
+/// surviving candidate, or several candidates left tied after every
+/// tiebreak — PG reports the last as `function X(…) is not unique`
+/// (SQLSTATE 42725) rather than picking one arbitrarily.
+enum CastMatch<'a> {
+    Match(&'a PgProc),
+    NoMatch,
+    Ambiguous,
+}
+
 fn find_cast_match<'a>(
     candidates: &[&'a PgProc],
     arg_types: &[PgTypeOid],
     snapshot: &PgCatalog,
-) -> Option<&'a PgProc> {
+) -> CastMatch<'a> {
     let matching: Vec<&PgProc> = candidates
         .iter()
         .filter(|f| f.proargtypes.len() == arg_types.len())
@@ -455,8 +482,11 @@ fn find_cast_match<'a>(
         .copied()
         .collect();
 
-    if matching.len() <= 1 {
-        return matching.into_iter().next();
+    if matching.is_empty() {
+        return CastMatch::NoMatch;
+    }
+    if matching.len() == 1 {
+        return CastMatch::Match(matching[0]);
     }
 
     if !arg_types.contains(&oid::UNKNOWN) {
@@ -510,11 +540,19 @@ fn find_cast_match<'a>(
                 narrowed.retain(|f| preferred_hits(f) == best_pref);
             }
         }
-        // Stable final pick (lowest OID) so resolution is deterministic even
-        // when several candidates remain tied.
-        return narrowed.into_iter().min_by_key(|f| f.oid);
+        // PG fails with `is not unique` when several candidates survive its
+        // tiebreaks; picking one would risk silently mistyping the call
+        // (`mod(int2,int2)` vs `mod(int8,int8)` for smallint inputs differ
+        // in result type).
+        return match narrowed.len() {
+            0 => CastMatch::NoMatch,
+            1 => CastMatch::Match(narrowed[0]),
+            _ => CastMatch::Ambiguous,
+        };
     }
 
+    // Unknown-argument resolution (PG's func_select_candidate): prefer
+    // candidates accepting the STRING category at every unknown position…
     let string_compatible: Vec<&PgProc> = matching
         .iter()
         .filter(|f| {
@@ -533,35 +571,106 @@ fn find_cast_match<'a>(
         .copied()
         .collect();
 
-    if string_compatible.is_empty() {
-        return matching.into_iter().next();
-    }
     if string_compatible.len() == 1 {
-        return Some(string_compatible[0]);
+        return CastMatch::Match(string_compatible[0]);
+    }
+    if string_compatible.len() > 1 {
+        let preferred: Vec<&PgProc> = string_compatible
+            .iter()
+            .filter(|f| {
+                f.proargtypes
+                    .iter()
+                    .zip(arg_types.iter())
+                    .all(|(&param_oid, &actual)| {
+                        if actual != oid::UNKNOWN {
+                            return true;
+                        }
+                        snapshot
+                            .get_type(param_oid)
+                            .is_some_and(|t| t.typispreferred)
+                    })
+            })
+            .copied()
+            .collect();
+        return match preferred.len() {
+            1 => CastMatch::Match(preferred[0]),
+            // Several string-accepting candidates left — PG gives up with
+            // `is not unique` instead of guessing.
+            _ => CastMatch::Ambiguous,
+        };
     }
 
-    let preferred: Vec<&PgProc> = string_compatible
+    // …otherwise every unknown slot's candidates must agree on a single
+    // type category; within it, candidates carrying the category's
+    // *preferred* type win (this is what resolves `round('1.5')` to
+    // `round(float8)` while `mod('5','2')` — int/numeric variants only,
+    // none preferred — stays ambiguous).
+    let unknown_slots: Vec<usize> = arg_types
         .iter()
-        .filter(|f| {
-            f.proargtypes
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(&param_oid, &actual)| {
-                    if actual != oid::UNKNOWN {
-                        return true;
-                    }
-                    snapshot
-                        .get_type(param_oid)
-                        .is_some_and(|t| t.typispreferred)
-                })
-        })
-        .copied()
+        .enumerate()
+        .filter(|&(_, &a)| a == oid::UNKNOWN)
+        .map(|(i, _)| i)
         .collect();
-
-    if !preferred.is_empty() {
-        return preferred.into_iter().next();
+    let mut narrowed = matching.clone();
+    for &i in &unknown_slots {
+        let categories: Vec<Option<TypCategory>> = narrowed
+            .iter()
+            .map(|f| {
+                f.proargtypes
+                    .get(i)
+                    .and_then(|&p| snapshot.get_type(p))
+                    .map(|t| t.typcategory)
+            })
+            .collect();
+        if categories.windows(2).any(|w| w[0] != w[1]) {
+            // Candidates disagree on the unknown slot's category — PG's
+            // func_select_candidate returns "multiple" here.
+            return CastMatch::Ambiguous;
+        }
+        let has_preferred = narrowed.iter().any(|f| {
+            f.proargtypes
+                .get(i)
+                .and_then(|&p| snapshot.get_type(p))
+                .is_some_and(|t| t.typispreferred)
+        });
+        if has_preferred {
+            narrowed.retain(|f| {
+                f.proargtypes
+                    .get(i)
+                    .and_then(|&p| snapshot.get_type(p))
+                    .is_some_and(|t| t.typispreferred)
+            });
+        }
     }
-    string_compatible.into_iter().next()
+    if narrowed.len() == 1 {
+        return CastMatch::Match(narrowed[0]);
+    }
+
+    // Last-gasp rule: when every *known* argument shares one type, assume
+    // the unknowns are of that type too and look for the single candidate
+    // that accepts it everywhere.
+    let known: Vec<PgTypeOid> = arg_types
+        .iter()
+        .copied()
+        .filter(|&a| a != oid::UNKNOWN)
+        .collect();
+    if let Some(&t) = known.first()
+        && known.iter().all(|&k| k == t)
+    {
+        let assumed: Vec<&PgProc> = narrowed
+            .iter()
+            .filter(|f| {
+                unknown_slots
+                    .iter()
+                    .all(|&i| f.proargtypes.get(i) == Some(&t))
+            })
+            .copied()
+            .collect();
+        if assumed.len() == 1 {
+            return CastMatch::Match(assumed[0]);
+        }
+    }
+    CastMatch::Ambiguous
 }
 
 /// Build the named output-argument list for an SRF / OUT-arg function from

@@ -72,7 +72,7 @@ use pgsafe_analyzer::{
     TypType, Type,
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 // ──────────────────────────────────────────────────────────────────────────
 // Schema the fuzzer generates queries against.
@@ -487,17 +487,17 @@ const LITERAL_PROBES: &[&str] = &[
 
 fn literal_for(ty: Ty, rng: &mut StdRng) -> String {
     match ty {
-        Ty::Int => ["0", "42", "-7", "2147483647"][rng.gen_range(0..4)].to_string(),
-        Ty::BigInt => ["0", "9999999999", "-1"][rng.gen_range(0..3)].to_string(),
-        Ty::Numeric => ["3.14", "0.0", "100.5"][rng.gen_range(0..3)].to_string(),
-        Ty::Float => ["2.5", "1e3", "0.0"][rng.gen_range(0..3)].to_string(),
-        Ty::Text => ["'hello'", "'x'", "''"][rng.gen_range(0..3)].to_string(),
-        Ty::Bool => ["true", "false"][rng.gen_range(0..2)].to_string(),
+        Ty::Int => ["0", "42", "-7", "2147483647"][rng.random_range(0..4)].to_string(),
+        Ty::BigInt => ["0", "9999999999", "-1"][rng.random_range(0..3)].to_string(),
+        Ty::Numeric => ["3.14", "0.0", "100.5"][rng.random_range(0..3)].to_string(),
+        Ty::Float => ["2.5", "1e3", "0.0"][rng.random_range(0..3)].to_string(),
+        Ty::Text => ["'hello'", "'x'", "''"][rng.random_range(0..3)].to_string(),
+        Ty::Bool => ["true", "false"][rng.random_range(0..2)].to_string(),
         Ty::Timestamptz => "now()".to_string(),
         Ty::Date => "current_date".to_string(),
         Ty::Uuid => "'00000000-0000-0000-0000-000000000000'::uuid".to_string(),
         Ty::Jsonb => "'{}'::jsonb".to_string(),
-        Ty::Enum => ["'draft'", "'published'", "'archived'"][rng.gen_range(0..3)].to_string(),
+        Ty::Enum => ["'draft'", "'published'", "'archived'"][rng.random_range(0..3)].to_string(),
         Ty::IntArr => "ARRAY[1, 2, 3]".to_string(),
         Ty::TextArr => "ARRAY['a', 'b']".to_string(),
     }
@@ -505,7 +505,7 @@ fn literal_for(ty: Ty, rng: &mut StdRng) -> String {
 
 /// A column reference from `table`, optionally a deliberately-wrong type.
 fn random_col<'a>(table: &'a Table, rng: &mut StdRng) -> &'a Col {
-    &table.cols[rng.gen_range(0..table.cols.len())]
+    &table.cols[rng.random_range(0..table.cols.len())]
 }
 
 /// Generate an expression. `depth` bounds recursion. The generator is only
@@ -513,9 +513,9 @@ fn random_col<'a>(table: &'a Table, rng: &mut StdRng) -> &'a Col {
 /// well-typed queries (type-inference bugs) and ill-typed ones (error-message
 /// bugs). `np` is the running parameter counter (see [`next_param`]).
 fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String {
-    if depth == 0 || rng.gen_bool(0.35) {
+    if depth == 0 || rng.random_bool(0.35) {
         // Leaf: column ref or literal.
-        return if rng.gen_bool(0.6) {
+        return if rng.random_bool(0.6) {
             random_col(table, rng).name.to_string()
         } else {
             let ty = [
@@ -525,23 +525,23 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
                 Ty::Numeric,
                 Ty::Float,
                 Ty::Timestamptz,
-            ][rng.gen_range(0..6)];
+            ][rng.random_range(0..6)];
             // ~15% of leaves are a query parameter rather than a column /
             // literal, so the oracle's input-parameter-type comparison gets
             // exercised. A bare `$pN` has no type context (PG reports it as
             // `unknown`/`text`); pin it with an explicit cast so PG infers a
             // concrete type we can check against.
-            if rng.gen_bool(0.15) {
-                let t = BASE_TYPE_NAMES[rng.gen_range(0..BASE_TYPE_NAMES.len())];
+            if rng.random_bool(0.15) {
+                let t = BASE_TYPE_NAMES[rng.random_range(0..BASE_TYPE_NAMES.len())];
                 return format!("(${}::{t})", next_param(np));
             }
             literal_for(ty, rng)
         };
     }
-    match rng.gen_range(0..12) {
+    match rng.random_range(0..12) {
         0 => {
             // Binary op.
-            let op = OPERATORS[rng.gen_range(0..OPERATORS.len())];
+            let op = OPERATORS[rng.random_range(0..OPERATORS.len())];
             format!(
                 "({} {} {})",
                 gen_expr(table, depth - 1, rng, np),
@@ -553,7 +553,7 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             // NULL test / IS DISTINCT FROM — always-boolean predicates that
             // accept any operand type.
             let col = random_col(table, rng);
-            match rng.gen_range(0..3) {
+            match rng.random_range(0..3) {
                 0 => format!("({} IS NULL)", col.name),
                 1 => format!("({} IS NOT NULL)", gen_expr(table, depth - 1, rng, np)),
                 _ => format!(
@@ -568,7 +568,7 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             // literals of the column's own type (the mutator mistypes them
             // later, exercising per-bound coercion errors).
             let col = random_col(table, rng);
-            match rng.gen_range(0..3) {
+            match rng.random_range(0..3) {
                 0 => format!(
                     "({} BETWEEN {} AND {})",
                     col.name,
@@ -591,9 +591,9 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
         }
         10 => {
             // Array subscript / slice over one of the array columns.
-            let arr = if rng.gen_bool(0.5) { "tags" } else { "nums" };
+            let arr = if rng.random_bool(0.5) { "tags" } else { "nums" };
             if table.cols.iter().any(|c| c.name == arr) {
-                if rng.gen_bool(0.3) {
+                if rng.random_bool(0.3) {
                     format!("({arr}[1:2])")
                 } else {
                     format!("({}[{}])", arr, gen_expr(table, depth - 1, rng, np))
@@ -605,8 +605,8 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
         11 => {
             // Literal-content probe in expression position: stresses the
             // analyzer's parse-time input validation (`literal_input`).
-            let lit = LITERAL_PROBES[rng.gen_range(0..LITERAL_PROBES.len())];
-            let ty = PROBE_TYPE_NAMES[rng.gen_range(0..PROBE_TYPE_NAMES.len())];
+            let lit = LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())];
+            let ty = PROBE_TYPE_NAMES[rng.random_range(0..PROBE_TYPE_NAMES.len())];
             format!("('{}'::{})", lit.replace('\'', "''"), ty)
         }
         7 => {
@@ -615,8 +615,8 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             // type *inference* from operator context (PG should report the
             // param as the column's type), the highest-value param case.
             let col = random_col(table, rng);
-            let op = ["=", "<>", "<", ">", "<=", ">="][rng.gen_range(0..6)];
-            let rhs = if rng.gen_bool(0.4) {
+            let op = ["=", "<>", "<", ">", "<=", ">="][rng.random_range(0..6)];
+            let rhs = if rng.random_bool(0.4) {
                 format!("${}", next_param(np))
             } else {
                 literal_for(col.ty, rng)
@@ -625,8 +625,8 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
         }
         1 => {
             // Function call with 0..3 args.
-            let f = FUNCTIONS[rng.gen_range(0..FUNCTIONS.len())];
-            let nargs = rng.gen_range(0..3);
+            let f = FUNCTIONS[rng.random_range(0..FUNCTIONS.len())];
+            let nargs = rng.random_range(0..3);
             let args: Vec<String> = (0..nargs)
                 .map(|_| gen_expr(table, depth - 1, rng, np))
                 .collect();
@@ -634,7 +634,7 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
         }
         2 => {
             // Cast.
-            let t = BASE_TYPE_NAMES[rng.gen_range(0..BASE_TYPE_NAMES.len())];
+            let t = BASE_TYPE_NAMES[rng.random_range(0..BASE_TYPE_NAMES.len())];
             format!("({})::{}", gen_expr(table, depth - 1, rng, np), t)
         }
         3 => format!(
@@ -652,9 +652,9 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             // Aggregate (valid only with/without GROUP BY; the oracle
             // judges), occasionally with a FILTER clause — placement and
             // FILTER-must-be-boolean rules get exercised for free.
-            let agg = ["count", "sum", "avg", "min", "max"][rng.gen_range(0..5)];
+            let agg = ["count", "sum", "avg", "min", "max"][rng.random_range(0..5)];
             let call = format!("{}({})", agg, gen_expr(table, depth - 1, rng, np));
-            if rng.gen_bool(0.2) {
+            if rng.random_bool(0.2) {
                 format!(
                     "({call} FILTER (WHERE {}))",
                     gen_expr(table, depth - 1, rng, np)
@@ -678,7 +678,7 @@ fn next_param(np: &mut u32) -> String {
 }
 
 fn pick_table(rng: &mut StdRng) -> &'static Table {
-    &TABLES[rng.gen_range(0..TABLES.len())]
+    &TABLES[rng.random_range(0..TABLES.len())]
 }
 
 /// A standalone scalar literal of a random type (no column references) — used
@@ -698,7 +698,7 @@ fn scalar_literal(rng: &mut StdRng) -> String {
         Ty::Enum,
         Ty::IntArr,
         Ty::TextArr,
-    ][rng.gen_range(0..13)];
+    ][rng.random_range(0..13)];
     literal_for(ty, rng)
 }
 
@@ -707,7 +707,7 @@ fn pick_cols<'a>(cols: &[&'a Col], k: usize, rng: &mut StdRng) -> Vec<&'a Col> {
     let mut idxs: Vec<usize> = (0..cols.len()).collect();
     let k = k.min(idxs.len());
     for i in 0..k {
-        let j = rng.gen_range(i..idxs.len());
+        let j = rng.random_range(i..idxs.len());
         idxs.swap(i, j);
     }
     idxs[..k].iter().map(|&i| cols[i]).collect()
@@ -716,7 +716,7 @@ fn pick_cols<'a>(cols: &[&'a Col], k: usize, rng: &mut StdRng) -> Vec<&'a Col> {
 /// Top-level statement dispatcher. Each invocation owns its parameter counter.
 fn gen_statement(rng: &mut StdRng) -> String {
     let np = &mut 0u32;
-    match rng.gen_range(0..100) {
+    match rng.random_range(0..100) {
         0..=49 => gen_select(rng, np),
         50..=60 => gen_set_op(rng, np),
         61..=68 => gen_cte(rng, np),
@@ -731,7 +731,7 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
     let mut sql = String::from("SELECT ");
 
-    match rng.gen_range(0..10) {
+    match rng.random_range(0..10) {
         0 => sql.push_str("DISTINCT "),
         1 => sql.push_str(&format!("DISTINCT ON ({}) ", gen_expr(table, 2, rng, np))),
         _ => {}
@@ -739,17 +739,17 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
 
     // Projection: 1..4 expressions, occasionally a scalar subquery or a
     // window function call (placement + frame rules judged by the oracle).
-    let n = rng.gen_range(1..4);
+    let n = rng.random_range(1..4);
     let projs: Vec<String> = (0..n)
         .map(|i| {
-            let e = if rng.gen_bool(0.15) {
+            let e = if rng.random_bool(0.15) {
                 gen_scalar_subquery(rng, np)
-            } else if rng.gen_bool(0.12) {
+            } else if rng.random_bool(0.12) {
                 gen_window_call(table, rng, np)
             } else {
                 gen_expr(table, 3, rng, np)
             };
-            if rng.gen_bool(0.4) {
+            if rng.random_bool(0.4) {
                 format!("{e} AS c{i}")
             } else {
                 e
@@ -761,9 +761,9 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
 
     // Optional join — varied type. CROSS JOIN takes no ON clause; LATERAL
     // subqueries may reference the left table's columns.
-    if rng.gen_bool(0.25) {
+    if rng.random_bool(0.25) {
         let other = pick_table(rng);
-        match rng.gen_range(0..6) {
+        match rng.random_range(0..6) {
             0 => sql.push_str(&format!(" CROSS JOIN {} AS j", other.name)),
             1 => sql.push_str(&format!(
                 ", LATERAL (SELECT {} AS lx FROM {} WHERE {}) AS l",
@@ -782,8 +782,8 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
         }
     }
 
-    if rng.gen_bool(0.6) {
-        let pred = if rng.gen_bool(0.25) {
+    if rng.random_bool(0.6) {
+        let pred = if rng.random_bool(0.25) {
             gen_subquery_predicate(table, rng, np)
         } else {
             gen_expr(table, 3, rng, np)
@@ -791,14 +791,14 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
         sql.push_str(&format!(" WHERE {pred}"));
     }
 
-    if rng.gen_bool(0.2) {
+    if rng.random_bool(0.2) {
         let c = random_col(table, rng);
         sql.push_str(&format!(" GROUP BY {}", c.name));
         // HAVING — sometimes an aggregate predicate (valid), sometimes an
         // arbitrary expression (exercises HAVING placement / boolean rules).
-        if rng.gen_bool(0.4) {
-            let pred = if rng.gen_bool(0.5) {
-                format!("count(*) > {}", rng.gen_range(0..5))
+        if rng.random_bool(0.4) {
+            let pred = if rng.random_bool(0.5) {
+                format!("count(*) > {}", rng.random_range(0..5))
             } else {
                 gen_expr(table, 2, rng, np)
             };
@@ -806,9 +806,9 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
         }
     }
 
-    if rng.gen_bool(0.2) {
+    if rng.random_bool(0.2) {
         sql.push_str(&format!(" ORDER BY {}", gen_expr(table, 2, rng, np)));
-        match rng.gen_range(0..4) {
+        match rng.random_range(0..4) {
             0 => sql.push_str(" DESC"),
             1 => sql.push_str(" NULLS FIRST"),
             2 => sql.push_str(" DESC NULLS LAST"),
@@ -816,15 +816,15 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
         }
     }
 
-    if rng.gen_bool(0.2) {
-        let lim = match rng.gen_range(0..3) {
-            0 => rng.gen_range(0..100).to_string(),
+    if rng.random_bool(0.2) {
+        let lim = match rng.random_range(0..3) {
+            0 => rng.random_range(0..100).to_string(),
             1 => format!("${}", next_param(np)),
             _ => gen_expr(table, 1, rng, np),
         };
         sql.push_str(&format!(" LIMIT {lim}"));
-        if rng.gen_bool(0.3) {
-            sql.push_str(&format!(" OFFSET {}", rng.gen_range(0..10)));
+        if rng.random_bool(0.3) {
+            sql.push_str(&format!(" OFFSET {}", rng.random_range(0..10)));
         }
     }
 
@@ -837,27 +837,27 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
 fn gen_window_call(table: &Table, rng: &mut StdRng, np: &mut u32) -> String {
     let over = {
         let mut parts = Vec::new();
-        if rng.gen_bool(0.5) {
+        if rng.random_bool(0.5) {
             parts.push(format!("PARTITION BY {}", random_col(table, rng).name));
         }
-        if rng.gen_bool(0.7) {
+        if rng.random_bool(0.7) {
             parts.push(format!("ORDER BY {}", random_col(table, rng).name));
         }
         parts.join(" ")
     };
-    match rng.gen_range(0..4) {
+    match rng.random_range(0..4) {
         0 => format!(
             "{}() OVER ({over})",
-            ["row_number", "rank", "dense_rank"][rng.gen_range(0..3)]
+            ["row_number", "rank", "dense_rank"][rng.random_range(0..3)]
         ),
         1 => format!(
             "{}({}) OVER ({over})",
-            ["sum", "avg", "min", "max", "count"][rng.gen_range(0..5)],
+            ["sum", "avg", "min", "max", "count"][rng.random_range(0..5)],
             random_col(table, rng).name
         ),
         2 => format!(
             "{}({}) OVER ({over})",
-            ["lag", "lead", "first_value", "last_value"][rng.gen_range(0..4)],
+            ["lag", "lead", "first_value", "last_value"][rng.random_range(0..4)],
             random_col(table, rng).name
         ),
         _ => format!("ntile({}) OVER ({over})", gen_expr(table, 1, rng, np)),
@@ -868,10 +868,10 @@ fn gen_window_call(table: &Table, rng: &mut StdRng, np: &mut u32) -> String {
 /// syntactically awkward inside a set-operation branch / CTE body / subquery.
 fn gen_simple_select(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
-    let n = rng.gen_range(1..3);
+    let n = rng.random_range(1..3);
     let projs: Vec<String> = (0..n).map(|_| gen_expr(table, 2, rng, np)).collect();
     let mut sql = format!("SELECT {} FROM {}", projs.join(", "), table.name);
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
     }
     sql
@@ -881,7 +881,7 @@ fn gen_simple_select(rng: &mut StdRng, np: &mut u32) -> String {
 /// slot. Mostly single-column so PG accepts it as a scalar.
 fn gen_scalar_subquery(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
-    let agg = ["count", "sum", "avg", "min", "max"][rng.gen_range(0..5)];
+    let agg = ["count", "sum", "avg", "min", "max"][rng.random_range(0..5)];
     let arg = gen_expr(table, 1, rng, np);
     format!("(SELECT {agg}({arg}) FROM {})", table.name)
 }
@@ -889,7 +889,7 @@ fn gen_scalar_subquery(rng: &mut StdRng, np: &mut u32) -> String {
 /// `col IN (SELECT …)` / `[NOT] EXISTS (SELECT …)` for a WHERE clause.
 fn gen_subquery_predicate(table: &'static Table, rng: &mut StdRng, np: &mut u32) -> String {
     let other = pick_table(rng);
-    match rng.gen_range(0..3) {
+    match rng.random_range(0..3) {
         0 => {
             let col = random_col(table, rng);
             let inner = random_col(other, rng);
@@ -914,7 +914,7 @@ fn gen_subquery_predicate(table: &'static Table, rng: &mut StdRng, np: &mut u32)
 /// Two simple selects combined with a set operation — exercises column-count
 /// and common-type reconciliation across the branches.
 fn gen_set_op(rng: &mut StdRng, np: &mut u32) -> String {
-    let op = ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"][rng.gen_range(0..4)];
+    let op = ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"][rng.random_range(0..4)];
     format!(
         "{} {op} {}",
         gen_simple_select(rng, np),
@@ -933,7 +933,7 @@ fn gen_cte(rng: &mut StdRng, np: &mut u32) -> String {
 // ── DML ──────────────────────────────────────────────────────────────────────
 
 fn gen_dml(rng: &mut StdRng, np: &mut u32) -> String {
-    match rng.gen_range(0..3) {
+    match rng.random_range(0..3) {
         0 => gen_insert(rng, np),
         1 => gen_update(rng, np),
         _ => gen_delete(rng, np),
@@ -942,10 +942,10 @@ fn gen_dml(rng: &mut StdRng, np: &mut u32) -> String {
 
 /// `RETURNING *` or a small projection over the affected table.
 fn gen_returning(table: &'static Table, rng: &mut StdRng, np: &mut u32) -> String {
-    if rng.gen_bool(0.3) {
+    if rng.random_bool(0.3) {
         return " RETURNING *".to_string();
     }
-    let n = rng.gen_range(1..3);
+    let n = rng.random_range(1..3);
     let projs: Vec<String> = (0..n).map(|_| gen_expr(table, 2, rng, np)).collect();
     format!(" RETURNING {}", projs.join(", "))
 }
@@ -954,7 +954,7 @@ fn gen_returning(table: &'static Table, rng: &mut StdRng, np: &mut u32) -> Strin
 /// parameters (inferred by assignment context), NULL, DEFAULT, or a
 /// deliberately mistyped literal.
 fn gen_insert_value(col: &Col, rng: &mut StdRng, np: &mut u32) -> String {
-    match rng.gen_range(0..10) {
+    match rng.random_range(0..10) {
         0..=4 => literal_for(col.ty, rng),
         5..=6 => format!("${}", next_param(np)),
         7 => "NULL".to_string(),
@@ -967,10 +967,10 @@ fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
     // Skip the identity `id` so most rows are insertable.
     let cols: Vec<&Col> = table.cols.iter().filter(|c| c.name != "id").collect();
-    let k = rng.gen_range(1..=cols.len().min(4));
+    let k = rng.random_range(1..=cols.len().min(4));
     let chosen = pick_cols(&cols, k, rng);
     let collist = chosen.iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
-    let mut sql = if rng.gen_bool(0.2) {
+    let mut sql = if rng.random_bool(0.2) {
         // INSERT … SELECT — arity and per-column assignment coercion across
         // a query source instead of a VALUES list.
         let src = pick_table(rng);
@@ -991,11 +991,11 @@ fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
     };
     // ON CONFLICT over the PK — DO NOTHING or DO UPDATE with a (sometimes
     // mistyped) SET, plus the EXCLUDED pseudo-relation occasionally.
-    if rng.gen_bool(0.15) {
-        match rng.gen_range(0..3) {
+    if rng.random_bool(0.15) {
+        match rng.random_range(0..3) {
             0 => sql.push_str(" ON CONFLICT (id) DO NOTHING"),
             1 => {
-                let c = chosen[rng.gen_range(0..chosen.len())];
+                let c = chosen[rng.random_range(0..chosen.len())];
                 sql.push_str(&format!(
                     " ON CONFLICT (id) DO UPDATE SET {} = {}",
                     c.name,
@@ -1003,7 +1003,7 @@ fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
                 ));
             }
             _ => {
-                let c = chosen[rng.gen_range(0..chosen.len())];
+                let c = chosen[rng.random_range(0..chosen.len())];
                 sql.push_str(&format!(
                     " ON CONFLICT (id) DO UPDATE SET {} = EXCLUDED.{}",
                     c.name, c.name
@@ -1011,7 +1011,7 @@ fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
             }
         }
     }
-    if rng.gen_bool(0.4) {
+    if rng.random_bool(0.4) {
         sql.push_str(&gen_returning(table, rng, np));
     }
     sql
@@ -1021,13 +1021,13 @@ fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
 /// aliasing, cross-row common-type resolution, and the unknown-literal
 /// column case all live here.
 fn gen_values_select(rng: &mut StdRng, np: &mut u32) -> String {
-    let n_rows = rng.gen_range(1..=3);
-    let n_cols = rng.gen_range(1..=3);
+    let n_rows = rng.random_range(1..=3);
+    let n_cols = rng.random_range(1..=3);
     let rows: Vec<String> = (0..n_rows)
         .map(|_| {
             let vals: Vec<String> = (0..n_cols)
                 .map(|_| {
-                    if rng.gen_bool(0.15) {
+                    if rng.random_bool(0.15) {
                         format!("${}", next_param(np))
                     } else {
                         scalar_literal(rng)
@@ -1038,10 +1038,10 @@ fn gen_values_select(rng: &mut StdRng, np: &mut u32) -> String {
         })
         .collect();
     let aliases: Vec<String> = (0..n_cols).map(|i| format!("a{i}")).collect();
-    let proj = if rng.gen_bool(0.5) {
+    let proj = if rng.random_bool(0.5) {
         "*".to_string()
     } else {
-        aliases[rng.gen_range(0..aliases.len())].clone()
+        aliases[rng.random_range(0..aliases.len())].clone()
     };
     format!(
         "SELECT {proj} FROM (VALUES {}) AS v({})",
@@ -1057,9 +1057,9 @@ fn gen_values_select(rng: &mut StdRng, np: &mut u32) -> String {
 /// directions: rejections must match PG's wording, acceptances must agree
 /// on the result type.
 fn gen_literal_probe(rng: &mut StdRng) -> String {
-    let lit = LITERAL_PROBES[rng.gen_range(0..LITERAL_PROBES.len())].replace('\'', "''");
-    let ty = PROBE_TYPE_NAMES[rng.gen_range(0..PROBE_TYPE_NAMES.len())];
-    match rng.gen_range(0..5) {
+    let lit = LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())].replace('\'', "''");
+    let ty = PROBE_TYPE_NAMES[rng.random_range(0..PROBE_TYPE_NAMES.len())];
+    match rng.random_range(0..5) {
         0 => format!("SELECT '{lit}'::{ty} AS c0"),
         1 => format!("SELECT '{lit}'::{ty} AS c0 FROM users"),
         2 => {
@@ -1078,7 +1078,7 @@ fn gen_literal_probe(rng: &mut StdRng) -> String {
             // INSERT assignment context.
             let table = pick_table(rng);
             let cols: Vec<&Col> = table.cols.iter().filter(|c| c.name != "id").collect();
-            let col = cols[rng.gen_range(0..cols.len())];
+            let col = cols[rng.random_range(0..cols.len())];
             format!("INSERT INTO {} ({}) VALUES ('{lit}')", table.name, col.name)
         }
     }
@@ -1087,13 +1087,13 @@ fn gen_literal_probe(rng: &mut StdRng) -> String {
 fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
     let cols: Vec<&Col> = table.cols.iter().filter(|c| c.name != "id").collect();
-    let k = rng.gen_range(1..=cols.len().min(3));
+    let k = rng.random_range(1..=cols.len().min(3));
     let chosen = pick_cols(&cols, k, rng);
     // In UPDATE, SET expressions can reference the table's columns.
     let sets = chosen
         .iter()
         .map(|c| {
-            let v = match rng.gen_range(0..10) {
+            let v = match rng.random_range(0..10) {
                 0..=4 => literal_for(c.ty, rng),
                 5..=6 => format!("${}", next_param(np)),
                 7 => "NULL".to_string(),
@@ -1105,10 +1105,10 @@ fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let mut sql = format!("UPDATE {} SET {sets}", table.name);
-    if rng.gen_bool(0.6) {
+    if rng.random_bool(0.6) {
         sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
     }
-    if rng.gen_bool(0.3) {
+    if rng.random_bool(0.3) {
         sql.push_str(&gen_returning(table, rng, np));
     }
     sql
@@ -1117,10 +1117,10 @@ fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
 fn gen_delete(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
     let mut sql = format!("DELETE FROM {}", table.name);
-    if rng.gen_bool(0.7) {
+    if rng.random_bool(0.7) {
         sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
     }
-    if rng.gen_bool(0.3) {
+    if rng.random_bool(0.3) {
         sql.push_str(&gen_returning(table, rng, np));
     }
     sql
@@ -1248,10 +1248,10 @@ fn gen_typed(
     rng: &mut StdRng,
     np: &mut u32,
 ) -> String {
-    if depth > 0 && !rng.gen_bool(0.4) {
+    if depth > 0 && !rng.random_bool(0.4) {
         if let Some(prods) = cat.by_result.get(&goal) {
             if !prods.is_empty() {
-                return match &prods[rng.gen_range(0..prods.len())] {
+                return match &prods[rng.random_range(0..prods.len())] {
                     Producer::Func { call, args } => {
                         let a: Vec<String> = args
                             .iter()
@@ -1284,14 +1284,14 @@ fn gen_typed_leaf(
 ) -> String {
     let matching: Vec<&(String, PgTypeOid, bool)> =
         cols.iter().filter(|(_, t, _)| *t == goal).collect();
-    if !matching.is_empty() && rng.gen_bool(0.6) {
-        return matching[rng.gen_range(0..matching.len())].0.clone();
+    if !matching.is_empty() && rng.random_bool(0.6) {
+        return matching[rng.random_range(0..matching.len())].0.clone();
     }
     let tname = match cat.type_name.get(&goal) {
         Some(n) => n.clone(),
         None => return "NULL".to_string(),
     };
-    if rng.gen_bool(0.15) {
+    if rng.random_bool(0.15) {
         return format!("(${}::{tname})", next_param(np));
     }
     format!("NULL::{tname}")
@@ -1304,20 +1304,20 @@ fn gen_typed_select(cat: &TypedCat, rng: &mut StdRng, np: &mut u32) -> Option<St
     if cat.relations.is_empty() || cat.producible.is_empty() {
         return None;
     }
-    let (tbl, cols) = &cat.relations[rng.gen_range(0..cat.relations.len())];
+    let (tbl, cols) = &cat.relations[rng.random_range(0..cat.relations.len())];
 
     // Goal types to draw from: the relation's own column types plus the global
     // producible set, so column leaves are reachable and the producer surface
     // is exercised.
     let pick_goal = |rng: &mut StdRng| -> PgTypeOid {
-        if !cols.is_empty() && rng.gen_bool(0.5) {
-            cols[rng.gen_range(0..cols.len())].1
+        if !cols.is_empty() && rng.random_bool(0.5) {
+            cols[rng.random_range(0..cols.len())].1
         } else {
-            cat.producible[rng.gen_range(0..cat.producible.len())]
+            cat.producible[rng.random_range(0..cat.producible.len())]
         }
     };
 
-    let n = rng.gen_range(1..4);
+    let n = rng.random_range(1..4);
     let projs: Vec<String> = (0..n)
         .map(|i| {
             let goal = pick_goal(rng);
@@ -1328,7 +1328,7 @@ fn gen_typed_select(cat: &TypedCat, rng: &mut StdRng, np: &mut u32) -> Option<St
 
     // Optional WHERE — a boolean-typed expression (so it's a *valid* filter,
     // exercising nullability/type through predicates rather than syntax).
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         let bool_oid = cat
             .type_name
             .iter()
@@ -1375,27 +1375,31 @@ fn gen_random_schema(rng: &mut StdRng) -> String {
     // A scalar type rendering, sometimes with a typmod — the typmod corners
     // (length/precision propagation) are a rich source of divergences.
     fn scalar_ty(rng: &mut StdRng) -> String {
-        match rng.gen_range(0..7) {
+        match rng.random_range(0..7) {
             0 => "varchar(8)".into(),
             1 => "numeric(10, 2)".into(),
             2 => "char(4)".into(),
             3 => "varchar".into(),
-            _ => BASES[rng.gen_range(0..BASES.len())].into(),
+            _ => BASES[rng.random_range(0..BASES.len())].into(),
         }
     }
 
     let mut s = String::new();
-    let n_en = rng.gen_range(0..=2);
+    let n_en = rng.random_range(0..=2);
     for i in 0..n_en {
         s.push_str(&format!("CREATE TYPE en_{i} AS ENUM ('a', 'b', 'c');\n"));
     }
-    let n_dom = rng.gen_range(0..=2);
+    let n_dom = rng.random_range(0..=2);
     for i in 0..n_dom {
         let base = scalar_ty(rng);
-        let extra = if rng.gen_bool(0.4) { " NOT NULL" } else { "" };
+        let extra = if rng.random_bool(0.4) {
+            " NOT NULL"
+        } else {
+            ""
+        };
         s.push_str(&format!("CREATE DOMAIN dom_{i} AS {base}{extra};\n"));
     }
-    let n_cmp = rng.gen_range(0..=2);
+    let n_cmp = rng.random_range(0..=2);
     for i in 0..n_cmp {
         s.push_str(&format!(
             "CREATE TYPE cmp_{i} AS (f0 {}, f1 {});\n",
@@ -1409,29 +1413,33 @@ fn gen_random_schema(rng: &mut StdRng) -> String {
     let col_ty = |rng: &mut StdRng| -> String {
         let mut choices = vec![
             scalar_ty(rng),
-            format!("{}[]", BASES[rng.gen_range(0..BASES.len())]),
+            format!("{}[]", BASES[rng.random_range(0..BASES.len())]),
             "int4[][]".into(),
         ];
         if n_en > 0 {
-            choices.push(format!("en_{}", rng.gen_range(0..n_en)));
+            choices.push(format!("en_{}", rng.random_range(0..n_en)));
         }
         if n_dom > 0 {
-            choices.push(format!("dom_{}", rng.gen_range(0..n_dom)));
+            choices.push(format!("dom_{}", rng.random_range(0..n_dom)));
         }
         if n_cmp > 0 {
-            choices.push(format!("cmp_{}", rng.gen_range(0..n_cmp)));
+            choices.push(format!("cmp_{}", rng.random_range(0..n_cmp)));
         }
-        choices[rng.gen_range(0..choices.len())].clone()
+        choices[rng.random_range(0..choices.len())].clone()
     };
 
-    let n_tbl = rng.gen_range(1..=3);
+    let n_tbl = rng.random_range(1..=3);
     for i in 0..n_tbl {
         let mut cols = vec!["id BIGINT PRIMARY KEY".to_string()];
-        for c in 0..rng.gen_range(2..=5) {
-            let nn = if rng.gen_bool(0.4) { " NOT NULL" } else { "" };
+        for c in 0..rng.random_range(2..=5) {
+            let nn = if rng.random_bool(0.4) {
+                " NOT NULL"
+            } else {
+                ""
+            };
             cols.push(format!("c{c} {}{nn}", col_ty(rng)));
         }
-        if rng.gen_bool(0.4) {
+        if rng.random_bool(0.4) {
             cols.push("g BIGINT GENERATED ALWAYS AS (id * 2) STORED".into());
         }
         s.push_str(&format!(
@@ -1439,10 +1447,10 @@ fn gen_random_schema(rng: &mut StdRng) -> String {
             cols.join(",\n  ")
         ));
     }
-    if n_tbl > 0 && rng.gen_bool(0.6) {
+    if n_tbl > 0 && rng.random_bool(0.6) {
         s.push_str("CREATE VIEW v_0 AS SELECT id, id + 1 AS idp, c0 FROM r_0;\n");
     }
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         s.push_str("CREATE SCHEMA s1;\nCREATE TABLE s1.t (id BIGINT PRIMARY KEY, val TEXT);\n");
     }
     s
@@ -1525,7 +1533,7 @@ fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<String> {
     }
 
     for _ in 0..n_edits {
-        let idx = rng.gen_range(0..nodes.len());
+        let idx = rng.random_range(0..nodes.len());
         apply_mutation(nodes[idx], rng);
     }
 
@@ -1540,19 +1548,19 @@ fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
             NodeMut::AConst(p) if !p.is_null() => {
                 let c = &mut *p;
                 c.isnull = false;
-                c.val = Some(match rng.gen_range(0..5) {
+                c.val = Some(match rng.random_range(0..5) {
                     0 => a_const::Val::Ival(protobuf::Integer {
-                        ival: rng.gen_range(-5..1000),
+                        ival: rng.random_range(-5..1000),
                     }),
                     1 => a_const::Val::Sval(protobuf::String {
                         // Drawn from the literal-probe pool so constant
                         // mutations stress the input-syntax validators too
                         // (radix/underscore ints, float specials, array /
                         // range / json shapes, datetime keywords, …).
-                        sval: LITERAL_PROBES[rng.gen_range(0..LITERAL_PROBES.len())].to_string(),
+                        sval: LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())].to_string(),
                     }),
                     2 => a_const::Val::Boolval(protobuf::Boolean {
-                        boolval: rng.gen_bool(0.5),
+                        boolval: rng.random_bool(0.5),
                     }),
                     3 => a_const::Val::Fval(protobuf::Float {
                         fval: "3.14".to_string(),
@@ -1569,7 +1577,7 @@ fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
                 if let Some(last) = cr.fields.last_mut()
                     && matches!(last.node, Some(NodeEnum::String(_)))
                 {
-                    let name = ALL_COLUMN_NAMES[rng.gen_range(0..ALL_COLUMN_NAMES.len())];
+                    let name = ALL_COLUMN_NAMES[rng.random_range(0..ALL_COLUMN_NAMES.len())];
                     *last = str_node(name);
                 }
             }
@@ -1577,20 +1585,20 @@ fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
                 let e = &mut *p;
                 // kind 0 == AEXPR_OP (a plain binary/unary operator).
                 if e.kind == 0 && e.name.len() == 1 {
-                    let op = OPERATORS[rng.gen_range(0..OPERATORS.len())];
+                    let op = OPERATORS[rng.random_range(0..OPERATORS.len())];
                     e.name[0] = str_node(op);
                 }
             }
             NodeMut::FuncCall(p) if !p.is_null() => {
                 let fc = &mut *p;
                 if !fc.agg_star {
-                    let f = FUNCTIONS[rng.gen_range(0..FUNCTIONS.len())];
+                    let f = FUNCTIONS[rng.random_range(0..FUNCTIONS.len())];
                     fc.funcname = vec![str_node(f)];
                 }
             }
             NodeMut::TypeName(p) if !p.is_null() => {
                 let tn = &mut *p;
-                let t = BASE_TYPE_NAMES[rng.gen_range(0..BASE_TYPE_NAMES.len())];
+                let t = BASE_TYPE_NAMES[rng.random_range(0..BASE_TYPE_NAMES.len())];
                 tn.names = vec![str_node(t)];
                 tn.typmods.clear();
                 tn.array_bounds.clear();
@@ -1894,7 +1902,7 @@ fn fuzz_analyze_against_pg() {
 
     let mut metamorphic_checks = 0u32;
     for i in 0..iters {
-        let roll = rng.gen_range(0..100);
+        let roll = rng.random_range(0..100);
         // `single_fault` marks the high-signal path: exactly one perturbation
         // of a valid query, so any divergence reflects a single error whose
         // report should match PG verbatim. Multi-fault queries can diverge
@@ -1930,15 +1938,15 @@ fn fuzz_analyze_against_pg() {
             gen_literal_probe(&mut rng)
         } else if single_fault {
             // Single-fault: one edit over a known-valid base.
-            let base = valid_seeds[rng.gen_range(0..valid_seeds.len())].clone();
+            let base = valid_seeds[rng.random_range(0..valid_seeds.len())].clone();
             match mutate(&base, &mut rng, 1) {
                 Some(m) => m,
                 None => continue,
             }
         } else {
             // Multi-fault: 1..=3 edits over any parseable seed.
-            let base = live_seeds[rng.gen_range(0..live_seeds.len())].clone();
-            let n_edits = rng.gen_range(1..=3);
+            let base = live_seeds[rng.random_range(0..live_seeds.len())].clone();
+            let n_edits = rng.random_range(1..=3);
             match mutate(&base, &mut rng, n_edits) {
                 Some(m) => m,
                 None => continue,
@@ -1958,7 +1966,7 @@ fn fuzz_analyze_against_pg() {
             }
             // Metamorphic self-consistency (Strategy 4): a pass-through wrap
             // must preserve the column type/nullability shape.
-            if q.can_run_as_subquery && rng.gen_bool(0.35) {
+            if q.can_run_as_subquery && rng.random_bool(0.35) {
                 metamorphic_checks += 1;
                 metamorphic_check(&db, &sql, q, &mut rng, &mut findings, i);
             }
@@ -2030,7 +2038,7 @@ fn metamorphic_check(
     findings: &mut BTreeMap<String, Finding>,
     iter: u32,
 ) {
-    let wrapped = if rng.gen_bool(0.5) {
+    let wrapped = if rng.random_bool(0.5) {
         format!("SELECT * FROM ({base_sql}) AS _m")
     } else {
         format!("WITH _m AS ({base_sql}) SELECT * FROM _m")

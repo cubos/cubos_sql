@@ -1054,3 +1054,51 @@ fn variadic_any_with_one_variadic_arg_accepted() {
         text()
     );
 }
+
+// ── Ambiguous overload resolution (SQLSTATE 42725) ──────────────────────────
+
+#[test]
+fn unknown_args_with_tied_candidates_is_not_unique() {
+    // `mod` has int2/int4/int8/numeric variants — all Numeric category,
+    // none carrying the category's preferred type (float8) — so unknown
+    // inputs can't be resolved and PG refuses rather than guessing.
+    let db = setup();
+    let err = db.analyze("SELECT mod('5', '2')").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("function mod(unknown, unknown) is not unique"),
+        "got: {err}"
+    );
+    let err = db.analyze("SELECT gcd('4', '6')").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("function gcd(unknown, unknown) is not unique"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn unknown_args_resolved_by_preferred_type() {
+    // `round` *does* have a float8 (preferred) variant, so the same shape
+    // resolves — to double precision, exactly like PG.
+    let db = setup();
+    let s = db.analyze("SELECT round('1.5') AS v").unwrap();
+    assert_cols(&s, vec![c("v", float8())]);
+    let s = db.analyze("SELECT power('2', '3') AS v").unwrap();
+    assert_cols(&s, vec![c("v", float8())]);
+}
+
+#[test]
+fn both_unknown_operator_with_many_overloads_is_not_unique() {
+    // `+` has no text overload and its candidates span several categories,
+    // so two untyped operands are ambiguous (PG: 42725). `=` resolves via
+    // the text fallback and stays accepted.
+    let db = setup();
+    let err = db.analyze("SELECT $p0 + $p1").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("operator is not unique: unknown + unknown"),
+        "got: {err}"
+    );
+    db.analyze("SELECT NULL = NULL").unwrap();
+}

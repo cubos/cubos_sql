@@ -315,6 +315,17 @@ impl PgCatalog {
     ///
     /// Candidates are gathered from every schema on the search_path (plus
     /// `pg_catalog` if not listed explicitly).
+    /// Whether any operator with this name exists on the search path —
+    /// distinguishes `operator is not unique: unknown + unknown` (overloads
+    /// exist but none can be picked) from `operator does not exist`.
+    pub fn operator_name_exists(&self, name: &str) -> bool {
+        self.schemas_for_lookup(None).into_iter().any(|nsoid| {
+            self.operator_by_qname
+                .get(&(nsoid, name.to_owned()))
+                .is_some_and(|oids| !oids.is_empty())
+        })
+    }
+
     pub fn find_operator(
         &self,
         name: &str,
