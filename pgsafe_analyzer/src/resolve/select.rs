@@ -216,6 +216,25 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         }
     }
 
+    // Process `DISTINCT ON (…)` expressions the same way — they resolve
+    // like ORDER BY items (select-list aliases allowed). A plain `DISTINCT`
+    // parses as a single empty node; skip it. Without this walk, a `$N`
+    // referenced only inside DISTINCT ON was never registered with the
+    // collector and analysis died on the param-count invariant.
+    for distinct_node in &sel.distinct_clause {
+        if distinct_node.node.is_some()
+            && let Err(e) = expr::infer_expr(
+                distinct_node,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                TypeGoal::NONE,
+            )
+            && !is_select_alias_reference(distinct_node, &select_aliases, &e)
+        {
+            return Err(e);
+        }
+    }
+
     // Process LIMIT / OFFSET — PG uses coerce_to_specific_type(INT8OID)
     // with COERCION_ASSIGNMENT, and emits its own wording on mismatch:
     // `argument of LIMIT must be type bigint, not type X` (likewise for

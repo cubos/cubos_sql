@@ -923,3 +923,32 @@ fn nullif_and_array_default_column_names() {
     let s = db.analyze("SELECT ARRAY[age, $p1] FROM users").unwrap();
     assert_eq!(s.columns[0].name, "array");
 }
+
+#[test]
+fn param_in_distinct_on_is_registered_and_typed() {
+    // DISTINCT ON expressions are walked like ORDER BY items — a `$N` seen
+    // only there used to die on the param-count invariant.
+    let db = setup();
+    let s = db
+        .analyze("SELECT DISTINCT ON (id = $p1) name FROM users")
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    // Select-list aliases stay referencable, like ORDER BY.
+    db.analyze("SELECT id AS x FROM users ORDER BY x").unwrap();
+}
+
+#[test]
+fn array_concat_param_adopts_array_type() {
+    // `tags || $1` resolves the polymorphic anycompatiblearray ||
+    // anycompatiblearray (most specific homogeneous match), so PG's
+    // Describe — and the analyzer — type the param as text[].
+    let db = setup();
+    let mut db2 = PgCatalog::new().unwrap();
+    db2.apply_sql("CREATE TABLE a (id BIGINT PRIMARY KEY, tags TEXT[], nums INT[] NOT NULL);")
+        .unwrap();
+    let _ = db;
+    let s = db2.analyze("SELECT tags || $p1 FROM a").unwrap();
+    assert_params(&s, vec![p(array_of(text()))]);
+    let s = db2.analyze("SELECT $p1 || nums FROM a").unwrap();
+    assert_params(&s, vec![p(array_of(int4()))]);
+}

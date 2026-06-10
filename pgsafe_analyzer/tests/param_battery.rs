@@ -63,6 +63,9 @@ const BATTERY: &[&str] = &[
     "SELECT active IS NOT TRUE FROM users",
     "SELECT NOT $p1",
     "SELECT id FROM users WHERE $p1",
+    "SELECT tags || $p1 FROM users",
+    "SELECT $p1 || nums FROM users",
+    "SELECT DISTINCT ON (id = $p1) name FROM users",
     // set-op reconciliation
     "SELECT $p1 UNION ALL SELECT age FROM users",
     "SELECT age FROM users UNION ALL SELECT $p1",

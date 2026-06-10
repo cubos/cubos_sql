@@ -512,11 +512,58 @@ impl PgCatalog {
             };
             if let Some(t) = known
                 && t != oid::UNKNOWN
-                && let Some(&op) = candidates
+            {
+                if let Some(&op) = candidates
                     .iter()
                     .find(|o| op_left(o) == Some(t) && o.oprright == t)
-            {
-                return op_match(concretize_operator(op, left_oid, right_oid, self));
+                {
+                    return op_match(concretize_operator(op, left_oid, right_oid, self));
+                }
+                // No concrete homogeneous overload — try the polymorphic
+                // ones with *both* sides bound to `t`, most specific
+                // signature first: `tags || $1` resolves
+                // `anycompatiblearray || anycompatiblearray` over
+                // `… || anycompatible` for (text[], text[]), so the param
+                // describes as text[], matching PG. Concretize with `t` on
+                // both sides (not UNKNOWN) so substitution binds fully.
+                let homogeneous = |o: &&PgOperator| -> bool {
+                    let l_ok = match op_left(o) {
+                        Some(e) if crate::polymorphic::is_polymorphic(e) => {
+                            crate::polymorphic::matches_polymorphic(e, t, self)
+                        }
+                        Some(e) => e == t,
+                        None => false,
+                    };
+                    let r_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
+                        crate::polymorphic::matches_polymorphic(o.oprright, t, self)
+                    } else {
+                        o.oprright == t
+                    };
+                    let has_poly = op_left(o).is_some_and(crate::polymorphic::is_polymorphic)
+                        || crate::polymorphic::is_polymorphic(o.oprright);
+                    has_poly && l_ok && r_ok
+                };
+                let poly_homog: Vec<&PgOperator> =
+                    candidates.iter().filter(|o| homogeneous(o)).copied().collect();
+                if !poly_homog.is_empty() {
+                    let score = |o: &&PgOperator| -> u16 {
+                        let l = op_left(o)
+                            .map(crate::polymorphic::polymorphic_specificity)
+                            .unwrap_or(10) as u16;
+                        let r = crate::polymorphic::polymorphic_specificity(o.oprright) as u16;
+                        l + r
+                    };
+                    if let Some(max_score) = poly_homog.iter().map(&score).max() {
+                        let best: Vec<&PgOperator> = poly_homog
+                            .iter()
+                            .filter(|o| score(o) == max_score)
+                            .copied()
+                            .collect();
+                        if best.len() == 1 {
+                            return op_match(concretize_operator(best[0], Some(t), t, self));
+                        }
+                    }
+                }
             }
         }
 
