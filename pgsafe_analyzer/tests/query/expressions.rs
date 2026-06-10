@@ -292,6 +292,81 @@ fn case_when_condition_must_be_boolean() {
     );
 }
 
+#[test]
+fn simple_case_when_values_compare_against_test_expr() {
+    let db = setup();
+    // Simple CASE (`CASE arg WHEN val …`): PG rewrites each WHEN into
+    // `arg = val`, so the values are comparands against the test
+    // expression, NOT boolean conditions. A regression once coerced
+    // 'adult' to boolean and rejected with `invalid input syntax for
+    // type boolean: "adult"`.
+    let s = db
+        .analyze("SELECT CASE name WHEN 'adult' THEN 1 WHEN 'minor' THEN 2 END AS v FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", int4())]);
+}
+
+#[test]
+fn simple_case_in_check_constraint() {
+    let mut db = PgCatalog::new().unwrap();
+    // Real-world regression shape: simple CASE over a discriminator column
+    // with boolean THEN results, inside a table-level CHECK.
+    db.apply_sql(
+        "CREATE TABLE conversation_events (
+            id      BIGINT PRIMARY KEY,
+            type    TEXT NOT NULL,
+            content TEXT,
+            CONSTRAINT conversation_events_shape CHECK (
+                CASE type
+                    WHEN 'user_message'  THEN content IS NOT NULL
+                    WHEN 'agent_message' THEN content IS NOT NULL
+                END
+            )
+        );",
+    )
+    .unwrap();
+}
+
+#[test]
+fn simple_case_when_value_needs_equality_overload_not_coercion() {
+    let db = setup();
+    // PG resolves `int4 = numeric` per WHEN — no coercion of the value to
+    // the test type is required.
+    let s = db
+        .analyze("SELECT CASE age WHEN 1.5 THEN 'x' END AS v FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", text())]);
+}
+
+#[test]
+fn simple_case_when_value_without_equality_operator_rejected() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT CASE age WHEN true THEN 'x' END FROM users"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: integer = boolean",
+    );
+}
+
+#[test]
+fn simple_case_unknown_when_value_validated_against_test_type() {
+    let db = setup();
+    // An UNKNOWN WHEN value is assumed to be the test expression's type;
+    // its literal content is validated under that type, like PG.
+    assert_analyze_err!(
+        db.analyze("SELECT CASE age WHEN 'abc' THEN 'x' END FROM users"),
+        AnalyzeError::InvalidLiteral(_),
+        concat!(
+            "invalid input syntax for type integer: \"abc\"\n",
+            "  ╭────\n",
+            "1 │ SELECT CASE age WHEN 'abc' THEN 'x' END FROM users\n",
+            "  ·                      ──┬──\n",
+            "  ·                        ╰─ this literal\n",
+            "  ╰────\n",
+        ),
+    );
+}
+
 // ── Boolean / NULL tests ─────────────────────────────────────────────────────
 
 #[test]

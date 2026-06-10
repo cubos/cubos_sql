@@ -152,17 +152,59 @@ pub(crate) fn infer_case(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
-    // Pass 1: infer WHEN conditions with BOOL goal, results with NONE.
+    // Simple CASE (`CASE arg WHEN val THEN …`): PG's transformCaseExpr
+    // rewrites each WHEN into `CaseTestExpr = val` and resolves the `=`
+    // operator — the WHEN values are comparands against the test
+    // expression, NOT boolean conditions. Infer the test expression once
+    // up front; its type drives the per-WHEN handling below.
+    let test_oid = expr
+        .arg
+        .as_ref()
+        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
+        .transpose()?
+        .map(|t| t.type_oid);
+
+    // Pass 1: infer WHEN conditions (BOOL goal for searched CASE, `=`
+    // operator resolution for simple CASE), results with NONE.
     let mut types = Vec::new();
     let mut any_branch_nullable = false;
 
     for arg in &expr.args {
         if let Some(node::Node::CaseWhen(when)) = arg.node.as_ref() {
-            // WHEN condition must be boolean. On a coerce-to-bool mismatch,
-            // rewrite to PG's exact wording (`argument of CASE/WHEN must be
-            // type boolean, not type X`) the same way the WHERE clause does;
-            // other errors carry their own message and propagate as-is.
-            if let Some(cond) = &when.expr
+            if let (Some(test_oid), Some(cond)) = (test_oid, &when.expr) {
+                // Simple CASE: each WHEN value resolves `test = val` — a
+                // concrete value only needs an `=` overload (coercing it to
+                // the test type would wrongly reject `CASE int_col WHEN
+                // 1.5 …`); an UNKNOWN value is assumed to be the test type
+                // (pins params, validates literal content; domains compare
+                // over their base type).
+                let t = infer_expr(cond, ctx, params, TypeGoal::NONE)?;
+                if test_oid != oid::UNKNOWN {
+                    if t.type_oid == oid::UNKNOWN {
+                        infer_expr(
+                            cond,
+                            ctx,
+                            params,
+                            TypeGoal::implicit(snapshot.unwrap_domain(test_oid)),
+                        )?;
+                    } else if snapshot
+                        .find_operator("=", Some(test_oid), t.type_oid)
+                        .is_none()
+                    {
+                        let l = crate::ddl::util::format_type_for_message(snapshot, test_oid);
+                        let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
+                        return Err(AnalyzeError::UndefinedOperator(format!(
+                            "operator does not exist: {l} = {r}"
+                        )));
+                    }
+                }
+            }
+            // Searched CASE: the WHEN condition must be boolean. On a
+            // coerce-to-bool mismatch, rewrite to PG's exact wording
+            // (`argument of CASE/WHEN must be type boolean, not type X`)
+            // the same way the WHERE clause does; other errors carry
+            // their own message and propagate as-is.
+            else if let Some(cond) = &when.expr
                 && let Err(e) = infer_expr(cond, ctx, params, TypeGoal::assignment(oid::BOOL))
             {
                 if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
