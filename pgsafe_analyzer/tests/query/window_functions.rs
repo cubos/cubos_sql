@@ -365,9 +365,7 @@ fn window_function_without_over_rejected() {
             .starts_with("window function row_number requires an OVER clause"),
         "got: {err}"
     );
-    let err = db
-        .analyze("SELECT lag(title) FROM posts")
-        .unwrap_err();
+    let err = db.analyze("SELECT lag(title) FROM posts").unwrap_err();
     assert!(
         err.to_string()
             .starts_with("window function lag requires an OVER clause"),

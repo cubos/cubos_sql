@@ -123,9 +123,7 @@ pub(crate) fn validate(
                 if content.parse::<u64>().is_ok_and(|v| v <= u32::MAX as u64) {
                     return Ok(());
                 }
-                return Err(format!(
-                    "value \"{content}\" is out of range for type oid"
-                ));
+                return Err(format!("value \"{content}\" is out of range for type oid"));
             }
             // Surrounding whitespace interacts with each reg* type's own
             // trimming rules (`' 42 '::regproc` is rejected, `' users '` is
@@ -375,9 +373,7 @@ fn validate_oid(content: &str) -> Result<(), String> {
         Err(_) => false, // > u64 digits — far out of range
     };
     if !in_range {
-        return Err(format!(
-            "value \"{content}\" is out of range for type oid"
-        ));
+        return Err(format!("value \"{content}\" is out of range for type oid"));
     }
     Ok(())
 }

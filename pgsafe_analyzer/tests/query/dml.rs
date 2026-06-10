@@ -1868,8 +1868,9 @@ fn insert_select_incompatible_column_type_rejected() {
         .analyze("INSERT INTO posts (user_id, title) SELECT preferences, name FROM users")
         .unwrap_err();
     assert!(
-        err.to_string()
-            .starts_with("column \"user_id\" is of type bigint but expression is of type user_prefs"),
+        err.to_string().starts_with(
+            "column \"user_id\" is of type bigint but expression is of type user_prefs"
+        ),
         "got: {err}"
     );
 }
