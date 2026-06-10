@@ -81,9 +81,7 @@ pub(crate) fn analyze_cte(
                         i + 1,
                     ),
                     None,
-                    Some(format!(
-                        "cast the non-recursive term's column to {overall}"
-                    )),
+                    Some(format!("cast the non-recursive term's column to {overall}")),
                 )
                 .finalize_implicit());
             }

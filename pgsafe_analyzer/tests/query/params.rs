@@ -1003,7 +1003,8 @@ fn any_param_against_array_column_rejected_like_pg() {
     // `nums = ANY($1)` would need an array-of-array to type the param —
     // PG fails the lookup at prepare time.
     let mut db = PgCatalog::new().unwrap();
-    db.apply_sql("CREATE TABLE t4 (nums INT[] NOT NULL);").unwrap();
+    db.apply_sql("CREATE TABLE t4 (nums INT[] NOT NULL);")
+        .unwrap();
     let err = db
         .analyze("SELECT 1 FROM t4 WHERE nums = ANY($p1)")
         .unwrap_err();

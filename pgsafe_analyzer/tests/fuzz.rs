@@ -953,18 +953,12 @@ fn gen_window_call(table: &Table, rng: &mut StdRng, np: &mut u32) -> String {
             // oracle judges). A $pN offset exercises frame-bound param
             // typing (int8 for ROWS).
             if rng.random_bool(0.3) {
-                parts.push(
-                    match rng.random_range(0..4) {
-                        0 => "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW".to_string(),
-                        1 => "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
-                            .to_string(),
-                        2 => format!(
-                            "ROWS BETWEEN ${} PRECEDING AND CURRENT ROW",
-                            next_param(np)
-                        ),
-                        _ => "ROWS 2 PRECEDING".to_string(),
-                    },
-                );
+                parts.push(match rng.random_range(0..4) {
+                    0 => "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW".to_string(),
+                    1 => "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING".to_string(),
+                    2 => format!("ROWS BETWEEN ${} PRECEDING AND CURRENT ROW", next_param(np)),
+                    _ => "ROWS 2 PRECEDING".to_string(),
+                });
             }
         }
         parts.join(" ")

@@ -431,9 +431,10 @@ impl PgCatalog {
                             match (declared, actual) {
                                 (Some(d), Some(a)) if d != a => {
                                     match (self.get_type(d), self.get_type(a)) {
-                                        (Some(dt), Some(at)) => (dt.typispreferred
-                                            && dt.typcategory == at.typcategory)
-                                            as u8,
+                                        (Some(dt), Some(at)) => {
+                                            (dt.typispreferred && dt.typcategory == at.typcategory)
+                                                as u8
+                                        }
                                         _ => 0,
                                     }
                                 }
@@ -446,7 +447,7 @@ impl PgCatalog {
                 if let Some(max_pref) = best.iter().map(preferred_hits).max()
                     && max_pref > 0
                 {
-                    best.retain(|o| preferred_hits(&o) == max_pref);
+                    best.retain(|o| preferred_hits(o) == max_pref);
                 }
             }
             // Several candidates surviving every concrete-args tiebreak is
