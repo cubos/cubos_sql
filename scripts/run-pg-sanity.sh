@@ -46,16 +46,24 @@ if [[ -z "$PG_PORT" ]]; then
     exit 1
 fi
 
-# Wait until the cluster accepts connections. `pg_isready` runs inside the
-# container so we don't need a libpq client on the host.
-echo "pg_sanity: waiting for PG to accept connections on 127.0.0.1:$PG_PORT..."
-for _ in $(seq 1 60); do
-    if docker exec "$CONTAINER_NAME" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
+# Wait until the cluster accepts real TCP queries. `pg_isready` over the
+# Unix socket is NOT enough: the postgres image's entrypoint starts a
+# temporary socket-only server for initdb scripts, stops it, and only then
+# launches the final TCP-listening one — a readiness probe that races into
+# that window passes and the test run then hits a connection refused. A
+# `SELECT 1` over TCP can only succeed against the final server; require a
+# couple of consecutive successes for good measure.
+echo "pg_sanity: waiting for PG to accept TCP queries on 127.0.0.1:$PG_PORT..."
+ready=0
+for _ in $(seq 1 120); do
+    if docker exec "$CONTAINER_NAME" psql -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -c "SELECT 1" >/dev/null 2>&1 \
+        && docker exec "$CONTAINER_NAME" psql -h 127.0.0.1 -U "$PG_USER" -d "$PG_DB" -c "SELECT 1" >/dev/null 2>&1; then
+        ready=1
         break
     fi
     sleep 0.5
 done
-if ! docker exec "$CONTAINER_NAME" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
+if [[ "$ready" -ne 1 ]]; then
     echo "pg_sanity: PG never became ready; container logs:" >&2
     docker logs "$CONTAINER_NAME" >&2 || true
     exit 1
