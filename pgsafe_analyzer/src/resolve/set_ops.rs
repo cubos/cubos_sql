@@ -30,16 +30,10 @@ pub(crate) fn analyze_set_operation(
     };
 
     if left_cols.len() != right_cols.len() {
-        return Err(crate::error::RawError::invalid(
-            format!("each {op_label} query must have the same number of columns"),
-            None,
-            Some(format!(
-                "the left side produces {} column(s), the right side {}",
-                left_cols.len(),
-                right_cols.len(),
-            )),
-        )
-        .finalize_implicit());
+        return Err(
+            crate::pgmsg::set_op_column_count(op_label, left_cols.len(), right_cols.len())
+                .finalize_implicit(),
+        );
     }
 
     // A bare `$N` projected by one branch adopts the column's reconciled
@@ -80,15 +74,14 @@ pub(crate) fn analyze_set_operation(
                 // from leaking.
                 let a = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
                 let b = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
-                return Err(crate::error::RawError::invalid(
-                    format!(
-                        "{op_label} types {a} and {b} cannot be matched (column `{}`)",
-                        l.name,
-                    ),
-                    None,
+                return Err(crate::pgmsg::types_cannot_be_matched(
+                    op_label,
+                    &a,
+                    &b,
+                    &format!(" (column `{}`)", l.name),
                     Some(format!(
                         "cast both sides to a common type, e.g. `{}::{a}`",
-                        l.name,
+                        l.name
                     )),
                 )
                 .finalize_implicit());

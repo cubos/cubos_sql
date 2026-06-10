@@ -231,14 +231,10 @@ pub(crate) fn process_from_item(
                     .collect();
                 // PG rejects more aliases than columns (42P10).
                 if col_aliases.len() > scope_cols.len() {
-                    return Err(crate::error::RawError::invalid(
-                        format!(
-                            "table \"{alias}\" has {} columns available but {} columns specified",
-                            scope_cols.len(),
-                            col_aliases.len(),
-                        ),
-                        None,
-                        None,
+                    return Err(crate::pgmsg::too_many_column_aliases(
+                        alias,
+                        scope_cols.len(),
+                        col_aliases.len(),
                     )
                     .finalize_implicit());
                 }
@@ -446,22 +442,10 @@ fn merge_using_columns(
     let mut merged: Vec<ScopeColumn> = Vec::with_capacity(using_names.len());
     for name in using_names {
         let Some((l_alias, l)) = find_col(left_start..left_end, name) else {
-            return Err(crate::error::RawError::invalid(
-                format!("column \"{name}\" specified in USING clause does not exist in left table"),
-                None,
-                None,
-            )
-            .finalize_implicit());
+            return Err(crate::pgmsg::using_column_missing(name, "left").finalize_implicit());
         };
         let Some((r_alias, r)) = find_col(left_end..right_end, name) else {
-            return Err(crate::error::RawError::invalid(
-                format!(
-                    "column \"{name}\" specified in USING clause does not exist in right table"
-                ),
-                None,
-                None,
-            )
-            .finalize_implicit());
+            return Err(crate::pgmsg::using_column_missing(name, "right").finalize_implicit());
         };
 
         let type_oid = if l.type_oid == r.type_oid {
@@ -471,12 +455,7 @@ fn merge_using_columns(
                 || {
                     let lt = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
                     let rt = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
-                    crate::error::RawError::invalid(
-                        format!("JOIN/USING types {lt} and {rt} cannot be matched"),
-                        None,
-                        None,
-                    )
-                    .finalize_implicit()
+                    crate::pgmsg::join_using_types_mismatch(&lt, &rt).finalize_implicit()
                 },
             )?
         };
@@ -535,15 +514,10 @@ fn apply_alias_column_names(
         return Ok(());
     };
     if colnames.len() > src.columns.len() {
-        return Err(crate::error::RawError::invalid(
-            format!(
-                "table \"{}\" has {} columns available but {} columns specified",
-                src.alias,
-                src.columns.len(),
-                colnames.len(),
-            ),
-            None,
-            None,
+        return Err(crate::pgmsg::too_many_column_aliases(
+            &src.alias,
+            src.columns.len(),
+            colnames.len(),
         )
         .finalize_implicit());
     }

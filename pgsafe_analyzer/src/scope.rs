@@ -157,12 +157,7 @@ impl Scope {
     /// empty-alias sources produced by JOIN USING merging are exempt.
     fn check_duplicate_alias(&self, alias: &str) -> Result<(), AnalyzeError> {
         if !alias.is_empty() && self.sources.iter().any(|s| s.alias == alias) {
-            return Err(RawError::invalid(
-                format!("table name \"{alias}\" specified more than once"),
-                None,
-                None,
-            )
-            .finalize_implicit());
+            return Err(crate::pgmsg::duplicate_table_alias(alias).finalize_implicit());
         }
         Ok(())
     }

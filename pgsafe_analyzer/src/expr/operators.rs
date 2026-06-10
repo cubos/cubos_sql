@@ -120,10 +120,7 @@ fn handle_nullif(
         // it was a NULLIF-shape mismatch.
         let l = crate::ddl::util::format_type_for_message(snapshot, left_oid_final);
         let r = crate::ddl::util::format_type_for_message(snapshot, right_oid_final);
-        return Err(AnalyzeError::Invalid(format!(
-            "operator does not exist: {l} = {r} \
-             (NULLIF types {l} and {r} cannot be matched)"
-        )));
+        return Err(crate::pgmsg::nullif_types_mismatch(&l, &r));
     }
 
     // Result type is the first arg's type (never bool). If the first arg
@@ -189,9 +186,7 @@ fn handle_distinct_from(
         // are reported as-is (`email = integer`), not unwrapped.
         let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
         let r = crate::ddl::util::format_type_for_message(snapshot, right_oid);
-        return Err(AnalyzeError::UndefinedOperator(format!(
-            "operator does not exist: {l} = {r}"
-        )));
+        return Err(crate::pgmsg::operator_does_not_exist(&l, "=", &r, None).finalize_implicit());
     }
     Ok(Some(ExprType::scalar(oid::BOOL, false)))
 }
@@ -260,9 +255,9 @@ fn handle_between(
                 {
                     let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
                     let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
-                    return Err(AnalyzeError::UndefinedOperator(format!(
-                        "operator does not exist: {l} {op} {r}"
-                    )));
+                    return Err(
+                        crate::pgmsg::operator_does_not_exist(&l, op, &r, None).finalize_implicit()
+                    );
                 }
             }
         }
@@ -321,9 +316,9 @@ fn handle_in_list(
             {
                 let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
                 let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
-                return Err(AnalyzeError::UndefinedOperator(format!(
-                    "operator does not exist: {l} {op} {r}"
-                )));
+                return Err(
+                    crate::pgmsg::operator_does_not_exist(&l, op, &r, None).finalize_implicit()
+                );
             }
         }
     }
@@ -394,9 +389,7 @@ fn handle_any_all(
             }
             None => {
                 let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-                return Err(AnalyzeError::Invalid(format!(
-                    "could not find array type for data type {l}"
-                )));
+                return Err(crate::pgmsg::no_array_type_for(&l));
             }
         }
     }
@@ -444,9 +437,9 @@ fn handle_any_all(
         {
             let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
             let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
-            return Err(AnalyzeError::UndefinedOperator(format!(
-                "operator does not exist: {l} {op_name} {r}"
-            )));
+            return Err(
+                crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, None).finalize_implicit(),
+            );
         }
     }
 
@@ -660,12 +653,10 @@ fn infer_generic_binary_op(
             let span = (expr.location >= 0).then(|| {
                 crate::error::SourceSpan::at_length(expr.location as usize, op_name.len())
             });
-            return Err(crate::error::RawError::invalid(
-                format!("operator is not unique: {left_pg} {op_name} {right_pg}"),
-                span,
-                Some("add an explicit type cast to one side, e.g. `expr::int4`".into()),
-            )
-            .finalize_implicit());
+            return Err(
+                crate::pgmsg::operator_is_not_unique(&left_pg, op_name, &right_pg, span)
+                    .finalize_implicit(),
+            );
         }
         crate::lookup::OperatorMatch::NotFound => {}
     }
@@ -682,10 +673,8 @@ fn infer_generic_binary_op(
     // so the caret spans the operator symbol/name.
     let span = (expr.location >= 0)
         .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
-    Err(crate::error::RawError::undefined_operator(
-        format!("operator does not exist: {left_pg} {op_name} {right_pg}"),
-        span,
-        None,
+    Err(
+        crate::pgmsg::operator_does_not_exist(&left_pg, op_name, &right_pg, span)
+            .finalize_implicit(),
     )
-    .finalize_implicit())
 }

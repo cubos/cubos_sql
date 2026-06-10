@@ -73,15 +73,11 @@ pub(crate) fn analyze_cte(
             if common != s.type_oid {
                 let seed_ty = crate::ddl::util::format_type_for_message(snapshot, s.type_oid);
                 let overall = crate::ddl::util::format_type_for_message(snapshot, common);
-                return Err(crate::error::RawError::invalid(
-                    format!(
-                        "recursive query \"{}\" column {} has type {seed_ty} in \
-                         non-recursive term but type {overall} overall",
-                        cte.ctename,
-                        i + 1,
-                    ),
-                    None,
-                    Some(format!("cast the non-recursive term's column to {overall}")),
+                return Err(crate::pgmsg::recursive_query_column_type(
+                    &cte.ctename,
+                    i + 1,
+                    &seed_ty,
+                    &overall,
                 )
                 .finalize_implicit());
             }

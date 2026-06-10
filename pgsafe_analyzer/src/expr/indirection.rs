@@ -424,9 +424,11 @@ pub(crate) fn infer_array_expr(
             // doesn't leak in front of it.
             let a = names.first().map(String::as_str).unwrap_or("?");
             let b = names.get(1).map(String::as_str).unwrap_or("?");
-            return Err(crate::error::RawError::invalid(
-                format!("ARRAY types {a} and {b} cannot be matched"),
-                None,
+            return Err(crate::pgmsg::types_cannot_be_matched(
+                "ARRAY",
+                a,
+                b,
+                "",
                 Some(format!(
                     "cast the elements to a common type, e.g. `elem::{a}`"
                 )),

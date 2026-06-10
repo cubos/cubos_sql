@@ -230,8 +230,8 @@ pub(crate) fn validate(
                     .chars()
                     .all(|c| c.is_ascii_alphabetic() || c.is_ascii_whitespace());
             if trimmed.is_empty() || purely_alphabetic {
-                return Err(format!(
-                    "invalid input syntax for type {msg_name}: \"{content}\""
+                return Err(crate::pgmsg::invalid_input_syntax_for_type(
+                    msg_name, content,
                 ));
             }
             Ok(())
@@ -294,8 +294,8 @@ fn validate_bool(content: &str) -> Result<(), String> {
     if ok {
         Ok(())
     } else {
-        Err(format!(
-            "invalid input syntax for type boolean: \"{content}\""
+        Err(crate::pgmsg::invalid_input_syntax_for_type(
+            "boolean", content,
         ))
     }
 }
@@ -342,7 +342,7 @@ fn take_digits(s: &mut &str, radix: u32) -> Option<String> {
 /// optional sign, then decimal digits or a `0x`/`0o`/`0b` radix prefix —
 /// underscores allowed between digits — followed by a range check.
 fn validate_int(content: &str, min: i128, max: i128, type_name: &str) -> Result<(), String> {
-    let syntax_err = || format!("invalid input syntax for type {type_name}: \"{content}\"");
+    let syntax_err = || crate::pgmsg::invalid_input_syntax_for_type(type_name, content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
 
     let negative = match s.as_bytes().first() {
@@ -411,7 +411,7 @@ fn parse_radix_digits(s: &mut &str) -> Option<(u32, String)> {
 /// magnitude fits `int32` (so `'-1'::oid` is 4294967295 but
 /// `'-4294967295'::oid` is out of range) — verified against PG 18.
 fn validate_oid(content: &str) -> Result<(), String> {
-    let syntax_err = || format!("invalid input syntax for type oid: \"{content}\"");
+    let syntax_err = || crate::pgmsg::invalid_input_syntax_for_type("oid", content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
     let negative = match s.strip_prefix(['+', '-']) {
         Some(rest) => {
@@ -446,7 +446,7 @@ fn validate_oid(content: &str) -> Result<(), String> {
 /// decimal float (`1`, `.5`, `5.`, `1e3`, `5.e-3`), or a C99 hex float
 /// (`0x1F`, `0x1.8p3`). No underscores, no range check (kept conservative).
 fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
-    let err = || format!("invalid input syntax for type {type_name}: \"{content}\"");
+    let err = || crate::pgmsg::invalid_input_syntax_for_type(type_name, content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
     if let Some(rest) = s.strip_prefix(['+', '-']) {
         s = rest;
@@ -516,7 +516,7 @@ fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
 /// value with optional fraction and `e`-exponent — underscores allowed
 /// between digits everywhere. No precision limit check.
 fn validate_numeric(content: &str) -> Result<(), String> {
-    let err = || format!("invalid input syntax for type numeric: \"{content}\"");
+    let err = || crate::pgmsg::invalid_input_syntax_for_type("numeric", content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
     if let Some(rest) = s.strip_prefix(['+', '-']) {
         s = rest;
@@ -573,7 +573,7 @@ fn validate_numeric(content: &str) -> Result<(), String> {
 /// of braces, with hyphens allowed only on the standard group boundaries
 /// (after hex digits 8, 12, 16, 20). No surrounding whitespace.
 fn validate_uuid(content: &str) -> Result<(), String> {
-    let err = || format!("invalid input syntax for type uuid: \"{content}\"");
+    let err = || crate::pgmsg::invalid_input_syntax_for_type("uuid", content);
     let s = match content.strip_prefix('{') {
         Some(rest) => rest.strip_suffix('}').ok_or_else(err)?,
         None => content,

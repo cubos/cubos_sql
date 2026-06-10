@@ -175,12 +175,10 @@ pub(crate) fn resolve_function(
                 .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(crate::error::RawError::invalid(
-                format!("function {qualified}({arg_list}) is not unique"),
-                span,
-                Some("add explicit type casts to the arguments to select one overload".into()),
-            )
-            .finalize_implicit());
+            return Err(
+                crate::pgmsg::function_is_not_unique(&qualified, &arg_list, span)
+                    .finalize_implicit(),
+            );
         }
         CastMatch::NoMatch => {}
     }

@@ -87,9 +87,11 @@ pub(crate) fn infer_coalesce(
                 snapshot,
                 snapshot.unwrap_domain(concrete_types[concrete_types.len() - 1]),
             );
-            crate::error::RawError::invalid(
-                format!("COALESCE types {first} and {last} cannot be matched"),
-                None,
+            crate::pgmsg::types_cannot_be_matched(
+                "COALESCE",
+                &first,
+                &last,
+                "",
                 Some(format!(
                     "add an explicit cast so the branches share a type, e.g. `expr::{last}`"
                 )),
@@ -244,9 +246,11 @@ pub(crate) fn infer_case(
                 snapshot,
                 snapshot.unwrap_domain(concrete_types[0]),
             );
-            crate::error::RawError::invalid(
-                format!("CASE types {last} and {first} cannot be matched"),
-                None,
+            crate::pgmsg::types_cannot_be_matched(
+                "CASE",
+                &last,
+                &first,
+                "",
                 Some(format!(
                     "add an explicit cast so the branches share a type, e.g. `expr::{first}`"
                 )),

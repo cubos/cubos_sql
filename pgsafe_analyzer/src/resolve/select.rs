@@ -215,11 +215,11 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         };
         if let Some(ord) = ordinal_of(inner) {
             if ord < 1 || ord as usize > n_targets {
-                return Err(crate::error::RawError::invalid(
-                    format!("ORDER BY position {ord} is not in select list"),
+                return Err(crate::pgmsg::position_not_in_select_list(
+                    "ORDER BY",
+                    ord,
                     crate::error::node_location(inner)
                         .and_then(crate::error::SourceSpan::from_node_token),
-                    None,
                 )
                 .finalize_implicit());
             }
@@ -235,11 +235,9 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             return Err(e);
         }
         if plain_distinct && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases) {
-            return Err(crate::error::RawError::invalid(
-                "for SELECT DISTINCT, ORDER BY expressions must appear in select list".to_string(),
+            return Err(crate::pgmsg::distinct_order_by_not_in_select_list(
                 crate::error::node_location(inner)
                     .and_then(crate::error::SourceSpan::from_node_qname),
-                None,
             )
             .finalize_implicit());
         }
@@ -336,12 +334,7 @@ fn check_window_refs(
     };
     let check_name = |name: &str| -> Result<(), AnalyzeError> {
         if !name.is_empty() && !defined.contains(name) {
-            return Err(crate::error::RawError::invalid(
-                format!("window \"{name}\" does not exist"),
-                None,
-                Some("define it in a WINDOW clause, e.g. `WINDOW w AS (ORDER BY …)`".into()),
-            )
-            .finalize_implicit());
+            return Err(crate::pgmsg::window_does_not_exist(name).finalize_implicit());
         }
         Ok(())
     };
@@ -524,11 +517,11 @@ pub(crate) fn walk_group_clause_node(
     // range); a valid one needs no further walking.
     if let Some(ord) = ordinal_of(group_node) {
         if ord < 1 || ord as usize > n_targets {
-            return Err(crate::error::RawError::invalid(
-                format!("GROUP BY position {ord} is not in select list"),
+            return Err(crate::pgmsg::position_not_in_select_list(
+                "GROUP BY",
+                ord,
                 crate::error::node_location(group_node)
                     .and_then(crate::error::SourceSpan::from_node_token),
-                None,
             )
             .finalize_implicit());
         }

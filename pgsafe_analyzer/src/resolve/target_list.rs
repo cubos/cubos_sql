@@ -151,15 +151,9 @@ pub(crate) fn analyze_values_lists(
         };
         // PG (SQLSTATE 42601): every row must have the first row's arity.
         if row.items.len() != arity {
-            return Err(crate::error::RawError::invalid(
-                "VALUES lists must all be the same length".to_string(),
-                None,
-                Some(format!(
-                    "the first row has {arity} column(s), a later row has {}",
-                    row.items.len()
-                )),
-            )
-            .finalize_implicit());
+            return Err(
+                crate::pgmsg::values_lists_length(arity, row.items.len()).finalize_implicit()
+            );
         }
         for (i, item) in row.items.iter().enumerate() {
             if i >= arity {

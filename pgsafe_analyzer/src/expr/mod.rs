@@ -499,9 +499,11 @@ pub(crate) fn infer_expr(
                         snapshot,
                         snapshot.unwrap_domain(*concrete.last().unwrap_or(&oid::UNKNOWN)),
                     );
-                    crate::error::RawError::invalid(
-                        format!("{label} types {first} and {last} cannot be matched"),
-                        None,
+                    crate::pgmsg::types_cannot_be_matched(
+                        label,
+                        &first,
+                        &last,
+                        "",
                         Some(format!(
                             "add an explicit cast so the arguments share a type, e.g. `expr::{last}`"
                         )),
