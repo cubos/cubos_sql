@@ -577,3 +577,20 @@ fn datetime_bare_words_rejected() {
         "invalid input syntax for type timestamp: \"allballs\""
     );
 }
+
+#[test]
+fn any_all_requires_array_on_right_side() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT id FROM t WHERE n = ANY(42)"),
+        "op ANY/ALL (array) requires array on right side"
+    );
+    assert_first_line!(
+        db.analyze("SELECT id FROM t WHERE n = ALL(b)"),
+        "op ANY/ALL (array) requires array on right side"
+    );
+    // An UNKNOWN right side is fine — it's coerced to the element array.
+    db.analyze("SELECT id FROM t WHERE n = ANY('{1,2}')")
+        .unwrap();
+    db.analyze("SELECT id FROM t WHERE n = ANY(nums)").unwrap();
+}

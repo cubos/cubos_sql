@@ -389,6 +389,24 @@ fn handle_any_all(
     let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
     let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
 
+    // A concrete right side must actually be an array — PG checks this
+    // before any operator resolution: `1 = ANY(42)` and
+    // `1 = ANY('{}'::jsonb)` both fail with this exact wording (42809).
+    // UNKNOWN right sides are excluded: they get coerced to `T[]` below.
+    if right_oid != oid::UNKNOWN
+        && !snapshot
+            .get_type(snapshot.unwrap_domain(right_oid))
+            .is_some_and(|t| t.typcategory == TypCategory::Array)
+    {
+        let span = crate::error::SourceSpan::from_location(expr.location);
+        return Err(crate::error::RawError::invalid(
+            "op ANY/ALL (array) requires array on right side".to_string(),
+            span,
+            Some("wrap the values in ARRAY[…] or pass an array value".into()),
+        )
+        .finalize_implicit());
+    }
+
     // left is concrete T, right is unknown → right must be T[].
     if left_oid != oid::UNKNOWN
         && right_oid == oid::UNKNOWN
