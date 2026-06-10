@@ -594,3 +594,52 @@ fn any_all_requires_array_on_right_side() {
         .unwrap();
     db.analyze("SELECT id FROM t WHERE n = ANY(nums)").unwrap();
 }
+
+#[test]
+fn cast_malformed_multirange_rejected() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT ''::int4multirange"),
+        "malformed multirange literal: \"\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'x'::int4multirange"),
+        "malformed multirange literal: \"x\""
+    );
+    for q in [
+        "SELECT '{}'::int4multirange AS v",
+        "SELECT ' {[1,2)} '::int4multirange AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+#[test]
+fn cast_to_input_refusing_system_types_rejected() {
+    // These internal types' input functions refuse any value — note the
+    // brin_minmax message drops the `pg_` prefix (PG's own string).
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT 'x'::pg_node_tree"),
+        "cannot accept a value of type pg_node_tree"
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'x'::pg_brin_minmax_multi_summary"),
+        "cannot accept a value of type brin_minmax_multi_summary"
+    );
+}
+
+#[test]
+fn cast_empty_string_to_system_identifier_types_rejected() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT ''::tid"),
+        "invalid input syntax for type tid: \"\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT ''::xid"),
+        "invalid input syntax for type xid: \"\""
+    );
+    // Non-empty contents stay unchecked (conservative).
+    db.analyze("SELECT '42'::xid AS v").unwrap();
+}

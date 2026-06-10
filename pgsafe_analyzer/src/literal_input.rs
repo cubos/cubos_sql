@@ -73,6 +73,16 @@ pub(crate) fn validate(
         return Err(format!("malformed range literal: \"{content}\""));
     }
 
+    // Multiranges: the value must open with `{` after optional whitespace
+    // (`'{}'` is the valid empty multirange). Member ranges aren't validated.
+    if t.typtype == TypType::Multirange {
+        let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if trimmed.starts_with('{') {
+            return Ok(());
+        }
+        return Err(format!("malformed multirange literal: \"{content}\""));
+    }
+
     // True arrays: after optional leading whitespace the value must open with
     // `{` (or `[` for the explicit-dimensions form `[1:2]={…}`). Element
     // contents are not validated. `oidvector`/`int2vector` share the Array
@@ -233,11 +243,24 @@ pub(crate) fn validate(
             }
             Ok(())
         }
-        // Network/geometric types whose input functions are too complex to
-        // model but are known to reject the empty string. (No alphabetic
-        // shortcut here: `'aabbccddeeff'::macaddr` is a valid MAC.)
+        // Internal statistics / parse-tree types whose input functions
+        // unconditionally refuse input. The message string is the input
+        // function's own (note `pg_brin_minmax_multi_summary`'s drops the
+        // prefix) — verified against PG 18.
+        name @ ("pg_node_tree" | "pg_ndistinct" | "pg_dependencies" | "pg_mcv_list"
+        | "pg_brin_bloom_summary" | "pg_brin_minmax_multi_summary" | "pg_ddl_command") => {
+            let msg_name = match name {
+                "pg_brin_minmax_multi_summary" => "brin_minmax_multi_summary",
+                other => other,
+            };
+            Err(format!("cannot accept a value of type {msg_name}"))
+        }
+        // Network/geometric types — and the system identifier types — whose
+        // input functions are too complex to model but are known to reject
+        // the empty string. (No alphabetic shortcut here:
+        // `'aabbccddeeff'::macaddr` is a valid MAC.)
         name @ ("macaddr" | "macaddr8" | "inet" | "cidr" | "point" | "lseg" | "box" | "path"
-        | "polygon" | "circle" | "line") => {
+        | "polygon" | "circle" | "line" | "tid" | "xid" | "xid8" | "cid") => {
             if content
                 .trim_matches(|c: char| c.is_ascii_whitespace())
                 .is_empty()
