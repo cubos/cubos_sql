@@ -10,7 +10,12 @@
 #
 # Usage:
 #   scripts/run-pg-sanity.sh                 # run the whole analyzer suite
-#   scripts/run-pg-sanity.sh -p pgsafe_analyzer alter_column   # filter
+#   scripts/run-pg-sanity.sh alter_column    # filter by test name
+#   scripts/run-pg-sanity.sh --run-ignored all -E 'test(fuzz_analyze_against_pg)'
+#
+# Extra args are appended to the default
+# `--release --features pg_sanity -p pgsafe_analyzer` invocation — callers
+# only pass filters / extra nextest flags, never the boilerplate.
 
 set -euo pipefail
 
@@ -73,11 +78,7 @@ export POSTGRES_URL="host=127.0.0.1 port=$PG_PORT user=$PG_USER password=$PG_PAS
 echo "pg_sanity: POSTGRES_URL=$POSTGRES_URL"
 echo "pg_sanity: running tests..."
 
-# Default to the analyzer suite; let callers override / append. Don't
-# forward `--release` automatically — leave that to the caller (or to
-# nextest's own profile-driven defaults).
-if [[ $# -eq 0 ]]; then
-    set -- --release --features pg_sanity -p pgsafe_analyzer
-fi
-
-cargo nextest run "$@"
+# Defaults always apply; extra args (filters, --run-ignored, -E …) are
+# appended. Repeating `-p`/`--features` from the command line is harmless —
+# cargo merges duplicates.
+cargo nextest run --release --features pg_sanity -p pgsafe_analyzer "$@"
