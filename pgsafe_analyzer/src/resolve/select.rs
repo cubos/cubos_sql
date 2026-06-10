@@ -228,33 +228,43 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         // Run the inference; on a coerce-to-int8 mismatch, rewrite to PG's
         // wording. Other errors (undefined column, etc.) propagate
         // verbatim — only TypeMismatch maps to `argument of LIMIT/OFFSET`.
-        if let Err(e) = expr::infer_expr(
+        // PG also forbids aggregates / window functions here (`aggregate
+        // functions are not allowed in LIMIT`), checked at its place in the
+        // error order: after the expression resolves, before the bigint
+        // complaint (same scheme as `coerce_bool_clause`).
+        match expr::infer_expr(
             limit_node,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             TypeGoal::assignment(oid::INT8),
         ) {
-            if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
-                return Err(e);
+            Ok(_) => {
+                check_no_aggregates_or_windows(limit_node, snapshot, label)?;
             }
-            let mut params2 = params.clone();
-            let actual_oid = expr::infer_expr(
-                limit_node,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
-                &mut params2,
-                TypeGoal::NONE,
-            )
-            .map(|t| t.type_oid)
-            .unwrap_or(oid::UNKNOWN);
-            let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-            let span = crate::error::node_location(limit_node)
-                .and_then(crate::error::SourceSpan::from_node_qname);
-            return Err(crate::error::RawError::invalid(
-                format!("argument of {label} must be type bigint, not type {actual_pg}"),
-                span,
-                None,
-            )
-            .finalize_implicit());
+            Err(e) => {
+                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                    return Err(e);
+                }
+                check_no_aggregates_or_windows(limit_node, snapshot, label)?;
+                let mut params2 = params.clone();
+                let actual_oid = expr::infer_expr(
+                    limit_node,
+                    expr::Ctx::new(&scope, &null_ctx, snapshot),
+                    &mut params2,
+                    TypeGoal::NONE,
+                )
+                .map(|t| t.type_oid)
+                .unwrap_or(oid::UNKNOWN);
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+                let span = crate::error::node_location(limit_node)
+                    .and_then(crate::error::SourceSpan::from_node_qname);
+                return Err(crate::error::RawError::invalid(
+                    format!("argument of {label} must be type bigint, not type {actual_pg}"),
+                    span,
+                    None,
+                )
+                .finalize_implicit());
+            }
         }
     }
 

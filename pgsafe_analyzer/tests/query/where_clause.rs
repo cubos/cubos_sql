@@ -509,3 +509,34 @@ fn join_on_non_boolean_uses_pg_wording() {
         "got: {err}"
     );
 }
+
+#[test]
+fn aggregate_in_limit_and_offset_rejected() {
+    // PG forbids aggregates/window calls in LIMIT/OFFSET — after the
+    // expression resolves, before the bigint-coercion complaint.
+    let db = setup();
+    let err = db
+        .analyze("SELECT id FROM users LIMIT count(*)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("aggregate functions are not allowed in LIMIT"),
+        "got: {err}"
+    );
+    let err = db
+        .analyze("SELECT id FROM users OFFSET sum(age)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("aggregate functions are not allowed in OFFSET"),
+        "got: {err}"
+    );
+    let err = db
+        .analyze("SELECT id FROM users LIMIT row_number() OVER ()")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("window functions are not allowed in LIMIT"),
+        "got: {err}"
+    );
+}
