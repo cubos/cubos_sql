@@ -346,68 +346,111 @@ impl PgCatalog {
     /// from "several candidates survived every tiebreak" — PG reports the
     /// latter as `operator is not unique: …` (SQLSTATE 42725) instead of
     /// `operator does not exist`.
+    ///
+    /// Orchestrates the §10.2 sequence; each step lives in a named helper:
+    /// exact match, then [`Self::operator_cast_step`] (implicit casts +
+    /// exactness/preferred-type tiebreaks), then
+    /// [`Self::operator_polymorphic_step`] (pseudo-type signatures), then
+    /// [`Self::operator_unknown_step`] (UNKNOWN-operand resolution).
     pub fn find_operator_detailed(
         &self,
         name: &str,
         left_oid: Option<PgTypeOid>,
         right_oid: PgTypeOid,
     ) -> OperatorMatch {
-        let mut candidate_buf: Vec<&PgOperator> = Vec::new();
-        for nsoid in self.schemas_for_lookup(None) {
-            if let Some(oids) = self.operator_by_qname.get(&(nsoid, name.to_owned())) {
-                for &oid in oids {
-                    if let Some(op) = self.pg_operator.get(&oid) {
-                        // Skip shell operators — `oprresult = None` means
-                        // the implementation hasn't been linked yet and
-                        // the operator can't appear in queries.
-                        if op.oprresult.is_some() {
-                            candidate_buf.push(op);
-                        }
-                    }
-                }
-            }
-        }
-        if candidate_buf.is_empty() {
+        let candidates = self.operator_candidates(name);
+        if candidates.is_empty() {
             return OperatorMatch::NotFound;
         }
-        let candidates = &candidate_buf;
 
         // PG §10.2 step 3b: unwrap domain types to their base types.
         let left_oid = left_oid.map(|oid| self.unwrap_domain(oid));
         let right_oid = self.unwrap_domain(right_oid);
 
-        // `oprleft = None` means prefix; the field is already an `Option`.
-        let op_left = |o: &PgOperator| -> Option<PgTypeOid> { o.oprleft };
-
-        // Step 1: exact match.
+        // Step 1: exact match. (`oprleft = None` means prefix operator.)
         if let Some(&op) = candidates
             .iter()
-            .find(|o| op_left(o) == left_oid && o.oprright == right_oid)
+            .find(|o| o.oprleft == left_oid && o.oprright == right_oid)
         {
             return op_match(concretize_operator(op, left_oid, right_oid, self));
         }
 
-        // Step 2: match via implicit casts. More than one candidate can
-        // match — PG §10.2 step 3c keeps those with the most exact matches
-        // on input types.
+        if let Some(outcome) = self.operator_cast_step(&candidates, left_oid, right_oid) {
+            return outcome;
+        }
+        if let Some(outcome) = self.operator_polymorphic_step(&candidates, left_oid, right_oid) {
+            return outcome;
+        }
+        self.operator_unknown_step(&candidates, left_oid, right_oid)
+    }
+
+    /// Candidate operators named `name` from every schema on the search path
+    /// (plus `pg_catalog` when not listed explicitly). Shell operators
+    /// (`oprresult = None` — implementation not linked yet) can't appear in
+    /// queries and are skipped.
+    fn operator_candidates(&self, name: &str) -> Vec<&PgOperator> {
+        let mut out: Vec<&PgOperator> = Vec::new();
+        for nsoid in self.schemas_for_lookup(None) {
+            if let Some(oids) = self.operator_by_qname.get(&(nsoid, name.to_owned())) {
+                for &oid in oids {
+                    if let Some(op) = self.pg_operator.get(&oid)
+                        && op.oprresult.is_some()
+                    {
+                        out.push(op);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One operand position of §10.2 matching: `actual` satisfies `declared`
+    /// exactly, via an implicit cast, or — when `poly` — via the polymorphic
+    /// shape constraint (`anyarray`, `anycompatible`, …).
+    fn operand_ok(&self, declared: PgTypeOid, actual: PgTypeOid, poly: bool) -> bool {
+        if poly && crate::polymorphic::is_polymorphic(declared) {
+            return crate::polymorphic::matches_polymorphic(declared, actual, self);
+        }
+        declared == actual || self.has_implicit_cast(actual, declared)
+    }
+
+    /// [`Self::operand_ok`] for the left operand, where `None` on both sides
+    /// means a prefix operator matching a prefix call.
+    fn left_operand_ok(
+        &self,
+        declared: Option<PgTypeOid>,
+        actual: Option<PgTypeOid>,
+        poly: bool,
+    ) -> bool {
+        match (declared, actual) {
+            (Some(d), Some(a)) => self.operand_ok(d, a, poly),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    /// Step 2: match via implicit casts. More than one candidate can match —
+    /// PG §10.2 step 3c keeps those with the most exact matches on input
+    /// types, then step 3d keeps those accepting the *preferred* type of the
+    /// input's category at the most coercion-needed positions. `None` when no
+    /// candidate is cast-compatible (fall through to the polymorphic and
+    /// UNKNOWN steps).
+    fn operator_cast_step(
+        &self,
+        candidates: &[&PgOperator],
+        left_oid: Option<PgTypeOid>,
+        right_oid: PgTypeOid,
+    ) -> Option<OperatorMatch> {
         let cast_matches: Vec<&PgOperator> = candidates
             .iter()
             .filter(|o| {
-                let left_ok = match (op_left(o), left_oid) {
-                    (Some(expected), Some(actual)) => {
-                        actual == expected || self.has_implicit_cast(actual, expected)
-                    }
-                    (None, None) => true,
-                    _ => false,
-                };
-                let right_ok =
-                    o.oprright == right_oid || self.has_implicit_cast(right_oid, o.oprright);
-                left_ok && right_ok
+                self.left_operand_ok(o.oprleft, left_oid, false)
+                    && self.operand_ok(o.oprright, right_oid, false)
             })
             .copied()
             .collect();
         let exact_score = |o: &&PgOperator| -> u8 {
-            let left_exact = match (op_left(o), left_oid) {
+            let left_exact = match (o.oprleft, left_oid) {
                 (Some(e), Some(a)) => (e == a) as u8,
                 (None, None) => 1,
                 _ => 0,
@@ -415,116 +458,85 @@ impl PgCatalog {
             let right_exact = (o.oprright == right_oid) as u8;
             left_exact + right_exact
         };
-        if let Some(max_score) = cast_matches.iter().map(exact_score).max() {
-            let mut best: Vec<&PgOperator> = cast_matches
-                .iter()
-                .filter(|o| exact_score(o) == max_score)
-                .copied()
-                .collect();
-            // PG §10.2 step 3d: among equally-exact candidates, keep those
-            // accepting the *preferred* type of the input's category at the
-            // most coercion-needed positions.
-            if best.len() > 1 {
-                let preferred_hits = |o: &&PgOperator| -> u8 {
-                    let is_pref_for =
-                        |declared: Option<PgTypeOid>, actual: Option<PgTypeOid>| -> u8 {
-                            match (declared, actual) {
-                                (Some(d), Some(a)) if d != a => {
-                                    match (self.get_type(d), self.get_type(a)) {
-                                        (Some(dt), Some(at)) => {
-                                            (dt.typispreferred && dt.typcategory == at.typcategory)
-                                                as u8
-                                        }
-                                        _ => 0,
-                                    }
-                                }
-                                _ => 0,
-                            }
-                        };
-                    is_pref_for(op_left(o), left_oid)
-                        + is_pref_for(Some(o.oprright), Some(right_oid))
+        let max_score = cast_matches.iter().map(exact_score).max()?;
+        let mut best: Vec<&PgOperator> = cast_matches
+            .iter()
+            .filter(|o| exact_score(o) == max_score)
+            .copied()
+            .collect();
+        if best.len() > 1 {
+            let preferred_hits = |o: &&PgOperator| -> u8 {
+                let left = match (o.oprleft, left_oid) {
+                    (Some(d), Some(a)) => self.is_preferred_for(d, a) as u8,
+                    _ => 0,
                 };
-                if let Some(max_pref) = best.iter().map(preferred_hits).max()
-                    && max_pref > 0
-                {
-                    best.retain(|o| preferred_hits(o) == max_pref);
-                }
-            }
-            // Several candidates surviving every concrete-args tiebreak is
-            // PG's `operator is not unique` (42725) — picking one would risk
-            // silently mistyping the expression.
-            return match best.len() {
-                1 => op_match(concretize_operator(best[0], left_oid, right_oid, self)),
-                0 => OperatorMatch::NotFound,
-                _ => OperatorMatch::Ambiguous,
+                left + self.is_preferred_for(o.oprright, right_oid) as u8
             };
+            if let Some(max_pref) = best.iter().map(preferred_hits).max()
+                && max_pref > 0
+            {
+                best.retain(|o| preferred_hits(o) == max_pref);
+            }
         }
+        // Several candidates surviving every concrete-args tiebreak is
+        // PG's `operator is not unique` (42725) — picking one would risk
+        // silently mistyping the expression.
+        Some(match best.len() {
+            1 => op_match(concretize_operator(best[0], left_oid, right_oid, self)),
+            0 => OperatorMatch::NotFound,
+            _ => OperatorMatch::Ambiguous,
+        })
+    }
 
-        // Step 2b: polymorphic match. Operators declared over pseudo-types
-        // (`anyarray || anyarray`, `anycompatible || anycompatiblearray`, …)
-        // never appear as exact matches — PG resolves them by checking the
-        // shape of the concrete operands against the pseudo-type's
-        // constraint, then substitutes the bound types into the result.
-        // UNKNOWN actuals are deliberately *not* accepted here — when one
-        // side is UNKNOWN we defer to step 3, which prefers a candidate
-        // whose known side matches *exactly* (e.g. `text || text` over
-        // `text || anynonarray` for `text || $1`; the polymorphic overload
-        // would leak the pseudo-type into the param). The gate must be
-        // explicit: `matches_polymorphic` itself accepts UNKNOWN for the
-        // non-array constraints.
-        let any_unknown = left_oid == Some(oid::UNKNOWN) || right_oid == oid::UNKNOWN;
+    /// Step 2b: polymorphic match. Operators declared over pseudo-types
+    /// (`anyarray || anyarray`, `anycompatible || anycompatiblearray`, …)
+    /// never appear as exact matches — PG resolves them by checking the
+    /// shape of the concrete operands against the pseudo-type's
+    /// constraint, then substitutes the bound types into the result.
+    /// UNKNOWN actuals are deliberately *not* accepted here — when one
+    /// side is UNKNOWN we defer to step 3, which prefers a candidate
+    /// whose known side matches *exactly* (e.g. `text || text` over
+    /// `text || anynonarray` for `text || $1`; the polymorphic overload
+    /// would leak the pseudo-type into the param). The gate must be
+    /// explicit: `matches_polymorphic` itself accepts UNKNOWN for the
+    /// non-array constraints. `None` (fall through) when no polymorphic
+    /// candidate matches or several tie on specificity.
+    fn operator_polymorphic_step(
+        &self,
+        candidates: &[&PgOperator],
+        left_oid: Option<PgTypeOid>,
+        right_oid: PgTypeOid,
+    ) -> Option<OperatorMatch> {
+        if left_oid == Some(oid::UNKNOWN) || right_oid == oid::UNKNOWN {
+            return None;
+        }
         let poly_matches: Vec<&PgOperator> = candidates
             .iter()
             .filter(|o| {
-                if any_unknown {
-                    return false;
-                }
-                let left_ok = match (op_left(o), left_oid) {
-                    (Some(expected), Some(actual))
-                        if crate::polymorphic::is_polymorphic(expected) =>
-                    {
-                        crate::polymorphic::matches_polymorphic(expected, actual, self)
-                    }
-                    (Some(expected), Some(actual)) => {
-                        expected == actual || self.has_implicit_cast(actual, expected)
-                    }
-                    (None, None) => true,
-                    _ => false,
-                };
-                let right_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
-                    crate::polymorphic::matches_polymorphic(o.oprright, right_oid, self)
-                } else {
-                    o.oprright == right_oid || self.has_implicit_cast(right_oid, o.oprright)
-                };
-                let has_any_poly = op_left(o).is_some_and(crate::polymorphic::is_polymorphic)
+                let has_any_poly = o.oprleft.is_some_and(crate::polymorphic::is_polymorphic)
                     || crate::polymorphic::is_polymorphic(o.oprright);
-                has_any_poly && left_ok && right_ok
+                has_any_poly
+                    && self.left_operand_ok(o.oprleft, left_oid, true)
+                    && self.operand_ok(o.oprright, right_oid, true)
             })
             .copied()
             .collect();
         // PG tie-break: among polymorphic candidates, pick the most specific
         // signature.
-        if !poly_matches.is_empty() {
-            let score = |o: &&PgOperator| -> u16 {
-                let l = op_left(o)
-                    .map(crate::polymorphic::polymorphic_specificity)
-                    .unwrap_or(10) as u16;
-                let r = crate::polymorphic::polymorphic_specificity(o.oprright) as u16;
-                l + r
-            };
-            if let Some(max_score) = poly_matches.iter().map(&score).max() {
-                let best: Vec<&PgOperator> = poly_matches
-                    .iter()
-                    .filter(|o| score(o) == max_score)
-                    .copied()
-                    .collect();
-                if best.len() == 1 {
-                    return op_match(concretize_operator(best[0], left_oid, right_oid, self));
-                }
-            }
-        }
+        let best = most_specific_polymorphic(&poly_matches)?;
+        Some(op_match(concretize_operator(
+            best, left_oid, right_oid, self,
+        )))
+    }
 
-        // Step 3 (PG §10.2 step 3): UNKNOWN-aware resolution.
+    /// Step 3 (PG §10.2 step 3): UNKNOWN-aware resolution — the homogeneous
+    /// `T OP T` probe for one-unknown calls, then substeps 3a–3d.
+    fn operator_unknown_step(
+        &self,
+        candidates: &[&PgOperator],
+        left_oid: Option<PgTypeOid>,
+        right_oid: PgTypeOid,
+    ) -> OperatorMatch {
         let left_unknown = left_oid == Some(oid::UNKNOWN);
         let right_unknown = right_oid == oid::UNKNOWN;
         if !left_unknown && !right_unknown {
@@ -533,13 +545,7 @@ impl PgCatalog {
 
         // When exactly one operand is UNKNOWN and the other is a concrete type
         // `T`, PG resolves the unknown to `T` — so `int4 = NULL`, `bigint > 'x'`
-        // and `int4 + NULL` are all valid. Prefer the homogeneous `T OP T`
-        // overload directly when it exists: without this, a type with
-        // cross-type operators (`int4 = int8`, `int4 = int2`, …) leaves several
-        // candidates that the category/`text` fallback below can't
-        // disambiguate, so the operator is wrongly reported as missing. The
-        // probe is exact (`oprleft == T && oprright == T`), so it only ever
-        // *adds* a resolution PG also makes — never changes an existing one.
+        // and `int4 + NULL` are all valid.
         if left_unknown ^ right_unknown {
             let known = if right_unknown {
                 left_oid
@@ -548,61 +554,10 @@ impl PgCatalog {
             };
             if let Some(t) = known
                 && t != oid::UNKNOWN
+                && let Some(outcome) =
+                    self.operator_homogeneous_probe(candidates, t, left_oid, right_oid)
             {
-                if let Some(&op) = candidates
-                    .iter()
-                    .find(|o| op_left(o) == Some(t) && o.oprright == t)
-                {
-                    return op_match(concretize_operator(op, left_oid, right_oid, self));
-                }
-                // No concrete homogeneous overload — try the polymorphic
-                // ones with *both* sides bound to `t`, most specific
-                // signature first: `tags || $1` resolves
-                // `anycompatiblearray || anycompatiblearray` over
-                // `… || anycompatible` for (text[], text[]), so the param
-                // describes as text[], matching PG. Concretize with `t` on
-                // both sides (not UNKNOWN) so substitution binds fully.
-                let homogeneous = |o: &&PgOperator| -> bool {
-                    let l_ok = match op_left(o) {
-                        Some(e) if crate::polymorphic::is_polymorphic(e) => {
-                            crate::polymorphic::matches_polymorphic(e, t, self)
-                        }
-                        Some(e) => e == t,
-                        None => false,
-                    };
-                    let r_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
-                        crate::polymorphic::matches_polymorphic(o.oprright, t, self)
-                    } else {
-                        o.oprright == t
-                    };
-                    let has_poly = op_left(o).is_some_and(crate::polymorphic::is_polymorphic)
-                        || crate::polymorphic::is_polymorphic(o.oprright);
-                    has_poly && l_ok && r_ok
-                };
-                let poly_homog: Vec<&PgOperator> = candidates
-                    .iter()
-                    .filter(|o| homogeneous(o))
-                    .copied()
-                    .collect();
-                if !poly_homog.is_empty() {
-                    let score = |o: &&PgOperator| -> u16 {
-                        let l = op_left(o)
-                            .map(crate::polymorphic::polymorphic_specificity)
-                            .unwrap_or(10) as u16;
-                        let r = crate::polymorphic::polymorphic_specificity(o.oprright) as u16;
-                        l + r
-                    };
-                    if let Some(max_score) = poly_homog.iter().map(&score).max() {
-                        let best: Vec<&PgOperator> = poly_homog
-                            .iter()
-                            .filter(|o| score(o) == max_score)
-                            .copied()
-                            .collect();
-                        if best.len() == 1 {
-                            return op_match(concretize_operator(best[0], Some(t), t, self));
-                        }
-                    }
-                }
+                return outcome;
             }
         }
 
@@ -616,24 +571,13 @@ impl PgCatalog {
         let mut remaining: Vec<&PgOperator> = candidates
             .iter()
             .filter(|o| {
-                let left_ok = match (op_left(o), left_oid) {
+                let left_ok = match (o.oprleft, left_oid) {
                     (Some(_), Some(actual)) if actual == oid::UNKNOWN => true,
-                    (Some(expected), Some(actual))
-                        if crate::polymorphic::is_polymorphic(expected) =>
-                    {
-                        crate::polymorphic::matches_polymorphic(expected, actual, self)
-                    }
-                    (Some(expected), Some(actual)) => self.has_implicit_cast(actual, expected),
+                    (Some(expected), Some(actual)) => self.operand_ok(expected, actual, true),
                     (None, None) => true,
                     _ => false,
                 };
-                let right_ok = if right_unknown {
-                    true
-                } else if crate::polymorphic::is_polymorphic(o.oprright) {
-                    crate::polymorphic::matches_polymorphic(o.oprright, right_oid, self)
-                } else {
-                    self.has_implicit_cast(right_oid, o.oprright)
-                };
+                let right_ok = right_unknown || self.operand_ok(o.oprright, right_oid, true);
                 left_ok && right_ok
             })
             .copied()
@@ -653,7 +597,7 @@ impl PgCatalog {
         if !left_unknown {
             let exact: Vec<&PgOperator> = remaining
                 .iter()
-                .filter(|o| op_left(o) == left_oid)
+                .filter(|o| o.oprleft == left_oid)
                 .copied()
                 .collect();
             if !exact.is_empty() {
@@ -684,7 +628,7 @@ impl PgCatalog {
         //     remaining candidates agree on the type category. If so, prefer
         //     the candidate that uses the *preferred* type in that category.
         if left_unknown {
-            let preferred = self.prefer_by_category(&remaining, |o| op_left(o));
+            let preferred = self.prefer_by_category(&remaining, |o| o.oprleft);
             if !preferred.is_empty() {
                 remaining = preferred;
             }
@@ -702,17 +646,16 @@ impl PgCatalog {
 
         // 3d. Final fallback: resolve UNKNOWN positions to `text`, since
         //     string constants default to text in PostgreSQL.
-        let text_oid = oid::TEXT;
         let resolved_left = if left_unknown {
-            Some(text_oid)
+            Some(oid::TEXT)
         } else {
             left_oid
         };
-        let resolved_right = if right_unknown { text_oid } else { right_oid };
+        let resolved_right = if right_unknown { oid::TEXT } else { right_oid };
 
         let exact_matches: Vec<&PgOperator> = remaining
             .iter()
-            .filter(|o| op_left(o) == resolved_left && o.oprright == resolved_right)
+            .filter(|o| o.oprleft == resolved_left && o.oprright == resolved_right)
             .copied()
             .collect();
         if exact_matches.len() == 1 {
@@ -724,32 +667,15 @@ impl PgCatalog {
             ));
         }
 
+        // A polymorphic parameter (`anynonarray` in `anynonarray || text`)
+        // accepts the resolved actual — this is what lets `int || 'x'`
+        // resolve via `anynonarray || text` once the unknown is resolved to
+        // `text`.
         let text_matches: Vec<&PgOperator> = remaining
             .iter()
             .filter(|o| {
-                let left_ok = match (op_left(o), resolved_left) {
-                    // A polymorphic parameter (`anynonarray` in
-                    // `anynonarray || text`) accepts the resolved actual — this
-                    // is what lets `int || 'x'` resolve via `anynonarray ||
-                    // text` once the unknown is resolved to `text`.
-                    (Some(expected), Some(actual))
-                        if crate::polymorphic::is_polymorphic(expected) =>
-                    {
-                        crate::polymorphic::matches_polymorphic(expected, actual, self)
-                    }
-                    (Some(expected), Some(actual)) => {
-                        expected == actual || self.has_implicit_cast(actual, expected)
-                    }
-                    (None, None) => true,
-                    _ => false,
-                };
-                let right_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
-                    crate::polymorphic::matches_polymorphic(o.oprright, resolved_right, self)
-                } else {
-                    o.oprright == resolved_right
-                        || self.has_implicit_cast(resolved_right, o.oprright)
-                };
-                left_ok && right_ok
+                self.left_operand_ok(o.oprleft, resolved_left, true)
+                    && self.operand_ok(o.oprright, resolved_right, true)
             })
             .copied()
             .collect();
@@ -770,6 +696,73 @@ impl PgCatalog {
         } else {
             OperatorMatch::NotFound
         }
+    }
+
+    /// Homogeneous probe for `unknown OP T` / `T OP unknown`: prefer the
+    /// concrete `T OP T` overload directly when it exists — without this, a
+    /// type with cross-type operators (`int4 = int8`, `int4 = int2`, …)
+    /// leaves several candidates that the category/`text` fallback can't
+    /// disambiguate, so the operator is wrongly reported as missing. The
+    /// probe is exact (`oprleft == T && oprright == T`), so it only ever
+    /// *adds* a resolution PG also makes — never changes an existing one.
+    ///
+    /// With no concrete homogeneous overload, try the polymorphic ones with
+    /// *both* sides bound to `t`, most specific signature first: `tags || $1`
+    /// resolves `anycompatiblearray || anycompatiblearray` over
+    /// `… || anycompatible` for (text[], text[]), so the param describes as
+    /// text[], matching PG. Concretize with `t` on both sides (not UNKNOWN)
+    /// so substitution binds fully.
+    fn operator_homogeneous_probe(
+        &self,
+        candidates: &[&PgOperator],
+        t: PgTypeOid,
+        left_oid: Option<PgTypeOid>,
+        right_oid: PgTypeOid,
+    ) -> Option<OperatorMatch> {
+        if let Some(&op) = candidates
+            .iter()
+            .find(|o| o.oprleft == Some(t) && o.oprright == t)
+        {
+            return Some(op_match(concretize_operator(op, left_oid, right_oid, self)));
+        }
+        let homogeneous = |o: &&PgOperator| -> bool {
+            let l_ok = match o.oprleft {
+                Some(e) if crate::polymorphic::is_polymorphic(e) => {
+                    crate::polymorphic::matches_polymorphic(e, t, self)
+                }
+                Some(e) => e == t,
+                None => false,
+            };
+            let r_ok = if crate::polymorphic::is_polymorphic(o.oprright) {
+                crate::polymorphic::matches_polymorphic(o.oprright, t, self)
+            } else {
+                o.oprright == t
+            };
+            let has_poly = o.oprleft.is_some_and(crate::polymorphic::is_polymorphic)
+                || crate::polymorphic::is_polymorphic(o.oprright);
+            has_poly && l_ok && r_ok
+        };
+        let poly_homog: Vec<&PgOperator> = candidates
+            .iter()
+            .filter(|o| homogeneous(o))
+            .copied()
+            .collect();
+        let best = most_specific_polymorphic(&poly_homog)?;
+        Some(op_match(concretize_operator(best, Some(t), t, self)))
+    }
+
+    /// PG §10.2 step 3d / §10.3 step 4d "accepts the preferred type": at a
+    /// *converted* position (`declared != actual`), the candidate's declared
+    /// type is the preferred type of the actual's category. Tests the
+    /// declared type's own `typispreferred` flag rather than asking the
+    /// catalog for "the" preferred type of a category — that lookup scans a
+    /// HashMap and isn't order-deterministic.
+    pub(crate) fn is_preferred_for(&self, declared: PgTypeOid, actual: PgTypeOid) -> bool {
+        declared != actual
+            && match (self.get_type(declared), self.get_type(actual)) {
+                (Some(dt), Some(at)) => dt.typispreferred && dt.typcategory == at.typcategory,
+                _ => false,
+            }
     }
 
     /// Among `candidates`, keep those whose type at the position extracted by
@@ -1011,6 +1004,24 @@ impl PgCatalog {
     pub fn search_path(&self) -> &[PgNamespaceOid] {
         &self.search_path
     }
+}
+
+/// Among polymorphic candidates, the unique one with the most specific
+/// signature (`anycompatiblearray` beats `anycompatible`, …); `None` when
+/// the list is empty or several candidates tie on specificity.
+fn most_specific_polymorphic<'a>(ops: &[&'a PgOperator]) -> Option<&'a PgOperator> {
+    let score = |o: &&PgOperator| -> u16 {
+        let l = o
+            .oprleft
+            .map(crate::polymorphic::polymorphic_specificity)
+            .unwrap_or(10) as u16;
+        let r = crate::polymorphic::polymorphic_specificity(o.oprright) as u16;
+        l + r
+    };
+    let max_score = ops.iter().map(score).max()?;
+    let mut best = ops.iter().filter(|o| score(o) == max_score);
+    let first = best.next()?;
+    best.next().is_none().then_some(*first)
 }
 
 /// Turn a [`PgOperator`] — which may declare polymorphic pseudo-types on its

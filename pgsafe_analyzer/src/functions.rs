@@ -508,24 +508,13 @@ fn find_cast_match<'a>(
             .filter(|f| exact(f) == best_exact)
             .collect();
         if narrowed.len() > 1 {
-            // "Accepts the preferred type": the candidate's parameter is, at a
-            // converted position, the preferred type of the argument's
-            // category. Test the parameter's own `typispreferred` flag rather
-            // than asking the catalog for "the" preferred type of a category —
-            // that lookup scans a HashMap and isn't order-deterministic.
+            // "Accepts the preferred type" — shared with operator resolution,
+            // see `PgCatalog::is_preferred_for`.
             let preferred_hits = |f: &PgProc| -> usize {
                 f.proargtypes
                     .iter()
                     .zip(arg_types)
-                    .filter(|&(&p, &a)| {
-                        p != a
-                            && match (snapshot.get_type(p), snapshot.get_type(a)) {
-                                (Some(pt), Some(at)) => {
-                                    pt.typispreferred && pt.typcategory == at.typcategory
-                                }
-                                _ => false,
-                            }
-                    })
+                    .filter(|&(&p, &a)| snapshot.is_preferred_for(p, a))
                     .count()
             };
             let best_pref = narrowed
