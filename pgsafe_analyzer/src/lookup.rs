@@ -543,8 +543,11 @@ impl PgCatalog {
                         || crate::polymorphic::is_polymorphic(o.oprright);
                     has_poly && l_ok && r_ok
                 };
-                let poly_homog: Vec<&PgOperator> =
-                    candidates.iter().filter(|o| homogeneous(o)).copied().collect();
+                let poly_homog: Vec<&PgOperator> = candidates
+                    .iter()
+                    .filter(|o| homogeneous(o))
+                    .copied()
+                    .collect();
                 if !poly_homog.is_empty() {
                     let score = |o: &&PgOperator| -> u16 {
                         let l = op_left(o)
@@ -677,7 +680,12 @@ impl PgCatalog {
             .copied()
             .collect();
         if exact_matches.len() == 1 {
-            return op_match(concretize_operator(exact_matches[0], resolved_left, resolved_right, self));
+            return op_match(concretize_operator(
+                exact_matches[0],
+                resolved_left,
+                resolved_right,
+                self,
+            ));
         }
 
         let text_matches: Vec<&PgOperator> = remaining

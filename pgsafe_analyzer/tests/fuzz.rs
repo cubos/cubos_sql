@@ -1734,7 +1734,9 @@ fn reductions(sql: &str) -> Vec<String> {
             } else {
                 return None;
             }
-            pg_query::deparse(&clone).ok().map(|s| positional_to_named(&s))
+            pg_query::deparse(&clone)
+                .ok()
+                .map(|s| positional_to_named(&s))
         };
 
         // Drop the last projection (keep at least one).

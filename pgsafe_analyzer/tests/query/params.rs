@@ -960,6 +960,8 @@ fn any_param_against_domain_column_pins_base_array() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE DOMAIN email AS TEXT; CREATE TABLE t3 (addr email);")
         .unwrap();
-    let s = db.analyze("SELECT 1 FROM t3 WHERE addr = ANY($p1)").unwrap();
+    let s = db
+        .analyze("SELECT 1 FROM t3 WHERE addr = ANY($p1)")
+        .unwrap();
     assert_params(&s, vec![p(array_of(text()))]);
 }

@@ -46,9 +46,10 @@ pub(crate) fn analyze_set_operation(
     // type — PG's Describe reports `SELECT $1 UNION ALL SELECT age` with $1
     // as the other branch's type, not text. Pin direct ParamRef targets
     // before the per-column merge below.
-    for (branch, own_cols, peer_cols) in
-        [(left, &left_cols, &right_cols), (right, &right_cols, &left_cols)]
-    {
+    for (branch, own_cols, peer_cols) in [
+        (left, &left_cols, &right_cols),
+        (right, &right_cols, &left_cols),
+    ] {
         for (i, target) in branch.target_list.iter().enumerate() {
             if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
                 && let Some(val) = &rt.val
