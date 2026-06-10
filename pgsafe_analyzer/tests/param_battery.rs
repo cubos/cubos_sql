@@ -56,6 +56,7 @@ const BATTERY: &[&str] = &[
     "SELECT id FROM users WHERE st IN ($p1, 'draft')",
     "SELECT id FROM users WHERE id = ANY($p1)",
     "SELECT id FROM users WHERE $p1 = ANY(tags)",
+    "SELECT id FROM users WHERE addr = ANY($p1)",
     "SELECT id FROM users WHERE addr IS DISTINCT FROM $p1",
     // bare-context defaults
     "SELECT $p1 IS NULL",

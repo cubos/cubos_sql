@@ -952,3 +952,14 @@ fn array_concat_param_adopts_array_type() {
     let s = db2.analyze("SELECT $p1 || nums FROM a").unwrap();
     assert_params(&s, vec![p(array_of(int4()))]);
 }
+
+#[test]
+fn any_param_against_domain_column_pins_base_array() {
+    // Operators resolve over the domain's base type — PG describes
+    // `addr = ANY($1)` (addr being a text domain) as text[], not email[].
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE DOMAIN email AS TEXT; CREATE TABLE t3 (addr email);")
+        .unwrap();
+    let s = db.analyze("SELECT 1 FROM t3 WHERE addr = ANY($p1)").unwrap();
+    assert_params(&s, vec![p(array_of(text()))]);
+}

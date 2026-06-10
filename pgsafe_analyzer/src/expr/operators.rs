@@ -410,7 +410,10 @@ fn handle_any_all(
     // left is concrete T, right is unknown → right must be T[].
     if left_oid != oid::UNKNOWN
         && right_oid == oid::UNKNOWN
-        && let Some(arr_oid) = snapshot.array_type_of(left_oid)
+        // Operators resolve over the domain's *base* type, so a domain
+        // column pins the param to the base's array (`email_col = ANY($1)`
+        // → text[], matching PG's Describe), not the domain's.
+        && let Some(arr_oid) = snapshot.array_type_of(snapshot.unwrap_domain(left_oid))
         && let Some(rexpr) = &expr.rexpr
     {
         swallow_unless_literal(infer_expr(rexpr, ctx, params, TypeGoal::implicit(arr_oid)))?;
