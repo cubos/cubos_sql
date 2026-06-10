@@ -206,3 +206,24 @@ fn union_varchar_first_branch_keeps_varchar() {
         .unwrap();
     assert_cols(&s, vec![c("v", text())]);
 }
+
+#[test]
+fn set_op_column_count_mismatch_uses_pg_wording() {
+    let db = setup();
+    let err = db
+        .analyze("SELECT id FROM users UNION SELECT id, title FROM posts")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("each UNION query must have the same number of columns"),
+        "got: {err}"
+    );
+    let err = db
+        .analyze("SELECT id FROM users INTERSECT SELECT id, title FROM posts")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("each INTERSECT query must have the same number of columns"),
+        "got: {err}"
+    );
+}

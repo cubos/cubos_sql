@@ -452,3 +452,47 @@ fn in_subquery_with_castable_types_accepted() {
         .unwrap();
     assert_eq!(col(&s, "id").pg_type, int8());
 }
+
+// ── LATERAL scope semantics (resolution precedence, ambiguity, `*`) ─────────
+
+#[test]
+fn lateral_star_excludes_lateral_sources() {
+    // Inside a LATERAL subquery, `SELECT *` expands only the subquery's own
+    // FROM — the laterally-visible outer aliases are reachable by name but
+    // are not part of the star.
+    let db = setup();
+    let s = db
+        .analyze("SELECT l.* FROM users, LATERAL (SELECT * FROM posts) AS l")
+        .unwrap();
+    assert_eq!(
+        s.columns.len(),
+        db.analyze("SELECT * FROM posts").unwrap().columns.len(),
+        "lateral star must expand only the inner FROM"
+    );
+}
+
+#[test]
+fn lateral_inner_from_shadows_lateral_ref() {
+    // `id` exists in both the inner FROM (posts) and the lateral outer
+    // (users) — PG resolves to the inner one with no ambiguity.
+    let db = setup();
+    db.analyze("SELECT 1 FROM users, LATERAL (SELECT id + 1 AS q FROM posts) AS l")
+        .unwrap();
+}
+
+#[test]
+fn lateral_two_same_level_sources_are_ambiguous() {
+    // Two lateral sources at the same level sharing a column name *are*
+    // ambiguous when referenced from the subquery.
+    let db = setup();
+    let err = db
+        .analyze(
+            "SELECT 1 FROM users u1, users u2, LATERAL (SELECT name || 'x' AS q FROM posts) AS l",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("column reference \"name\" is ambiguous"),
+        "got: {err}"
+    );
+}

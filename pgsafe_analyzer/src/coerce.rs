@@ -149,6 +149,13 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         return None;
     }
 
+    // PG's first pass: when *every* input — unknowns/NULLs included — is the
+    // exact same type, keep it as-is. This is the only path that preserves a
+    // domain: `COALESCE(d, d)` is `d`.
+    if types[0] != oid::UNKNOWN && types.iter().all(|&t| t == types[0]) {
+        return Some(types[0]);
+    }
+
     let concrete: Vec<PgTypeOid> = types
         .iter()
         .copied()
@@ -158,15 +165,10 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         return Some(oid::TEXT);
     }
 
-    // All branches the *same* type (including the same domain) keep that type —
-    // `COALESCE(d, d)` is `d`, not its base.
-    if concrete.iter().all(|&t| t == concrete[0]) {
-        return Some(concrete[0]);
-    }
-
-    // Otherwise PG resolves the common type over the *base* types: a domain
-    // contributes its base, so `COALESCE(email, text)` is `text` and the
-    // "cannot be matched" wording reports base names. Smash domains here.
+    // Any mixed input — even just a NULL alongside a single domain — goes
+    // through PG's main loop, which smashes every input to its base type
+    // up front (`getBaseType`): `COALESCE(d, NULL)` is the *base*, and the
+    // "cannot be matched" wording reports base names. Verified on PG 18.
     let concrete: Vec<PgTypeOid> = concrete
         .iter()
         .map(|&t| snapshot.unwrap_domain(t))

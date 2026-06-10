@@ -23,13 +23,22 @@ pub(crate) fn analyze_correlated_select(
     params: &mut ParamCollector,
     outer_scope: &crate::scope::Scope,
 ) -> AnalyzeResult {
+    // Everything the enclosing level can see — its own FROM plus any
+    // lateral refs it received — is reachable from the sublink as a
+    // correlated (fallback-only) reference.
+    let outer: Vec<_> = outer_scope
+        .sources
+        .iter()
+        .chain(outer_scope.lateral_sources.iter())
+        .cloned()
+        .collect();
     analyze_select_with_ctes_and_outer(
         sel,
         snapshot,
         params,
         &HashMap::new(),
         &[],
-        &outer_scope.sources,
+        &outer,
         &[],
     )
 }
@@ -98,12 +107,14 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     }
 
     let mut scope = Scope::default();
-    // LATERAL: outer aliases live as if locally declared (visible to `*`,
-    // can be referenced unqualified, etc.). Correlated sublinks: outer
-    // aliases are only a fallback so an inner alias of the same name
-    // shadows correctly. Shadowed: aliases live only as a hint for the
-    // diagnostic when the SQL reaches across the boundary.
-    scope.sources.extend(lateral_sources.iter().cloned());
+    // LATERAL: outer aliases resolve like outer references — the subquery's
+    // own FROM wins first, they're excluded from `*` expansion, and two
+    // lateral sources sharing a column name are ambiguous among themselves
+    // (their own tier). Correlated sublinks: outer aliases are only a
+    // fallback so an inner alias of the same name shadows correctly.
+    // Shadowed: aliases live only as a hint for the diagnostic when the SQL
+    // reaches across the boundary.
+    scope.lateral_sources.extend(lateral_sources.iter().cloned());
     scope
         .outer_sources
         .extend(correlated_sources.iter().cloned());

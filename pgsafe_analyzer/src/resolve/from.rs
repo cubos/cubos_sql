@@ -161,10 +161,19 @@ pub(crate) fn process_from_item(
                 // but tracked so a stray reference produces PG's exact
                 // `invalid reference to FROM-clause entry for table "x"`
                 // diagnostic instead of a generic missing-column message.
+                // Lateral visibility is transitive: a LATERAL subquery nested
+                // inside another one still sees the outermost lateral refs,
+                // so pass the enclosing scope's own lateral tier along too.
+                let visible: Vec<_> = scope
+                    .sources
+                    .iter()
+                    .chain(scope.lateral_sources.iter())
+                    .cloned()
+                    .collect();
                 let (lateral_sources, shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
-                    (scope.sources.clone(), Vec::new())
+                    (visible, Vec::new())
                 } else {
-                    (Vec::new(), scope.sources.clone())
+                    (Vec::new(), visible)
                 };
                 let (cols, _) = analyze_select_with_ctes_and_outer(
                     sel,
@@ -373,6 +382,9 @@ fn infer_srf_arg_types(
     // Non-LATERAL SRF args can't see the enclosing FROM; LATERAL args can.
     let mut arg_scope = Scope::default();
     arg_scope.sources.extend(scope.sources.clone());
+    arg_scope
+        .lateral_sources
+        .extend(scope.lateral_sources.clone());
     arg_scope.outer_sources.extend(scope.outer_sources.clone());
     let empty_null_ctx = NullabilityContext::default();
     let mut arg_types = Vec::with_capacity(func_call.args.len());

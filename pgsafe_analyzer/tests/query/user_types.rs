@@ -691,3 +691,48 @@ fn schema_qualified_domain_param() {
         Some("pg_catalog.jsonb"),
     );
 }
+
+// ── Domains in common-type resolution (select_common_type) ──────────────────
+
+#[test]
+fn all_same_domain_branches_preserve_domain() {
+    // PG's first pass keeps the type when *every* input is identical —
+    // `COALESCE(d, d)` stays the domain.
+    let db = setup_scalar_domains();
+    let s = db
+        .analyze("SELECT COALESCE(addr, addr) AS v FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", domain("public", "email", text()))]);
+}
+
+#[test]
+fn domain_with_null_branch_resolves_to_base() {
+    // A NULL alongside sends the resolution through PG's main loop, which
+    // smashes every input to its base type — `COALESCE(d, NULL)` is text.
+    let db = setup_scalar_domains();
+    let s = db
+        .analyze("SELECT COALESCE(addr, NULL) AS v FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", text())]);
+
+    let s = db
+        .analyze("SELECT GREATEST(n, NULL) AS v FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", int4())]);
+}
+
+#[test]
+fn case_without_else_smashes_domain_to_base() {
+    // The implicit `ELSE NULL` participates in common-type resolution, so a
+    // missing ELSE also degrades the domain to its base type.
+    let db = setup_scalar_domains();
+    let s = db
+        .analyze("SELECT CASE WHEN true THEN addr END AS v FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", text())]);
+    // With an explicit same-domain ELSE the domain is preserved.
+    let s = db
+        .analyze("SELECT CASE WHEN true THEN addr ELSE addr END AS v FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", domain("public", "email", text()))]);
+}

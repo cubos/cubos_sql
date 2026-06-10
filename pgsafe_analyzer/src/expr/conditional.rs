@@ -88,7 +88,11 @@ pub(crate) fn infer_coalesce(
             .preferred_type_in_category(TypCategory::String)
             .unwrap_or(oid::UNKNOWN)
     } else {
-        coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
+        // Resolve over the *full* arg list (unknowns included): the
+        // all-identical fast path that preserves domains must see a NULL
+        // branch — `COALESCE(d, NULL)` is the base type, `COALESCE(d, d)`
+        // stays `d`.
+        coerce::find_common_type(&types, snapshot).ok_or_else(|| {
             // PG (SQLSTATE 42804): `COALESCE types A and B cannot be
             // matched`. PG reports the COALESCE args in source order
             // (first then last), the *opposite* of CASE which orders the
@@ -198,6 +202,11 @@ pub(crate) fn infer_case(
         types.push(t.type_oid);
         any_branch_nullable = any_branch_nullable || t.nullable;
     } else {
+        // PG adds an implicit `ELSE NULL`, and that NULL participates in
+        // common-type resolution — it's what keeps `CASE WHEN c THEN
+        // domain_col END` from preserving the domain (the all-same-type
+        // fast path requires *every* input identical).
+        types.push(oid::UNKNOWN);
         any_branch_nullable = true;
     }
 
@@ -216,7 +225,9 @@ pub(crate) fn infer_case(
             .preferred_type_in_category(TypCategory::String)
             .unwrap_or(oid::UNKNOWN)
     } else {
-        coerce::find_common_type(&concrete_types, snapshot).ok_or_else(|| {
+        // Full branch list (unknowns included) — see the COALESCE note: the
+        // implicit `ELSE NULL` must defeat the domain-preserving fast path.
+        coerce::find_common_type(&types, snapshot).ok_or_else(|| {
             // PG: `CASE types A and B cannot be matched` — last branch
             // first, candidate type from prior branches second. Report base
             // type names (domains are resolved over their base).

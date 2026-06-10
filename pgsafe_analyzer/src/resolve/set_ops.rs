@@ -22,10 +22,24 @@ pub(crate) fn analyze_set_operation(
     let (left_cols, _) = analyze_select_with_ctes(left, snapshot, params, cte_scopes)?;
     let (right_cols, _) = analyze_select_with_ctes(right, snapshot, params, cte_scopes)?;
 
+    // PG names the operation in both error messages below.
+    let op_label = match protobuf::SetOperation::try_from(sel.op) {
+        Ok(protobuf::SetOperation::SetopIntersect) => "INTERSECT",
+        Ok(protobuf::SetOperation::SetopExcept) => "EXCEPT",
+        _ => "UNION",
+    };
+
     if left_cols.len() != right_cols.len() {
-        return Err(AnalyzeError::Unsupported(
-            "UNION branches have different column counts".into(),
-        ));
+        return Err(crate::error::RawError::invalid(
+            format!("each {op_label} query must have the same number of columns"),
+            None,
+            Some(format!(
+                "the left side produces {} column(s), the right side {}",
+                left_cols.len(),
+                right_cols.len(),
+            )),
+        )
+        .finalize_implicit());
     }
 
     let mut columns = Vec::with_capacity(left_cols.len());
@@ -39,13 +53,14 @@ pub(crate) fn analyze_set_operation(
             (Some(t), _) => t,
             (None, true) => {
                 // PG (SQLSTATE 42804): `UNION types A and B cannot be
-                // matched`. Use `Invalid` to keep
-                // `TypeMismatch::Display`'s generic prefix from leaking.
+                // matched` — INTERSECT/EXCEPT use their own name. Use
+                // `Invalid` to keep `TypeMismatch::Display`'s generic prefix
+                // from leaking.
                 let a = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
                 let b = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
                 return Err(crate::error::RawError::invalid(
                     format!(
-                        "UNION types {a} and {b} cannot be matched (column `{}`)",
+                        "{op_label} types {a} and {b} cannot be matched (column `{}`)",
                         l.name,
                     ),
                     None,

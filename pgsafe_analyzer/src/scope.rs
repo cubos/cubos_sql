@@ -62,6 +62,13 @@ pub(crate) struct TableSource {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
+    /// Same-level FROM items made visible by `LATERAL`. PG resolves them
+    /// like outer references: the subquery's own `sources` win first, these
+    /// come next, and ambiguity is only raised *within* a tier (two lateral
+    /// sources sharing a column name is ambiguous; a lateral source sharing
+    /// a name with an inner source is not). Excluded from `*` expansion —
+    /// `SELECT * FROM b` inside `LATERAL (…)` produces only `b`'s columns.
+    pub lateral_sources: Vec<TableSource>,
     pub outer_sources: Vec<TableSource>,
     /// Aliases that exist in the enclosing scope but are *not* visible here
     /// — same shape PG uses for non-LATERAL subqueries: a reference like
@@ -228,6 +235,7 @@ impl Scope {
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
         self.sources
             .iter()
+            .chain(self.lateral_sources.iter())
             .chain(self.outer_sources.iter())
             .find(|s| s.alias == alias)
     }
@@ -239,7 +247,12 @@ impl Scope {
         span: Option<SourceSpan>,
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
-            for source in self.sources.iter().chain(self.outer_sources.iter()) {
+            for source in self
+                .sources
+                .iter()
+                .chain(self.lateral_sources.iter())
+                .chain(self.outer_sources.iter())
+            {
                 if source.alias == t
                     && let Some(col) = source
                         .columns
@@ -274,7 +287,7 @@ impl Scope {
             ));
         }
 
-        for tier in [&self.sources, &self.outer_sources] {
+        for tier in [&self.sources, &self.lateral_sources, &self.outer_sources] {
             let mut matches: Vec<&ScopeColumn> = Vec::new();
             for source in tier {
                 if let Some(col) = source.columns.iter().find(|c| c.name == column) {
