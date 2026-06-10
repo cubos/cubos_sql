@@ -282,18 +282,31 @@ fn array_literal_bool_and_int_rejected() {
 }
 
 #[test]
-fn array_literal_unknown_and_int_accepted_by_analyzer() {
-    // Analyzer-only acceptance: `'x'` is an unknown literal coerced toward
-    // the int4 branch, and our analyzer takes the lenient path (lands the
-    // array on `int4[]`). Real PG runs `int4in('x')` during constant
-    // folding at parse_analyze and raises `invalid input syntax for type
-    // integer: "x"`. Replicating PG's per-type input parsers is outside
-    // the analyzer's scope (see NULLIF/CASE/COALESCE peers), so we accept
-    // the divergence and skip the mirror — the query would still fail at
-    // runtime in real PG.
-    let mut db = setup();
-    db.skip_pg_sanity();
-    let s = db.analyze("SELECT ARRAY['x', 1] AS xs").unwrap();
+fn array_literal_with_invalid_unknown_content_rejected() {
+    // `'x'` is an unknown literal coerced to the int4 branch's type; PG runs
+    // `int4in('x')` at parse_analyze time and raises `invalid input syntax
+    // for type integer: "x"`. The analyzer mirrors that via `literal_input`.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT ARRAY['x', 1] AS xs"),
+        AnalyzeError::InvalidLiteral(_),
+        concat!(
+            "invalid input syntax for type integer: \"x\"\n",
+            "  ╭────\n",
+            "1 │ SELECT ARRAY['x', 1] AS xs\n",
+            "  ·              ─┬─\n",
+            "  ·               ╰─ this literal\n",
+            "  ╰────\n",
+        ),
+    );
+}
+
+#[test]
+fn array_literal_with_valid_unknown_content_coerced() {
+    // The flip side: `'2'` parses fine as int4, so the array lands on
+    // `int4[]` exactly like PG.
+    let db = setup();
+    let s = db.analyze("SELECT ARRAY['2', 1] AS xs").unwrap();
     assert_cols(&s, vec![c("xs", array_of(int4()))]);
 }
 

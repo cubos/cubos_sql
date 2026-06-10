@@ -89,6 +89,19 @@ pub enum AnalyzeError {
     #[error("{0}")]
     Invalid(String),
 
+    /// An untyped string literal's *content* is not valid input for the
+    /// concrete type the context coerces it to (`'x'::int`,
+    /// `WHERE int_col = 'x'`, …). PG runs the type's input function on such
+    /// constants at parse-analysis time; this mirrors `invalid_text_
+    /// representation` (22P02) and friends with PG's verbatim wording.
+    ///
+    /// Kept as its own variant (rather than folded into [`Self::Invalid`])
+    /// because inference sites that *speculatively* re-walk an expression
+    /// under a type goal — operator/CASE/COALESCE back-fills, whose other
+    /// failures are deliberately swallowed — must still propagate this one.
+    #[error("{0}")]
+    InvalidLiteral(String),
+
     /// The parser reported a JOIN kind the analyzer does not recognize.
     /// Returned instead of silently falling back to INNER JOIN semantics,
     /// which would produce incorrect nullability.
@@ -643,6 +656,18 @@ impl RawError {
         }
     }
 
+    /// Build an `InvalidLiteral` raw error (a string literal whose content
+    /// fails the target type's input function at parse time).
+    pub(crate) fn invalid_literal(message: String, span: Option<SourceSpan>) -> Self {
+        let primary = span.map(|s| DiagnosticLabel::new(s, "this literal"));
+        Self {
+            kind: AnalyzeError::InvalidLiteral(message),
+            primary,
+            secondaries: Vec::new(),
+            hint: None,
+        }
+    }
+
     /// Build an `Unsupported` raw error.
     #[allow(dead_code)] // infra reserved for variants not yet migrated
     pub(crate) fn unsupported(
@@ -758,6 +783,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::IndeterminateType(_) => AnalyzeError::IndeterminateType(rendered),
         AnalyzeError::Unsupported(_) => AnalyzeError::Unsupported(rendered),
         AnalyzeError::Invalid(_) => AnalyzeError::Invalid(rendered),
+        AnalyzeError::InvalidLiteral(_) => AnalyzeError::InvalidLiteral(rendered),
         AnalyzeError::UndefinedType(_) => AnalyzeError::UndefinedType(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..

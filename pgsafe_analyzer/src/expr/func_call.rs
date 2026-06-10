@@ -57,7 +57,7 @@ pub(crate) fn infer_func_call(
     }
 
     // Pass 2: back-fill UNKNOWN args from the resolved signature.
-    backfill_func_args(func, &args, &resolved, ctx, params);
+    backfill_func_args(func, &args, &resolved, ctx, params)?;
 
     // Walk aggregate / window modifiers so embedded params and column refs
     // are inferred and validated.
@@ -190,7 +190,7 @@ fn backfill_func_args(
     resolved: &functions::ResolvedFunction,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-) {
+) -> Result<(), AnalyzeError> {
     for (i, arg) in func.args.iter().enumerate() {
         if i >= args.direct_count {
             break;
@@ -199,9 +199,13 @@ fn backfill_func_args(
             && let Some(&expected) = resolved.arg_types.get(i)
             && expected != oid::UNKNOWN
         {
-            let _ = infer_expr(arg, ctx, params, TypeGoal::implicit(expected));
+            // Speculative re-walk: ordinary failures are swallowed, but a
+            // literal-content rejection is the parse-time error PG itself
+            // raises from this argument coercion (`sqrt('x')`).
+            swallow_unless_literal(infer_expr(arg, ctx, params, TypeGoal::implicit(expected)))?;
         }
     }
+    Ok(())
 }
 
 /// Walk aggregate modifiers so any `$N` placeholders they contain get their
@@ -216,7 +220,28 @@ fn walk_func_modifiers(
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     if let Some(filter) = &func.agg_filter {
-        infer_expr(filter, ctx, params, TypeGoal::implicit(oid::BOOL))?;
+        // FILTER is a boolean clause like WHERE; on a coerce-to-bool
+        // mismatch PG names the clause: `argument of FILTER must be type
+        // boolean, not type X`. Other errors propagate as-is.
+        if let Err(e) = infer_expr(filter, ctx, params, TypeGoal::assignment(oid::BOOL)) {
+            if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                return Err(e);
+            }
+            let mut params2 = params.clone();
+            let actual_oid = infer_expr(filter, ctx, &mut params2, TypeGoal::NONE)
+                .map(|t| t.type_oid)
+                .unwrap_or(oid::UNKNOWN);
+            let actual_pg = crate::ddl::util::format_type_for_message(ctx.snapshot, actual_oid);
+            let span = crate::error::node_location(filter)
+                .and_then(crate::error::SourceSpan::from_node_qname);
+            return Err(crate::error::RawError::invalid(
+                format!("argument of FILTER must be type boolean, not type {actual_pg}"),
+                span,
+                None,
+            )
+            .with_primary_label(format!("this is {actual_pg}, expected boolean"))
+            .finalize_implicit());
+        }
     }
     // Per-aggregate `ORDER BY` (e.g. `array_agg(x ORDER BY y)`). For
     // ordered-set aggregates (`WITHIN GROUP`) the sort expressions were

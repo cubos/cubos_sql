@@ -24,6 +24,8 @@ mod dml;
 mod expressions;
 #[path = "query/joins.rs"]
 mod joins;
+#[path = "query/literal_input.rs"]
+mod literal_input;
 #[path = "query/params.rs"]
 mod params;
 #[path = "query/records.rs"]

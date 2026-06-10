@@ -132,31 +132,18 @@ pub(crate) fn can_cast_explicit(
     false
 }
 
-/// Numeric type promotion order (lower index = less preferred).
-const NUMERIC_PROMOTION: &[(PgTypeOid, u8)] = &[
-    (oid::INT2, 0),
-    (oid::INT4, 1),
-    (oid::INT8, 2),
-    (oid::NUMERIC, 3),
-    (oid::FLOAT4, 4),
-    (oid::FLOAT8, 5),
-];
-
-fn numeric_rank(type_oid: PgTypeOid) -> Option<u8> {
-    NUMERIC_PROMOTION
-        .iter()
-        .find(|(oid, _)| *oid == type_oid)
-        .map(|(_, rank)| *rank)
-}
-
-/// Check if a type is a string-like type.
-fn is_string_type(type_oid: PgTypeOid) -> bool {
-    matches!(type_oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME)
-}
-
 /// Find the common supertype for a list of types.
 ///
-/// Used for CASE, COALESCE, UNION column reconciliation.
+/// Used for CASE, COALESCE, UNION, ARRAY, and VALUES column reconciliation.
+///
+/// Mirrors PG's `select_common_type` (parse_coerce.c): start from the first
+/// concrete type and switch the running candidate to a later type only when
+/// the candidate isn't its category's preferred type and the implicit cast
+/// between them is *one-way* (candidate → next but not back). The
+/// directionality matters: `varchar` then `text` keeps **varchar** (the casts
+/// are bidirectional), while `int4` then `int8` promotes to **int8**. A
+/// category mismatch — or a survivor some input can't implicitly reach —
+/// yields `None`, which callers render as PG's "X and Y cannot be matched".
 pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Option<PgTypeOid> {
     if types.is_empty() {
         return None;
@@ -189,29 +176,35 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         return Some(concrete[0]);
     }
 
-    if concrete.iter().all(|t| numeric_rank(*t).is_some()) {
-        return concrete.iter().max_by_key(|t| numeric_rank(**t)).copied();
-    }
+    let category = |t: PgTypeOid| snapshot.get_type(t).map(|ty| ty.typcategory);
+    let preferred = |t: PgTypeOid| snapshot.get_type(t).is_some_and(|ty| ty.typispreferred);
 
-    if concrete.iter().all(|t| is_string_type(*t)) {
-        return Some(oid::TEXT);
-    }
-
-    for &candidate in &concrete {
-        if concrete
-            .iter()
-            .all(|&t| t == candidate || snapshot.has_implicit_cast(t, candidate))
+    let mut ptype = concrete[0];
+    let pcategory = category(ptype)?;
+    for &n in &concrete[1..] {
+        if n == ptype {
+            continue;
+        }
+        if category(n) != Some(pcategory) {
+            return None;
+        }
+        if !preferred(ptype)
+            && snapshot.has_implicit_cast(ptype, n)
+            && !snapshot.has_implicit_cast(n, ptype)
         {
-            return Some(candidate);
+            ptype = n;
         }
     }
 
+    // PG defers this check to the per-value coercion step; folding it in here
+    // keeps the callers' single "cannot be matched" path for same-category
+    // pairs with no implicit route (e.g. two different enum types).
     if concrete
         .iter()
-        .all(|&t| t == oid::TEXT || snapshot.has_implicit_cast(t, oid::TEXT))
+        .all(|&t| t == ptype || snapshot.has_implicit_cast(t, ptype))
     {
-        return Some(oid::TEXT);
+        Some(ptype)
+    } else {
+        None
     }
-
-    None
 }

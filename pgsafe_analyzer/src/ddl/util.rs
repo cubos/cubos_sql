@@ -166,11 +166,14 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     };
 
     // Array deconstruction. PG checks `IsTrueArrayType(typeform) &&
-    // typeform->typstorage != TYPSTORAGE_PLAIN` — we approximate with
-    // `typcategory == Array` and a present `typelem`, which excludes
-    // `oidvector`/`int2vector` (plain-storage pseudo-arrays).
+    // typeform->typstorage != TYPSTORAGE_PLAIN` — we approximate by
+    // requiring the element's canonical `typarray` to point back at this
+    // type, which excludes `oidvector`/`int2vector` (plain-storage
+    // pseudo-arrays that PG renders by their own name, e.g.
+    // `function to_char(oidvector) does not exist`).
     if t.typcategory == crate::pg_catalog::TypCategory::Array
         && let Some(elem_oid) = t.typelem
+        && snapshot.array_type_of(elem_oid) == Some(oid)
     {
         return format!("{}[]", format_type_for_message(snapshot, elem_oid));
     }

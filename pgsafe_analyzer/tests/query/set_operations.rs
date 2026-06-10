@@ -187,3 +187,22 @@ fn complex_union_three_branches() {
     // All three NOT NULL → union NOT NULL.
     assert!(!col(&info, "label").nullable);
 }
+
+#[test]
+fn union_varchar_first_branch_keeps_varchar() {
+    // PG's `select_common_type` only switches the running candidate when the
+    // implicit cast is one-way; varchar ↔ text casts exist in both
+    // directions, so the *first* branch's type wins: varchar UNION text is
+    // varchar (and text UNION varchar is text). Found by the differential
+    // fuzzer — collapsing every string mix to text diverges from Describe.
+    let db = setup();
+    let s = db
+        .analyze("SELECT name::varchar AS v FROM users UNION SELECT title FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("v", varchar())]);
+
+    let s = db
+        .analyze("SELECT name AS v FROM users UNION SELECT title::varchar FROM posts")
+        .unwrap();
+    assert_cols(&s, vec![c("v", text())]);
+}

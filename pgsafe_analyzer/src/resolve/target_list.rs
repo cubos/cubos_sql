@@ -164,11 +164,42 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
+    let common: Vec<PgTypeOid> = (0..arity)
+        .map(|i| {
+            crate::coerce::find_common_type(&column_types[i], snapshot).unwrap_or(oid::UNKNOWN)
+        })
+        .collect();
+
+    // Back-fill: re-walk cells whose type stayed UNKNOWN with the column's
+    // resolved common type as the goal, so `(VALUES (42), ($1))` pins the
+    // param to int4 (matching PG's Describe) and string-literal contents
+    // get validated. Speculative-walk rules apply: only literal-content
+    // rejections propagate.
+    let mut row_idx = 0usize;
+    for row_node in values_lists {
+        let Some(node::Node::List(row)) = row_node.node.as_ref() else {
+            continue;
+        };
+        for (i, item) in row.items.iter().enumerate() {
+            if i >= arity || common[i] == oid::UNKNOWN {
+                continue;
+            }
+            if column_types[i].get(row_idx) == Some(&oid::UNKNOWN) {
+                expr::swallow_unless_literal(expr::infer_expr(
+                    item,
+                    expr::Ctx::new(&empty_scope, &empty_null, snapshot),
+                    params,
+                    TypeGoal::implicit(common[i]),
+                ))?;
+            }
+        }
+        row_idx += 1;
+    }
+
     let columns = (0..arity)
         .map(|i| RawColumn {
             name: format!("column{}", i + 1),
-            type_oid: crate::coerce::find_common_type(&column_types[i], snapshot)
-                .unwrap_or(oid::UNKNOWN),
+            type_oid: common[i],
             nullable: column_nullable[i],
             typmod: None,
             // VALUES literals don't carry a column-level collation — PG

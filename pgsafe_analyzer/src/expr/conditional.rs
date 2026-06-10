@@ -57,15 +57,17 @@ pub(crate) fn infer_coalesce(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
-    // Pass 1: infer all args bottom-up. Bare string literals in UNKNOWN slots
-    // are reinterpreted as `text` so `COALESCE(int_col, 'x')` rejects instead
-    // of silently coercing the literal under the concrete branch's type.
+    // Pass 1: infer all args bottom-up. Bare string literals stay UNKNOWN —
+    // exactly like PG's `select_common_type` — and get coerced (and their
+    // content validated) under the resolved common type in pass 2, so
+    // `COALESCE(int_col, '42')` is integer and `COALESCE(int_col, 'x')`
+    // fails with PG's `invalid input syntax for type integer: "x"`.
     let mut types = Vec::new();
     let mut all_nullable = true;
 
     for arg in &expr.args {
         let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
-        types.push(unknown_literal_as_text(Some(arg), t.type_oid));
+        types.push(t.type_oid);
         if !t.nullable {
             all_nullable = false;
         }
@@ -114,11 +116,12 @@ pub(crate) fn infer_coalesce(
         })?
     };
 
-    // Pass 2: back-fill UNKNOWN args with the resolved common type.
+    // Pass 2: back-fill UNKNOWN args with the resolved common type. Literal
+    // content rejections propagate (PG raises them from this coercion).
     if type_oid != oid::UNKNOWN {
         for (i, arg) in expr.args.iter().enumerate() {
             if types[i] == oid::UNKNOWN {
-                let _ = infer_expr(arg, ctx, params, TypeGoal::implicit(type_oid));
+                swallow_unless_literal(infer_expr(arg, ctx, params, TypeGoal::implicit(type_oid)))?;
             }
         }
     }
@@ -176,13 +179,14 @@ pub(crate) fn infer_case(
                 .with_primary_label(format!("this is {actual_pg}, expected boolean"))
                 .finalize_implicit());
             }
-            // THEN result. Untyped string literals are reinterpreted as
-            // `text` for branch reconciliation — PG's common-type rules
-            // compare literal syntax against the concrete branch's type
-            // and reject mismatches like `CASE … THEN 1 ELSE 'x' END`.
+            // THEN result. Untyped string literals stay UNKNOWN for branch
+            // reconciliation (PG's `select_common_type` behavior); their
+            // content is validated under the resolved common type in pass 2,
+            // so `CASE … THEN 1 ELSE 'x' END` fails with PG's `invalid input
+            // syntax for type integer: "x"` while `… ELSE '2' END` is fine.
             if let Some(result) = &when.result {
                 let t = infer_expr(result, ctx, params, TypeGoal::NONE)?;
-                types.push(unknown_literal_as_text(Some(result), t.type_oid));
+                types.push(t.type_oid);
                 any_branch_nullable = any_branch_nullable || t.nullable;
             }
         }
@@ -191,7 +195,7 @@ pub(crate) fn infer_case(
     // ELSE clause.
     if let Some(defresult) = &expr.defresult {
         let t = infer_expr(defresult, ctx, params, TypeGoal::NONE)?;
-        types.push(unknown_literal_as_text(Some(defresult), t.type_oid));
+        types.push(t.type_oid);
         any_branch_nullable = any_branch_nullable || t.nullable;
     } else {
         any_branch_nullable = true;
@@ -236,6 +240,8 @@ pub(crate) fn infer_case(
     };
 
     // Pass 2: back-fill UNKNOWN result branches with the common type.
+    // Literal content rejections propagate (PG raises them from this
+    // coercion).
     if type_oid != oid::UNKNOWN {
         let mut type_idx = 0;
         for arg in &expr.args {
@@ -243,7 +249,12 @@ pub(crate) fn infer_case(
                 && let Some(result) = &when.result
             {
                 if types.get(type_idx) == Some(&oid::UNKNOWN) {
-                    let _ = infer_expr(result, ctx, params, TypeGoal::implicit(type_oid));
+                    swallow_unless_literal(infer_expr(
+                        result,
+                        ctx,
+                        params,
+                        TypeGoal::implicit(type_oid),
+                    ))?;
                 }
                 type_idx += 1;
             }
@@ -251,7 +262,12 @@ pub(crate) fn infer_case(
         if let Some(defresult) = &expr.defresult
             && types.get(type_idx) == Some(&oid::UNKNOWN)
         {
-            let _ = infer_expr(defresult, ctx, params, TypeGoal::implicit(type_oid));
+            swallow_unless_literal(infer_expr(
+                defresult,
+                ctx,
+                params,
+                TypeGoal::implicit(type_oid),
+            ))?;
         }
     }
 

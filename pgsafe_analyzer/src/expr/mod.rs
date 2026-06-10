@@ -452,8 +452,53 @@ pub(crate) fn infer_expr(
             }
             let resolved_type = match PgTypeOid::new(mm.minmaxtype) {
                 Some(t) if t != oid::UNKNOWN => t,
-                _ => crate::coerce::find_common_type(&arg_oids, snapshot).unwrap_or(oid::UNKNOWN),
+                _ => crate::coerce::find_common_type(&arg_oids, snapshot).ok_or_else(|| {
+                    // PG (SQLSTATE 42804): `GREATEST types X and Y cannot be
+                    // matched` — first/last concrete args, base type names
+                    // (domains resolve over their base), same shape as the
+                    // COALESCE wording.
+                    let label = match protobuf::MinMaxOp::try_from(mm.op) {
+                        Ok(protobuf::MinMaxOp::IsLeast) => "LEAST",
+                        _ => "GREATEST",
+                    };
+                    let concrete: Vec<PgTypeOid> = arg_oids
+                        .iter()
+                        .copied()
+                        .filter(|&t| t != oid::UNKNOWN)
+                        .collect();
+                    let first = crate::ddl::util::format_type_for_message(
+                        snapshot,
+                        snapshot.unwrap_domain(*concrete.first().unwrap_or(&oid::UNKNOWN)),
+                    );
+                    let last = crate::ddl::util::format_type_for_message(
+                        snapshot,
+                        snapshot.unwrap_domain(*concrete.last().unwrap_or(&oid::UNKNOWN)),
+                    );
+                    crate::error::RawError::invalid(
+                        format!("{label} types {first} and {last} cannot be matched"),
+                        None,
+                        Some(format!(
+                            "add an explicit cast so the arguments share a type, e.g. `expr::{last}`"
+                        )),
+                    )
+                    .finalize_implicit()
+                })?,
             };
+            // Back-fill UNKNOWN args with the resolved common type so
+            // embedded params get pinned and string-literal contents are
+            // validated (PG rejects `GREATEST(1, 'x')` at parse time).
+            if resolved_type != oid::UNKNOWN {
+                for (arg, &t) in mm.args.iter().zip(&arg_oids) {
+                    if t == oid::UNKNOWN {
+                        swallow_unless_literal(infer_expr(
+                            arg,
+                            ctx,
+                            params,
+                            TypeGoal::implicit(resolved_type),
+                        ))?;
+                    }
+                }
+            }
             // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
             Ok(ExprType::scalar(resolved_type, !any_arg || all_nullable))
         }
@@ -665,11 +710,41 @@ pub(crate) fn infer_expr(
         ))),
     }?;
 
+    // PG runs the target type's input function on untyped string-literal
+    // constants the moment a context coerces them to a concrete type
+    // (`coerce_type` → `stringTypeDatum`), so `WHERE int_col = 'x'` fails at
+    // parse time with `invalid input syntax for type integer: "x"`. Mirror
+    // it: a string literal whose type stayed UNKNOWN meeting a concrete goal
+    // gets its *content* validated here.
+    if goal.has_expectation()
+        && result.type_oid == oid::UNKNOWN
+        && let Some(node::Node::AConst(ac)) = node.node.as_ref()
+        && !ac.isnull
+        && let Some(a_const::Val::Sval(sv)) = &ac.val
+        && let Err(msg) = crate::literal_input::validate(&sv.sval, goal.type_oid, snapshot)
+    {
+        let span =
+            crate::error::node_location(node).and_then(crate::error::SourceSpan::from_node_token);
+        return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
+    }
+
     // Verify result is compatible with the goal type. Pass the location
     // of the offending expression so a `TypeMismatch` carries a snippet.
     check_goal_compatibility(&result, &goal, snapshot, crate::error::node_location(node))?;
 
     Ok(result)
+}
+
+/// Filter for *speculative* re-inference sites (operator / CASE / COALESCE /
+/// function-argument back-fills): most failures there just mean the candidate
+/// goal didn't fit and are deliberately swallowed, but a literal-content
+/// rejection is exactly the error PG itself raises from that coercion, so it
+/// must survive. Returns `Err` only for [`AnalyzeError::InvalidLiteral`].
+pub(crate) fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeError> {
+    match r {
+        Err(e @ AnalyzeError::InvalidLiteral(_)) => Err(e),
+        _ => Ok(()),
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

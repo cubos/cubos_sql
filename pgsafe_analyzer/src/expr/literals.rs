@@ -53,6 +53,20 @@ pub(crate) fn infer_type_cast(
 
     let target_oid = resolve_type_name(cast.type_name.as_ref(), snapshot)?;
 
+    // PG validates the *content* of an untyped string literal against the
+    // target's input function at parse time (`'x'::int` fails prepare with
+    // `invalid input syntax for type integer: "x"`). Mirror it for the types
+    // we model — see `literal_input`.
+    if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+        && !ac.isnull
+        && let Some(a_const::Val::Sval(sv)) = &ac.val
+        && let Err(msg) = crate::literal_input::validate(&sv.sval, target_oid, snapshot)
+    {
+        let span =
+            crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
+        return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
+    }
+
     // An explicit cast (::type / CAST) overrides type checking — we do NOT
     // check compatibility of the inner expression against the target type.
     // The inner expression is normally inferred with NONE to avoid false

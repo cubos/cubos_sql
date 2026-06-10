@@ -32,7 +32,12 @@
 //!   4. a **metamorphic** check (`metamorphic_check`) that wraps a valid query
 //!      in a pass-through subquery/CTE and asserts the analyzer reports the same
 //!      column type/nullability shape — the only way to test nullability
-//!      propagation, since PG's wire protocol doesn't expose it.
+//!      propagation, since PG's wire protocol doesn't expose it; and
+//!   5. a **literal-content probe** (`gen_literal_probe`) that pushes a pool of
+//!      valid/invalid literal strings (`'0x1F'`, `'1_'`, `'NaN'`, `'[1,]'`, …)
+//!      through every coercion context (cast, operator, COALESCE, INSERT)
+//!      against a wide type surface — stressing the analyzer's parse-time
+//!      input validation (`literal_input`) in both directions.
 //!
 //! It also fuzzes the **schema**: each run extends the fixed base with a seeded
 //! random schema (`gen_random_schema`) — domains, composites, multi-dim arrays,
@@ -367,6 +372,115 @@ const BASE_TYPE_NAMES: &[&str] = &[
     "bytea",
 ];
 
+/// Cast targets for the literal-probe generator (Strategy 5): the base types
+/// plus types whose *input syntax* the analyzer validates (or deliberately
+/// doesn't) — ranges, arrays, json, datetimes, geometrics, reg*, and the
+/// schema's own enum/domain. Probing `'<content>'::<type>` across this
+/// surface checks both rejection wording and acceptance agreement.
+const PROBE_TYPE_NAMES: &[&str] = &[
+    "int2",
+    "int4",
+    "int8",
+    "oid",
+    "float4",
+    "float8",
+    "numeric",
+    "bool",
+    "uuid",
+    "json",
+    "jsonb",
+    "int4range",
+    "numrange",
+    "tstzrange",
+    "int4[]",
+    "text[]",
+    "date",
+    "time",
+    "timetz",
+    "timestamp",
+    "timestamptz",
+    "interval",
+    "macaddr",
+    "inet",
+    "point",
+    "box",
+    "bit",
+    "varbit",
+    "money",
+    "regclass",
+    "regtype",
+    "regproc",
+    "bytea",
+    "text",
+    "status", // enum from the fixed schema
+    "email",  // domain over text
+];
+
+/// Literal contents for the probe generator — a mix of valid and invalid
+/// inputs per type family: integer radix/underscore forms (PG 16+), float
+/// specials, malformed numerics, array/range/json shapes, uuid variants,
+/// datetime keywords, enum labels. Every entry is interesting against
+/// *several* of the types above.
+const LITERAL_PROBES: &[&str] = &[
+    "",
+    " ",
+    "x",
+    "hello",
+    "42",
+    "-7",
+    " 42 ",
+    "+42",
+    "- 42",
+    "0x1F",
+    "0o17",
+    "0b101",
+    "1_000",
+    "1__0",
+    "1_",
+    "_1",
+    "42abc",
+    "2147483648",
+    "9999999999999999999999",
+    "3.14",
+    ".5",
+    "5.",
+    "1e3",
+    "1e",
+    "1.2.3",
+    "NaN",
+    "inf",
+    "-Infinity",
+    "t",
+    "tr",
+    "ye",
+    "of",
+    "o",
+    "10",
+    "{}",
+    "{1,2}",
+    "{\"a\": 1}",
+    "[1,2]",
+    "[1,2)",
+    "(1,2]",
+    "empty",
+    " EMPTY ",
+    "[1,]",
+    "01",
+    "nullx",
+    "1.5e3",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+    "a0eebc999c0b4ef8bb6d6bb9bd380a11",
+    "a0-eebc999c0b4ef8bb6d6bb9bd380a11",
+    "now",
+    "2024-01-01",
+    "1 day",
+    "draft",
+    "published",
+    "bogus_label",
+    "users",
+    "no_such_relation",
+];
+
 // ──────────────────────────────────────────────────────────────────────────
 // Strategy 1 — schema-driven template generation.
 // ──────────────────────────────────────────────────────────────────────────
@@ -424,7 +538,7 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             literal_for(ty, rng)
         };
     }
-    match rng.gen_range(0..8) {
+    match rng.gen_range(0..12) {
         0 => {
             // Binary op.
             let op = OPERATORS[rng.gen_range(0..OPERATORS.len())];
@@ -434,6 +548,66 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
                 op,
                 gen_expr(table, depth - 1, rng, np)
             )
+        }
+        8 => {
+            // NULL test / IS DISTINCT FROM — always-boolean predicates that
+            // accept any operand type.
+            let col = random_col(table, rng);
+            match rng.gen_range(0..3) {
+                0 => format!("({} IS NULL)", col.name),
+                1 => format!("({} IS NOT NULL)", gen_expr(table, depth - 1, rng, np)),
+                _ => format!(
+                    "({} IS DISTINCT FROM {})",
+                    col.name,
+                    literal_for(col.ty, rng)
+                ),
+            }
+        }
+        9 => {
+            // BETWEEN / IN-list / = ANY(array) over a column, usually with
+            // literals of the column's own type (the mutator mistypes them
+            // later, exercising per-bound coercion errors).
+            let col = random_col(table, rng);
+            match rng.gen_range(0..3) {
+                0 => format!(
+                    "({} BETWEEN {} AND {})",
+                    col.name,
+                    literal_for(col.ty, rng),
+                    literal_for(col.ty, rng)
+                ),
+                1 => format!(
+                    "({} IN ({}, {}))",
+                    col.name,
+                    literal_for(col.ty, rng),
+                    literal_for(col.ty, rng)
+                ),
+                _ => format!(
+                    "({} = ANY(ARRAY[{}, {}]))",
+                    col.name,
+                    literal_for(col.ty, rng),
+                    literal_for(col.ty, rng)
+                ),
+            }
+        }
+        10 => {
+            // Array subscript / slice over one of the array columns.
+            let arr = if rng.gen_bool(0.5) { "tags" } else { "nums" };
+            if table.cols.iter().any(|c| c.name == arr) {
+                if rng.gen_bool(0.3) {
+                    format!("({arr}[1:2])")
+                } else {
+                    format!("({}[{}])", arr, gen_expr(table, depth - 1, rng, np))
+                }
+            } else {
+                gen_expr(table, depth - 1, rng, np)
+            }
+        }
+        11 => {
+            // Literal-content probe in expression position: stresses the
+            // analyzer's parse-time input validation (`literal_input`).
+            let lit = LITERAL_PROBES[rng.gen_range(0..LITERAL_PROBES.len())];
+            let ty = PROBE_TYPE_NAMES[rng.gen_range(0..PROBE_TYPE_NAMES.len())];
+            format!("('{}'::{})", lit.replace('\'', "''"), ty)
         }
         7 => {
             // Type-aware comparison: a column against a literal — or a bare
@@ -475,9 +649,19 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             gen_expr(table, depth - 1, rng, np)
         ),
         5 => {
-            // Aggregate (valid only with/without GROUP BY; the oracle judges).
+            // Aggregate (valid only with/without GROUP BY; the oracle
+            // judges), occasionally with a FILTER clause — placement and
+            // FILTER-must-be-boolean rules get exercised for free.
             let agg = ["count", "sum", "avg", "min", "max"][rng.gen_range(0..5)];
-            format!("{}({})", agg, gen_expr(table, depth - 1, rng, np))
+            let call = format!("{}({})", agg, gen_expr(table, depth - 1, rng, np));
+            if rng.gen_bool(0.2) {
+                format!(
+                    "({call} FILTER (WHERE {}))",
+                    gen_expr(table, depth - 1, rng, np)
+                )
+            } else {
+                call
+            }
         }
         _ => format!("(NOT {})", gen_expr(table, depth - 1, rng, np)),
     }
@@ -533,9 +717,10 @@ fn pick_cols<'a>(cols: &[&'a Col], k: usize, rng: &mut StdRng) -> Vec<&'a Col> {
 fn gen_statement(rng: &mut StdRng) -> String {
     let np = &mut 0u32;
     match rng.gen_range(0..100) {
-        0..=54 => gen_select(rng, np),
-        55..=66 => gen_set_op(rng, np),
-        67..=74 => gen_cte(rng, np),
+        0..=49 => gen_select(rng, np),
+        50..=60 => gen_set_op(rng, np),
+        61..=68 => gen_cte(rng, np),
+        69..=74 => gen_values_select(rng, np),
         _ => gen_dml(rng, np),
     }
 }
@@ -552,12 +737,15 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
         _ => {}
     }
 
-    // Projection: 1..4 expressions, occasionally a scalar subquery.
+    // Projection: 1..4 expressions, occasionally a scalar subquery or a
+    // window function call (placement + frame rules judged by the oracle).
     let n = rng.gen_range(1..4);
     let projs: Vec<String> = (0..n)
         .map(|i| {
             let e = if rng.gen_bool(0.15) {
                 gen_scalar_subquery(rng, np)
+            } else if rng.gen_bool(0.12) {
+                gen_window_call(table, rng, np)
             } else {
                 gen_expr(table, 3, rng, np)
             };
@@ -571,19 +759,26 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
     sql.push_str(&projs.join(", "));
     sql.push_str(&format!(" FROM {}", table.name));
 
-    // Optional join — varied type. CROSS JOIN takes no ON clause.
+    // Optional join — varied type. CROSS JOIN takes no ON clause; LATERAL
+    // subqueries may reference the left table's columns.
     if rng.gen_bool(0.25) {
         let other = pick_table(rng);
-        let jt =
-            ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN"][rng.gen_range(0..5)];
-        if jt == "CROSS JOIN" {
-            sql.push_str(&format!(" CROSS JOIN {} AS j", other.name));
-        } else {
-            sql.push_str(&format!(
-                " {jt} {} AS j ON {}",
+        match rng.gen_range(0..6) {
+            0 => sql.push_str(&format!(" CROSS JOIN {} AS j", other.name)),
+            1 => sql.push_str(&format!(
+                ", LATERAL (SELECT {} AS lx FROM {} WHERE {}) AS l",
+                gen_expr(other, 2, rng, np),
                 other.name,
-                gen_expr(table, 2, rng, np)
-            ));
+                gen_expr(table, 2, rng, np),
+            )),
+            r => {
+                let jt = ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"][r - 2];
+                sql.push_str(&format!(
+                    " {jt} {} AS j ON {}",
+                    other.name,
+                    gen_expr(table, 2, rng, np)
+                ));
+            }
         }
     }
 
@@ -599,10 +794,26 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
     if rng.gen_bool(0.2) {
         let c = random_col(table, rng);
         sql.push_str(&format!(" GROUP BY {}", c.name));
+        // HAVING — sometimes an aggregate predicate (valid), sometimes an
+        // arbitrary expression (exercises HAVING placement / boolean rules).
+        if rng.gen_bool(0.4) {
+            let pred = if rng.gen_bool(0.5) {
+                format!("count(*) > {}", rng.gen_range(0..5))
+            } else {
+                gen_expr(table, 2, rng, np)
+            };
+            sql.push_str(&format!(" HAVING {pred}"));
+        }
     }
 
     if rng.gen_bool(0.2) {
         sql.push_str(&format!(" ORDER BY {}", gen_expr(table, 2, rng, np)));
+        match rng.gen_range(0..4) {
+            0 => sql.push_str(" DESC"),
+            1 => sql.push_str(" NULLS FIRST"),
+            2 => sql.push_str(" DESC NULLS LAST"),
+            _ => {}
+        }
     }
 
     if rng.gen_bool(0.2) {
@@ -612,9 +823,45 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
             _ => gen_expr(table, 1, rng, np),
         };
         sql.push_str(&format!(" LIMIT {lim}"));
+        if rng.gen_bool(0.3) {
+            sql.push_str(&format!(" OFFSET {}", rng.gen_range(0..10)));
+        }
     }
 
     sql
+}
+
+/// A window-function call for a projection slot: ranking functions,
+/// aggregates with OVER, and the value-window family (`lag`/`lead`, whose
+/// edge-NULL semantics make nullability interesting).
+fn gen_window_call(table: &Table, rng: &mut StdRng, np: &mut u32) -> String {
+    let over = {
+        let mut parts = Vec::new();
+        if rng.gen_bool(0.5) {
+            parts.push(format!("PARTITION BY {}", random_col(table, rng).name));
+        }
+        if rng.gen_bool(0.7) {
+            parts.push(format!("ORDER BY {}", random_col(table, rng).name));
+        }
+        parts.join(" ")
+    };
+    match rng.gen_range(0..4) {
+        0 => format!(
+            "{}() OVER ({over})",
+            ["row_number", "rank", "dense_rank"][rng.gen_range(0..3)]
+        ),
+        1 => format!(
+            "{}({}) OVER ({over})",
+            ["sum", "avg", "min", "max", "count"][rng.gen_range(0..5)],
+            random_col(table, rng).name
+        ),
+        2 => format!(
+            "{}({}) OVER ({over})",
+            ["lag", "lead", "first_value", "last_value"][rng.gen_range(0..4)],
+            random_col(table, rng).name
+        ),
+        _ => format!("ntile({}) OVER ({over})", gen_expr(table, 1, rng, np)),
+    }
 }
 
 /// `SELECT <projs> FROM <table> [WHERE <expr>]` — no clauses that would be
@@ -723,16 +970,118 @@ fn gen_insert(rng: &mut StdRng, np: &mut u32) -> String {
     let k = rng.gen_range(1..=cols.len().min(4));
     let chosen = pick_cols(&cols, k, rng);
     let collist = chosen.iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
-    let vals = chosen
-        .iter()
-        .map(|c| gen_insert_value(c, rng, np))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut sql = format!("INSERT INTO {} ({collist}) VALUES ({vals})", table.name);
+    let mut sql = if rng.gen_bool(0.2) {
+        // INSERT … SELECT — arity and per-column assignment coercion across
+        // a query source instead of a VALUES list.
+        let src = pick_table(rng);
+        let exprs: Vec<String> = (0..k).map(|_| gen_expr(src, 2, rng, np)).collect();
+        format!(
+            "INSERT INTO {} ({collist}) SELECT {} FROM {}",
+            table.name,
+            exprs.join(", "),
+            src.name
+        )
+    } else {
+        let vals = chosen
+            .iter()
+            .map(|c| gen_insert_value(c, rng, np))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("INSERT INTO {} ({collist}) VALUES ({vals})", table.name)
+    };
+    // ON CONFLICT over the PK — DO NOTHING or DO UPDATE with a (sometimes
+    // mistyped) SET, plus the EXCLUDED pseudo-relation occasionally.
+    if rng.gen_bool(0.15) {
+        match rng.gen_range(0..3) {
+            0 => sql.push_str(" ON CONFLICT (id) DO NOTHING"),
+            1 => {
+                let c = chosen[rng.gen_range(0..chosen.len())];
+                sql.push_str(&format!(
+                    " ON CONFLICT (id) DO UPDATE SET {} = {}",
+                    c.name,
+                    literal_for(c.ty, rng)
+                ));
+            }
+            _ => {
+                let c = chosen[rng.gen_range(0..chosen.len())];
+                sql.push_str(&format!(
+                    " ON CONFLICT (id) DO UPDATE SET {} = EXCLUDED.{}",
+                    c.name, c.name
+                ));
+            }
+        }
+    }
     if rng.gen_bool(0.4) {
         sql.push_str(&gen_returning(table, rng, np));
     }
     sql
+}
+
+/// `SELECT … FROM (VALUES …) AS v(a, b)` — a derived VALUES table: column
+/// aliasing, cross-row common-type resolution, and the unknown-literal
+/// column case all live here.
+fn gen_values_select(rng: &mut StdRng, np: &mut u32) -> String {
+    let n_rows = rng.gen_range(1..=3);
+    let n_cols = rng.gen_range(1..=3);
+    let rows: Vec<String> = (0..n_rows)
+        .map(|_| {
+            let vals: Vec<String> = (0..n_cols)
+                .map(|_| {
+                    if rng.gen_bool(0.15) {
+                        format!("${}", next_param(np))
+                    } else {
+                        scalar_literal(rng)
+                    }
+                })
+                .collect();
+            format!("({})", vals.join(", "))
+        })
+        .collect();
+    let aliases: Vec<String> = (0..n_cols).map(|i| format!("a{i}")).collect();
+    let proj = if rng.gen_bool(0.5) {
+        "*".to_string()
+    } else {
+        aliases[rng.gen_range(0..aliases.len())].clone()
+    };
+    format!(
+        "SELECT {proj} FROM (VALUES {}) AS v({})",
+        rows.join(", "),
+        aliases.join(", ")
+    )
+}
+
+/// A standalone literal-content probe (Strategy 5): `'<content>'::<type>`
+/// in one of several coercion contexts — explicit cast, comparison against
+/// a typed column, COALESCE branch, INSERT assignment. Directly stresses
+/// the analyzer's parse-time input validation (`literal_input`) in both
+/// directions: rejections must match PG's wording, acceptances must agree
+/// on the result type.
+fn gen_literal_probe(rng: &mut StdRng) -> String {
+    let lit = LITERAL_PROBES[rng.gen_range(0..LITERAL_PROBES.len())].replace('\'', "''");
+    let ty = PROBE_TYPE_NAMES[rng.gen_range(0..PROBE_TYPE_NAMES.len())];
+    match rng.gen_range(0..5) {
+        0 => format!("SELECT '{lit}'::{ty} AS c0"),
+        1 => format!("SELECT '{lit}'::{ty} AS c0 FROM users"),
+        2 => {
+            // Comparison against a typed column — the literal is coerced by
+            // operator resolution, not an explicit cast.
+            let table = pick_table(rng);
+            let col = random_col(table, rng);
+            format!("SELECT id FROM {} WHERE {} = '{lit}'", table.name, col.name)
+        }
+        3 => {
+            let table = pick_table(rng);
+            let col = random_col(table, rng);
+            format!("SELECT COALESCE({}, '{lit}') FROM {}", col.name, table.name)
+        }
+        _ => {
+            // INSERT assignment context.
+            let table = pick_table(rng);
+            let cols: Vec<&Col> = table.cols.iter().filter(|c| c.name != "id").collect();
+            let col = cols[rng.gen_range(0..cols.len())];
+            format!("INSERT INTO {} ({}) VALUES ('{lit}')", table.name, col.name)
+        }
+    }
 }
 
 fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
@@ -1118,6 +1467,28 @@ const SEEDS: &[&str] = &[
     "SELECT CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END FROM users",
     "SELECT id::text, score::int FROM users",
     "SELECT extract(year FROM created_at) FROM users",
+    // Window functions / FILTER / HAVING / set-returning shapes.
+    "SELECT row_number() OVER (ORDER BY id) FROM users",
+    "SELECT sum(views) OVER (PARTITION BY user_id ORDER BY id) FROM posts",
+    "SELECT lag(title) OVER (ORDER BY published_at) FROM posts",
+    "SELECT count(*) FILTER (WHERE active) FROM users",
+    "SELECT st, count(*) FROM users GROUP BY st HAVING count(*) > 1",
+    // Predicate special forms.
+    "SELECT id FROM users WHERE age BETWEEN 18 AND 65",
+    "SELECT id FROM users WHERE st IN ('draft', 'published')",
+    "SELECT id FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
+    "SELECT name FROM users WHERE addr IS DISTINCT FROM 'x'",
+    "SELECT id FROM posts WHERE published_at IS NOT NULL",
+    // Conditional / minmax functions.
+    "SELECT GREATEST(age, 5), LEAST(views, 10) FROM users, posts",
+    "SELECT NULLIF(score, 0) FROM users",
+    "SELECT COALESCE(body, title, 'untitled') FROM posts",
+    // DML beyond single-row VALUES.
+    "INSERT INTO posts (user_id, title) SELECT id, name FROM users RETURNING id",
+    "INSERT INTO users (name) VALUES ('x') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+    // Derived tables.
+    "SELECT v.a FROM (VALUES (1, 'x'), (2, 'y')) AS v(a, b)",
+    "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id)",
 ];
 
 fn str_node(s: &str) -> protobuf::Node {
@@ -1174,7 +1545,11 @@ fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
                         ival: rng.gen_range(-5..1000),
                     }),
                     1 => a_const::Val::Sval(protobuf::String {
-                        sval: ["x", "hello", ""][rng.gen_range(0..3)].to_string(),
+                        // Drawn from the literal-probe pool so constant
+                        // mutations stress the input-syntax validators too
+                        // (radix/underscore ints, float specials, array /
+                        // range / json shapes, datetime keywords, …).
+                        sval: LITERAL_PROBES[rng.gen_range(0..LITERAL_PROBES.len())].to_string(),
                     }),
                     2 => a_const::Val::Boolval(protobuf::Boolean {
                         boolval: rng.gen_bool(0.5),
@@ -1316,8 +1691,11 @@ fn minimize(db: &PgCatalog, sql: &str, kind: DivergenceKind) -> String {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// A stable signature for a divergence: kind + the message with the
-/// query-specific `SQL:\n---\n…\n---\n` block stripped, so two findings with
-/// the same root cause but different triggering queries collapse to one.
+/// query-specific `SQL:\n---\n…\n---\n` block stripped and content
+/// placeholders normalized (quoted strings → `"_"`, digit runs → `N`), so
+/// two findings with the same root cause but different triggering queries /
+/// literal contents collapse to one. Twenty probes of `'<garbage>'::date`
+/// are one missing validator, not twenty findings.
 fn signature(div: &Divergence) -> String {
     let stripped = match (div.message.find("SQL:\n---\n"), div.message.find("\n---\n")) {
         (Some(start), _) => {
@@ -1332,7 +1710,37 @@ fn signature(div: &Divergence) -> String {
         }
         _ => div.message.clone(),
     };
-    format!("{:?}|{}", div.kind, stripped)
+    format!("{:?}|{}", div.kind, collapse_content(&stripped))
+}
+
+/// Collapse `"quoted"` spans to `"_"` and digit runs to `N` — shared by the
+/// dedup signature and the summary's family bucketing.
+fn collapse_content(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_quote = false;
+    let mut prev_digit = false;
+    for c in line.chars() {
+        if c == '"' {
+            if !in_quote {
+                out.push_str("\"_\"");
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        if c.is_ascii_digit() {
+            if !prev_digit {
+                out.push('N');
+            }
+            prev_digit = true;
+        } else {
+            prev_digit = false;
+            out.push(c);
+        }
+    }
+    out
 }
 
 struct Finding {
@@ -1493,8 +1901,11 @@ fn fuzz_analyze_against_pg() {
         // merely on *which* simultaneous error each side reports first — by
         // design we don't treat that ordering as a bug (see CLAUDE.md), so
         // those findings are kept separate and de-prioritized.
-        let single_fault = (35..70).contains(&roll) && !valid_seeds.is_empty();
-        let sql = if roll < 18 {
+        // Literal probes (32..40) are single-coercion by construction, so
+        // they share the high-signal tier with the single-edit mutations.
+        let single_fault =
+            (32..40).contains(&roll) || ((40..80).contains(&roll) && !valid_seeds.is_empty());
+        let sql = if roll < 15 {
             // Type-directed generator (Strategy 3): valid by construction, so
             // the oracle can compare column types — the highest-value
             // divergence on accepted queries. Falls back to the template
@@ -1503,13 +1914,20 @@ fn fuzz_analyze_against_pg() {
                 Some(q) => q,
                 None => gen_statement(&mut rng),
             }
-        } else if roll < 35 {
-            // Template generator (SELECT / set-op / CTE / DML).
+        } else if roll < 32 {
+            // Template generator (SELECT / set-op / CTE / VALUES / DML).
             let q = gen_statement(&mut rng);
             if pg_query::parse(&q).is_ok() && live_seeds.len() < 400 {
                 live_seeds.push(q.clone());
             }
             q
+        } else if roll < 40 {
+            // Literal-content probe (Strategy 5): single coercion of a
+            // string literal into a typed context. By construction these
+            // have at most one fault, so the report must match PG verbatim
+            // — treated as high-signal below via `single_fault`'s sibling
+            // branch in the recording (probe shapes are single-coercion).
+            gen_literal_probe(&mut rng)
         } else if single_fault {
             // Single-fault: one edit over a known-valid base.
             let base = valid_seeds[rng.gen_range(0..valid_seeds.len())].clone();
@@ -1695,35 +2113,8 @@ fn family(f: &Finding) -> String {
         .lines()
         .find_map(|l| l.trim_start().strip_prefix("PG (expected prefix): "))
         .or_else(|| f.message.lines().next())
-        .unwrap_or("")
-        .to_string();
-
-    // Collapse "<quoted>" → "_" and runs of digits → N.
-    let mut out = String::with_capacity(line.len());
-    let mut in_quote = false;
-    let mut prev_digit = false;
-    for c in line.chars() {
-        if c == '"' {
-            if !in_quote {
-                out.push_str("\"_\"");
-            }
-            in_quote = !in_quote;
-            continue;
-        }
-        if in_quote {
-            continue;
-        }
-        if c.is_ascii_digit() {
-            if !prev_digit {
-                out.push('N');
-            }
-            prev_digit = true;
-        } else {
-            prev_digit = false;
-            out.push(c);
-        }
-    }
-    out
+        .unwrap_or("");
+    collapse_content(line)
 }
 
 fn print_summary(iters: u32, findings: &BTreeMap<String, Finding>) {

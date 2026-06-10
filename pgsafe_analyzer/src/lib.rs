@@ -39,6 +39,7 @@ mod expr;
 mod functions;
 mod grouping;
 mod lexer;
+mod literal_input;
 mod lookup;
 mod nullability;
 mod oid;

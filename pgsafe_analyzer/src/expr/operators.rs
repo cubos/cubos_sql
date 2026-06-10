@@ -84,51 +84,50 @@ fn handle_nullif(
     let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
 
     // Back-fill UNKNOWN side with the concrete side via implicit goal so
-    // params and bare unknowns get pinned. Errors here are non-fatal: a
-    // genuinely incompatible pair falls through to the operator check.
+    // params and bare unknowns get pinned. Errors here are non-fatal (a
+    // genuinely incompatible pair falls through to the operator check) —
+    // except a literal-content rejection, which is exactly the error PG
+    // raises from this coercion (`NULLIF(1, 'x')` → `invalid input syntax
+    // for type integer: "x"`).
     let left_oid_final = if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
-        expr.lexpr
+        match expr
+            .lexpr
             .as_ref()
-            .and_then(|n| {
-                infer_expr(n, ctx, params, TypeGoal::implicit(right_oid))
-                    .ok()
-                    .map(|t| t.type_oid)
-            })
-            .unwrap_or(left_oid)
+            .map(|n| infer_expr(n, ctx, params, TypeGoal::implicit(right_oid)))
+        {
+            Some(Ok(t)) => t.type_oid,
+            Some(Err(e @ AnalyzeError::InvalidLiteral(_))) => return Err(e),
+            _ => left_oid,
+        }
     } else {
         left_oid
     };
     let right_oid_final = if right_oid == oid::UNKNOWN && left_oid_final != oid::UNKNOWN {
-        expr.rexpr
+        match expr
+            .rexpr
             .as_ref()
-            .and_then(|n| {
-                infer_expr(n, ctx, params, TypeGoal::implicit(left_oid_final))
-                    .ok()
-                    .map(|t| t.type_oid)
-            })
-            .unwrap_or(right_oid)
+            .map(|n| infer_expr(n, ctx, params, TypeGoal::implicit(left_oid_final)))
+        {
+            Some(Ok(t)) => t.type_oid,
+            Some(Err(e @ AnalyzeError::InvalidLiteral(_))) => return Err(e),
+            _ => right_oid,
+        }
     } else {
         right_oid
     };
 
-    // Validate: `=` must be defined between the two types. For untyped
-    // string literals (`'x'`), treat them as `text` during the check so
-    // `NULLIF(int, 'x')` still surfaces a type clash (analyzer is more
-    // strict than PG here, which validates the literal at parse_analyze
-    // time and would emit `invalid input syntax for type integer`).
-    let left_for_check = unknown_literal_as_text(expr.lexpr.as_deref(), left_oid_final);
-    let right_for_check = unknown_literal_as_text(expr.rexpr.as_deref(), right_oid_final);
-    if left_for_check != oid::UNKNOWN
-        && right_for_check != oid::UNKNOWN
+    // Validate: `=` must be defined between the two types.
+    if left_oid_final != oid::UNKNOWN
+        && right_oid_final != oid::UNKNOWN
         && snapshot
-            .find_operator("=", Some(left_for_check), right_for_check)
+            .find_operator("=", Some(left_oid_final), right_oid_final)
             .is_none()
     {
         // PG's wording is `operator does not exist: A = B`. We append the
         // NULLIF context as a suffix so the macro caller still sees that
         // it was a NULLIF-shape mismatch.
-        let l = crate::ddl::util::format_type_for_message(snapshot, left_for_check);
-        let r = crate::ddl::util::format_type_for_message(snapshot, right_for_check);
+        let l = crate::ddl::util::format_type_for_message(snapshot, left_oid_final);
+        let r = crate::ddl::util::format_type_for_message(snapshot, right_oid_final);
         return Err(AnalyzeError::Invalid(format!(
             "operator does not exist: {l} = {r} \
              (NULLIF types {l} and {r} cannot be matched)"
@@ -155,6 +154,7 @@ fn handle_distinct_from(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
+    let Ctx { snapshot, .. } = ctx;
     if !matches!(
         protobuf::AExprKind::try_from(expr.kind),
         Ok(protobuf::AExprKind::AexprDistinct) | Ok(protobuf::AExprKind::AexprNotDistinct)
@@ -167,16 +167,50 @@ fn handle_distinct_from(
         .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
         .transpose()?;
     let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
-    let rhs_goal = if left_oid != oid::UNKNOWN {
-        TypeGoal::implicit(left_oid)
-    } else {
-        TypeGoal::NONE
-    };
-    let _ = expr
+    let right = expr
         .rexpr
         .as_ref()
-        .map(|n| infer_expr(n, ctx, params, rhs_goal))
+        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
         .transpose()?;
+    let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
+
+    // PG transforms the construct through the `=` operator's resolution:
+    // an UNKNOWN side is assumed to be the concrete peer's type (re-infer to
+    // pin params / validate literal content); two concrete sides must have
+    // an actual `=` overload — a goal-driven coercion check would wrongly
+    // reject comparable pairs like `int4 IS DISTINCT FROM numeric`.
+    if left_oid != oid::UNKNOWN && right_oid == oid::UNKNOWN {
+        if let Some(rexpr) = &expr.rexpr {
+            infer_expr(
+                rexpr,
+                ctx,
+                params,
+                TypeGoal::implicit(snapshot.unwrap_domain(left_oid)),
+            )?;
+        }
+    } else if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
+        if let Some(lexpr) = &expr.lexpr {
+            infer_expr(
+                lexpr,
+                ctx,
+                params,
+                TypeGoal::implicit(snapshot.unwrap_domain(right_oid)),
+            )?;
+        }
+    } else if left_oid != oid::UNKNOWN
+        && right_oid != oid::UNKNOWN
+        && snapshot
+            .find_operator("=", Some(left_oid), right_oid)
+            .is_none()
+    {
+        // PG: `operator does not exist: <left> = <right>` — domain names
+        // are reported as-is (`email = integer`), not unwrapped.
+        let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
+        let r = crate::ddl::util::format_type_for_message(snapshot, right_oid);
+        return Err(AnalyzeError::UndefinedOperator(format!(
+            "operator does not exist: {l} = {r}"
+        )));
+    }
     Ok(Some(ExprType::scalar(oid::BOOL, false)))
 }
 
@@ -200,6 +234,11 @@ fn handle_between(
     ) {
         return Ok(None);
     }
+    let Ctx { snapshot, .. } = ctx;
+    let negated = matches!(
+        protobuf::AExprKind::try_from(expr.kind),
+        Ok(protobuf::AExprKind::AexprNotBetween) | Ok(protobuf::AExprKind::AexprNotBetweenSym)
+    );
     let left = expr
         .lexpr
         .as_ref()
@@ -211,14 +250,44 @@ fn handle_between(
     if let Some(rexpr) = &expr.rexpr
         && let Some(node::Node::List(list)) = rexpr.node.as_ref()
     {
-        let goal = if left_oid != oid::UNKNOWN {
-            TypeGoal::implicit(left_oid)
-        } else {
-            TypeGoal::NONE
-        };
-        for item in &list.items {
-            let t = infer_expr(item, ctx, params, goal.clone())?;
+        for (i, item) in list.items.iter().enumerate() {
+            // PG transforms `x BETWEEN lo AND hi` into `x >= lo AND x <= hi`
+            // (`x < lo OR x > hi` for NOT BETWEEN) and resolves each
+            // comparison operator independently — so a concrete bound only
+            // needs an operator overload, NOT a coercion to the lhs type
+            // (`age BETWEEN 18 AND 3.14` is valid: int4 <= numeric exists).
+            // An UNKNOWN bound is assumed to be the lhs type (pins params,
+            // validates literal content).
+            let t = infer_expr(item, ctx, params, TypeGoal::NONE)?;
             any_bound_nullable = any_bound_nullable || t.nullable;
+            if left_oid == oid::UNKNOWN {
+                continue;
+            }
+            if t.type_oid == oid::UNKNOWN {
+                infer_expr(
+                    item,
+                    ctx,
+                    params,
+                    TypeGoal::implicit(snapshot.unwrap_domain(left_oid)),
+                )?;
+            } else {
+                let op = match (negated, i) {
+                    (false, 0) => ">=",
+                    (false, _) => "<=",
+                    (true, 0) => "<",
+                    (true, _) => ">",
+                };
+                if snapshot
+                    .find_operator(op, Some(left_oid), t.type_oid)
+                    .is_none()
+                {
+                    let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
+                    let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
+                    return Err(AnalyzeError::UndefinedOperator(format!(
+                        "operator does not exist: {l} {op} {r}"
+                    )));
+                }
+            }
         }
     }
 
@@ -242,6 +311,7 @@ fn handle_in_list(
     ) {
         return Ok(None);
     }
+    let Ctx { snapshot, .. } = ctx;
     let left = expr
         .lexpr
         .as_ref()
@@ -249,18 +319,40 @@ fn handle_in_list(
         .transpose()?;
     let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
 
+    // PG transforms `x IN (a, b)` into `x = a OR x = b` (resolved per item;
+    // `<>` for NOT IN, which pg_query tags with op name "<>"). A concrete
+    // item only needs an operator overload — coercing it to the lhs type
+    // would wrongly reject `age IN (18, 3.14)`. UNKNOWN items are assumed
+    // to be the lhs type (pins params, validates literal content).
+    let op_name = extract_string_fields(&expr.name).join(".");
+    let op = if op_name == "<>" { "<>" } else { "=" };
     let mut any_right_nullable = false;
     if let Some(rexpr) = &expr.rexpr
         && let Some(node::Node::List(list)) = rexpr.node.as_ref()
     {
-        let goal = if left_oid != oid::UNKNOWN {
-            TypeGoal::implicit(left_oid)
-        } else {
-            TypeGoal::NONE
-        };
         for item in &list.items {
-            let t = infer_expr(item, ctx, params, goal.clone())?;
+            let t = infer_expr(item, ctx, params, TypeGoal::NONE)?;
             any_right_nullable = any_right_nullable || t.nullable;
+            if left_oid == oid::UNKNOWN {
+                continue;
+            }
+            if t.type_oid == oid::UNKNOWN {
+                infer_expr(
+                    item,
+                    ctx,
+                    params,
+                    TypeGoal::implicit(snapshot.unwrap_domain(left_oid)),
+                )?;
+            } else if snapshot
+                .find_operator(op, Some(left_oid), t.type_oid)
+                .is_none()
+            {
+                let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
+                let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
+                return Err(AnalyzeError::UndefinedOperator(format!(
+                    "operator does not exist: {l} {op} {r}"
+                )));
+            }
         }
     }
 
@@ -303,7 +395,7 @@ fn handle_any_all(
         && let Some(arr_oid) = snapshot.array_type_of(left_oid)
         && let Some(rexpr) = &expr.rexpr
     {
-        let _ = infer_expr(rexpr, ctx, params, TypeGoal::implicit(arr_oid));
+        swallow_unless_literal(infer_expr(rexpr, ctx, params, TypeGoal::implicit(arr_oid)))?;
     }
 
     // right is concrete T[], left is unknown → left must be the element type T.
@@ -318,7 +410,7 @@ fn handle_any_all(
         })
         && let Some(lexpr) = &expr.lexpr
     {
-        let _ = infer_expr(lexpr, ctx, params, TypeGoal::implicit(elem_oid));
+        swallow_unless_literal(infer_expr(lexpr, ctx, params, TypeGoal::implicit(elem_oid)))?;
     }
 
     let any_nullable =
@@ -382,9 +474,19 @@ fn handle_row_row(
     // concrete OID as goal so embedded params get pinned.
     for (i, (l, r)) in left_types.iter().zip(right_types.iter()).enumerate() {
         if l.type_oid != oid::UNKNOWN && r.type_oid == oid::UNKNOWN {
-            let _ = infer_expr(&rrow.args[i], ctx, params, TypeGoal::implicit(l.type_oid));
+            swallow_unless_literal(infer_expr(
+                &rrow.args[i],
+                ctx,
+                params,
+                TypeGoal::implicit(l.type_oid),
+            ))?;
         } else if r.type_oid != oid::UNKNOWN && l.type_oid == oid::UNKNOWN {
-            let _ = infer_expr(&lrow.args[i], ctx, params, TypeGoal::implicit(r.type_oid));
+            swallow_unless_literal(infer_expr(
+                &lrow.args[i],
+                ctx,
+                params,
+                TypeGoal::implicit(r.type_oid),
+            ))?;
         }
     }
 
@@ -480,6 +582,12 @@ fn infer_generic_binary_op(
     // a domain column (`email_col <= $1`) is inferred by PG as the base
     // (`text`), not the domain. Pinning the param to the raw domain would
     // diverge from PG's Describe.
+    // These two pre-resolution walks are *guesses* — the operator actually
+    // chosen may coerce the unknown side to a different type entirely
+    // (`1 || 'x'` resolves to `anynonarray || text`, so `'x'` becomes text,
+    // not integer). Swallow everything here, including literal-content
+    // rejections; the post-resolution back-fill below validates against the
+    // operator's *declared* argument type, which is the coercion PG performs.
     if let (Some(l_oid), true) = (left_oid, right_oid == oid::UNKNOWN)
         && l_oid != oid::UNKNOWN
         && let Some(rexpr) = &expr.rexpr
@@ -539,12 +647,17 @@ fn infer_generic_binary_op(
         if left_oid_resolved == Some(oid::UNKNOWN)
             && let (Some(expected), Some(lexpr)) = (op.left_type_oid, &expr.lexpr)
         {
-            let _ = infer_expr(lexpr, ctx, params, TypeGoal::implicit(expected));
+            swallow_unless_literal(infer_expr(lexpr, ctx, params, TypeGoal::implicit(expected)))?;
         }
         if right_oid_resolved == oid::UNKNOWN
             && let Some(rexpr) = &expr.rexpr
         {
-            let _ = infer_expr(rexpr, ctx, params, TypeGoal::implicit(op.right_type_oid));
+            swallow_unless_literal(infer_expr(
+                rexpr,
+                ctx,
+                params,
+                TypeGoal::implicit(op.right_type_oid),
+            ))?;
         }
         return Ok(ExprType::scalar(op.result_type_oid, nullable));
     }

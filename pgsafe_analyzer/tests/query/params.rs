@@ -804,3 +804,37 @@ fn torture_param_in_coalesce() {
     // $p1 is NOT NULL by default → COALESCE has a NOT NULL arg → NOT NULL.
     assert!(!col(&info, "val").nullable);
 }
+
+#[test]
+fn param_pinned_by_values_list_common_type() {
+    // A `$param` cell in a derived VALUES table adopts the column's common
+    // type resolved from its concrete sibling rows — PG's Describe reports
+    // `(VALUES (42), ($1))` with $1 as int4, not text. Found by the
+    // differential fuzzer (the VALUES reconciliation skipped the back-fill).
+    let db = setup();
+    let info = db
+        .analyze("SELECT a0 FROM (VALUES (42), ($p1)) AS v(a0)")
+        .unwrap();
+    assert_cols(&info, vec![c("a0", int4())]);
+    assert_params(&info, vec![p(int4())]);
+
+    let info = db
+        .analyze("SELECT a0 FROM (VALUES (3.14), ($p1)) AS v(a0)")
+        .unwrap();
+    assert_params(&info, vec![p(numeric())]);
+}
+
+#[test]
+fn values_list_literal_content_validated_under_common_type() {
+    // The same back-fill validates string-literal contents: the second
+    // row's 'x' must parse as the column's int4 common type.
+    let db = setup();
+    let err = db
+        .analyze("SELECT a0 FROM (VALUES (42), ('x')) AS v(a0)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("invalid input syntax for type integer: \"x\""),
+        "got: {err}"
+    );
+}

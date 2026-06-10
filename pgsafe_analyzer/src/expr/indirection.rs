@@ -142,13 +142,43 @@ pub(crate) fn infer_indirection(
                     continue;
                 }
 
+                // PG validates the container's subscriptability *before*
+                // coercing the index expressions (`('…'::json)['a']` reports
+                // `cannot subscript type json …`, not an index-type error),
+                // so check it up front for both the slice and element paths.
+                if snapshot
+                    .get_type(current.type_oid)
+                    .is_some_and(|t| t.typcategory != TypCategory::Array || t.typelem.is_none())
+                {
+                    return Err(AnalyzeError::Unsupported(format!(
+                        "cannot subscript type {} because it does not support subscripting",
+                        crate::ddl::util::format_type_for_message(snapshot, current.type_oid)
+                    )));
+                }
+
                 // Walk both bounds with an int4 goal so params and column
                 // refs inside `arr[lo:hi]` / `arr[i]` get typed and
-                // validated. Track nullability so slice results propagate
-                // NULL from any NULL bound.
+                // validated (PG coerces subscripts to int4 in assignment
+                // context). A coercion failure gets PG's exact wording.
+                // Track nullability so slice results propagate NULL from
+                // any NULL bound.
                 let mut any_bound_nullable = false;
                 for bound in [&ai.lidx, &ai.uidx].into_iter().flatten() {
-                    let t = infer_expr(bound, ctx, params, TypeGoal::assignment(oid::INT4))?;
+                    let t = match infer_expr(bound, ctx, params, TypeGoal::assignment(oid::INT4)) {
+                        Ok(t) => t,
+                        Err(AnalyzeError::TypeMismatch { .. }) => {
+                            let span = crate::error::node_location(bound)
+                                .and_then(crate::error::SourceSpan::from_node_qname);
+                            return Err(crate::error::RawError::invalid(
+                                "array subscript must have type integer".to_string(),
+                                span,
+                                None,
+                            )
+                            .with_primary_label("this is not an integer")
+                            .finalize_implicit());
+                        }
+                        Err(e) => return Err(e),
+                    };
                     any_bound_nullable = any_bound_nullable || t.nullable;
                 }
 
@@ -404,6 +434,16 @@ pub(crate) fn infer_array_expr(
             .finalize_implicit());
         }
     };
+    // Pass 2: back-fill UNKNOWN elements with the resolved common type so
+    // embedded params get pinned and string-literal contents are validated
+    // (PG rejects `ARRAY[1, 'x']` at parse time with `invalid input syntax`).
+    if common != oid::UNKNOWN {
+        for (elem, &t) in arr.elements.iter().zip(&element_types) {
+            if t == oid::UNKNOWN {
+                swallow_unless_literal(infer_expr(elem, ctx, params, TypeGoal::implicit(common)))?;
+            }
+        }
+    }
     // PG collapses array dimensions into the same type OID:
     // `ARRAY[ARRAY[1,2], ARRAY[3,4]]` is `int4[]`, not `int4[][]`. So if the
     // common element type is already an array, reuse it instead of trying to

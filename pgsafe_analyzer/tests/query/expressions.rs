@@ -204,19 +204,33 @@ fn nullif_incompatible_concrete_types_rejected() {
 
 #[test]
 fn nullif_int_with_string_literal_rejected() {
-    // PG runs the type's input function at parse_analyze time and raises
-    // `invalid input syntax for type integer: "x"`. The analyzer takes the
-    // strictly-typed path (treats the bare literal as text and reports
-    // `operator does not exist: integer = text`) — both reject, but the
-    // wording can't be aligned without re-implementing PG's input parsers,
-    // which is outside the analyzer's scope. Opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // PG resolves `=` for (integer, unknown) to integer = integer and runs
+    // int4's input function on the literal at parse_analyze time. The
+    // analyzer mirrors it via `literal_input`, message verbatim.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x') FROM users"),
-        AnalyzeError::Invalid(_),
-        "operator does not exist: integer = text (NULLIF types integer and text cannot be matched)",
+        AnalyzeError::InvalidLiteral(_),
+        concat!(
+            "invalid input syntax for type integer: \"x\"\n",
+            "  ╭────\n",
+            "1 │ SELECT NULLIF(age, 'x') FROM users\n",
+            "  ·                    ─┬─\n",
+            "  ·                     ╰─ this literal\n",
+            "  ╰────\n",
+        ),
     );
+}
+
+#[test]
+fn nullif_int_with_numeric_string_literal_coerced() {
+    // The flip side: `'42'` is valid int4 input, so PG accepts and the
+    // result keeps the first argument's type.
+    let db = setup();
+    let s = db
+        .analyze("SELECT NULLIF(age, '42') AS v FROM users")
+        .unwrap();
+    assert_cols(&s, vec![cn("v", int4())]);
 }
 
 // ── CASE ─────────────────────────────────────────────────────────────────────
@@ -634,22 +648,32 @@ fn case_with_incompatible_concrete_arms_rejected() {
 
 #[test]
 fn case_with_incompatible_unknown_literal_rejected() {
-    // PG runs int4's input function on the literal at parse_analyze time and
-    // raises `invalid input syntax for type integer: "x"`. The analyzer
-    // promotes the bare literal to text and reports the CASE-types clash
-    // instead — both reject, but the wording can't be aligned without
-    // re-implementing PG's per-type input parsers (out of scope). Opt out
-    // of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // The branches resolve to int4 (the only concrete type); PG then runs
+    // int4's input function on the literal at parse_analyze time. The
+    // analyzer mirrors it via `literal_input`, message verbatim.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x' END"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidLiteral(_),
         concat!(
-            "CASE types text and integer cannot be matched\n",
-            "  help: add an explicit cast so the branches share a type, e.g. `expr::integer`\n",
+            "invalid input syntax for type integer: \"x\"\n",
+            "  ╭────\n",
+            "1 │ SELECT CASE WHEN true THEN 1 ELSE 'x' END\n",
+            "  ·                                   ─┬─\n",
+            "  ·                                    ╰─ this literal\n",
+            "  ╰────\n",
         ),
     );
+}
+
+#[test]
+fn case_with_valid_unknown_literal_coerced() {
+    // `'2'` is valid int4 input, so the CASE lands on integer — like PG.
+    let db = setup();
+    let s = db
+        .analyze("SELECT CASE WHEN true THEN 1 ELSE '2' END AS v")
+        .unwrap();
+    assert_cols(&s, vec![c("v", int4())]);
 }
 
 #[test]
@@ -667,22 +691,30 @@ fn coalesce_with_incompatible_concrete_arms_rejected() {
 
 #[test]
 fn coalesce_with_incompatible_unknown_literal_rejected() {
-    // PG runs int4's input function on the literal at parse_analyze time and
-    // raises `invalid input syntax for type integer: "x"`. The analyzer
-    // promotes the bare literal to text and reports the COALESCE-types
-    // clash instead — both reject, but the wording can't be aligned without
-    // re-implementing PG's per-type input parsers (out of scope). Opt out
-    // of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // The args resolve to int4 (the only concrete type); PG then runs
+    // int4's input function on the literal at parse_analyze time. The
+    // analyzer mirrors it via `literal_input`, message verbatim.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(1, 'x')"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidLiteral(_),
         concat!(
-            "COALESCE types integer and text cannot be matched\n",
-            "  help: add an explicit cast so the branches share a type, e.g. `expr::text`\n",
+            "invalid input syntax for type integer: \"x\"\n",
+            "  ╭────\n",
+            "1 │ SELECT COALESCE(1, 'x')\n",
+            "  ·                    ─┬─\n",
+            "  ·                     ╰─ this literal\n",
+            "  ╰────\n",
         ),
     );
+}
+
+#[test]
+fn coalesce_with_valid_unknown_literal_coerced() {
+    // `'42'` is valid int4 input, so COALESCE lands on integer — like PG.
+    let db = setup();
+    let s = db.analyze("SELECT COALESCE(1, '42') AS v").unwrap();
+    assert_cols(&s, vec![c("v", int4())]);
 }
 
 // ── GREATEST / LEAST (non-strict minmax) ────────────────────────────────────
