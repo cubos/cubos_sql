@@ -8,7 +8,8 @@
 //! them all.
 #![cfg(feature = "pg_sanity")]
 
-use pgsafe_analyzer::PgCatalog;
+#[path = "common/parity.rs"]
+mod parity;
 
 const SETUP: &str = "
 CREATE TABLE a (id BIGINT PRIMARY KEY, x INT NOT NULL, label TEXT);
@@ -66,29 +67,5 @@ const BATTERY: &[&str] = &[
 
 #[test]
 fn review_battery() {
-    let mut db = PgCatalog::new().expect("mirror");
-    db.apply_sql(SETUP).expect("setup");
-    let mut divergences = 0;
-    for sql in BATTERY {
-        let (_res, div) = db.analyze_checked(sql);
-        if let Some(d) = div {
-            divergences += 1;
-            eprintln!(
-                "\n[{:?}] {sql}\n  {}",
-                d.kind,
-                d.message
-                    .lines()
-                    .filter(|l| l.contains("analyzer") || l.contains("PG"))
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .join("\n  ")
-            );
-        }
-    }
-    assert_eq!(
-        divergences,
-        0,
-        "{divergences}/{} review shapes diverged from PG",
-        BATTERY.len()
-    );
+    parity::assert_battery_parity(SETUP, BATTERY, "review shapes");
 }
