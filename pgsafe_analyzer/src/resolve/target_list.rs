@@ -197,12 +197,12 @@ pub(crate) fn analyze_values_lists(
                 continue;
             }
             if column_types[i].get(row_idx) == Some(&oid::UNKNOWN) {
-                expr::swallow_unless_literal(expr::infer_expr(
+                expr::coerce_unknown_to(
                     item,
                     expr::Ctx::new(&empty_scope, &empty_null, snapshot),
                     params,
-                    TypeGoal::implicit(common[i]),
-                ))?;
+                    common[i],
+                )?;
             }
         }
         row_idx += 1;

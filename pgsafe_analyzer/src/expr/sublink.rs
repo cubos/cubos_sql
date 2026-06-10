@@ -111,12 +111,12 @@ pub(crate) fn infer_sublink(
                     // by PG to its peer — pin params and skip the rejection.
                     if l_oid == oid::UNKNOWN {
                         if r_oid != oid::UNKNOWN {
-                            swallow_unless_literal(infer_expr(
+                            coerce_unknown_to(
                                 lhs_node,
                                 ctx,
                                 params,
-                                TypeGoal::implicit(snapshot.unwrap_domain(r_oid)),
-                            ))?;
+                                snapshot.unwrap_domain(r_oid),
+                            )?;
                         }
                         continue;
                     }

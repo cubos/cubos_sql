@@ -125,7 +125,7 @@ pub(crate) fn infer_coalesce(
     if type_oid != oid::UNKNOWN {
         for (i, arg) in expr.args.iter().enumerate() {
             if types[i] == oid::UNKNOWN {
-                swallow_unless_literal(infer_expr(arg, ctx, params, TypeGoal::implicit(type_oid)))?;
+                coerce_unknown_to(arg, ctx, params, type_oid)?;
             }
         }
     }
@@ -302,12 +302,7 @@ pub(crate) fn infer_case(
                 && let Some(result) = &when.result
             {
                 if types.get(type_idx) == Some(&oid::UNKNOWN) {
-                    swallow_unless_literal(infer_expr(
-                        result,
-                        ctx,
-                        params,
-                        TypeGoal::implicit(type_oid),
-                    ))?;
+                    coerce_unknown_to(result, ctx, params, type_oid)?;
                 }
                 type_idx += 1;
             }
@@ -315,12 +310,7 @@ pub(crate) fn infer_case(
         if let Some(defresult) = &expr.defresult
             && types.get(type_idx) == Some(&oid::UNKNOWN)
         {
-            swallow_unless_literal(infer_expr(
-                defresult,
-                ctx,
-                params,
-                TypeGoal::implicit(type_oid),
-            ))?;
+            coerce_unknown_to(defresult, ctx, params, type_oid)?;
         }
     }
 

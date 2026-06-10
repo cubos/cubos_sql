@@ -440,7 +440,7 @@ pub(crate) fn infer_array_expr(
     if common != oid::UNKNOWN {
         for (elem, &t) in arr.elements.iter().zip(&element_types) {
             if t == oid::UNKNOWN {
-                swallow_unless_literal(infer_expr(elem, ctx, params, TypeGoal::implicit(common)))?;
+                coerce_unknown_to(elem, ctx, params, common)?;
             }
         }
     }

@@ -90,28 +90,20 @@ fn handle_nullif(
     // raises from this coercion (`NULLIF(1, 'x')` → `invalid input syntax
     // for type integer: "x"`).
     let left_oid_final = if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
-        match expr
-            .lexpr
-            .as_ref()
-            .map(|n| infer_expr(n, ctx, params, TypeGoal::implicit(right_oid)))
-        {
-            Some(Ok(t)) => t.type_oid,
-            Some(Err(e @ AnalyzeError::InvalidLiteral(_))) => return Err(e),
-            _ => left_oid,
+        if let Some(lexpr) = &expr.lexpr {
+            coerce_unknown_to(lexpr, ctx, params, right_oid)?;
         }
+        // The coerced side now carries the peer's type — PG resolves the
+        // `=` over (peer, peer).
+        right_oid
     } else {
         left_oid
     };
     let right_oid_final = if right_oid == oid::UNKNOWN && left_oid_final != oid::UNKNOWN {
-        match expr
-            .rexpr
-            .as_ref()
-            .map(|n| infer_expr(n, ctx, params, TypeGoal::implicit(left_oid_final)))
-        {
-            Some(Ok(t)) => t.type_oid,
-            Some(Err(e @ AnalyzeError::InvalidLiteral(_))) => return Err(e),
-            _ => right_oid,
+        if let Some(rexpr) = &expr.rexpr {
+            coerce_unknown_to(rexpr, ctx, params, left_oid_final)?;
         }
+        left_oid_final
     } else {
         right_oid
     };
@@ -181,21 +173,11 @@ fn handle_distinct_from(
     // reject comparable pairs like `int4 IS DISTINCT FROM numeric`.
     if left_oid != oid::UNKNOWN && right_oid == oid::UNKNOWN {
         if let Some(rexpr) = &expr.rexpr {
-            infer_expr(
-                rexpr,
-                ctx,
-                params,
-                TypeGoal::implicit(snapshot.unwrap_domain(left_oid)),
-            )?;
+            coerce_unknown_to(rexpr, ctx, params, snapshot.unwrap_domain(left_oid))?;
         }
     } else if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
         if let Some(lexpr) = &expr.lexpr {
-            infer_expr(
-                lexpr,
-                ctx,
-                params,
-                TypeGoal::implicit(snapshot.unwrap_domain(right_oid)),
-            )?;
+            coerce_unknown_to(lexpr, ctx, params, snapshot.unwrap_domain(right_oid))?;
         }
     } else if left_oid != oid::UNKNOWN
         && right_oid != oid::UNKNOWN
@@ -264,12 +246,7 @@ fn handle_between(
                 continue;
             }
             if t.type_oid == oid::UNKNOWN {
-                infer_expr(
-                    item,
-                    ctx,
-                    params,
-                    TypeGoal::implicit(snapshot.unwrap_domain(left_oid)),
-                )?;
+                coerce_unknown_to(item, ctx, params, snapshot.unwrap_domain(left_oid))?;
             } else {
                 let op = match (negated, i) {
                     (false, 0) => ">=",
@@ -337,12 +314,7 @@ fn handle_in_list(
                 continue;
             }
             if t.type_oid == oid::UNKNOWN {
-                infer_expr(
-                    item,
-                    ctx,
-                    params,
-                    TypeGoal::implicit(snapshot.unwrap_domain(left_oid)),
-                )?;
+                coerce_unknown_to(item, ctx, params, snapshot.unwrap_domain(left_oid))?;
             } else if snapshot
                 .find_operator(op, Some(left_oid), t.type_oid)
                 .is_none()
@@ -417,12 +389,7 @@ fn handle_any_all(
         match snapshot.array_type_of(snapshot.unwrap_domain(left_oid)) {
             Some(arr_oid) => {
                 if let Some(rexpr) = &expr.rexpr {
-                    swallow_unless_literal(infer_expr(
-                        rexpr,
-                        ctx,
-                        params,
-                        TypeGoal::implicit(arr_oid),
-                    ))?;
+                    coerce_unknown_to(rexpr, ctx, params, arr_oid)?;
                 }
             }
             None => {
@@ -446,7 +413,7 @@ fn handle_any_all(
         })
         && let Some(lexpr) = &expr.lexpr
     {
-        swallow_unless_literal(infer_expr(lexpr, ctx, params, TypeGoal::implicit(elem_oid)))?;
+        coerce_unknown_to(lexpr, ctx, params, elem_oid)?;
     }
 
     // Both sides concrete: PG resolves `<left> <op> <element>` against the
@@ -544,19 +511,9 @@ fn handle_row_row(
     // concrete OID as goal so embedded params get pinned.
     for (i, (l, r)) in left_types.iter().zip(right_types.iter()).enumerate() {
         if l.type_oid != oid::UNKNOWN && r.type_oid == oid::UNKNOWN {
-            swallow_unless_literal(infer_expr(
-                &rrow.args[i],
-                ctx,
-                params,
-                TypeGoal::implicit(l.type_oid),
-            ))?;
+            coerce_unknown_to(&rrow.args[i], ctx, params, l.type_oid)?;
         } else if r.type_oid != oid::UNKNOWN && l.type_oid == oid::UNKNOWN {
-            swallow_unless_literal(infer_expr(
-                &lrow.args[i],
-                ctx,
-                params,
-                TypeGoal::implicit(r.type_oid),
-            ))?;
+            coerce_unknown_to(&lrow.args[i], ctx, params, r.type_oid)?;
         }
     }
 
@@ -682,22 +639,12 @@ fn infer_generic_binary_op(
             if left_oid_resolved == Some(oid::UNKNOWN)
                 && let (Some(expected), Some(lexpr)) = (op.left_type_oid, &expr.lexpr)
             {
-                swallow_unless_literal(infer_expr(
-                    lexpr,
-                    ctx,
-                    params,
-                    TypeGoal::implicit(expected),
-                ))?;
+                coerce_unknown_to(lexpr, ctx, params, expected)?;
             }
             if right_oid_resolved == oid::UNKNOWN
                 && let Some(rexpr) = &expr.rexpr
             {
-                swallow_unless_literal(infer_expr(
-                    rexpr,
-                    ctx,
-                    params,
-                    TypeGoal::implicit(op.right_type_oid),
-                ))?;
+                coerce_unknown_to(rexpr, ctx, params, op.right_type_oid)?;
             }
             return Ok(ExprType::scalar(op.result_type_oid, nullable));
         }

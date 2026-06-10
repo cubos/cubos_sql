@@ -297,7 +297,7 @@ fn backfill_func_args(
             // Speculative re-walk: ordinary failures are swallowed, but a
             // literal-content rejection is the parse-time error PG itself
             // raises from this argument coercion (`sqrt('x')`).
-            swallow_unless_literal(infer_expr(arg, ctx, params, TypeGoal::implicit(expected)))?;
+            coerce_unknown_to(arg, ctx, params, expected)?;
         }
     }
     Ok(())

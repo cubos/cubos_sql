@@ -527,12 +527,7 @@ pub(crate) fn infer_expr(
             if resolved_type != oid::UNKNOWN {
                 for (arg, &t) in mm.args.iter().zip(&arg_oids) {
                     if t == oid::UNKNOWN {
-                        swallow_unless_literal(infer_expr(
-                            arg,
-                            ctx,
-                            params,
-                            TypeGoal::implicit(resolved_type),
-                        ))?;
+                        coerce_unknown_to(arg, ctx, params, resolved_type)?;
                     }
                 }
             }
@@ -788,11 +783,37 @@ pub(crate) fn infer_expr(
 /// goal didn't fit and are deliberately swallowed, but a literal-content
 /// rejection is exactly the error PG itself raises from that coercion, so it
 /// must survive. Returns `Err` only for [`AnalyzeError::InvalidLiteral`].
-pub(crate) fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeError> {
+fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeError> {
     match r {
         Err(e @ AnalyzeError::InvalidLiteral(_)) => Err(e),
         _ => Ok(()),
     }
+}
+
+/// PG's `coerce_type` for a pass-2 back-fill: an expression whose bottom-up
+/// inference stayed UNKNOWN adopts the type its context resolved. A bare
+/// `$N` is pinned to `target`, an untyped string literal has its *content*
+/// validated against `target`'s input function (both via the goal-driven
+/// re-walk through [`infer_expr`]), and any other shape is walked under the
+/// goal so nested unknowns resolve the same way.
+///
+/// Re-walk failures other than a literal-content rejection are swallowed:
+/// the walk is speculative (the enclosing construct owns its own error
+/// reporting), but the literal rejection is exactly the parse-time error PG
+/// raises from this coercion.
+///
+/// This is **the** primitive every two-pass construct (operator/function
+/// arguments, CASE/COALESCE/GREATEST branches, ARRAY elements, VALUES
+/// cells, set-operation projections, …) must use for its back-fill —
+/// open-coded goal walks are how parameters historically ended up typed
+/// differently from PG's Describe.
+pub(crate) fn coerce_unknown_to(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    target: PgTypeOid,
+) -> Result<(), AnalyzeError> {
+    swallow_unless_literal(infer_expr(node, ctx, params, TypeGoal::implicit(target)))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
