@@ -32,15 +32,7 @@ pub(crate) fn analyze_correlated_select(
         .chain(outer_scope.lateral_sources.iter())
         .cloned()
         .collect();
-    analyze_select_with_ctes_and_outer(
-        sel,
-        snapshot,
-        params,
-        &HashMap::new(),
-        &[],
-        &outer,
-        &[],
-    )
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &outer, &[])
 }
 
 pub(crate) fn analyze_select_with_ctes(
@@ -114,7 +106,9 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // fallback so an inner alias of the same name shadows correctly.
     // Shadowed: aliases live only as a hint for the diagnostic when the SQL
     // reaches across the boundary.
-    scope.lateral_sources.extend(lateral_sources.iter().cloned());
+    scope
+        .lateral_sources
+        .extend(lateral_sources.iter().cloned());
     scope
         .outer_sources
         .extend(correlated_sources.iter().cloned());

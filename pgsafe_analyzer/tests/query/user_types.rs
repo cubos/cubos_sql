@@ -715,9 +715,7 @@ fn domain_with_null_branch_resolves_to_base() {
         .unwrap();
     assert_cols(&s, vec![cn("v", text())]);
 
-    let s = db
-        .analyze("SELECT GREATEST(n, NULL) AS v FROM t")
-        .unwrap();
+    let s = db.analyze("SELECT GREATEST(n, NULL) AS v FROM t").unwrap();
     assert_cols(&s, vec![cn("v", int4())]);
 }
 
