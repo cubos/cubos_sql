@@ -84,7 +84,12 @@ pub(crate) fn validate(
             .is_some_and(|e| snapshot.array_type_of(e) == Some(target))
     {
         let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if trimmed.starts_with(['{', '[']) {
+        if trimmed.starts_with('{') {
+            return Ok(());
+        }
+        // The explicit-dimensions form is `[lo:hi]…={…}` — a `[` opener
+        // without the `={` separator (e.g. `'[1,]'`) is malformed.
+        if trimmed.starts_with('[') && trimmed.contains("={") {
             return Ok(());
         }
         return Err(format!("malformed array literal: \"{content}\""));
@@ -110,20 +115,44 @@ pub(crate) fn validate(
             if trimmed.is_empty() {
                 return Err("invalid name syntax".to_string());
             }
-            // All-digits is an OID literal, always syntactically fine.
-            if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            // All-digits is an OID literal — subject to oid's range check
+            // (`'99…9'::regproc` → `value "…" is out of range for type oid`).
+            // The check is on the *raw* content: reg* input functions only
+            // take the OID path when the whole string is digits.
+            if content.chars().all(|c| c.is_ascii_digit()) {
+                if content.parse::<u64>().is_ok_and(|v| v <= u32::MAX as u64) {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "value \"{content}\" is out of range for type oid"
+                ));
+            }
+            // Surrounding whitespace interacts with each reg* type's own
+            // trimming rules (`' 42 '::regproc` is rejected, `' users '` is
+            // not necessarily) — accept rather than model them.
+            if trimmed != content {
                 return Ok(());
             }
-            if !matches!(name, "regclass" | "regproc") {
+            if !matches!(name, "regclass" | "regproc" | "regtype") {
                 return Ok(());
             }
             // Quoted / qualified forms need real identifier parsing — skip.
             if trimmed.contains(['"', '.']) {
                 return Ok(());
             }
+            // `regtype` parses its value with the full type-name grammar
+            // (`'character varying'`, `'int[]'`, `'numeric(10,2)'`, …); only
+            // a single bare identifier is simple enough to resolve here.
+            if name == "regtype"
+                && !trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Ok(());
+            }
             // An unquoted name containing whitespace fails PG's identifier
             // splitting up front (`'1 day'::regclass` → invalid name syntax).
-            if trimmed.chars().any(|c| c.is_ascii_whitespace()) {
+            if name != "regtype" && trimmed.chars().any(|c| c.is_ascii_whitespace()) {
                 return Err("invalid name syntax".to_string());
             }
             // Unquoted identifiers fold to lowercase before lookup. System
@@ -144,6 +173,18 @@ pub(crate) fn validate(
                     1 => Ok(()),
                     _ => Err(format!("more than one function named \"{folded}\"")),
                 },
+                // A bare identifier for `regtype`: try the SQL-standard
+                // aliases (`integer` → `int4`) then the catalog.
+                "regtype" => {
+                    let normalized = crate::ddl::util::normalize_type_name(&folded);
+                    if snapshot.resolve_type_by_name(None, normalized).is_some()
+                        || snapshot.resolve_type_by_name(None, &folded).is_some()
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!("type \"{folded}\" does not exist"))
+                    }
+                }
                 _ => Ok(()),
             }
         }
@@ -305,21 +346,38 @@ fn parse_radix_digits(s: &mut &str) -> Option<(u32, String)> {
 }
 
 /// Mirrors `uint32in_subr` (numutils.c): `strtoul` semantics — optional
-/// whitespace and sign (negative values wrap), decimal or `0x`-prefixed
-/// digits, **no** underscores or `0o`/`0b`. The wrap-around makes a range
-/// check pointless for fuzz-realistic values, so only syntax is checked.
+/// whitespace and sign, decimal or `0x`-prefixed digits, **no** underscores
+/// or `0o`/`0b`. The range check follows strtoul's wrap-around acceptance:
+/// a value is in range when it fits `uint32`, or when it's negative and its
+/// magnitude fits `int32` (so `'-1'::oid` is 4294967295 but
+/// `'-4294967295'::oid` is out of range) — verified against PG 18.
 fn validate_oid(content: &str) -> Result<(), String> {
     let syntax_err = || format!("invalid input syntax for type oid: \"{content}\"");
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    if let Some(rest) = s.strip_prefix(['+', '-']) {
-        s = rest;
-    }
+    let negative = match s.strip_prefix(['+', '-']) {
+        Some(rest) => {
+            let neg = s.starts_with('-');
+            s = rest;
+            neg
+        }
+        None => false,
+    };
     let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(rest) => (16, rest),
         None => (10, s),
     };
     if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
         return Err(syntax_err());
+    }
+    let in_range = match u64::from_str_radix(digits, radix) {
+        Ok(v) if negative => v <= i32::MAX as u64 + 1,
+        Ok(v) => v <= u32::MAX as u64,
+        Err(_) => false, // > u64 digits — far out of range
+    };
+    if !in_range {
+        return Err(format!(
+            "value \"{content}\" is out of range for type oid"
+        ));
     }
     Ok(())
 }

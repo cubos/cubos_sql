@@ -22,6 +22,9 @@ pub(crate) struct ResolvedFunction {
     pub arg_types: Vec<PgTypeOid>,
     pub schema: String,
     pub is_aggregate: bool,
+    /// `pg_proc.prokind == 'w'` — a true window function (`row_number`,
+    /// `lag`, …), which *requires* an OVER clause at the call site.
+    pub is_window: bool,
     pub is_strict: bool,
     /// Named output columns for SRFs / OUT-arg functions, derived from the
     /// matched `pg_proc`'s `proallargtypes`/`proargmodes`/`proargnames`.
@@ -612,6 +615,7 @@ fn make_resolved(f: &PgProc, snapshot: &PgCatalog) -> ResolvedFunction {
             .map(str::to_owned)
             .unwrap_or_default(),
         is_aggregate: matches!(f.prokind, ProKind::Aggregate),
+        is_window: matches!(f.prokind, ProKind::Window),
         is_strict: f.proisstrict,
         out_args: build_out_args(f),
     }
@@ -659,6 +663,7 @@ fn make_resolved_polymorphic(
             .map(str::to_owned)
             .unwrap_or_default(),
         is_aggregate: matches!(f.prokind, ProKind::Aggregate),
+        is_window: matches!(f.prokind, ProKind::Window),
         is_strict: f.proisstrict,
         out_args,
     }

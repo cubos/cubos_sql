@@ -135,15 +135,16 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // boolean, not type X`. Catch the generic coerce error and rewrite to
     // PG's exact message so `pglite_sanity` matches.
     if let Some(where_clause) = &sel.where_clause {
-        // PG rejects aggregate / window function calls inside WHERE
-        // (they reference the post-aggregation row, not the pre-aggregation
-        // one). Catch these statically before the type pass runs.
-        check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
+        // PG rejects aggregate / window function calls inside WHERE (they
+        // reference the post-aggregation row, not the pre-aggregation one) —
+        // but only after the expression itself resolves; the ordering lives
+        // in `coerce_bool_clause`.
         coerce_bool_clause(
             where_clause,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             "WHERE",
+            Some("WHERE"),
         )?;
     }
 
@@ -176,13 +177,15 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         )?;
     }
 
-    // Process HAVING clause — same boolean goal as WHERE.
+    // Process HAVING clause — same boolean goal as WHERE, but aggregates
+    // are of course allowed there.
     if let Some(having) = &sel.having_clause {
         coerce_bool_clause(
             having,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             "HAVING",
+            None,
         )?;
     }
 
@@ -291,7 +294,8 @@ pub(crate) fn walk_group_clause_node(
         }
         return Ok(());
     }
-    check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
+    // PG transforms the expression first (bottom-up resolution errors win)
+    // and raises the no-aggregates placement error afterwards.
     if let Err(e) = expr::infer_expr(
         group_node,
         expr::Ctx::new(scope, null_ctx, snapshot),
@@ -301,6 +305,7 @@ pub(crate) fn walk_group_clause_node(
     {
         return Err(e);
     }
+    check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
     Ok(())
 }
 

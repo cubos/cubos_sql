@@ -56,6 +56,31 @@ pub(crate) fn infer_func_call(
         check_no_nested_aggregates(func, snapshot)?;
     }
 
+    // PG's OVER-clause placement rules (parse_func.c): a true window
+    // function (`prokind = 'w'`) is only callable with an OVER clause, and
+    // OVER itself is only attachable to window functions and aggregates.
+    // Messages verbatim; PG renders the name as written (qualified iff the
+    // call was qualified).
+    let written_name = func_name_parts.join(".");
+    if resolved.is_window && func.over.is_none() {
+        return Err(crate::error::RawError::invalid(
+            format!("window function {written_name} requires an OVER clause"),
+            crate::error::SourceSpan::from_node_qname(func.location),
+            Some("add `OVER ()` (or a window definition) after the call".into()),
+        )
+        .finalize_implicit());
+    }
+    if func.over.is_some() && !resolved.is_window && !resolved.is_aggregate {
+        return Err(crate::error::RawError::invalid(
+            format!(
+                "OVER specified, but {written_name} is not a window function nor an aggregate function"
+            ),
+            crate::error::SourceSpan::from_node_qname(func.location),
+            None,
+        )
+        .finalize_implicit());
+    }
+
     // Pass 2: back-fill UNKNOWN args from the resolved signature.
     backfill_func_args(func, &args, &resolved, ctx, params)?;
 

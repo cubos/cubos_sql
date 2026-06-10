@@ -413,6 +413,40 @@ fn handle_any_all(
         swallow_unless_literal(infer_expr(lexpr, ctx, params, TypeGoal::implicit(elem_oid)))?;
     }
 
+    // Both sides concrete: PG resolves `<left> <op> <element>` against the
+    // operator catalog — `prefs = ANY(ARRAY[1,2,3])` fails at parse time
+    // with `operator does not exist: jsonb = integer`. Mirror it (the
+    // previous behavior accepted any concrete pair). A non-array right side
+    // is a different PG error ("op ANY/ALL (array) requires array on right
+    // side") with riskier corner cases (jsonb, record), so that check stays
+    // out of scope.
+    if left_oid != oid::UNKNOWN
+        && right_oid != oid::UNKNOWN
+        && let Some(elem_oid) = snapshot
+            .get_type(snapshot.unwrap_domain(right_oid))
+            .and_then(|t| {
+                if t.typcategory == TypCategory::Array {
+                    t.typelem
+                } else {
+                    None
+                }
+            })
+    {
+        let op_name = extract_string_fields(&expr.name).join(".");
+        if !op_name.is_empty()
+            && !op_name.contains('.')
+            && snapshot
+                .find_operator(&op_name, Some(left_oid), elem_oid)
+                .is_none()
+        {
+            let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
+            let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
+            return Err(AnalyzeError::UndefinedOperator(format!(
+                "operator does not exist: {l} {op_name} {r}"
+            )));
+        }
+    }
+
     let any_nullable =
         left.as_ref().is_some_and(|l| l.nullable) || right.as_ref().is_some_and(|r| r.nullable);
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))

@@ -357,7 +357,61 @@ fn analyze_insert_select(
     // cleanly. Earlier this swallowed the error with `let _ =`, which masked
     // typos in JOIN ON or in the SELECT target list as a downstream
     // `param count mismatch` invariant failure.
-    analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
+    let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
+
+    // Each SELECT output column must be assignment-coercible to its target
+    // column — PG rejects `INSERT INTO t (int8_col) SELECT jsonb_col …` at
+    // parse time with `column "X" is of type Y but expression is of type Z`.
+    // Untyped string literals in the projection surface as `text` from the
+    // target-list boundary; PG instead coerces them through the target's
+    // input function, so for those we validate the literal *content* (and
+    // accept) rather than comparing the placeholder text type.
+    for (i, sel_col) in sel_cols.iter().enumerate() {
+        let Some(tc) = target_col_at(tgt, i) else {
+            continue;
+        };
+        if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == tc.atttypid {
+            continue;
+        }
+        let literal = val_sel.target_list.get(i).and_then(|t| {
+            if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+                && let Some(val) = &rt.val
+                && let Some(node::Node::AConst(ac)) = val.node.as_ref()
+                && !ac.isnull
+                && let Some(pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+            {
+                Some(sv.sval.as_str())
+            } else {
+                None
+            }
+        });
+        if let Some(text) = literal {
+            if let Err(msg) = crate::literal_input::validate(text, tc.atttypid, snapshot) {
+                return Err(crate::error::RawError::invalid_literal(msg, None).finalize_implicit());
+            }
+            continue;
+        }
+        if !crate::coerce::can_coerce(
+            sel_col.type_oid,
+            tc.atttypid,
+            crate::coerce::CoercionContext::Assignment,
+            snapshot,
+        ) {
+            let expected = crate::ddl::util::format_type_for_message(snapshot, tc.atttypid);
+            let actual = crate::ddl::util::format_type_for_message(snapshot, sel_col.type_oid);
+            return Err(crate::error::RawError::invalid(
+                format!(
+                    "column \"{}\" is of type {expected} but expression is of type {actual}",
+                    tc.attname
+                ),
+                None,
+                Some(format!(
+                    "cast the SELECT expression, e.g. `expr::{expected}`"
+                )),
+            )
+            .finalize_implicit());
+        }
+    }
 
     for (i, target) in val_sel.target_list.iter().enumerate() {
         if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
@@ -604,6 +658,7 @@ pub(crate) fn analyze_update(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             "WHERE",
+            Some("WHERE"),
         )?;
     }
 
@@ -684,6 +739,7 @@ pub(crate) fn analyze_delete(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             "WHERE",
+            Some("WHERE"),
         )?;
     }
 

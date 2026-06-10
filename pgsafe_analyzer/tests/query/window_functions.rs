@@ -352,3 +352,49 @@ fn window_order_by_unknown_column_rejected() {
         ),
     );
 }
+
+// ── OVER-clause placement rules (parse_func.c) ──────────────────────────────
+
+#[test]
+fn window_function_without_over_rejected() {
+    // A `prokind = 'w'` function is only callable with an OVER clause.
+    let db = setup();
+    let err = db.analyze("SELECT row_number() FROM posts").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("window function row_number requires an OVER clause"),
+        "got: {err}"
+    );
+    let err = db
+        .analyze("SELECT lag(title) FROM posts")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("window function lag requires an OVER clause"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn over_on_plain_function_rejected() {
+    // OVER attaches only to window functions and aggregates.
+    let db = setup();
+    let err = db
+        .analyze("SELECT length(title) OVER () FROM posts")
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "OVER specified, but length is not a window function nor an aggregate function"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn over_on_aggregate_still_allowed() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT sum(views) OVER (PARTITION BY user_id) AS w FROM posts")
+        .unwrap();
+    assert!(!col(&s, "w").nullable || col(&s, "w").nullable); // shape-only smoke
+}

@@ -128,7 +128,7 @@ pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<PgTypeOi
 }
 
 /// Normalize PostgreSQL type name aliases to their canonical form.
-fn normalize_type_name(name: &str) -> &str {
+pub(crate) fn normalize_type_name(name: &str) -> &str {
     match name {
         "integer" | "int" => "int4",
         "smallint" => "int2",

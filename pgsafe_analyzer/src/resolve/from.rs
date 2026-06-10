@@ -88,12 +88,15 @@ pub(crate) fn process_from_item(
             // `ON` are never registered with the collector and `into_sorted`
             // reports a spurious "parameter gap".
             if let Some(quals) = &join.quals {
-                check_no_aggregates_or_windows(quals, snapshot, "JOIN/ON")?;
-                expr::infer_expr(
+                // Shares WHERE's machinery: resolution errors first, then
+                // the no-aggregates placement rule, then PG's clause wording
+                // (`argument of JOIN/ON must be type boolean, not type X`).
+                super::coerce_bool_clause(
                     quals,
                     expr::Ctx::new(scope, null_ctx, snapshot),
                     params,
-                    TypeGoal::assignment(oid::BOOL),
+                    "JOIN/ON",
+                    Some("JOIN/ON"),
                 )?;
             }
 

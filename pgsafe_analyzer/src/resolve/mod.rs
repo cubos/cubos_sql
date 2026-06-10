@@ -572,32 +572,55 @@ fn check_no_aggregates_or_windows(
     Ok(())
 }
 
-/// Coerce a clause expression (WHERE / HAVING / DML WHERE) to boolean and, on
-/// a coerce-to-bool mismatch, rewrite to PG's exact wording — `argument of
-/// {label} must be type boolean, not type X` — so the `pg_sanity` prefix check
-/// matches. Errors that aren't a `TypeMismatch` (undefined column, subquery
-/// arity, …) carry their own specific message and propagate unchanged.
+/// Coerce a clause expression (WHERE / JOIN ON / HAVING / DML WHERE) to
+/// boolean and, on a coerce-to-bool mismatch, rewrite to PG's exact wording —
+/// `argument of {label} must be type boolean, not type X` — so the
+/// `pg_sanity` prefix check matches. Errors that aren't a `TypeMismatch`
+/// (undefined column, subquery arity, …) carry their own specific message and
+/// propagate unchanged.
+///
+/// `agg_context`, when set, enforces PG's no-aggregates/no-windows placement
+/// rule for the clause — at PG's point in the error ordering: PG transforms
+/// the expression bottom-up first (so an unresolvable function inside an
+/// aggregate reports `function … does not exist`, not the placement error),
+/// raises the placement error at the aggregate node, and only then applies
+/// the clause's boolean coercion. Hence: inference errors win, then
+/// placement, then the boolean rewrite.
 fn coerce_bool_clause(
     node: &protobuf::Node,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     label: &str,
+    agg_context: Option<&str>,
 ) -> Result<(), AnalyzeError> {
     let Ctx {
         scope,
         null_ctx,
         snapshot,
     } = ctx;
-    let Err(e) = expr::infer_expr(
+    let inferred = expr::infer_expr(
         node,
         expr::Ctx::new(scope, null_ctx, snapshot),
         params,
         TypeGoal::assignment(oid::BOOL),
-    ) else {
-        return Ok(());
+    );
+    let e = match inferred {
+        Ok(_) => {
+            if let Some(c) = agg_context {
+                check_no_aggregates_or_windows(node, snapshot, c)?;
+            }
+            return Ok(());
+        }
+        Err(e) => e,
     };
     if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
         return Err(e);
+    }
+    // The expression resolved but isn't boolean — placement still outranks
+    // the boolean complaint (`WHERE min(id)` is "aggregate functions are not
+    // allowed in WHERE", not "argument of WHERE must be type boolean").
+    if let Some(c) = agg_context {
+        check_no_aggregates_or_windows(node, snapshot, c)?;
     }
     let mut params2 = params.clone();
     let actual_oid = expr::infer_expr(

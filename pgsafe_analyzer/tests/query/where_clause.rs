@@ -463,3 +463,49 @@ fn stress_complex_where_params() {
     assert_cols(&info, vec![c("id", int8())]);
     assert_params(&info, vec![p(text()), p(text()), p(int4())]);
 }
+
+// ── Error ordering: resolution before placement before boolean coercion ─────
+
+#[test]
+fn where_unresolvable_aggregate_reports_resolution_error() {
+    // PG transforms bottom-up: `min(text, text)` has no overload, so the
+    // `function … does not exist` error fires before the aggregate-placement
+    // rule gets a chance.
+    let db = setup();
+    let err = db
+        .analyze("SELECT id FROM users WHERE min(name, name)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("function min(text, text) does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn where_valid_aggregate_reports_placement_error() {
+    // A resolvable aggregate in WHERE keeps the placement error — and it
+    // outranks the boolean-coercion complaint (`min(id)` is bigint).
+    let db = setup();
+    let err = db
+        .analyze("SELECT id FROM users WHERE min(id)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("aggregate functions are not allowed in WHERE"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn join_on_non_boolean_uses_pg_wording() {
+    let db = setup();
+    let err = db
+        .analyze("SELECT u.id FROM users u JOIN users v ON u.age + v.age")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("argument of JOIN/ON must be type boolean, not type integer"),
+        "got: {err}"
+    );
+}

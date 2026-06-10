@@ -462,3 +462,64 @@ fn greatest_unmatched_types_rejected() {
         "LEAST types boolean and integer cannot be matched"
     );
 }
+
+#[test]
+fn oid_range_checked() {
+    let db = setup();
+    // strtoul wrap-around semantics: positive values must fit uint32;
+    // negative magnitudes must fit int32 (`'-1'` is 4294967295).
+    db.analyze("SELECT '-1'::oid AS v").unwrap();
+    assert_first_line!(
+        db.analyze("SELECT '99999999999999999999'::oid"),
+        "value \"99999999999999999999\" is out of range for type oid"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '-4294967295'::oid"),
+        "value \"-4294967295\" is out of range for type oid"
+    );
+    // The reg* OID-literal path shares the range check.
+    assert_first_line!(
+        db.analyze("SELECT '9999999999999999999999'::regproc"),
+        "value \"9999999999999999999999\" is out of range for type oid"
+    );
+}
+
+#[test]
+fn array_dimension_form_requires_separator() {
+    let db = setup();
+    // `[…]` openers are only valid as the explicit-dimensions form
+    // `[lo:hi]={…}` — a bare bracket list is malformed.
+    assert_first_line!(
+        db.analyze("SELECT '[1,]'::int4[]"),
+        "malformed array literal: \"[1,]\""
+    );
+    db.analyze("SELECT '[1:2]={1,2}'::int4[] AS v").unwrap();
+}
+
+#[test]
+fn regtype_bare_identifier_resolved_against_catalog() {
+    let db = setup();
+    db.analyze("SELECT 'integer'::regtype AS v").unwrap();
+    db.analyze("SELECT 'status'::regtype AS v").unwrap();
+    assert_first_line!(
+        db.analyze("SELECT 'NaN'::regtype"),
+        "type \"nan\" does not exist"
+    );
+    // Anything beyond a bare identifier uses the full type grammar — skip.
+    db.analyze("SELECT 'character varying'::regtype AS v")
+        .unwrap();
+}
+
+#[test]
+fn any_all_with_concrete_incompatible_sides_rejected() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT id FROM t WHERE s = ANY(ARRAY[1, 2, 3])"),
+        "operator does not exist: text = integer"
+    );
+    db.analyze("SELECT id FROM t WHERE n = ANY(ARRAY[1, 2, 3])")
+        .unwrap();
+    // Cross-type comparisons still resolve through the operator catalog.
+    db.analyze("SELECT id FROM t WHERE id = ANY(ARRAY[1, 2, 3])")
+        .unwrap();
+}

@@ -1856,3 +1856,45 @@ fn update_text_into_int_column_rejected() {
         ),
     );
 }
+
+// ── INSERT … SELECT assignment type checking ────────────────────────────────
+
+#[test]
+fn insert_select_incompatible_column_type_rejected() {
+    // PG checks each SELECT output column against the target column at parse
+    // time: jsonb has no assignment cast to bigint.
+    let db = setup();
+    let err = db
+        .analyze("INSERT INTO posts (user_id, title) SELECT preferences, name FROM users")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("column \"user_id\" is of type bigint but expression is of type user_prefs"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn insert_select_coercible_column_types_accepted() {
+    // int4 → int8 is an implicit cast; text stays text.
+    let db = setup();
+    db.analyze("INSERT INTO posts (user_id, title) SELECT age, name FROM users")
+        .unwrap();
+}
+
+#[test]
+fn insert_select_unknown_literal_content_validated() {
+    // A bare string literal in the SELECT projection is coerced through the
+    // target column's input function, exactly like a VALUES literal.
+    let db = setup();
+    let err = db
+        .analyze("INSERT INTO posts (user_id) SELECT 'x' FROM users")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("invalid input syntax for type bigint: \"x\""),
+        "got: {err}"
+    );
+    db.analyze("INSERT INTO posts (user_id) SELECT '42' FROM users")
+        .unwrap();
+}
