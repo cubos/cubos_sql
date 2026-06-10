@@ -528,12 +528,16 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             ][rng.random_range(0..6)];
             // ~15% of leaves are a query parameter rather than a column /
             // literal, so the oracle's input-parameter-type comparison gets
-            // exercised. A bare `$pN` has no type context (PG reports it as
-            // `unknown`/`text`); pin it with an explicit cast so PG infers a
-            // concrete type we can check against.
-            if rng.random_bool(0.15) {
+            // exercised. A third are pinned with an explicit cast (checks
+            // the trivially-known type round-trips); the rest are *bare* so
+            // the enclosing context — function argument, operator operand,
+            // CASE branch — must infer them exactly like PG does.
+            if rng.random_bool(0.05) {
                 let t = BASE_TYPE_NAMES[rng.random_range(0..BASE_TYPE_NAMES.len())];
                 return format!("(${}::{t})", next_param(np));
+            }
+            if rng.random_bool(0.105) {
+                return format!("${}", next_param(np));
             }
             literal_for(ty, rng)
         };
@@ -551,7 +555,8 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
         }
         8 => {
             // NULL test / IS DISTINCT FROM — always-boolean predicates that
-            // accept any operand type.
+            // accept any operand type. The DISTINCT rhs may be a bare
+            // param (typed from the lhs, like `=`).
             let col = random_col(table, rng);
             match rng.random_range(0..3) {
                 0 => format!("({} IS NULL)", col.name),
@@ -559,33 +564,34 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
                 _ => format!(
                     "({} IS DISTINCT FROM {})",
                     col.name,
-                    literal_for(col.ty, rng)
+                    lit_or_param(col.ty, rng, np)
                 ),
             }
         }
         9 => {
-            // BETWEEN / IN-list / = ANY(array) over a column, usually with
-            // literals of the column's own type (the mutator mistypes them
-            // later, exercising per-bound coercion errors).
+            // BETWEEN / IN-list / = ANY(array) over a column, with literals
+            // of the column's own type or bare params (typed per-bound by
+            // PG); the mutator mistypes the literals later, exercising
+            // per-bound coercion errors.
             let col = random_col(table, rng);
             match rng.random_range(0..3) {
                 0 => format!(
                     "({} BETWEEN {} AND {})",
                     col.name,
-                    literal_for(col.ty, rng),
-                    literal_for(col.ty, rng)
+                    lit_or_param(col.ty, rng, np),
+                    lit_or_param(col.ty, rng, np)
                 ),
                 1 => format!(
                     "({} IN ({}, {}))",
                     col.name,
-                    literal_for(col.ty, rng),
-                    literal_for(col.ty, rng)
+                    lit_or_param(col.ty, rng, np),
+                    lit_or_param(col.ty, rng, np)
                 ),
                 _ => format!(
                     "({} = ANY(ARRAY[{}, {}]))",
                     col.name,
-                    literal_for(col.ty, rng),
-                    literal_for(col.ty, rng)
+                    lit_or_param(col.ty, rng, np),
+                    lit_or_param(col.ty, rng, np)
                 ),
             }
         }
@@ -675,6 +681,76 @@ fn next_param(np: &mut u32) -> String {
     let name = format!("p{}", *np);
     *np += 1;
     name
+}
+
+/// A literal of `ty` — or, some of the time, a bare `$pN` parameter in its
+/// place. Bare params in rich positions (BETWEEN bounds, IN items, function
+/// args, CASE branches, …) are what exercise PG's parameter-type inference;
+/// this is exactly the surface where the analyzer's typing has to match
+/// PG's Describe.
+fn lit_or_param(ty: Ty, rng: &mut StdRng, np: &mut u32) -> String {
+    if rng.random_bool(0.3) {
+        format!("${}", next_param(np))
+    } else {
+        literal_for(ty, rng)
+    }
+}
+
+/// Convert the fuzzer's named placeholders (`$pN`, the form the analyzer
+/// accepts) into PG-native positional ones (`$N`) so `pg_query` can parse
+/// the statement — the mutation/minimization pipeline operates on the
+/// positional form. Quote-aware enough for fuzzer-generated SQL.
+fn named_to_positional(sql: &str) -> String {
+    rewrite_params(sql, |digits, out| {
+        out.push('$');
+        out.push_str(digits);
+    })
+}
+
+/// Inverse of [`named_to_positional`]: deparsed/mutated SQL carries `$N`;
+/// the analyzer wants `$pN`.
+fn positional_to_named(sql: &str) -> String {
+    rewrite_params(sql, |digits, out| {
+        out.push_str("$p");
+        out.push_str(digits);
+    })
+}
+
+/// Shared scanner: find `$p?<digits>` outside single-quoted strings and let
+/// `emit` rewrite each occurrence.
+fn rewrite_params(sql: &str, emit: impl Fn(&str, &mut String)) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            in_string = !in_string;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_string && c == '$' {
+            let mut j = i + 1;
+            if j < chars.len() && chars[j] == 'p' {
+                j += 1;
+            }
+            let digits_start = j;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > digits_start {
+                let digits: String = chars[digits_start..j].iter().collect();
+                emit(&digits, &mut out);
+                i = j;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 fn pick_table(rng: &mut StdRng) -> &'static Table {
@@ -854,6 +930,14 @@ fn gen_window_call(table: &Table, rng: &mut StdRng, np: &mut u32) -> String {
             "{}({}) OVER ({over})",
             ["sum", "avg", "min", "max", "count"][rng.random_range(0..5)],
             random_col(table, rng).name
+        ),
+        2 if rng.random_bool(0.35) => format!(
+            // Two-arg lag/lead: the offset is int4 in PG's signature — a
+            // bare param here is typed through function-argument inference.
+            "{}({}, ${}) OVER ({over})",
+            ["lag", "lead"][rng.random_range(0..2)],
+            random_col(table, rng).name,
+            next_param(np)
         ),
         2 => format!(
             "{}({}) OVER ({over})",
@@ -1460,8 +1544,10 @@ fn gen_random_schema(rng: &mut StdRng) -> String {
 // Strategy 2 — AST mutation via pg_query parse → tweak → deparse.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Param-free seed queries for the AST mutator (it feeds them to `pg_query`,
-/// which only understands positional `$N`, so we avoid named params here).
+/// Seed queries for the AST mutator. Named `$pN` params are welcome: the
+/// pools store the positional (`$N`) form pg_query understands, and the
+/// mutation boundary converts back — mutating *around* a bare param is the
+/// canonical single-fault probe of parameter-type inference.
 const SEEDS: &[&str] = &[
     "SELECT id, name FROM users WHERE age > 18",
     "SELECT count(*), max(score) FROM users GROUP BY st",
@@ -1494,6 +1580,18 @@ const SEEDS: &[&str] = &[
     // DML beyond single-row VALUES.
     "INSERT INTO posts (user_id, title) SELECT id, name FROM users RETURNING id",
     "INSERT INTO users (name) VALUES ('x') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+    // Parametrized shapes — params in operator, function-argument,
+    // conditional, special-form, and set-op positions.
+    "SELECT id FROM users WHERE id = $p1 AND name = $p2",
+    "SELECT age + $p1 FROM users",
+    "SELECT name || $p1 FROM users",
+    "SELECT coalesce($p1, age) FROM users",
+    "SELECT substr(name, $p1) FROM users",
+    "SELECT id FROM users WHERE age BETWEEN $p1 AND $p2",
+    "SELECT id FROM users WHERE id = ANY($p1)",
+    "SELECT CASE WHEN active THEN $p1 ELSE age END FROM users",
+    "SELECT $p1 UNION ALL SELECT age FROM users",
+    "SELECT prefs -> $p1 FROM users",
     // Derived tables.
     "SELECT v.a FROM (VALUES (1, 'x'), (2, 'y')) AS v(a, b)",
     "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id)",
@@ -1616,7 +1714,8 @@ fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
 /// Candidate reductions of `sql` produced by structural edits to the parsed
 /// SELECT (drop a projection, drop a clause, unwrap a binary expr).
 fn reductions(sql: &str) -> Vec<String> {
-    let Ok(parsed) = pg_query::parse(sql) else {
+    // `sql` is in the analyzer's named form; pg_query needs positional.
+    let Ok(parsed) = pg_query::parse(&named_to_positional(sql)) else {
         return Vec::new();
     };
     // The wrapper `ParseResult` isn't `Clone`, but the inner protobuf message
@@ -1635,7 +1734,7 @@ fn reductions(sql: &str) -> Vec<String> {
             } else {
                 return None;
             }
-            pg_query::deparse(&clone).ok()
+            pg_query::deparse(&clone).ok().map(|s| positional_to_named(&s))
         };
 
         // Drop the last projection (keep at least one).
@@ -1897,7 +1996,8 @@ fn fuzz_analyze_against_pg() {
             let (r, d) = db.analyze_checked(s);
             r.is_ok() && d.is_none()
         })
-        .map(|s| s.to_string())
+        // Pools hold the positional (`$N`) form pg_query can parse.
+        .map(|s| named_to_positional(s))
         .collect();
 
     let mut metamorphic_checks = 0u32;
@@ -1924,9 +2024,12 @@ fn fuzz_analyze_against_pg() {
             }
         } else if roll < 32 {
             // Template generator (SELECT / set-op / CTE / VALUES / DML).
+            // Pool the *positional* form (`$N`) — pg_query can parse it, so
+            // parametrized statements feed the mutation pipeline too.
             let q = gen_statement(&mut rng);
-            if pg_query::parse(&q).is_ok() && live_seeds.len() < 400 {
-                live_seeds.push(q.clone());
+            let positional = named_to_positional(&q);
+            if pg_query::parse(&positional).is_ok() && live_seeds.len() < 400 {
+                live_seeds.push(positional);
             }
             q
         } else if roll < 40 {
@@ -1937,10 +2040,11 @@ fn fuzz_analyze_against_pg() {
             // branch in the recording (probe shapes are single-coercion).
             gen_literal_probe(&mut rng)
         } else if single_fault {
-            // Single-fault: one edit over a known-valid base.
+            // Single-fault: one edit over a known-valid base (pooled in
+            // positional form; the analyzer wants named `$pN` back).
             let base = valid_seeds[rng.random_range(0..valid_seeds.len())].clone();
             match mutate(&base, &mut rng, 1) {
-                Some(m) => m,
+                Some(m) => positional_to_named(&m),
                 None => continue,
             }
         } else {
@@ -1948,7 +2052,7 @@ fn fuzz_analyze_against_pg() {
             let base = live_seeds[rng.random_range(0..live_seeds.len())].clone();
             let n_edits = rng.random_range(1..=3);
             match mutate(&base, &mut rng, n_edits) {
-                Some(m) => m,
+                Some(m) => positional_to_named(&m),
                 None => continue,
             }
         };
@@ -1957,12 +2061,13 @@ fn fuzz_analyze_against_pg() {
         if let (Ok(q), None) = (&result, &divergence) {
             // Grow the valid-base pool with cleanly-analyzing queries we
             // generate, so single-fault has fresh material beyond the static
-            // seeds. Require pg_query to parse it too: the AST mutator re-parses
-            // these and only understands positional `$N`, not the `$pN` named
-            // params the template generator emits — so a parametrized query
-            // would just be skipped.
-            if valid_seeds.len() < 400 && pg_query::parse(&sql).is_ok() {
-                valid_seeds.push(sql.clone());
+            // seeds. Pool the *positional* (`$N`) form: pg_query parses it,
+            // so parametrized queries join the mutation pipeline — mutating
+            // *around* a bare param is exactly the single-fault shape that
+            // stresses parameter-type inference.
+            let positional = named_to_positional(&sql);
+            if valid_seeds.len() < 400 && pg_query::parse(&positional).is_ok() {
+                valid_seeds.push(positional);
             }
             // Metamorphic self-consistency (Strategy 4): a pass-through wrap
             // must preserve the column type/nullability shape.
