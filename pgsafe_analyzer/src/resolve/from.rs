@@ -71,93 +71,7 @@ pub(crate) fn process_from_item(
             apply_alias_column_names(scope, rv.alias.as_ref())?;
         }
         node::Node::JoinExpr(join) => {
-            // Process left and right sides.
-            let left_start = scope.sources.len();
-            if let Some(larg) = &join.larg {
-                process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params)?;
-            }
-            let left_end = scope.sources.len();
-
-            if let Some(rarg) = &join.rarg {
-                process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params)?;
-            }
-            let right_end = scope.sources.len();
-
-            // Walk the ON clause *before* applying outer-join nullability:
-            // PG evaluates `ON` on paired rows where right-side columns are
-            // still NOT NULL (for LEFT JOIN), and only null-pads non-matches
-            // afterwards. Without this walk, `$N` parameters used only in
-            // `ON` are never registered with the collector and `into_sorted`
-            // reports a spurious "parameter gap".
-            if let Some(quals) = &join.quals {
-                // Shares WHERE's machinery: resolution errors first, then
-                // the no-aggregates placement rule, then PG's clause wording
-                // (`argument of JOIN/ON must be type boolean, not type X`).
-                crate::clause::coerce_clause_expr(
-                    quals,
-                    expr::Ctx::new(scope, null_ctx, snapshot),
-                    params,
-                    crate::clause::ClauseKind::JoinOn,
-                )?;
-            }
-
-            // Apply JOIN nullability. Fail loudly on unknown join kinds rather
-            // than defaulting to INNER, which would silently produce wrong
-            // nullability for outer joins the parser couldn't classify.
-            let join_type = JoinType::try_from(join.jointype)
-                .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
-
-            match join_type {
-                JoinType::JoinLeft => {
-                    let right_aliases =
-                        nullability::collect_aliases(&scope.sources[left_end..right_end]);
-                    null_ctx.mark_all_nullable(&right_aliases);
-                }
-                JoinType::JoinRight => {
-                    let left_aliases =
-                        nullability::collect_aliases(&scope.sources[left_start..left_end]);
-                    null_ctx.mark_all_nullable(&left_aliases);
-                }
-                JoinType::JoinFull => {
-                    let all_aliases =
-                        nullability::collect_aliases(&scope.sources[left_start..right_end]);
-                    null_ctx.mark_all_nullable(&all_aliases);
-                }
-                JoinType::JoinInner => {} // No nullability change.
-                other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
-            }
-
-            // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns:
-            // the output has ONE column per name (placed before both sides'
-            // remaining columns in `*`), an unqualified reference resolves
-            // to it without ambiguity, and the constituents stay reachable
-            // qualified (`a.id`) and via `a.*`.
-            let using_names: Vec<String> = if join.is_natural {
-                // Common column names, in left-side column order.
-                let right_names: std::collections::HashSet<&str> = scope.sources
-                    [left_end..right_end]
-                    .iter()
-                    .flat_map(|s| s.columns.iter().map(|c| c.name.as_str()))
-                    .collect();
-                scope.sources[left_start..left_end]
-                    .iter()
-                    .flat_map(|s| s.columns.iter().map(|c| c.name.clone()))
-                    .filter(|n| right_names.contains(n.as_str()))
-                    .collect()
-            } else {
-                expr::extract_string_fields(&join.using_clause)
-            };
-            if !using_names.is_empty() {
-                merge_using_columns(
-                    scope,
-                    snapshot,
-                    &using_names,
-                    left_start,
-                    left_end,
-                    right_end,
-                    join_type,
-                )?;
-            }
+            process_join_expr(join, scope, null_ctx, snapshot, cte_scopes, params)?;
         }
         node::Node::RangeSubselect(sub) => {
             let alias = sub
@@ -404,6 +318,133 @@ pub(crate) fn process_range_function(
     Ok(())
 }
 
+/// The contiguous run of `scope.sources` contributed by one side of a JOIN.
+///
+/// FROM processing appends sources in traversal order, so a JOIN's sides are
+/// always adjacent runs; addressing them through captured spans (instead of
+/// loose `left_start`/`left_end`/`right_end` indices) keeps the nullability
+/// promotion and USING merging phrased as "the left side's sources".
+#[derive(Clone, Copy)]
+struct SourceSpan {
+    start: usize,
+    end: usize,
+}
+
+impl SourceSpan {
+    /// Run `f` (which may append sources to the scope) and capture the span
+    /// of sources it added.
+    fn capture(
+        scope: &mut Scope,
+        f: impl FnOnce(&mut Scope) -> Result<(), AnalyzeError>,
+    ) -> Result<SourceSpan, AnalyzeError> {
+        let start = scope.sources.len();
+        f(scope)?;
+        Ok(SourceSpan {
+            start,
+            end: scope.sources.len(),
+        })
+    }
+
+    /// Union with an adjacent later span (left side `.to(right side)`).
+    fn to(self, other: SourceSpan) -> SourceSpan {
+        SourceSpan {
+            start: self.start,
+            end: other.end,
+        }
+    }
+
+    fn sources(self, scope: &Scope) -> &[crate::scope::TableSource] {
+        &scope.sources[self.start..self.end]
+    }
+}
+
+/// `a JOIN b ON …` / `USING (…)` / `NATURAL …`: process both sides, walk the
+/// ON clause, apply outer-join nullability to the null-padded side(s), and
+/// merge USING/NATURAL columns.
+fn process_join_expr(
+    join: &protobuf::JoinExpr,
+    scope: &mut Scope,
+    null_ctx: &mut NullabilityContext,
+    snapshot: &PgCatalog,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let left = SourceSpan::capture(scope, |scope| match &join.larg {
+        Some(larg) => process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params),
+        None => Ok(()),
+    })?;
+    let right = SourceSpan::capture(scope, |scope| match &join.rarg {
+        Some(rarg) => process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params),
+        None => Ok(()),
+    })?;
+
+    // Walk the ON clause *before* applying outer-join nullability:
+    // PG evaluates `ON` on paired rows where right-side columns are
+    // still NOT NULL (for LEFT JOIN), and only null-pads non-matches
+    // afterwards. Without this walk, `$N` parameters used only in
+    // `ON` are never registered with the collector and `into_sorted`
+    // reports a spurious "parameter gap".
+    if let Some(quals) = &join.quals {
+        // Shares WHERE's machinery: resolution errors first, then
+        // the no-aggregates placement rule, then PG's clause wording
+        // (`argument of JOIN/ON must be type boolean, not type X`).
+        crate::clause::coerce_clause_expr(
+            quals,
+            expr::Ctx::new(scope, null_ctx, snapshot),
+            params,
+            crate::clause::ClauseKind::JoinOn,
+        )?;
+    }
+
+    // Apply JOIN nullability. Fail loudly on unknown join kinds rather
+    // than defaulting to INNER, which would silently produce wrong
+    // nullability for outer joins the parser couldn't classify.
+    let join_type = JoinType::try_from(join.jointype)
+        .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
+
+    match join_type {
+        JoinType::JoinLeft => {
+            let right_aliases = nullability::collect_aliases(right.sources(scope));
+            null_ctx.mark_all_nullable(&right_aliases);
+        }
+        JoinType::JoinRight => {
+            let left_aliases = nullability::collect_aliases(left.sources(scope));
+            null_ctx.mark_all_nullable(&left_aliases);
+        }
+        JoinType::JoinFull => {
+            let all_aliases = nullability::collect_aliases(left.to(right).sources(scope));
+            null_ctx.mark_all_nullable(&all_aliases);
+        }
+        JoinType::JoinInner => {} // No nullability change.
+        other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
+    }
+
+    // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns:
+    // the output has ONE column per name (placed before both sides'
+    // remaining columns in `*`), an unqualified reference resolves
+    // to it without ambiguity, and the constituents stay reachable
+    // qualified (`a.id`) and via `a.*`.
+    let using_names: Vec<String> = if join.is_natural {
+        // Common column names, in left-side column order.
+        let right_names: std::collections::HashSet<&str> = right
+            .sources(scope)
+            .iter()
+            .flat_map(|s| s.columns.iter().map(|c| c.name.as_str()))
+            .collect();
+        left.sources(scope)
+            .iter()
+            .flat_map(|s| s.columns.iter().map(|c| c.name.clone()))
+            .filter(|n| right_names.contains(n.as_str()))
+            .collect()
+    } else {
+        expr::extract_string_fields(&join.using_clause)
+    };
+    if !using_names.is_empty() {
+        merge_using_columns(scope, snapshot, &using_names, left, right, join_type)?;
+    }
+    Ok(())
+}
+
 /// Build the merged columns for `JOIN USING` / `NATURAL JOIN` and splice
 /// them into the scope as a synthetic empty-alias source placed *before*
 /// both join sides — which is exactly where PG puts them in `*` expansion
@@ -420,18 +461,16 @@ pub(crate) fn process_range_function(
 ///   preserved side), the right's for RIGHT, and `COALESCE(l, r)` for FULL
 ///   — all computed from the columns' *base* nullability (the outer-join
 ///   promotion applies to the constituent aliases, not the merged copy).
-#[allow(clippy::too_many_arguments)]
 fn merge_using_columns(
     scope: &mut Scope,
     snapshot: &PgCatalog,
     using_names: &[String],
-    left_start: usize,
-    left_end: usize,
-    right_end: usize,
+    left: SourceSpan,
+    right: SourceSpan,
     join_type: JoinType,
 ) -> Result<(), AnalyzeError> {
-    let find_col = |range: std::ops::Range<usize>, name: &str| -> Option<(String, ScopeColumn)> {
-        scope.sources[range].iter().find_map(|s| {
+    let find_col = |span: SourceSpan, name: &str| -> Option<(String, ScopeColumn)> {
+        scope.sources[span.start..span.end].iter().find_map(|s| {
             s.columns
                 .iter()
                 .find(|c| c.name == name)
@@ -441,10 +480,10 @@ fn merge_using_columns(
 
     let mut merged: Vec<ScopeColumn> = Vec::with_capacity(using_names.len());
     for name in using_names {
-        let Some((l_alias, l)) = find_col(left_start..left_end, name) else {
+        let Some((l_alias, l)) = find_col(left, name) else {
             return Err(crate::pgmsg::using_column_missing(name, "left").finalize_implicit());
         };
-        let Some((r_alias, r)) = find_col(left_end..right_end, name) else {
+        let Some((r_alias, r)) = find_col(right, name) else {
             return Err(crate::pgmsg::using_column_missing(name, "right").finalize_implicit());
         };
 
@@ -484,7 +523,7 @@ fn merge_using_columns(
     }
 
     scope.sources.insert(
-        left_start,
+        left.start,
         crate::scope::TableSource {
             alias: String::new(),
             columns: merged,
