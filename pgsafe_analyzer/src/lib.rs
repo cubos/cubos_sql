@@ -31,6 +31,7 @@
 //! // result.params[0].rust_type  == "i64"
 //! ```
 
+mod clause;
 mod coerce;
 mod ddl;
 mod diagnostic;

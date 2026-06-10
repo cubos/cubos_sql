@@ -653,12 +653,11 @@ pub(crate) fn analyze_update(
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &upd.where_clause {
-        coerce_bool_clause(
+        crate::clause::coerce_clause_expr(
             where_clause,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
-            "WHERE",
-            Some("WHERE"),
+            crate::clause::ClauseKind::Where,
         )?;
     }
 
@@ -734,12 +733,11 @@ pub(crate) fn analyze_delete(
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {
-        coerce_bool_clause(
+        crate::clause::coerce_clause_expr(
             where_clause,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
-            "WHERE",
-            Some("WHERE"),
+            crate::clause::ClauseKind::Where,
         )?;
     }
 

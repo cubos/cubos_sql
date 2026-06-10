@@ -424,13 +424,9 @@ pub(crate) fn infer_expr(
         node::Node::BooleanTest(t) => {
             // `x IS [NOT] TRUE/FALSE/UNKNOWN` coerces its operand to boolean
             // (PG's coerce_to_boolean) — so a bare `$1 IS TRUE` pins the
-            // param as bool, and a non-boolean operand gets PG's wording.
-            if let Some(arg) = &t.arg
-                && let Err(e) = infer_expr(arg, ctx, params, TypeGoal::assignment(oid::BOOL))
-            {
-                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
-                    return Err(e);
-                }
+            // param as bool, and a non-boolean operand gets PG's wording
+            // from the shared clause walker.
+            if let Some(arg) = &t.arg {
                 let label = match protobuf::BoolTestType::try_from(t.booltesttype) {
                     Ok(protobuf::BoolTestType::IsTrue) => "IS TRUE",
                     Ok(protobuf::BoolTestType::IsNotTrue) => "IS NOT TRUE",
@@ -439,20 +435,12 @@ pub(crate) fn infer_expr(
                     Ok(protobuf::BoolTestType::IsUnknown) => "IS UNKNOWN",
                     _ => "IS NOT UNKNOWN",
                 };
-                let mut params2 = params.clone();
-                let actual_oid = infer_expr(arg, ctx, &mut params2, TypeGoal::NONE)
-                    .map(|x| x.type_oid)
-                    .unwrap_or(oid::UNKNOWN);
-                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-                let span = crate::error::node_location(arg)
-                    .and_then(crate::error::SourceSpan::from_node_qname);
-                return Err(crate::error::RawError::invalid(
-                    format!("argument of {label} must be type boolean, not type {actual_pg}"),
-                    span,
-                    None,
-                )
-                .with_primary_label(format!("this is {actual_pg}, expected boolean"))
-                .finalize_implicit());
+                crate::clause::coerce_clause_expr(
+                    arg,
+                    ctx,
+                    params,
+                    crate::clause::ClauseKind::BoolTest(label),
+                )?;
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }

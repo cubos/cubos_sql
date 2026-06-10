@@ -9,40 +9,18 @@ pub(crate) fn infer_bool_expr(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    let Ctx { snapshot, .. } = ctx;
-    // PG names the failing argument after the operator (`argument of NOT must
-    // be type boolean, not type X`, likewise AND / OR).
-    let label = match protobuf::BoolExprType::try_from(expr.boolop) {
-        Ok(protobuf::BoolExprType::NotExpr) => "NOT",
-        Ok(protobuf::BoolExprType::OrExpr) => "OR",
-        _ => "AND",
+    // PG names the failing argument after the operator (`argument of NOT
+    // must be type boolean, not type X`, likewise AND / OR) — the shared
+    // clause walker owns the wording.
+    let kind = match protobuf::BoolExprType::try_from(expr.boolop) {
+        Ok(protobuf::BoolExprType::NotExpr) => crate::clause::ClauseKind::Not,
+        Ok(protobuf::BoolExprType::OrExpr) => crate::clause::ClauseKind::Or,
+        _ => crate::clause::ClauseKind::And,
     };
     let mut any_nullable = false;
     for arg in &expr.args {
-        match infer_expr(arg, ctx, params, TypeGoal::assignment(oid::BOOL)) {
-            Ok(t) => any_nullable = any_nullable || t.nullable,
-            // Rewrite a coerce-to-bool mismatch to PG's exact wording; other
-            // errors keep their own message.
-            Err(e) => {
-                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
-                    return Err(e);
-                }
-                let mut params2 = params.clone();
-                let actual_oid = infer_expr(arg, ctx, &mut params2, TypeGoal::NONE)
-                    .map(|t| t.type_oid)
-                    .unwrap_or(oid::UNKNOWN);
-                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-                let span = crate::error::node_location(arg)
-                    .and_then(crate::error::SourceSpan::from_node_qname);
-                return Err(crate::error::RawError::invalid(
-                    format!("argument of {label} must be type boolean, not type {actual_pg}"),
-                    span,
-                    None,
-                )
-                .with_primary_label(format!("this is {actual_pg}, expected boolean"))
-                .finalize_implicit());
-            }
-        }
+        let t = crate::clause::coerce_clause_expr(arg, ctx, params, kind)?;
+        any_nullable = any_nullable || t.nullable;
     }
     Ok(ExprType::scalar(oid::BOOL, any_nullable))
 }
@@ -199,31 +177,16 @@ pub(crate) fn infer_case(
                     }
                 }
             }
-            // Searched CASE: the WHEN condition must be boolean. On a
-            // coerce-to-bool mismatch, rewrite to PG's exact wording
-            // (`argument of CASE/WHEN must be type boolean, not type X`)
-            // the same way the WHERE clause does; other errors carry
-            // their own message and propagate as-is.
-            else if let Some(cond) = &when.expr
-                && let Err(e) = infer_expr(cond, ctx, params, TypeGoal::assignment(oid::BOOL))
-            {
-                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
-                    return Err(e);
-                }
-                let mut params2 = params.clone();
-                let actual_oid = infer_expr(cond, ctx, &mut params2, TypeGoal::NONE)
-                    .map(|t| t.type_oid)
-                    .unwrap_or(oid::UNKNOWN);
-                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-                let span = crate::error::node_location(cond)
-                    .and_then(crate::error::SourceSpan::from_node_qname);
-                return Err(crate::error::RawError::invalid(
-                    format!("argument of CASE/WHEN must be type boolean, not type {actual_pg}"),
-                    span,
-                    None,
-                )
-                .with_primary_label(format!("this is {actual_pg}, expected boolean"))
-                .finalize_implicit());
+            // Searched CASE: the WHEN condition must be boolean
+            // (`argument of CASE/WHEN must be type boolean, not type X`) —
+            // wording and ordering live in the shared clause walker.
+            else if let Some(cond) = &when.expr {
+                crate::clause::coerce_clause_expr(
+                    cond,
+                    ctx,
+                    params,
+                    crate::clause::ClauseKind::CaseWhen,
+                )?;
             }
             // THEN result. Untyped string literals stay UNKNOWN for branch
             // reconciliation (PG's `select_common_type` behavior); their

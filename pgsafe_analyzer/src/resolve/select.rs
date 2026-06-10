@@ -144,12 +144,11 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         // reference the post-aggregation row, not the pre-aggregation one) —
         // but only after the expression itself resolves; the ordering lives
         // in `coerce_bool_clause`.
-        coerce_bool_clause(
+        crate::clause::coerce_clause_expr(
             where_clause,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
-            "WHERE",
-            Some("WHERE"),
+            crate::clause::ClauseKind::Where,
         )?;
     }
 
@@ -186,12 +185,11 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
     if let Some(having) = &sel.having_clause {
-        coerce_bool_clause(
+        crate::clause::coerce_clause_expr(
             having,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
-            "HAVING",
-            None,
+            crate::clause::ClauseKind::Having,
         )?;
     }
 
@@ -293,56 +291,21 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         }
     }
 
-    // Process LIMIT / OFFSET — PG uses coerce_to_specific_type(INT8OID)
-    // with COERCION_ASSIGNMENT, and emits its own wording on mismatch:
-    // `argument of LIMIT must be type bigint, not type X` (likewise for
-    // OFFSET). Catch the generic coerce error and rewrite to PG's exact
-    // message so `pglite_sanity` matches.
-    for (limit_node, label) in [(&sel.limit_count, "LIMIT"), (&sel.limit_offset, "OFFSET")] {
+    // Process LIMIT / OFFSET — int8 coercion, placement rule, and PG's
+    // wording all live in the shared clause walker.
+    for (limit_node, kind) in [
+        (&sel.limit_count, crate::clause::ClauseKind::Limit),
+        (&sel.limit_offset, crate::clause::ClauseKind::Offset),
+    ] {
         let Some(limit_node) = limit_node else {
             continue;
         };
-        // Run the inference; on a coerce-to-int8 mismatch, rewrite to PG's
-        // wording. Other errors (undefined column, etc.) propagate
-        // verbatim — only TypeMismatch maps to `argument of LIMIT/OFFSET`.
-        // PG also forbids aggregates / window functions here (`aggregate
-        // functions are not allowed in LIMIT`), checked at its place in the
-        // error order: after the expression resolves, before the bigint
-        // complaint (same scheme as `coerce_bool_clause`).
-        match expr::infer_expr(
+        crate::clause::coerce_clause_expr(
             limit_node,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
-            TypeGoal::assignment(oid::INT8),
-        ) {
-            Ok(_) => {
-                check_no_aggregates_or_windows(limit_node, snapshot, label)?;
-            }
-            Err(e) => {
-                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
-                    return Err(e);
-                }
-                check_no_aggregates_or_windows(limit_node, snapshot, label)?;
-                let mut params2 = params.clone();
-                let actual_oid = expr::infer_expr(
-                    limit_node,
-                    expr::Ctx::new(&scope, &null_ctx, snapshot),
-                    &mut params2,
-                    TypeGoal::NONE,
-                )
-                .map(|t| t.type_oid)
-                .unwrap_or(oid::UNKNOWN);
-                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
-                let span = crate::error::node_location(limit_node)
-                    .and_then(crate::error::SourceSpan::from_node_qname);
-                return Err(crate::error::RawError::invalid(
-                    format!("argument of {label} must be type bigint, not type {actual_pg}"),
-                    span,
-                    None,
-                )
-                .finalize_implicit());
-            }
-        }
+            kind,
+        )?;
     }
 
     // Resolve target list (SELECT expressions) — no type expectation.
@@ -582,7 +545,7 @@ pub(crate) fn walk_group_clause_node(
     {
         return Err(e);
     }
-    check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
+    crate::clause::check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
     Ok(())
 }
 

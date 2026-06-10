@@ -93,12 +93,11 @@ pub(crate) fn process_from_item(
                 // Shares WHERE's machinery: resolution errors first, then
                 // the no-aggregates placement rule, then PG's clause wording
                 // (`argument of JOIN/ON must be type boolean, not type X`).
-                super::coerce_bool_clause(
+                crate::clause::coerce_clause_expr(
                     quals,
                     expr::Ctx::new(scope, null_ctx, snapshot),
                     params,
-                    "JOIN/ON",
-                    Some("JOIN/ON"),
+                    crate::clause::ClauseKind::JoinOn,
                 )?;
             }
 
