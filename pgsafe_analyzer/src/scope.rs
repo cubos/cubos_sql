@@ -76,6 +76,12 @@ pub(crate) struct Scope {
     /// reference to FROM-clause entry for table "t"` instead of the generic
     /// `column "t.col" does not exist`. Never consulted for resolution.
     pub shadowed_sources: Vec<TableSource>,
+    /// `(alias, column)` pairs merged away by `JOIN USING` / `NATURAL JOIN`:
+    /// hidden from the *unqualified* `*` expansion and from unqualified
+    /// name resolution (the merged column — a synthetic empty-alias source —
+    /// takes their place), but still reachable qualified (`a.id`) and via
+    /// `a.*`, exactly like PG.
+    pub join_hidden: std::collections::HashSet<(String, String)>,
 }
 
 /// Build the public-facing `UndefinedTable` error for a missing relation,
@@ -146,6 +152,21 @@ pub(crate) fn undefined_column_error(
 }
 
 impl Scope {
+    /// PG (SQLSTATE 42712): every FROM item of one query level needs a
+    /// distinct alias — `FROM users u, posts u` is rejected. The synthetic
+    /// empty-alias sources produced by JOIN USING merging are exempt.
+    fn check_duplicate_alias(&self, alias: &str) -> Result<(), AnalyzeError> {
+        if !alias.is_empty() && self.sources.iter().any(|s| s.alias == alias) {
+            return Err(RawError::invalid(
+                format!("table name \"{alias}\" specified more than once"),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
+        Ok(())
+    }
+
     /// Add a table from the catalog.
     ///
     /// `span` covers the relation reference in the original SQL — usually
@@ -161,6 +182,7 @@ impl Scope {
         alias: &str,
         span: Option<SourceSpan>,
     ) -> Result<(), AnalyzeError> {
+        self.check_duplicate_alias(alias)?;
         let table = snapshot
             .resolve_table(schema, name)
             .ok_or_else(|| undefined_table_error(snapshot, schema, name, span))?;
@@ -195,13 +217,19 @@ impl Scope {
     }
 
     /// Add a virtual table (CTE, subquery result).
-    pub fn add_virtual_table(&mut self, alias: &str, columns: Vec<ScopeColumn>) {
+    pub fn add_virtual_table(
+        &mut self,
+        alias: &str,
+        columns: Vec<ScopeColumn>,
+    ) -> Result<(), AnalyzeError> {
+        self.check_duplicate_alias(alias)?;
         self.sources.push(TableSource {
             alias: alias.to_owned(),
             columns,
             system_columns: Vec::new(),
             source_qn: None,
         });
+        Ok(())
     }
 
     /// Add columns from a DML target table (for RETURNING).
@@ -267,7 +295,16 @@ impl Scope {
             // when `t` is visible in the enclosing FROM but not here, point
             // at the FROM-clause-entry visibility rule rather than the
             // generic missing-column message. The hint mirrors PG's HINT.
-            if self.shadowed_sources.iter().any(|s| s.alias == t) {
+            // The same wording covers qualifying by a table's *real* name
+            // when the FROM entry gave it an alias (`SELECT users.id FROM
+            // users u` — PG hints at the alias).
+            let aliased_away = self
+                .sources
+                .iter()
+                .chain(self.lateral_sources.iter())
+                .chain(self.outer_sources.iter())
+                .any(|s| s.alias != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t));
+            if aliased_away || self.shadowed_sources.iter().any(|s| s.alias == t) {
                 return Err(undefined_column_error(
                     self,
                     column,
@@ -290,7 +327,15 @@ impl Scope {
         for tier in [&self.sources, &self.lateral_sources, &self.outer_sources] {
             let mut matches: Vec<&ScopeColumn> = Vec::new();
             for source in tier {
-                if let Some(col) = source.columns.iter().find(|c| c.name == column) {
+                if let Some(col) = source.columns.iter().find(|c| {
+                    c.name == column
+                        // Columns merged away by JOIN USING / NATURAL are
+                        // only reachable qualified; the synthetic merged
+                        // column stands in for unqualified references.
+                        && !self
+                            .join_hidden
+                            .contains(&(source.alias.clone(), c.name.clone()))
+                }) {
                     matches.push(col);
                 }
             }
@@ -321,5 +366,23 @@ impl Scope {
 
     pub fn all_columns(&self) -> Vec<&ScopeColumn> {
         self.sources.iter().flat_map(|s| s.columns.iter()).collect()
+    }
+
+    /// Columns the bare `*` expands to: everything visible, minus the
+    /// constituents merged away by JOIN USING / NATURAL (their synthetic
+    /// merged column — placed before both sides — stands in for them).
+    /// `t.*` deliberately does NOT use this: PG includes the join columns
+    /// when the star is qualified.
+    pub fn star_columns(&self) -> Vec<&ScopeColumn> {
+        self.sources
+            .iter()
+            .flat_map(|s| {
+                s.columns.iter().filter(|c| {
+                    !self
+                        .join_hidden
+                        .contains(&(s.alias.clone(), c.name.clone()))
+                })
+            })
+            .collect()
     }
 }

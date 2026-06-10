@@ -1014,3 +1014,13 @@ fn any_param_against_array_column_rejected_like_pg() {
         "got: {err}"
     );
 }
+
+#[test]
+fn escape_string_does_not_swallow_params() {
+    // `E'it\'s'` is one string (the backslash escapes the quote); the
+    // param after it must still be lexed and typed. The lexer used to
+    // treat `\'` as the string end and eat `$p1` inside a phantom string.
+    let db = setup();
+    let s = db.analyze("SELECT E'it\\'s' || $p1 FROM users").unwrap();
+    assert_params(&s, vec![p(text())]);
+}

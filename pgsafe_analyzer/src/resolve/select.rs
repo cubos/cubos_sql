@@ -179,6 +179,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             &select_aliases,
+            sel.target_list.len(),
         )?;
     }
 
@@ -200,19 +201,50 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // operator context and any column refs are validated. A bare
     // identifier may name a select-list alias that isn't in the FROM
     // scope (PG resolution rule); suppress `UndefinedColumn` only in that
-    // exact shape so typos still surface.
+    // exact shape so typos still surface. Integer literals are *ordinals*:
+    // they reference a projection position and must be in range (42P10).
+    let n_targets = sel.target_list.len();
+    // `SELECT DISTINCT` (the plain form parses as one empty node) restricts
+    // ORDER BY to expressions that appear in the select list.
+    let plain_distinct =
+        !sel.distinct_clause.is_empty() && sel.distinct_clause.iter().all(|n| n.node.is_none());
     for sort_node in &sel.sort_clause {
-        if let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref()
-            && let Some(inner) = sb.node.as_deref()
-            && let Err(e) = expr::infer_expr(
-                inner,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
-                params,
-                TypeGoal::NONE,
-            )
-            && !is_select_alias_reference(inner, &select_aliases, &e)
+        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+            continue;
+        };
+        let Some(inner) = sb.node.as_deref() else {
+            continue;
+        };
+        if let Some(ord) = ordinal_of(inner) {
+            if ord < 1 || ord as usize > n_targets {
+                return Err(crate::error::RawError::invalid(
+                    format!("ORDER BY position {ord} is not in select list"),
+                    crate::error::node_location(inner)
+                        .and_then(crate::error::SourceSpan::from_node_token),
+                    None,
+                )
+                .finalize_implicit());
+            }
+            continue;
+        }
+        if let Err(e) = expr::infer_expr(
+            inner,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+            TypeGoal::NONE,
+        ) && !is_select_alias_reference(inner, &select_aliases, &e)
         {
             return Err(e);
+        }
+        if plain_distinct && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases) {
+            return Err(crate::error::RawError::invalid(
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                    .to_string(),
+                crate::error::node_location(inner)
+                    .and_then(crate::error::SourceSpan::from_node_qname),
+                None,
+            )
+            .finalize_implicit());
         }
     }
 
@@ -232,6 +264,33 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             && !is_select_alias_reference(distinct_node, &select_aliases, &e)
         {
             return Err(e);
+        }
+    }
+
+    // Named-window references: `OVER w` (and `OVER (w …)` inheritance) must
+    // name a window defined in this SELECT's WINDOW clause — PG (42704):
+    // `window "w" does not exist`. Window calls only appear in the target
+    // list and ORDER BY.
+    let defined_windows: std::collections::HashSet<&str> = sel
+        .window_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::WindowDef(w) if !w.name.is_empty() => Some(w.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for t in &sel.target_list {
+        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            check_window_refs(val, &defined_windows)?;
+        }
+    }
+    for sort_node in &sel.sort_clause {
+        if let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref()
+            && let Some(inner) = sb.node.as_deref()
+        {
+            check_window_refs(inner, &defined_windows)?;
         }
     }
 
@@ -302,6 +361,175 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     Ok((columns, None))
 }
 
+/// Recursively find window-function calls and verify that any *named*
+/// window they reference (`OVER w` sets `WindowDef.name`; `OVER (w …)`
+/// inheritance sets `refname`) is defined in the SELECT's WINDOW clause.
+/// SubLinks are skipped — their windows belong to the inner query.
+fn check_window_refs(
+    node: &protobuf::Node,
+    defined: &std::collections::HashSet<&str>,
+) -> Result<(), AnalyzeError> {
+    let Some(inner) = node.node.as_ref() else {
+        return Ok(());
+    };
+    let check_name = |name: &str| -> Result<(), AnalyzeError> {
+        if !name.is_empty() && !defined.contains(name) {
+            return Err(crate::error::RawError::invalid(
+                format!("window \"{name}\" does not exist"),
+                None,
+                Some("define it in a WINDOW clause, e.g. `WINDOW w AS (ORDER BY …)`".into()),
+            )
+            .finalize_implicit());
+        }
+        Ok(())
+    };
+    match inner {
+        node::Node::FuncCall(fc) => {
+            if let Some(over) = &fc.over {
+                check_name(&over.name)?;
+                check_name(&over.refname)?;
+            }
+            for arg in &fc.args {
+                check_window_refs(arg, defined)?;
+            }
+            if let Some(f) = &fc.agg_filter {
+                check_window_refs(f, defined)?;
+            }
+        }
+        node::Node::AExpr(e) => {
+            if let Some(l) = &e.lexpr {
+                check_window_refs(l, defined)?;
+            }
+            if let Some(r) = &e.rexpr {
+                check_window_refs(r, defined)?;
+            }
+        }
+        node::Node::BoolExpr(b) => {
+            for a in &b.args {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::TypeCast(c) => {
+            if let Some(a) = &c.arg {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::CaseExpr(c) => {
+            for w in &c.args {
+                check_window_refs(w, defined)?;
+            }
+            if let Some(d) = &c.defresult {
+                check_window_refs(d, defined)?;
+            }
+        }
+        node::Node::CaseWhen(w) => {
+            if let Some(e) = &w.expr {
+                check_window_refs(e, defined)?;
+            }
+            if let Some(r) = &w.result {
+                check_window_refs(r, defined)?;
+            }
+        }
+        node::Node::CoalesceExpr(c) => {
+            for a in &c.args {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::MinMaxExpr(m) => {
+            for a in &m.args {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::NullTest(t) => {
+            if let Some(a) = &t.arg {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::BooleanTest(t) => {
+            if let Some(a) = &t.arg {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::AArrayExpr(a) => {
+            for e in &a.elements {
+                check_window_refs(e, defined)?;
+            }
+        }
+        node::Node::RowExpr(r) => {
+            for a in &r.args {
+                check_window_refs(a, defined)?;
+            }
+        }
+        node::Node::List(l) => {
+            for i in &l.items {
+                check_window_refs(i, defined)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// If `node` is a bare integer literal, return its value — GROUP BY / ORDER
+/// BY treat those as 1-based projection ordinals.
+pub(crate) fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
+    if let Some(node::Node::AConst(ac)) = node.node.as_ref()
+        && !ac.isnull
+        && let Some(pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
+    {
+        return Some(i.ival as i64);
+    }
+    None
+}
+
+/// Structural fingerprint of an expression node with the `location` fields
+/// neutralized — `Debug` output with every `location: N` span removed. Used
+/// to compare an ORDER BY expression against the projection entries (PG's
+/// "appears in select list" test), where byte positions necessarily differ.
+fn node_fingerprint(node: &protobuf::Node) -> String {
+    let dbg = format!("{node:?}");
+    let mut out = String::with_capacity(dbg.len());
+    let mut rest = dbg.as_str();
+    while let Some(pos) = rest.find("location: ") {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + "location: ".len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// PG's SELECT DISTINCT rule: an ORDER BY expression must appear in the
+/// select list — as a structurally equal expression or as a select-list
+/// alias (ordinals are handled by the caller).
+fn sort_expr_in_select_list(
+    inner: &protobuf::Node,
+    target_list: &[protobuf::Node],
+    select_aliases: &std::collections::HashSet<String>,
+) -> bool {
+    if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref() {
+        let parts = expr::extract_string_fields(&cr.fields);
+        if let [single] = parts.as_slice()
+            && select_aliases.contains(single)
+        {
+            return true;
+        }
+    }
+    let want = node_fingerprint(inner);
+    target_list.iter().any(|t| {
+        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            node_fingerprint(val) == want
+        } else {
+            false
+        }
+    })
+}
+
 /// Walk one entry from `sel.group_clause`, recursing into `GroupingSet`
 /// nodes (`GROUPING SETS`/`ROLLUP`/`CUBE`) to reach the underlying
 /// expressions. The walk type-checks parameters and rejects aggregates /
@@ -311,6 +539,7 @@ pub(crate) fn walk_group_clause_node(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     select_aliases: &std::collections::HashSet<String>,
+    n_targets: usize,
 ) -> Result<(), AnalyzeError> {
     let Ctx {
         scope,
@@ -324,7 +553,22 @@ pub(crate) fn walk_group_clause_node(
                 expr::Ctx::new(scope, null_ctx, snapshot),
                 params,
                 select_aliases,
+                n_targets,
             )?;
+        }
+        return Ok(());
+    }
+    // Integer literals are 1-based projection ordinals (42P10 when out of
+    // range); a valid one needs no further walking.
+    if let Some(ord) = ordinal_of(group_node) {
+        if ord < 1 || ord as usize > n_targets {
+            return Err(crate::error::RawError::invalid(
+                format!("GROUP BY position {ord} is not in select list"),
+                crate::error::node_location(group_node)
+                    .and_then(crate::error::SourceSpan::from_node_token),
+                None,
+            )
+            .finalize_implicit());
         }
         return Ok(());
     }

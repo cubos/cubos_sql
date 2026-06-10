@@ -67,7 +67,10 @@ impl std::error::Error for LexError {}
 /// Internal state machine states for the lexer.
 enum LexState {
     Normal,
-    StringLiteral(usize),
+    /// Inside a single-quoted string; the bool marks an `E'…'` escape
+    /// string, where a backslash escapes the next character (so `\'` does
+    /// not close it).
+    StringLiteral(usize, bool),
     DollarQuote(String, usize),
     LineComment,
     /// Block comment with nesting depth and start position of the outermost `/*`.
@@ -135,7 +138,13 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
         match &state {
             LexState::Normal => {
                 if chars[i] == '\'' {
-                    state = LexState::StringLiteral(byte_offset_of(i, &char_byte_lens));
+                    // `E'…'` / `e'…'` escape strings: backslash escapes the
+                    // next char. The prefix only counts when the E is its own
+                    // token (not the tail of an identifier like `tablE`).
+                    let escape = i > 0
+                        && matches!(chars[i - 1], 'E' | 'e')
+                        && (i < 2 || !is_ident_char(chars[i - 2]));
+                    state = LexState::StringLiteral(byte_offset_of(i, &char_byte_lens), escape);
                     out.push('\'');
                     i += 1;
                 } else if chars[i] == '"' {
@@ -304,9 +313,16 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                     i += 1;
                 }
             }
-            LexState::StringLiteral(start_pos) => {
+            LexState::StringLiteral(start_pos, escape) => {
                 let start_pos = *start_pos;
-                if chars[i] == '\'' {
+                let escape = *escape;
+                if escape && chars[i] == '\\' && i + 1 < len {
+                    // Escape string: the backslash consumes the next char
+                    // (`\'`, `\\`, …) without affecting string state.
+                    out.push(chars[i]);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else if chars[i] == '\'' {
                     if i + 1 < len && chars[i + 1] == '\'' {
                         out.push('\'');
                         out.push('\'');
@@ -321,7 +337,7 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                     i += 1;
                 }
                 if i >= len
-                    && let LexState::StringLiteral(_) = state
+                    && let LexState::StringLiteral(..) = state
                 {
                     return Err(LexError::UnclosedString {
                         position: start_pos,
@@ -429,7 +445,7 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
 
     match &state {
         LexState::Normal | LexState::LineComment => {}
-        LexState::StringLiteral(p) => return Err(LexError::UnclosedString { position: *p }),
+        LexState::StringLiteral(p, _) => return Err(LexError::UnclosedString { position: *p }),
         LexState::DollarQuote(tag, p) => {
             return Err(LexError::UnclosedDollarQuote {
                 tag: tag.clone(),

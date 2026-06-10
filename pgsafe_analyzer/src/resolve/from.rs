@@ -51,7 +51,8 @@ pub(crate) fn process_from_item(
                         c
                     })
                     .collect();
-                scope.add_virtual_table(alias, cols);
+                scope.add_virtual_table(alias, cols)?;
+                apply_alias_column_names(scope, rv.alias.as_ref())?;
                 return Ok(());
             }
 
@@ -67,6 +68,7 @@ pub(crate) fn process_from_item(
                 alias,
                 crate::error::SourceSpan::from_node_qname(rv.location),
             )?;
+            apply_alias_column_names(scope, rv.alias.as_ref())?;
         }
         node::Node::JoinExpr(join) => {
             // Process left and right sides.
@@ -124,6 +126,38 @@ pub(crate) fn process_from_item(
                 }
                 JoinType::JoinInner => {} // No nullability change.
                 other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
+            }
+
+            // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns:
+            // the output has ONE column per name (placed before both sides'
+            // remaining columns in `*`), an unqualified reference resolves
+            // to it without ambiguity, and the constituents stay reachable
+            // qualified (`a.id`) and via `a.*`.
+            let using_names: Vec<String> = if join.is_natural {
+                // Common column names, in left-side column order.
+                let right_names: std::collections::HashSet<&str> = scope.sources
+                    [left_end..right_end]
+                    .iter()
+                    .flat_map(|s| s.columns.iter().map(|c| c.name.as_str()))
+                    .collect();
+                scope.sources[left_start..left_end]
+                    .iter()
+                    .flat_map(|s| s.columns.iter().map(|c| c.name.clone()))
+                    .filter(|n| right_names.contains(n.as_str()))
+                    .collect()
+            } else {
+                expr::extract_string_fields(&join.using_clause)
+            };
+            if !using_names.is_empty() {
+                merge_using_columns(
+                    scope,
+                    snapshot,
+                    &using_names,
+                    left_start,
+                    left_end,
+                    right_end,
+                    join_type,
+                )?;
             }
         }
         node::Node::RangeSubselect(sub) => {
@@ -196,12 +230,25 @@ pub(crate) fn process_from_item(
                         record_fields: rc.record_fields,
                     })
                     .collect();
+                // PG rejects more aliases than columns (42P10).
+                if col_aliases.len() > scope_cols.len() {
+                    return Err(crate::error::RawError::invalid(
+                        format!(
+                            "table \"{alias}\" has {} columns available but {} columns specified",
+                            scope_cols.len(),
+                            col_aliases.len(),
+                        ),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit());
+                }
                 for (i, alias_name) in col_aliases.iter().enumerate() {
                     if let Some(c) = scope_cols.get_mut(i) {
                         c.name = alias_name.clone();
                     }
                 }
-                scope.add_virtual_table(alias, scope_cols);
+                scope.add_virtual_table(alias, scope_cols)?;
             }
         }
         node::Node::RangeFunction(rf) => {
@@ -358,7 +405,156 @@ pub(crate) fn process_range_function(
         }
     }
 
-    scope.add_virtual_table(alias, cols);
+    scope.add_virtual_table(alias, cols)?;
+    Ok(())
+}
+
+/// Build the merged columns for `JOIN USING` / `NATURAL JOIN` and splice
+/// them into the scope as a synthetic empty-alias source placed *before*
+/// both join sides — which is exactly where PG puts them in `*` expansion
+/// (`SELECT * FROM a JOIN b USING (id)` is `id, <a-rest>, <b-rest>`). The
+/// constituent columns are recorded in `scope.join_hidden` so unqualified
+/// resolution and the bare `*` skip them.
+///
+/// Merged-column semantics mirrored from PG:
+/// - missing name → `column "x" specified in USING clause does not exist
+///   in left/right table` (42703);
+/// - type: the sides' common type, else `JOIN/USING types X and Y cannot
+///   be matched` (42804);
+/// - nullability: the merged value is the left side's for INNER/LEFT (the
+///   preserved side), the right's for RIGHT, and `COALESCE(l, r)` for FULL
+///   — all computed from the columns' *base* nullability (the outer-join
+///   promotion applies to the constituent aliases, not the merged copy).
+#[allow(clippy::too_many_arguments)]
+fn merge_using_columns(
+    scope: &mut Scope,
+    snapshot: &PgCatalog,
+    using_names: &[String],
+    left_start: usize,
+    left_end: usize,
+    right_end: usize,
+    join_type: JoinType,
+) -> Result<(), AnalyzeError> {
+    let find_col = |range: std::ops::Range<usize>, name: &str| -> Option<(String, ScopeColumn)> {
+        scope.sources[range].iter().find_map(|s| {
+            s.columns
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| (s.alias.clone(), c.clone()))
+        })
+    };
+
+    let mut merged: Vec<ScopeColumn> = Vec::with_capacity(using_names.len());
+    for name in using_names {
+        let Some((l_alias, l)) = find_col(left_start..left_end, name) else {
+            return Err(crate::error::RawError::invalid(
+                format!(
+                    "column \"{name}\" specified in USING clause does not exist in left table"
+                ),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        };
+        let Some((r_alias, r)) = find_col(left_end..right_end, name) else {
+            return Err(crate::error::RawError::invalid(
+                format!(
+                    "column \"{name}\" specified in USING clause does not exist in right table"
+                ),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        };
+
+        let type_oid = if l.type_oid == r.type_oid {
+            l.type_oid
+        } else {
+            crate::coerce::find_common_type(&[l.type_oid, r.type_oid], snapshot).ok_or_else(
+                || {
+                    let lt = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
+                    let rt = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
+                    crate::error::RawError::invalid(
+                        format!("JOIN/USING types {lt} and {rt} cannot be matched"),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit()
+                },
+            )?
+        };
+        let base_not_null = match join_type {
+            JoinType::JoinRight => r.base_not_null,
+            JoinType::JoinFull => l.base_not_null || r.base_not_null,
+            _ => l.base_not_null,
+        };
+        merged.push(ScopeColumn {
+            name: name.clone(),
+            type_oid,
+            base_not_null,
+            typmod: if l.typmod == r.typmod { l.typmod } else { None },
+            collation: if l.collation == r.collation {
+                l.collation
+            } else {
+                None
+            },
+            // The synthetic source's (empty) alias — never referenced
+            // qualified.
+            table_alias: String::new(),
+            record_fields: None,
+        });
+        scope.join_hidden.insert((l_alias, name.clone()));
+        scope.join_hidden.insert((r_alias, name.clone()));
+    }
+
+    scope.sources.insert(
+        left_start,
+        crate::scope::TableSource {
+            alias: String::new(),
+            columns: merged,
+            system_columns: Vec::new(),
+            source_qn: None,
+        },
+    );
+    Ok(())
+}
+
+/// Apply a FROM item's column-alias list (`users AS t(a, b, c)`) to the
+/// just-added source: rename positionally, and mirror PG's 42P10 rejection
+/// when more aliases than columns are given (`table "t" has N columns
+/// available but M columns specified`).
+fn apply_alias_column_names(
+    scope: &mut Scope,
+    alias_node: Option<&pg_query::protobuf::Alias>,
+) -> Result<(), AnalyzeError> {
+    let Some(a) = alias_node else {
+        return Ok(());
+    };
+    let colnames = expr::extract_string_fields(&a.colnames);
+    if colnames.is_empty() {
+        return Ok(());
+    }
+    let Some(src) = scope.sources.last_mut() else {
+        return Ok(());
+    };
+    if colnames.len() > src.columns.len() {
+        return Err(crate::error::RawError::invalid(
+            format!(
+                "table \"{}\" has {} columns available but {} columns specified",
+                src.alias,
+                src.columns.len(),
+                colnames.len(),
+            ),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    for (i, name) in colnames.into_iter().enumerate() {
+        if let Some(c) = src.columns.get_mut(i) {
+            c.name = name;
+        }
+    }
     Ok(())
 }
 

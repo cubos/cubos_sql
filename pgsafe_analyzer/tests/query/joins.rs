@@ -307,3 +307,57 @@ fn torture_left_join_on_union_subquery() {
     // val: NOT NULL in the union, but LEFT JOIN makes it nullable.
     assert_cols(&info, vec![c("name", text()), cn("val", text())]);
 }
+
+// ── JOIN USING / NATURAL JOIN column merging ────────────────────────────────
+
+#[test]
+fn join_using_merges_columns_in_star_and_resolution() {
+    let db = setup();
+    // `*` lists the merged column once, before both sides' remainders.
+    let s = db
+        .analyze("SELECT * FROM users JOIN posts USING (id)")
+        .unwrap();
+    let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["id", "name", "age", "user_id", "title", "body", "published_at"]
+    );
+    // Unqualified `id` resolves to the merged column — no ambiguity.
+    db.analyze("SELECT id FROM users JOIN posts USING (id)")
+        .unwrap();
+    // Qualified references and qualified stars still see the constituents.
+    let s = db
+        .analyze("SELECT users.id, posts.id FROM users JOIN posts USING (id)")
+        .unwrap();
+    assert_eq!(s.columns.len(), 2);
+    let s = db
+        .analyze("SELECT u.* FROM users u JOIN posts p USING (id)")
+        .unwrap();
+    assert_eq!(s.columns.len(), 3, "u.* keeps the join column");
+}
+
+#[test]
+fn full_join_using_merged_column_is_coalesce_not_null() {
+    let db = setup();
+    // FULL JOIN pads each side with NULLs, but the merged USING column is
+    // COALESCE(l, r): with both bases NOT NULL it can never be NULL — while
+    // the constituents are nullable. Not observable through PG's wire
+    // protocol, so pinned here.
+    let s = db
+        .analyze("SELECT id, users.id AS uid FROM users FULL JOIN posts USING (id)")
+        .unwrap();
+    assert!(!s.columns[0].nullable, "merged id is COALESCE of NOT NULLs");
+    assert!(s.columns[1].nullable, "constituent is null-padded");
+}
+
+#[test]
+fn left_join_using_merged_column_keeps_left_nullability() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT id FROM users LEFT JOIN posts USING (id)")
+        .unwrap();
+    assert!(
+        !s.columns[0].nullable,
+        "LEFT JOIN merged column is the (preserved) left side"
+    );
+}

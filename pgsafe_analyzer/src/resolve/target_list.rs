@@ -48,7 +48,7 @@ pub(crate) fn resolve_target_list(
                     .flat_map(|s| s.columns.iter())
                     .collect()
             } else {
-                scope.all_columns()
+                scope.star_columns()
             };
 
             for col in star_cols {
@@ -149,6 +149,18 @@ pub(crate) fn analyze_values_lists(
         let Some(node::Node::List(row)) = row_node.node.as_ref() else {
             continue;
         };
+        // PG (SQLSTATE 42601): every row must have the first row's arity.
+        if row.items.len() != arity {
+            return Err(crate::error::RawError::invalid(
+                "VALUES lists must all be the same length".to_string(),
+                None,
+                Some(format!(
+                    "the first row has {arity} column(s), a later row has {}",
+                    row.items.len()
+                )),
+            )
+            .finalize_implicit());
+        }
         for (i, item) in row.items.iter().enumerate() {
             if i >= arity {
                 break;
