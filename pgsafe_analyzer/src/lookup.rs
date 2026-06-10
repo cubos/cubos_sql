@@ -24,6 +24,21 @@ pub struct ResolvedOperator {
     pub result_type_oid: PgTypeOid,
 }
 
+/// Outcome of [`PgCatalog::find_operator_detailed`]: a unique winner, no
+/// viable candidate, or several candidates left tied after every tiebreak
+/// (PG reports the last as `operator is not unique`, SQLSTATE 42725).
+pub enum OperatorMatch {
+    Found(ResolvedOperator),
+    NotFound,
+    Ambiguous,
+}
+
+/// Map a concretization result into the detailed outcome (a failed
+/// polymorphic substitution counts as no match).
+fn op_match(op: Option<ResolvedOperator>) -> OperatorMatch {
+    op.map_or(OperatorMatch::NotFound, OperatorMatch::Found)
+}
+
 const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
 impl PgCatalog {
@@ -315,23 +330,28 @@ impl PgCatalog {
     ///
     /// Candidates are gathered from every schema on the search_path (plus
     /// `pg_catalog` if not listed explicitly).
-    /// Whether any operator with this name exists on the search path —
-    /// distinguishes `operator is not unique: unknown + unknown` (overloads
-    /// exist but none can be picked) from `operator does not exist`.
-    pub fn operator_name_exists(&self, name: &str) -> bool {
-        self.schemas_for_lookup(None).into_iter().any(|nsoid| {
-            self.operator_by_qname
-                .get(&(nsoid, name.to_owned()))
-                .is_some_and(|oids| !oids.is_empty())
-        })
-    }
-
     pub fn find_operator(
         &self,
         name: &str,
         left_oid: Option<PgTypeOid>,
         right_oid: PgTypeOid,
     ) -> Option<ResolvedOperator> {
+        match self.find_operator_detailed(name, left_oid, right_oid) {
+            OperatorMatch::Found(op) => Some(op),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::find_operator`] but distinguishes "no candidate at all"
+    /// from "several candidates survived every tiebreak" — PG reports the
+    /// latter as `operator is not unique: …` (SQLSTATE 42725) instead of
+    /// `operator does not exist`.
+    pub fn find_operator_detailed(
+        &self,
+        name: &str,
+        left_oid: Option<PgTypeOid>,
+        right_oid: PgTypeOid,
+    ) -> OperatorMatch {
         let mut candidate_buf: Vec<&PgOperator> = Vec::new();
         for nsoid in self.schemas_for_lookup(None) {
             if let Some(oids) = self.operator_by_qname.get(&(nsoid, name.to_owned())) {
@@ -348,7 +368,7 @@ impl PgCatalog {
             }
         }
         if candidate_buf.is_empty() {
-            return None;
+            return OperatorMatch::NotFound;
         }
         let candidates = &candidate_buf;
 
@@ -364,7 +384,7 @@ impl PgCatalog {
             .iter()
             .find(|o| op_left(o) == left_oid && o.oprright == right_oid)
         {
-            return concretize_operator(op, left_oid, right_oid, self);
+            return op_match(concretize_operator(op, left_oid, right_oid, self));
         }
 
         // Step 2: match via implicit casts. More than one candidate can
@@ -401,7 +421,7 @@ impl PgCatalog {
                 .find(|o| exact_score(o) == max_score)
                 .copied()
         {
-            return concretize_operator(best, left_oid, right_oid, self);
+            return op_match(concretize_operator(best, left_oid, right_oid, self));
         }
 
         // Step 2b: polymorphic match. Operators declared over pseudo-types
@@ -412,10 +432,17 @@ impl PgCatalog {
         // UNKNOWN actuals are deliberately *not* accepted here — when one
         // side is UNKNOWN we defer to step 3, which prefers a candidate
         // whose known side matches *exactly* (e.g. `text || text` over
-        // `anycompatible || anycompatiblearray` for `text || 'foo'`).
+        // `text || anynonarray` for `text || $1`; the polymorphic overload
+        // would leak the pseudo-type into the param). The gate must be
+        // explicit: `matches_polymorphic` itself accepts UNKNOWN for the
+        // non-array constraints.
+        let any_unknown = left_oid == Some(oid::UNKNOWN) || right_oid == oid::UNKNOWN;
         let poly_matches: Vec<&PgOperator> = candidates
             .iter()
             .filter(|o| {
+                if any_unknown {
+                    return false;
+                }
                 let left_ok = match (op_left(o), left_oid) {
                     (Some(expected), Some(actual))
                         if crate::polymorphic::is_polymorphic(expected) =>
@@ -456,7 +483,7 @@ impl PgCatalog {
                     .copied()
                     .collect();
                 if best.len() == 1 {
-                    return concretize_operator(best[0], left_oid, right_oid, self);
+                    return op_match(concretize_operator(best[0], left_oid, right_oid, self));
                 }
             }
         }
@@ -465,7 +492,7 @@ impl PgCatalog {
         let left_unknown = left_oid == Some(oid::UNKNOWN);
         let right_unknown = right_oid == oid::UNKNOWN;
         if !left_unknown && !right_unknown {
-            return None;
+            return OperatorMatch::NotFound;
         }
 
         // When exactly one operand is UNKNOWN and the other is a concrete type
@@ -489,7 +516,7 @@ impl PgCatalog {
                     .iter()
                     .find(|o| op_left(o) == Some(t) && o.oprright == t)
             {
-                return concretize_operator(op, left_oid, right_oid, self);
+                return op_match(concretize_operator(op, left_oid, right_oid, self));
             }
         }
 
@@ -527,10 +554,12 @@ impl PgCatalog {
             .collect();
 
         if remaining.len() <= 1 {
-            return remaining
-                .into_iter()
-                .next()
-                .and_then(|o| concretize_operator(o, left_oid, right_oid, self));
+            return op_match(
+                remaining
+                    .into_iter()
+                    .next()
+                    .and_then(|o| concretize_operator(o, left_oid, right_oid, self)),
+            );
         }
 
         // 3b. If one side is known, keep only candidates that accept exactly
@@ -557,10 +586,12 @@ impl PgCatalog {
         }
 
         if remaining.len() <= 1 {
-            return remaining
-                .into_iter()
-                .next()
-                .and_then(|o| concretize_operator(o, left_oid, right_oid, self));
+            return op_match(
+                remaining
+                    .into_iter()
+                    .next()
+                    .and_then(|o| concretize_operator(o, left_oid, right_oid, self)),
+            );
         }
 
         // 3c (PG §10.2 step 3e-f). For each UNKNOWN position, check if all
@@ -580,7 +611,7 @@ impl PgCatalog {
         }
 
         if remaining.len() == 1 {
-            return concretize_operator(remaining[0], left_oid, right_oid, self);
+            return op_match(concretize_operator(remaining[0], left_oid, right_oid, self));
         }
 
         // 3d. Final fallback: resolve UNKNOWN positions to `text`, since
@@ -599,7 +630,7 @@ impl PgCatalog {
             .copied()
             .collect();
         if exact_matches.len() == 1 {
-            return concretize_operator(exact_matches[0], resolved_left, resolved_right, self);
+            return op_match(concretize_operator(exact_matches[0], resolved_left, resolved_right, self));
         }
 
         let text_matches: Vec<&PgOperator> = remaining
@@ -632,10 +663,22 @@ impl PgCatalog {
             .copied()
             .collect();
         if text_matches.len() == 1 {
-            return concretize_operator(text_matches[0], resolved_left, resolved_right, self);
+            return op_match(concretize_operator(
+                text_matches[0],
+                resolved_left,
+                resolved_right,
+                self,
+            ));
         }
 
-        None
+        // Several candidates survived every unknown-side tiebreak — PG
+        // reports ambiguity (`bday + $1`: date+int4 / date+interval /
+        // date+time all remain) rather than picking one.
+        if remaining.len() > 1 {
+            OperatorMatch::Ambiguous
+        } else {
+            OperatorMatch::NotFound
+        }
     }
 
     /// Among `candidates`, keep those whose type at the position extracted by

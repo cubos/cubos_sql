@@ -215,14 +215,7 @@ pub(crate) fn validate(
             let keywords: &[&str] = match name {
                 "time" | "timetz" => &["now", "allballs"],
                 "interval" => &["infinity"],
-                _ => &[
-                    "now",
-                    "today",
-                    "tomorrow",
-                    "yesterday",
-                    "epoch",
-                    "infinity",
-                ],
+                _ => &["now", "today", "tomorrow", "yesterday", "epoch", "infinity"],
             };
             let trimmed = content
                 .trim_matches(|c: char| c.is_ascii_whitespace())
@@ -247,8 +240,13 @@ pub(crate) fn validate(
         // unconditionally refuse input. The message string is the input
         // function's own (note `pg_brin_minmax_multi_summary`'s drops the
         // prefix) — verified against PG 18.
-        name @ ("pg_node_tree" | "pg_ndistinct" | "pg_dependencies" | "pg_mcv_list"
-        | "pg_brin_bloom_summary" | "pg_brin_minmax_multi_summary" | "pg_ddl_command") => {
+        name @ ("pg_node_tree"
+        | "pg_ndistinct"
+        | "pg_dependencies"
+        | "pg_mcv_list"
+        | "pg_brin_bloom_summary"
+        | "pg_brin_minmax_multi_summary"
+        | "pg_ddl_command") => {
             let msg_name = match name {
                 "pg_brin_minmax_multi_summary" => "brin_minmax_multi_summary",
                 other => other,

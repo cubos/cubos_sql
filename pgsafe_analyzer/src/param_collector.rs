@@ -24,6 +24,14 @@ pub(crate) struct ParamCollector {
     /// silently falling back. Marking is harmless if a later inference
     /// site (e.g. ROW=ROW back-fill) pins the param to a concrete type.
     indeterminate_required: HashSet<i32>,
+    /// Param numbers whose type PG *locked* as unknown at first use:
+    /// `$1 IS NULL` consumes the parameter without assigning a type, and PG
+    /// does not let a later use back-fill it — `SELECT $1 IS NULL, $1 = 1`
+    /// is `could not determine data type of parameter $1` (42P08) even
+    /// though the second use would pin int4. Unlike
+    /// [`Self::indeterminate_required`], this fails finalization regardless
+    /// of any type recorded afterwards.
+    indeterminate_locked: HashSet<i32>,
 }
 
 impl ParamCollector {
@@ -76,6 +84,16 @@ impl ParamCollector {
         self.indeterminate_required.insert(param_num);
     }
 
+    /// Mark `param_num` as consumed-untyped at this point (PG's first-use
+    /// type locking): finalization fails even if a later site records a
+    /// type. No-op when the param already has a type — `$1 = 1, $1 IS NULL`
+    /// is fine because the first use typed it.
+    pub fn mark_indeterminate_locked(&mut self, param_num: i32) {
+        if !self.constraints.contains_key(&param_num) {
+            self.indeterminate_locked.insert(param_num);
+        }
+    }
+
     /// Return all parameters in order, validating that every seen param has a type.
     ///
     /// Returns `(param_number, type_oid, nullable)` tuples.
@@ -88,9 +106,11 @@ impl ParamCollector {
         // points at the *lowest*-numbered offending param — `HashSet`
         // iteration order is otherwise non-deterministic across builds.
         let mut indeterminate: Vec<i32> = self.indeterminate_required.iter().copied().collect();
+        indeterminate.extend(self.indeterminate_locked.iter().copied());
         indeterminate.sort_unstable();
+        indeterminate.dedup();
         for num in indeterminate {
-            if !self.constraints.contains_key(&num) {
+            if self.indeterminate_locked.contains(&num) || !self.constraints.contains_key(&num) {
                 return Err(crate::error::RawError::indeterminate_type(
                     format!("could not determine data type of parameter ${num}"),
                     None,

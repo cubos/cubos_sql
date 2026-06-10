@@ -410,12 +410,49 @@ pub(crate) fn infer_expr(
         node::Node::NullTest(t) => {
             if let Some(arg) = &t.arg {
                 infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+                // IS [NOT] NULL accepts any type, so it pins nothing — and
+                // PG *locks* the parameter's type at this first untyped use:
+                // `SELECT $1 IS NULL, $1 = 1` is `could not determine data
+                // type of parameter $1` (42P08) even though the later use
+                // would pin int4. A param typed *before* this point is fine.
+                if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+                    params.mark_indeterminate_locked(p.number);
+                }
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }
         node::Node::BooleanTest(t) => {
-            if let Some(arg) = &t.arg {
-                infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+            // `x IS [NOT] TRUE/FALSE/UNKNOWN` coerces its operand to boolean
+            // (PG's coerce_to_boolean) — so a bare `$1 IS TRUE` pins the
+            // param as bool, and a non-boolean operand gets PG's wording.
+            if let Some(arg) = &t.arg
+                && let Err(e) = infer_expr(arg, ctx, params, TypeGoal::assignment(oid::BOOL))
+            {
+                if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+                    return Err(e);
+                }
+                let label = match protobuf::BoolTestType::try_from(t.booltesttype) {
+                    Ok(protobuf::BoolTestType::IsTrue) => "IS TRUE",
+                    Ok(protobuf::BoolTestType::IsNotTrue) => "IS NOT TRUE",
+                    Ok(protobuf::BoolTestType::IsFalse) => "IS FALSE",
+                    Ok(protobuf::BoolTestType::IsNotFalse) => "IS NOT FALSE",
+                    Ok(protobuf::BoolTestType::IsUnknown) => "IS UNKNOWN",
+                    _ => "IS NOT UNKNOWN",
+                };
+                let mut params2 = params.clone();
+                let actual_oid = infer_expr(arg, ctx, &mut params2, TypeGoal::NONE)
+                    .map(|x| x.type_oid)
+                    .unwrap_or(oid::UNKNOWN);
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
+                let span = crate::error::node_location(arg)
+                    .and_then(crate::error::SourceSpan::from_node_qname);
+                return Err(crate::error::RawError::invalid(
+                    format!("argument of {label} must be type boolean, not type {actual_pg}"),
+                    span,
+                    None,
+                )
+                .with_primary_label(format!("this is {actual_pg}, expected boolean"))
+                .finalize_implicit());
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }

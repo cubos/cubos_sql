@@ -42,6 +42,27 @@ pub(crate) fn analyze_set_operation(
         .finalize_implicit());
     }
 
+    // A bare `$N` projected by one branch adopts the column's reconciled
+    // type — PG's Describe reports `SELECT $1 UNION ALL SELECT age` with $1
+    // as the other branch's type, not text. Pin direct ParamRef targets
+    // before the per-column merge below.
+    for (branch, own_cols, peer_cols) in
+        [(left, &left_cols, &right_cols), (right, &right_cols, &left_cols)]
+    {
+        for (i, target) in branch.target_list.iter().enumerate() {
+            if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+                && let Some(val) = &rt.val
+                && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && own_cols.get(i).is_some_and(|c| c.type_oid == oid::UNKNOWN)
+                && let Some(peer) = peer_cols.get(i)
+                && peer.type_oid != oid::UNKNOWN
+                && params.get(p.number) == oid::UNKNOWN
+            {
+                params.record(p.number, snapshot.unwrap_domain(peer.type_oid));
+            }
+        }
+    }
+
     let mut columns = Vec::with_capacity(left_cols.len());
     for (l, r) in left_cols.into_iter().zip(right_cols) {
         // When both sides carry concrete types (not UNKNOWN), their common

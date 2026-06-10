@@ -634,107 +634,77 @@ fn infer_generic_binary_op(
     // a domain column (`email_col <= $1`) is inferred by PG as the base
     // (`text`), not the domain. Pinning the param to the raw domain would
     // diverge from PG's Describe.
-    // These two pre-resolution walks are *guesses* — the operator actually
-    // chosen may coerce the unknown side to a different type entirely
-    // (`1 || 'x'` resolves to `anynonarray || text`, so `'x'` becomes text,
-    // not integer). Swallow everything here, including literal-content
-    // rejections; the post-resolution back-fill below validates against the
-    // operator's *declared* argument type, which is the coercion PG performs.
-    if let (Some(l_oid), true) = (left_oid, right_oid == oid::UNKNOWN)
-        && l_oid != oid::UNKNOWN
-        && let Some(rexpr) = &expr.rexpr
-    {
-        let _ = infer_expr(
-            rexpr,
-            ctx,
-            params,
-            TypeGoal::implicit(snapshot.unwrap_domain(l_oid)),
-        );
-    }
-    if let Some(r) = &right
-        && r.type_oid != oid::UNKNOWN
-        && left_oid == Some(oid::UNKNOWN)
-        && let Some(lexpr) = &expr.lexpr
-    {
-        let _ = infer_expr(
-            lexpr,
-            ctx,
-            params,
-            TypeGoal::implicit(snapshot.unwrap_domain(r.type_oid)),
-        );
-    }
-
-    // Re-read types after back-fill.
-    let left_oid_resolved = expr
-        .lexpr
-        .as_ref()
-        .and_then(|n| match n.node.as_ref() {
-            Some(node::Node::ParamRef(p)) => {
-                let t = params.get(p.number);
-                if t != oid::UNKNOWN { Some(t) } else { left_oid }
-            }
-            _ => left_oid,
-        })
-        .or(left_oid);
-    let right_oid_resolved = expr
-        .rexpr
-        .as_ref()
-        .map(|n| match n.node.as_ref() {
-            Some(node::Node::ParamRef(p)) => {
-                let t = params.get(p.number);
-                if t != oid::UNKNOWN { t } else { right_oid }
-            }
-            _ => right_oid,
-        })
-        .unwrap_or(right_oid);
+    // No pre-resolution "assume the unknown side is the other side's type"
+    // walk happens here: that guess pinned `$1` in `prefs -> $1` to jsonb
+    // and then failed resolution, while PG resolves the operator *with* the
+    // unknown (`jsonb -> text` wins via the string-category rule) and only
+    // then coerces. `find_operator`'s unknown handling covers the
+    // homogeneous probe (`T OP T`) and the category/text fallbacks; the
+    // post-resolution back-fill below pins params and validates literal
+    // content against the operator's *declared* argument types — the
+    // coercion PG actually performs.
+    let left_oid_resolved = left_oid;
+    let right_oid_resolved = right_oid;
 
     let any_nullable =
         left.as_ref().is_some_and(|l| l.nullable) || right.as_ref().is_some_and(|r| r.nullable);
     let op_always_nullable = functions::is_nullable_operator(op_name);
     let nullable = any_nullable || op_always_nullable;
 
-    // Try operator lookup with resolved types.
-    if let Some(op) = snapshot.find_operator(op_name, left_oid_resolved, right_oid_resolved) {
-        // Pass 2: back-fill still-UNKNOWN sides with operator's expected types.
-        if left_oid_resolved == Some(oid::UNKNOWN)
-            && let (Some(expected), Some(lexpr)) = (op.left_type_oid, &expr.lexpr)
-        {
-            swallow_unless_literal(infer_expr(lexpr, ctx, params, TypeGoal::implicit(expected)))?;
+    // Operator lookup with the bottom-up types — UNKNOWN sides are resolved
+    // by `find_operator`'s own rules (homogeneous probe, category and text
+    // fallbacks), exactly like PG; the unknown side is *not* pre-pinned to
+    // the concrete peer's type.
+    match snapshot.find_operator_detailed(op_name, left_oid_resolved, right_oid_resolved) {
+        crate::lookup::OperatorMatch::Found(op) => {
+            // Pass 2: back-fill still-UNKNOWN sides with the operator's
+            // *declared* argument types — the coercion PG performs (this is
+            // what pins `$1` in `prefs -> $1` to text, and validates literal
+            // content).
+            if left_oid_resolved == Some(oid::UNKNOWN)
+                && let (Some(expected), Some(lexpr)) = (op.left_type_oid, &expr.lexpr)
+            {
+                swallow_unless_literal(infer_expr(
+                    lexpr,
+                    ctx,
+                    params,
+                    TypeGoal::implicit(expected),
+                ))?;
+            }
+            if right_oid_resolved == oid::UNKNOWN
+                && let Some(rexpr) = &expr.rexpr
+            {
+                swallow_unless_literal(infer_expr(
+                    rexpr,
+                    ctx,
+                    params,
+                    TypeGoal::implicit(op.right_type_oid),
+                ))?;
+            }
+            return Ok(ExprType::scalar(op.result_type_oid, nullable));
         }
-        if right_oid_resolved == oid::UNKNOWN
-            && let Some(rexpr) = &expr.rexpr
-        {
-            swallow_unless_literal(infer_expr(
-                rexpr,
-                ctx,
-                params,
-                TypeGoal::implicit(op.right_type_oid),
-            ))?;
+        crate::lookup::OperatorMatch::Ambiguous => {
+            // PG (SQLSTATE 42725): `operator is not unique: <left> <op>
+            // <right>` — several overloads survived the unknown-side
+            // tiebreaks (`bday + $1`, `$1 + $2`, `NULL + NULL`).
+            let left_pg = crate::ddl::util::format_type_for_message(
+                snapshot,
+                left_oid_resolved.unwrap_or(oid::UNKNOWN),
+            );
+            let right_pg = crate::ddl::util::format_type_for_message(snapshot, right_oid_resolved);
+            let span = (expr.location >= 0).then(|| {
+                crate::error::SourceSpan::at_length(expr.location as usize, op_name.len())
+            });
+            return Err(crate::error::RawError::invalid(
+                format!("operator is not unique: {left_pg} {op_name} {right_pg}"),
+                span,
+                Some("add an explicit type cast to one side, e.g. `expr::int4`".into()),
+            )
+            .finalize_implicit());
         }
-        return Ok(ExprType::scalar(op.result_type_oid, nullable));
+        crate::lookup::OperatorMatch::NotFound => {}
     }
 
-    // `find_operator` fails in two semantically different ways:
-    //   * both operand types are UNKNOWN and several overloads exist → PG
-    //     `ambiguous_operator` (42725): `operator is not unique: unknown +
-    //     unknown` (`$1 + $2`, `NULL + NULL`; the text fallback already
-    //     resolved single-winner cases like `$1 = $2` before we got here).
-    //   * at least one side is concrete → PG `undefined_function` / operator
-    //     (42883): the operator really doesn't exist for these types. The
-    //     zero-candidate both-unknown case falls through here too — the
-    //     generic message renders the sides as `unknown`, matching PG.
-    let left_unknown = left_oid_resolved.map(|o| o == oid::UNKNOWN).unwrap_or(true);
-    let right_unknown = right_oid_resolved == oid::UNKNOWN;
-    if left_unknown && right_unknown && snapshot.operator_name_exists(op_name) {
-        let span = (expr.location >= 0)
-            .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
-        return Err(crate::error::RawError::invalid(
-            format!("operator is not unique: unknown {op_name} unknown"),
-            span,
-            Some("add an explicit type cast to one side, e.g. `expr::int4`".into()),
-        )
-        .finalize_implicit());
-    }
     // PG (SQLSTATE 42883): `operator does not exist: <left> <op> <right>`.
     // Use PG's user-facing type names (`integer`, `bigint`, …) so the
     // sanity-check prefix match passes.

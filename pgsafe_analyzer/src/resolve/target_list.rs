@@ -337,6 +337,20 @@ pub(crate) fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
             _ => (2, Some("greatest".to_string())),
         },
         node::Node::NullIfExpr(_) => (2, Some("nullif".to_string())),
+        // The *raw* parse tree spells NULLIF as an `AExpr` with the Nullif
+        // kind (the `NullIfExpr` node above only exists post-analysis) — PG
+        // names the output column `nullif` either way.
+        node::Node::AExpr(e)
+            if matches!(
+                protobuf::AExprKind::try_from(e.kind),
+                Ok(protobuf::AExprKind::AexprNullif)
+            ) =>
+        {
+            (2, Some("nullif".to_string()))
+        }
+        // `ARRAY[…]` constructors are named `array` (FigureColnameInternal's
+        // T_A_ArrayExpr arm).
+        node::Node::AArrayExpr(_) => (2, Some("array".to_string())),
         node::Node::RowExpr(_) => (2, Some("row".to_string())),
         // SQL value functions are named after the keyword spelling (PG's
         // FigureColname): `SELECT current_date` → column `current_date`.

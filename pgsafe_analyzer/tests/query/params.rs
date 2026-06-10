@@ -838,3 +838,88 @@ fn values_list_literal_content_validated_under_common_type() {
         "got: {err}"
     );
 }
+
+// ── Param inference in operator / set-op / null-test contexts ───────────────
+
+#[test]
+fn param_in_json_operator_gets_declared_arg_type() {
+    // `prefs -> $p1` resolves `jsonb -> text` (string-category rule); the
+    // param adopts the operator's *declared* right type. The old behavior
+    // pre-pinned the param to the left side's type (jsonb) and then failed
+    // resolution entirely.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE j (id BIGINT PRIMARY KEY, prefs JSONB);")
+        .unwrap();
+    let s = db.analyze("SELECT prefs -> $p1 FROM j").unwrap();
+    assert_params(&s, vec![p(text())]);
+    let s = db.analyze("SELECT prefs #> $p1 FROM j").unwrap();
+    assert_params(&s, vec![p(array_of(text()))]);
+}
+
+#[test]
+fn param_in_set_op_branch_adopts_peer_type() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT $p1 UNION ALL SELECT age FROM users")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    let s = db
+        .analyze("SELECT age FROM users UNION ALL SELECT $p1")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+}
+
+#[test]
+fn bare_param_in_null_test_is_indeterminate() {
+    // IS [NOT] NULL accepts any type and pins nothing — PG rejects with
+    // `could not determine data type of parameter $1`.
+    let db = setup();
+    let err = db.analyze("SELECT $p1 IS NULL").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not determine data type of parameter $1"),
+        "got: {err}"
+    );
+    // PG locks the type at first use: a later concrete use does NOT fix it…
+    let err = db.analyze("SELECT $p1 IS NULL, $p1 = 1").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not determine data type of parameter $1"),
+        "got: {err}"
+    );
+    // …but a use typed *before* the null test is fine.
+    db.analyze("SELECT $p1 = 1, $p1 IS NULL").unwrap();
+}
+
+#[test]
+fn ambiguous_unknown_operand_is_not_unique() {
+    // `date + unknown` keeps date+int4 / date+interval / date+time alive
+    // through every tiebreak — PG: `operator is not unique` (42725).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE d (id BIGINT PRIMARY KEY, bday DATE);")
+        .unwrap();
+    let err = db.analyze("SELECT bday + $p1 FROM d").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("operator is not unique: date + unknown"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn concat_with_param_resolves_homogeneous_overload() {
+    // `text || $1` must pick `text || text` (param = text), not the
+    // polymorphic `text || anynonarray`.
+    let db = setup();
+    let s = db.analyze("SELECT name || $p1 FROM users").unwrap();
+    assert_params(&s, vec![p(text())]);
+}
+
+#[test]
+fn nullif_and_array_default_column_names() {
+    let db = setup();
+    let s = db.analyze("SELECT NULLIF($p1, age) FROM users").unwrap();
+    assert_eq!(s.columns[0].name, "nullif");
+    let s = db.analyze("SELECT ARRAY[age, $p1] FROM users").unwrap();
+    assert_eq!(s.columns[0].name, "array");
+}
