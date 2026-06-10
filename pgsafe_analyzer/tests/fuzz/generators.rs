@@ -450,7 +450,19 @@ pub(crate) fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
             1 => format!("${}", next_param(np)),
             _ => gen_expr(table, 1, rng, np),
         };
-        sql.push_str(&format!(" LIMIT {lim}"));
+        if rng.random_bool(0.2) {
+            // SQL-standard form; WITH TIES requires an ORDER BY, which this
+            // SELECT only sometimes has — the invalid combination is itself
+            // a useful probe (PG rejects it with a dedicated message).
+            let ties = if rng.random_bool(0.5) {
+                "WITH TIES"
+            } else {
+                "ONLY"
+            };
+            sql.push_str(&format!(" FETCH FIRST {lim} ROWS {ties}"));
+        } else {
+            sql.push_str(&format!(" LIMIT {lim}"));
+        }
         if rng.random_bool(0.3) {
             sql.push_str(&format!(" OFFSET {}", rng.random_range(0..10)));
         }
@@ -855,8 +867,17 @@ pub(crate) fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let mut sql = format!("UPDATE {} SET {sets}", table.name);
+    // `FROM other` — extra joinable source visible to WHERE/RETURNING.
+    let from = rng.random_bool(0.2).then(|| pick_table(rng));
+    if let Some(f) = from {
+        sql.push_str(&format!(" FROM {} AS f_src", f.name));
+    }
     if rng.random_bool(0.6) {
         sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
+        if let Some(f) = from {
+            let fc = random_col(f, rng);
+            sql.push_str(&format!(" AND f_src.{} IS NOT NULL", fc.name));
+        }
     }
     if rng.random_bool(0.3) {
         sql.push_str(&gen_returning(table, rng, np));
@@ -867,8 +888,21 @@ pub(crate) fn gen_update(rng: &mut StdRng, np: &mut u32) -> String {
 pub(crate) fn gen_delete(rng: &mut StdRng, np: &mut u32) -> String {
     let table = pick_table(rng);
     let mut sql = format!("DELETE FROM {}", table.name);
+    // `USING other` — extra joinable source visible to WHERE/RETURNING.
+    let using = rng.random_bool(0.2).then(|| pick_table(rng));
+    if let Some(u) = using {
+        sql.push_str(&format!(" USING {} AS u_src", u.name));
+    }
     if rng.random_bool(0.7) {
         sql.push_str(&format!(" WHERE {}", gen_expr(table, 2, rng, np)));
+        if let Some(u) = using {
+            let uc = random_col(u, rng);
+            let tc = random_col(table, rng);
+            sql.push_str(&format!(
+                " AND u_src.{} IS NOT NULL AND {}.{} IS NOT NULL",
+                uc.name, table.name, tc.name
+            ));
+        }
     }
     if rng.random_bool(0.3) {
         sql.push_str(&gen_returning(table, rng, np));

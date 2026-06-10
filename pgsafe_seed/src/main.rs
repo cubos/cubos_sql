@@ -252,7 +252,7 @@ fn export_enums(client: &mut postgres::Client) -> Result<Vec<PgEnum>, postgres::
 
 fn export_ranges(client: &mut postgres::Client) -> Result<Vec<PgRange>, postgres::Error> {
     let rows = client.query(
-        "SELECT rngtypid, rngsubtype FROM pg_catalog.pg_range ORDER BY rngtypid",
+        "SELECT rngtypid, rngsubtype, rngmultitypid FROM pg_catalog.pg_range ORDER BY rngtypid",
         &[],
     )?;
     Ok(rows
@@ -260,9 +260,11 @@ fn export_ranges(client: &mut postgres::Client) -> Result<Vec<PgRange>, postgres
         .map(|r| {
             let rngtypid: u32 = r.get(0);
             let rngsubtype: u32 = r.get(1);
+            let rngmultitypid: u32 = r.get(2);
             PgRange {
                 rngtypid: PgTypeOid::new(rngtypid).expect("rngtypid is non-zero"),
                 rngsubtype: PgTypeOid::new(rngsubtype).expect("rngsubtype is non-zero"),
+                rngmultitypid: PgTypeOid::new(rngmultitypid),
             }
         })
         .collect())

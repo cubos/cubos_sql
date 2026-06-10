@@ -1,7 +1,7 @@
 //! PostgreSQL polymorphic pseudo-type handling (`anyelement`,
-//! `anyarray`, `anycompatible`, …): matching actual args against a
-//! pseudo-type, binding the concrete types implied by a call, and
-//! substituting them back into a result type.
+//! `anyarray`, `anyrange`, `anycompatible`, …): matching actual args
+//! against a pseudo-type, binding the concrete types implied by a call,
+//! and substituting them back into a result type.
 //!
 //! Shared by both function resolution ([`crate::functions`]) and operator
 //! resolution ([`crate::lookup`]) — PG applies the same rules to both.
@@ -21,6 +21,19 @@ pub(crate) const ANYCOMPATIBLEARRAY: PgTypeOid = PgTypeOid::from_raw(5078);
 pub(crate) const ANYCOMPATIBLENONARRAY: PgTypeOid = PgTypeOid::from_raw(5079);
 pub(crate) const ANYCOMPATIBLERANGE: PgTypeOid = PgTypeOid::from_raw(5080);
 pub(crate) const ANYCOMPATIBLEMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4538);
+
+/// The concrete types a polymorphic call binds, one slot per pseudo-type
+/// family. Binding any slot derives the related ones where the catalog
+/// knows the relation (array → element, range → subtype element,
+/// multirange → range → element), mirroring PG's
+/// `enforce_generic_type_consistency`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PolyBindings {
+    pub element: Option<PgTypeOid>,
+    pub array: Option<PgTypeOid>,
+    pub range: Option<PgTypeOid>,
+    pub multirange: Option<PgTypeOid>,
+}
 
 /// Is `expected` a polymorphic pseudo-type that PG would accept `actual` for?
 pub(crate) fn matches_polymorphic(
@@ -45,9 +58,13 @@ pub(crate) fn matches_polymorphic(
             snapshot.get_type(actual).map(|t| t.typtype),
             Some(TypType::Enum)
         ),
-        ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => matches!(
+        ANYRANGE | ANYCOMPATIBLERANGE => matches!(
             snapshot.get_type(actual).map(|t| t.typtype),
             Some(TypType::Range)
+        ),
+        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => matches!(
+            snapshot.get_type(actual).map(|t| t.typtype),
+            Some(TypType::Multirange)
         ),
         _ => false,
     }
@@ -83,8 +100,7 @@ pub(crate) fn bind_polymorphic_from(
     expected: PgTypeOid,
     actual: PgTypeOid,
     snapshot: &PgCatalog,
-    bound_element: &mut Option<PgTypeOid>,
-    bound_array: &mut Option<PgTypeOid>,
+    bindings: &mut PolyBindings,
 ) {
     // PG (`enforce_generic_type_consistency`) skips UNKNOWN actuals when
     // unifying polymorphic args — the unknown is coerced to the resolved
@@ -97,19 +113,31 @@ pub(crate) fn bind_polymorphic_from(
     }
     match expected {
         ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
-            bound_element.get_or_insert(actual);
+            bindings.element.get_or_insert(actual);
         }
         ANYARRAY | ANYCOMPATIBLEARRAY => {
-            bound_array.get_or_insert(actual);
+            bindings.array.get_or_insert(actual);
             if let Some(t) = snapshot.get_type(actual)
                 && t.typcategory == TypCategory::Array
                 && let Some(elem) = t.typelem
             {
-                bound_element.get_or_insert(elem);
+                bindings.element.get_or_insert(elem);
             }
         }
-        ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => {
-            bound_array.get_or_insert(actual);
+        ANYRANGE | ANYCOMPATIBLERANGE => {
+            bindings.range.get_or_insert(actual);
+            if let Some(sub) = snapshot.range_subtype(actual) {
+                bindings.element.get_or_insert(sub);
+            }
+        }
+        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => {
+            bindings.multirange.get_or_insert(actual);
+            if let Some(r) = snapshot.range_of_multirange(actual) {
+                bindings.range.get_or_insert(r);
+                if let Some(sub) = snapshot.range_subtype(r) {
+                    bindings.element.get_or_insert(sub);
+                }
+            }
         }
         _ => {}
     }
@@ -117,20 +145,72 @@ pub(crate) fn bind_polymorphic_from(
 
 pub(crate) fn substitute_polymorphic(
     oid: PgTypeOid,
-    bound_element: Option<PgTypeOid>,
-    bound_array: Option<PgTypeOid>,
+    bindings: &PolyBindings,
     snapshot: &PgCatalog,
 ) -> PgTypeOid {
     match oid {
         ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
-            bound_element.unwrap_or(oid)
+            bindings.element.unwrap_or(oid)
         }
-        ANYARRAY | ANYCOMPATIBLEARRAY => bound_array
-            .or_else(|| bound_element.and_then(|e| snapshot.array_type_of(e)))
+        ANYARRAY | ANYCOMPATIBLEARRAY => bindings
+            .array
+            .or_else(|| bindings.element.and_then(|e| snapshot.array_type_of(e)))
             .unwrap_or(oid),
-        ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => {
-            bound_array.unwrap_or(oid)
-        }
+        ANYRANGE | ANYCOMPATIBLERANGE => bindings.range.unwrap_or(oid),
+        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => bindings
+            .multirange
+            .or_else(|| bindings.range.and_then(|r| snapshot.multirange_of_range(r)))
+            .unwrap_or(oid),
         _ => oid,
     }
+}
+
+/// PG's `enforce_generic_type_consistency` for the strict (non-
+/// `anycompatible`) family: once the call's bindings are known, a
+/// *concrete* actual at a polymorphic position must be the resolved type
+/// itself or implicitly castable to it. This is what rejects
+/// `tstzrange @> 1` (anyelement resolves to `timestamptz`, no implicit
+/// `integer` cast) while keeping `array_position(int8[], int4)` (implicit
+/// int4 → int8). The `anycompatible*` family instead promotes through
+/// `select_common_type` and is not checked here. UNKNOWN actuals are
+/// always consistent — they're coerced to the resolved type afterwards.
+pub(crate) fn binding_consistent(
+    expected: PgTypeOid,
+    actual: PgTypeOid,
+    bindings: &PolyBindings,
+    snapshot: &PgCatalog,
+) -> bool {
+    if actual == oid::UNKNOWN {
+        return true;
+    }
+    match expected {
+        ANYELEMENT | ANYNONARRAY | ANYENUM | ANYARRAY | ANYRANGE | ANYMULTIRANGE => {
+            let resolved = substitute_polymorphic(expected, bindings, snapshot);
+            resolved == actual
+                || (resolved != expected && snapshot.has_implicit_cast(actual, resolved))
+        }
+        _ => true,
+    }
+}
+
+/// Bind every polymorphic position of a call and verify the strict-family
+/// consistency rule across all of them. Returns the bindings on success,
+/// `None` when some concrete actual contradicts the resolution.
+pub(crate) fn unify_polymorphic_call(
+    declared: &[PgTypeOid],
+    actuals: &[PgTypeOid],
+    snapshot: &PgCatalog,
+) -> Option<PolyBindings> {
+    let mut bindings = PolyBindings::default();
+    for (&expected, &actual) in declared.iter().zip(actuals.iter()) {
+        if is_polymorphic(expected) {
+            bind_polymorphic_from(expected, actual, snapshot, &mut bindings);
+        }
+    }
+    for (&expected, &actual) in declared.iter().zip(actuals.iter()) {
+        if is_polymorphic(expected) && !binding_consistent(expected, actual, &bindings, snapshot) {
+            return None;
+        }
+    }
+    Some(bindings)
 }

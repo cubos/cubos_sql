@@ -417,6 +417,9 @@ fn find_polymorphic_match<'a>(
                         || matches_polymorphic(expected, actual, snapshot)
                 })
         })
+        // Per-position matching passed; the call as a whole must also
+        // unify (anyelement == the range's subtype, etc.).
+        .filter(|f| unify_polymorphic_call(&f.proargtypes, arg_types, snapshot).is_some())
         .copied()
         .collect();
     if strict.len() == 1 {
@@ -723,31 +726,19 @@ fn make_resolved_polymorphic(
     actual_args: &[PgTypeOid],
     snapshot: &PgCatalog,
 ) -> ResolvedFunction {
-    let mut bound_element: Option<PgTypeOid> = None;
-    let mut bound_array: Option<PgTypeOid> = None;
-
+    let mut bindings = PolyBindings::default();
     for (&expected, &actual) in f.proargtypes.iter().zip(actual_args.iter()) {
-        bind_polymorphic_from(
-            expected,
-            actual,
-            snapshot,
-            &mut bound_element,
-            &mut bound_array,
-        );
+        bind_polymorphic_from(expected, actual, snapshot, &mut bindings);
     }
 
     let agg_final = aggregate_final_return(f, snapshot);
-    let return_type_oid = substitute_polymorphic(
-        agg_final.unwrap_or(f.prorettype),
-        bound_element,
-        bound_array,
-        snapshot,
-    );
+    let return_type_oid =
+        substitute_polymorphic(agg_final.unwrap_or(f.prorettype), &bindings, snapshot);
     let out_args = build_out_args(f)
         .into_iter()
         .map(|field| OutArg {
             name: field.name,
-            type_oid: substitute_polymorphic(field.type_oid, bound_element, bound_array, snapshot),
+            type_oid: substitute_polymorphic(field.type_oid, &bindings, snapshot),
             not_null: field.not_null,
         })
         .collect();

@@ -279,9 +279,13 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typtypmod: None,
         typcollation: None,
     });
+    // TODO: PG also auto-creates the companion multirange type
+    // (`<name>_multirange` / MULTIRANGE_TYPE_NAME); the DDL interpreter
+    // does not yet, so user-defined ranges have no rngmultitypid.
     interp.insert_pg_range(PgRange {
         rngtypid: oid,
         rngsubtype: subtype_oid,
+        rngmultitypid: None,
     });
 
     register_array_type(interp, nsoid, &name, oid)?;

@@ -209,6 +209,30 @@ impl PgCatalog {
         None
     }
 
+    /// Subtype of a range type (`pg_range.rngsubtype`): `tstzrange` →
+    /// `timestamptz`. `None` when `oid` is not a range type.
+    pub fn range_subtype(&self, range_oid: PgTypeOid) -> Option<PgTypeOid> {
+        self.pg_range.get(&range_oid).map(|r| r.rngsubtype)
+    }
+
+    /// The multirange type built over a range type
+    /// (`pg_range.rngmultitypid`): `tstzrange` → `tstzmultirange`. `None`
+    /// for non-range types and for user-defined ranges created by the DDL
+    /// interpreter (which doesn't build companion multiranges yet).
+    pub fn multirange_of_range(&self, range_oid: PgTypeOid) -> Option<PgTypeOid> {
+        self.pg_range.get(&range_oid).and_then(|r| r.rngmultitypid)
+    }
+
+    /// The range type a multirange is built over (reverse of
+    /// [`Self::multirange_of_range`]; linear scan — `pg_range` has a few
+    /// dozen rows).
+    pub fn range_of_multirange(&self, multirange_oid: PgTypeOid) -> Option<PgTypeOid> {
+        self.pg_range
+            .values()
+            .find(|r| r.rngmultitypid == Some(multirange_oid))
+            .map(|r| r.rngtypid)
+    }
+
     /// The preferred type of a given `pg_type.typcategory`. Used when the
     /// analyzer needs to pick a concrete type for an expression whose inputs
     /// are all UNKNOWN (string-category literals default to `text`, numeric
@@ -1033,6 +1057,9 @@ fn most_specific_polymorphic<'a>(ops: &[&'a PgOperator]) -> Option<&'a PgOperato
 /// Returns `None` for shell operators (`oprresult = None`); those are
 /// pre-filtered out of [`PgCatalog::find_operator`]'s candidate list, so in
 /// practice this only short-circuits if a caller bypasses that filter.
+/// Also returns `None` when a concrete operand contradicts the polymorphic
+/// resolution (`tstzrange @> 1` — anyelement resolves to timestamptz), per
+/// PG's `enforce_generic_type_consistency`.
 fn concretize_operator(
     op: &PgOperator,
     left_actual: Option<PgTypeOid>,
@@ -1040,42 +1067,16 @@ fn concretize_operator(
     db: &PgCatalog,
 ) -> Option<ResolvedOperator> {
     let op_left = op.oprleft;
-    let mut bound_element: Option<PgTypeOid> = None;
-    let mut bound_array: Option<PgTypeOid> = None;
-    if let (Some(expected_l), Some(actual_l)) = (op_left, left_actual)
-        && crate::polymorphic::is_polymorphic(expected_l)
-    {
-        crate::polymorphic::bind_polymorphic_from(
-            expected_l,
-            actual_l,
-            db,
-            &mut bound_element,
-            &mut bound_array,
-        );
-    }
-    if crate::polymorphic::is_polymorphic(op.oprright) {
-        crate::polymorphic::bind_polymorphic_from(
-            op.oprright,
-            right_actual,
-            db,
-            &mut bound_element,
-            &mut bound_array,
-        );
-    }
+    let declared: Vec<PgTypeOid> = op_left.into_iter().chain([op.oprright]).collect();
+    let actuals: Vec<PgTypeOid> = match (op_left, left_actual) {
+        (Some(_), Some(l)) => vec![l, right_actual],
+        _ => vec![right_actual],
+    };
+    let bindings = crate::polymorphic::unify_polymorphic_call(&declared, &actuals, db)?;
     Some(ResolvedOperator {
         left_type_oid: op_left
-            .map(|o| crate::polymorphic::substitute_polymorphic(o, bound_element, bound_array, db)),
-        right_type_oid: crate::polymorphic::substitute_polymorphic(
-            op.oprright,
-            bound_element,
-            bound_array,
-            db,
-        ),
-        result_type_oid: crate::polymorphic::substitute_polymorphic(
-            op.oprresult?,
-            bound_element,
-            bound_array,
-            db,
-        ),
+            .map(|o| crate::polymorphic::substitute_polymorphic(o, &bindings, db)),
+        right_type_oid: crate::polymorphic::substitute_polymorphic(op.oprright, &bindings, db),
+        result_type_oid: crate::polymorphic::substitute_polymorphic(op.oprresult?, &bindings, db),
     })
 }

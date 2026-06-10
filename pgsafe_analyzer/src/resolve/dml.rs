@@ -709,11 +709,9 @@ pub(crate) fn analyze_delete(
     let table_attrs = snapshot.attributes_of(table.oid).to_vec();
 
     // Walk `DELETE … WITH (cte) …` so parameters inside the CTE register
-    // with the collector. CTE visibility inside WHERE sublinks is a
-    // separate concern (subselects don't currently inherit outer CTEs);
-    // this fix is scoped to closing the param-tracking gap.
+    // with the collector and the CTE alias is visible to the USING clause.
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
     if let Some(with) = &del.with_clause {
-        let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
         for cte_node in &with.ctes {
             if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
                 let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
@@ -723,13 +721,29 @@ pub(crate) fn analyze_delete(
     }
 
     let mut scope = Scope::default();
-    let null_ctx = NullabilityContext::default();
+    let mut null_ctx = NullabilityContext::default();
+    let alias = relation
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.as_str())
+        .unwrap_or(&relation.relname);
     scope.add_dml_target(
         snapshot,
-        &relation.relname,
+        alias,
         crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
         &table_attrs,
     );
+
+    // `DELETE … USING t1, t2 …` is UPDATE's FROM: extra joinable sources
+    // visible to WHERE and RETURNING.
+    process_from_clause(
+        &del.using_clause,
+        &mut scope,
+        &mut null_ctx,
+        snapshot,
+        &cte_scopes,
+        params,
+    )?;
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {

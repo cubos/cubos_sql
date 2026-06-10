@@ -324,6 +324,11 @@ pub struct PgRange {
     pub rngtypid: PgTypeOid,
     /// FK `pg_type.oid` of the subtype.
     pub rngsubtype: PgTypeOid,
+    /// FK `pg_type.oid` of the multirange type built over this range
+    /// (`pg_range.rngmultitypid`). `Option` so stale seeds without the
+    /// column still load; regenerate via `cargo run -p pgsafe_seed`.
+    #[serde(default)]
+    pub rngmultitypid: Option<PgTypeOid>,
 }
 
 /// `pg_constraint.contype`. PG chars: `c` check, `f` foreign key, `n` not

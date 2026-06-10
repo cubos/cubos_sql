@@ -286,6 +286,24 @@ impl Scope {
                     return Ok(col);
                 }
             }
+            // The alias exists but lacks the column → PG's qualified
+            // missing-column wording, formatted through identifier quoting
+            // rules (`column t.col does not exist`, `column "T".col does
+            // not exist` when `T` needs quoting).
+            let alias_exists = self
+                .sources
+                .iter()
+                .chain(self.lateral_sources.iter())
+                .chain(self.outer_sources.iter())
+                .any(|s| s.alias == t);
+            if alias_exists {
+                return Err(undefined_column_error(
+                    self,
+                    column,
+                    format!("column {} does not exist", QualifiedName::new(t, column)),
+                    span,
+                ));
+            }
             // Match PG's wording for the non-LATERAL outer-reference case:
             // when `t` is visible in the enclosing FROM but not here, point
             // at the FROM-clause-entry visibility rule rather than the
@@ -311,16 +329,16 @@ impl Scope {
                 )
                 .finalize_implicit());
             }
-            // PG formats qualified missing columns through identifier
-            // quoting rules (`column t.col does not exist`, but
-            // `column "T".col does not exist` when `T` needs quoting).
-            // Bare names use the simple `"col"` form just below.
-            return Err(undefined_column_error(
-                self,
-                column,
-                format!("column {} does not exist", QualifiedName::new(t, column)),
+            // The alias matches nothing in scope at all — PG reports the
+            // missing FROM entry (42P01), not a missing column.
+            return Err(crate::error::RawError::new(
+                AnalyzeError::UndefinedTable(format!(
+                    "missing FROM-clause entry for table \"{t}\""
+                )),
                 span,
-            ));
+                None,
+            )
+            .finalize_implicit());
         }
 
         for tier in [&self.sources, &self.lateral_sources, &self.outer_sources] {

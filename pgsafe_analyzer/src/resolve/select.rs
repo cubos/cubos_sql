@@ -128,6 +128,10 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         params,
     )?;
 
+    // `FOR UPDATE OF alias` (and FOR SHARE / NO KEY UPDATE / KEY SHARE):
+    // every named relation must be a FROM entry of *this* query level.
+    check_locking_clause(&sel.locking_clause, &scope)?;
+
     // Expand `GROUPING SETS` / `ROLLUP` / `CUBE`: promote columns that
     // some grouping set omits to nullable, and remember whether any
     // grouping set is empty (drives aggregate-result nullability).
@@ -566,4 +570,42 @@ pub(crate) fn is_select_alias_reference(
         return false;
     };
     aliases.contains(&s.sval)
+}
+
+/// Validate `FOR UPDATE OF a, b` (and the other lock strengths): PG
+/// requires every named relation to be an entry of the current query
+/// level's FROM clause — `relation "x" in FOR UPDATE clause not found in
+/// FROM clause` (SQLSTATE 42P01) otherwise.
+fn check_locking_clause(
+    locking_clause: &[protobuf::Node],
+    scope: &Scope,
+) -> Result<(), AnalyzeError> {
+    for node in locking_clause {
+        let Some(node::Node::LockingClause(lc)) = node.node.as_ref() else {
+            continue;
+        };
+        let clause = match lc.strength() {
+            pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
+            pg_query::protobuf::LockClauseStrength::LcsForshare => "FOR SHARE",
+            pg_query::protobuf::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
+            _ => "FOR UPDATE",
+        };
+        for rel in &lc.locked_rels {
+            let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
+                continue;
+            };
+            if scope.find_source(&rv.relname).is_none() {
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::UndefinedTable(format!(
+                        "relation \"{}\" in {clause} clause not found in FROM clause",
+                        rv.relname
+                    )),
+                    crate::error::SourceSpan::from_node_qname(rv.location),
+                    None,
+                )
+                .finalize_implicit());
+            }
+        }
+    }
+    Ok(())
 }
