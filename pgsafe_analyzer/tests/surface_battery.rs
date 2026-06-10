@@ -31,7 +31,8 @@ CREATE TABLE events (
 );
 CREATE TABLE counters (
     key TEXT PRIMARY KEY,
-    n INT NOT NULL
+    n INT NOT NULL,
+    price NUMERIC(8,2)
 );
 ";
 
@@ -92,6 +93,10 @@ const BATTERY: &[&str] = &[
     "INSERT INTO counters DEFAULT VALUES",
     "INSERT INTO events (id, user_id, at, kind) OVERRIDING SYSTEM VALUE VALUES (1, 1, now(), 'x')",
     "INSERT INTO events (id, user_id, at, kind) VALUES (1, 1, now(), 'x')",
+    // ── numeric typmod: content validity outranks magnitude ────────────
+    "INSERT INTO counters (key, n, price) VALUES ('k', 1, 'not-a-number')",
+    "INSERT INTO counters (key, n, price) VALUES ('k', 1, '1234567.00')",
+    "INSERT INTO counters (key, n, price) VALUES ('k', 1, '123456.78')",
     // ── misc uncovered corners ──────────────────────────────────────────
     "SELECT DISTINCT ON (kind, user_id) id FROM events ORDER BY kind, user_id, at DESC",
     "SELECT count(*) FILTER (WHERE age > 18) - count(*) FILTER (WHERE age <= 18) FROM users",

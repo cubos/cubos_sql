@@ -515,7 +515,7 @@ fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
 /// `inf[inity]` (case-insensitive), a `0x`/`0o`/`0b` integer, or a decimal
 /// value with optional fraction and `e`-exponent — underscores allowed
 /// between digits everywhere. No precision limit check.
-fn validate_numeric(content: &str) -> Result<(), String> {
+pub(crate) fn validate_numeric(content: &str) -> Result<(), String> {
     let err = || crate::pgmsg::invalid_input_syntax_for_type("numeric", content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
     if let Some(rest) = s.strip_prefix(['+', '-']) {

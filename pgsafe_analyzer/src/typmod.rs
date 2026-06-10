@@ -283,6 +283,12 @@ pub fn check_literal_assignment(
         }
         DecodedTypmod::Numeric { precision, scale } => {
             let raw = numeric_literal_string(value)?;
+            // Content first, magnitude second — PG runs numeric_in before
+            // applying the typmod, so a malformed literal is 22P02
+            // (`invalid input syntax`), never `numeric field overflow`.
+            if let Err(msg) = crate::literal_input::validate_numeric(&raw) {
+                return Some(AnalyzeError::InvalidLiteral(msg));
+            }
             check_numeric_overflow(&raw, precision, scale)
         }
         DecodedTypmod::VectorDim(n) => {

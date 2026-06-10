@@ -24,7 +24,9 @@ if [[ ${#SEEDS[@]} -eq 0 ]]; then
 fi
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-root="target/fuzz-campaign/$(date +%Y%m%d-%H%M%S)"
+# Absolute path: FUZZ_OUT reaches the test process, whose cwd is the crate
+# directory (nextest), not the workspace root.
+root="$(pwd)/target/fuzz-campaign/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$root"
 
 for seed in "${SEEDS[@]}"; do
