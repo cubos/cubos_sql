@@ -2,9 +2,10 @@
 //!
 //! Variant names mirror PostgreSQL error categories (SQLSTATE class 42):
 //! `UndefinedTable` = 42P01, `UndefinedColumn` = 42703, `UndefinedFunction` /
-//! `UndefinedOperator` = 42883, `IndeterminateType` = 42P18, and so on. This
-//! lets consumers map our errors to PG error codes without an extra translation
-//! table, and helps us stay honest about what each variant actually represents.
+//! `UndefinedOperator` = 42883, and so on. [`AnalyzeError::sqlstate`] is the
+//! canonical variant → code mapping; the `pg_sanity` oracle cross-checks it
+//! against the code the live server attaches, which keeps the taxonomy
+//! honest about what each variant actually represents.
 
 use thiserror::Error;
 
@@ -33,6 +34,65 @@ pub enum AnalyzeError {
     #[error("{0}")]
     UndefinedColumn(String),
 
+    /// Several columns in scope match an unqualified reference. Equivalent
+    /// to PG `ambiguous_column` (SQLSTATE 42702).
+    #[error("{0}")]
+    AmbiguousColumn(String),
+
+    /// Several function or operator overloads survived every resolution
+    /// tiebreak (`operator is not unique`, `function … is not unique`).
+    /// Equivalent to PG `ambiguous_function` (SQLSTATE 42725).
+    #[error("{0}")]
+    AmbiguousFunction(String),
+
+    /// A schema object other than a relation/column/function/type is
+    /// missing — a named window, the array type of a type, etc. Equivalent
+    /// to PG `undefined_object` (SQLSTATE 42704).
+    #[error("{0}")]
+    UndefinedObject(String),
+
+    /// An object of the wrong kind was used: a procedure called in an
+    /// expression, `OVER` on a plain function, a window function without
+    /// `OVER`. Equivalent to PG `wrong_object_type` (SQLSTATE 42809).
+    #[error("{0}")]
+    WrongObjectType(String),
+
+    /// A GROUP BY / ORDER BY ordinal out of range, the SELECT DISTINCT
+    /// ORDER BY rule, or a FROM column-alias list longer than the relation.
+    /// Equivalent to PG `invalid_column_reference` (SQLSTATE 42P10).
+    #[error("{0}")]
+    InvalidColumnReference(String),
+
+    /// A FROM-clause alias used more than once. Equivalent to PG
+    /// `duplicate_alias` (SQLSTATE 42712).
+    #[error("{0}")]
+    DuplicateAlias(String),
+
+    /// Construct-level type reconciliation failed: the `… types X and Y
+    /// cannot be matched` family (CASE/COALESCE/UNION/ARRAY/JOIN USING),
+    /// recursive-CTE column types, clause arguments of the wrong type
+    /// (`argument of WHERE must be type boolean`). Equivalent to PG
+    /// `datatype_mismatch` (SQLSTATE 42804).
+    #[error("{0}")]
+    DatatypeMismatch(String),
+
+    /// Aggregate placement / grouping rules: aggregates not allowed in a
+    /// clause, ungrouped column references, nested aggregates. Equivalent
+    /// to PG `grouping_error` (SQLSTATE 42803).
+    #[error("{0}")]
+    GroupingError(String),
+
+    /// Window-function placement rules (`window functions are not allowed
+    /// in WHERE`). Equivalent to PG `windowing_error` (SQLSTATE 42P20).
+    #[error("{0}")]
+    WindowingError(String),
+
+    /// Semantic-analysis errors PostgreSQL classifies as `syntax_error`
+    /// (SQLSTATE 42601) even though they aren't grammar failures: VALUES
+    /// list arity, set-operation column counts.
+    #[error("{0}")]
+    SyntaxError(String),
+
     /// A type referenced in the query is not in the catalog. Equivalent to
     /// PG `undefined_object` (SQLSTATE 42704) when the lookup was by name,
     /// or surfaces an internal OID mismatch when the lookup was by OID.
@@ -53,12 +113,22 @@ pub enum AnalyzeError {
     #[error("{0}")]
     UndefinedOperator(String),
 
-    /// The type of an expression could not be determined — typically a bare
-    /// parameter with no context, or an operator with UNKNOWN on both sides
-    /// that resolves ambiguously. Equivalent to PG `indeterminate_datatype`
-    /// (SQLSTATE 42P18).
+    /// The type of an expression could not be determined — a bare parameter
+    /// no use of the query could type (`SELECT $1 IS NULL`, `ROW($1)`,
+    /// `concat(name, $1)`). Equivalent to PG `indeterminate_datatype`
+    /// (SQLSTATE 42P18). PG reports the *same wording* with a different
+    /// code when the parameter's uses deduced conflicting types — see
+    /// [`Self::AmbiguousParameter`]; both verified on PG 18.
     #[error("{0}")]
     IndeterminateType(String),
+
+    /// A parameter with one use that locks it as untypable *and* another
+    /// that deduces a concrete type — the deductions conflict
+    /// (`SELECT $1 IS NULL, $1 = 1`). Same `could not determine data type
+    /// of parameter $N` wording as [`Self::IndeterminateType`], but PG
+    /// attaches `ambiguous_parameter` (SQLSTATE 42P08) on this path.
+    #[error("{0}")]
+    AmbiguousParameter(String),
 
     /// A type mismatch: an expression's type cannot be coerced to the expected
     /// type. Equivalent to PG `datatype_mismatch` (SQLSTATE 42804) or
@@ -123,6 +193,47 @@ pub enum AnalyzeError {
     /// IO error (reading/writing snapshot files).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl AnalyzeError {
+    /// The SQLSTATE PostgreSQL attaches to the error class this variant
+    /// represents — a pure variant → code mapping, with no inspection of
+    /// the message payload.
+    ///
+    /// Returns `None` for variants that span several PG codes
+    /// ([`Self::Invalid`], [`Self::InvalidLiteral`] — 22P02/22003/0A000
+    /// depending on the input function, [`Self::TypeMismatch`] —
+    /// 42804/42846 depending on context) and for purely internal failures.
+    /// The `pg_sanity` oracle compares this against the live server's
+    /// `DbError::code()` whenever it is `Some`.
+    pub fn sqlstate(&self) -> Option<&'static str> {
+        use AnalyzeError::*;
+        match self {
+            Lex(_) | Parse(_) | SyntaxError(_) => Some("42601"),
+            UndefinedTable(_) => Some("42P01"),
+            UndefinedColumn(_) => Some("42703"),
+            AmbiguousColumn(_) => Some("42702"),
+            UndefinedType(_) | UndefinedObject(_) => Some("42704"),
+            UndefinedFunction(_) | UndefinedOperator(_) => Some("42883"),
+            AmbiguousFunction(_) => Some("42725"),
+            WrongObjectType(_) => Some("42809"),
+            IndeterminateType(_) => Some("42P18"),
+            AmbiguousParameter(_) => Some("42P08"),
+            InvalidColumnReference(_) => Some("42P10"),
+            DuplicateAlias(_) => Some("42712"),
+            DatatypeMismatch(_) => Some("42804"),
+            GroupingError(_) => Some("42803"),
+            WindowingError(_) => Some("42P20"),
+            TypeMismatch { .. }
+            | Invalid(_)
+            | InvalidLiteral(_)
+            | Unsupported(_)
+            | UnsupportedJoinType(_)
+            | Internal(_)
+            | Serde(_)
+            | Io(_) => None,
+        }
+    }
 }
 
 impl From<LexError> for AnalyzeError {
@@ -525,6 +636,20 @@ impl RawError {
         }
     }
 
+    /// Build a raw error around an already-constructed [`AnalyzeError`] —
+    /// used by the `pgmsg` constructors, which pick the variant carrying
+    /// the right SQLSTATE for each wording. The caret label starts empty;
+    /// chain [`Self::with_primary_label`] to set one.
+    pub(crate) fn new(kind: AnalyzeError, span: Option<SourceSpan>, hint: Option<String>) -> Self {
+        let primary = span.map(|s| DiagnosticLabel::new(s, ""));
+        Self {
+            kind,
+            primary,
+            secondaries: Vec::new(),
+            hint,
+        }
+    }
+
     /// Construct an `UndefinedTable` raw error with optional span and hint.
     /// `qualified` is the relation name as the user wrote it
     /// (`schema.name` when qualified, bare `name` otherwise) — PG's error
@@ -625,21 +750,6 @@ impl RawError {
             },
             primary,
             secondaries,
-            hint,
-        }
-    }
-
-    /// Build an `IndeterminateType` raw error for an untyped parameter.
-    pub(crate) fn indeterminate_type(
-        message: String,
-        span: Option<SourceSpan>,
-        hint: Option<String>,
-    ) -> Self {
-        let primary = span.map(|s| DiagnosticLabel::new(s, "type cannot be determined"));
-        Self {
-            kind: AnalyzeError::IndeterminateType(message),
-            primary,
-            secondaries: Vec::new(),
             hint,
         }
     }
@@ -781,10 +891,21 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::UndefinedFunction(_) => AnalyzeError::UndefinedFunction(rendered),
         AnalyzeError::UndefinedOperator(_) => AnalyzeError::UndefinedOperator(rendered),
         AnalyzeError::IndeterminateType(_) => AnalyzeError::IndeterminateType(rendered),
+        AnalyzeError::AmbiguousParameter(_) => AnalyzeError::AmbiguousParameter(rendered),
         AnalyzeError::Unsupported(_) => AnalyzeError::Unsupported(rendered),
         AnalyzeError::Invalid(_) => AnalyzeError::Invalid(rendered),
         AnalyzeError::InvalidLiteral(_) => AnalyzeError::InvalidLiteral(rendered),
         AnalyzeError::UndefinedType(_) => AnalyzeError::UndefinedType(rendered),
+        AnalyzeError::AmbiguousColumn(_) => AnalyzeError::AmbiguousColumn(rendered),
+        AnalyzeError::AmbiguousFunction(_) => AnalyzeError::AmbiguousFunction(rendered),
+        AnalyzeError::UndefinedObject(_) => AnalyzeError::UndefinedObject(rendered),
+        AnalyzeError::WrongObjectType(_) => AnalyzeError::WrongObjectType(rendered),
+        AnalyzeError::InvalidColumnReference(_) => AnalyzeError::InvalidColumnReference(rendered),
+        AnalyzeError::DuplicateAlias(_) => AnalyzeError::DuplicateAlias(rendered),
+        AnalyzeError::DatatypeMismatch(_) => AnalyzeError::DatatypeMismatch(rendered),
+        AnalyzeError::GroupingError(_) => AnalyzeError::GroupingError(rendered),
+        AnalyzeError::WindowingError(_) => AnalyzeError::WindowingError(rendered),
+        AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

@@ -170,7 +170,7 @@ fn window_function_in_where_rejected() {
     // PG: `window functions are not allowed in WHERE`.
     assert_analyze_err!(
         db.analyze("SELECT id FROM posts WHERE ROW_NUMBER() OVER () = 1"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::WindowingError(_),
         concat!(
             "window functions are not allowed in WHERE\n",
             "  ╭────\n",
@@ -191,7 +191,7 @@ fn window_function_in_group_by_rejected() {
             "SELECT title, COUNT(*) FROM posts \
              GROUP BY title, ROW_NUMBER() OVER ()"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::WindowingError(_),
         concat!(
             "window functions are not allowed in GROUP BY\n",
             "  ╭────\n",

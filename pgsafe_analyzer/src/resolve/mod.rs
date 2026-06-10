@@ -465,7 +465,7 @@ fn validate_on_conflict_target(
                     // Append the ON CONFLICT context as a suffix so the
                     // execute-fallback prefix check passes while the macro
                     // caller still sees the clause that produced it.
-                    return Err(AnalyzeError::Invalid(format!(
+                    return Err(AnalyzeError::UndefinedColumn(format!(
                         "column \"{}\" does not exist (referenced in ON CONFLICT)",
                         ie.name
                     )));

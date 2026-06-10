@@ -165,7 +165,7 @@ fn coalesce_domain_mismatch_reports_base_type_name() {
     // matching PG, not the domain name `positive_int`.
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(balance, true) FROM accounts"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "COALESCE types integer and boolean cannot be matched\n",
             "  help: add an explicit cast so the branches share a type, e.g. `expr::boolean`\n",
@@ -260,7 +260,7 @@ fn array_literal_incompatible_types_rejected() {
     // explicit `'x'::text` to force a real type clash at parse time.
     assert_analyze_err!(
         db.analyze("SELECT ARRAY['x'::text, 1]"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "ARRAY types text and integer cannot be matched\n",
             "  help: cast the elements to a common type, e.g. `elem::text`\n",
@@ -273,7 +273,7 @@ fn array_literal_bool_and_int_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT ARRAY[true, 1]"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "ARRAY types boolean and integer cannot be matched\n",
             "  help: cast the elements to a common type, e.g. `elem::boolean`\n",

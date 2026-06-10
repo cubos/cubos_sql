@@ -105,18 +105,21 @@ pub(crate) fn infer_func_call(
     // call was qualified).
     let written_name = func_name_parts.join(".");
     if resolved.is_window && func.over.is_none() {
-        return Err(crate::error::RawError::invalid(
-            format!("window function {written_name} requires an OVER clause"),
+        // PG classifies both placement failures as wrong_object_type (42809).
+        return Err(crate::error::RawError::new(
+            AnalyzeError::WrongObjectType(format!(
+                "window function {written_name} requires an OVER clause"
+            )),
             crate::error::SourceSpan::from_node_qname(func.location),
             Some("add `OVER ()` (or a window definition) after the call".into()),
         )
         .finalize_implicit());
     }
     if func.over.is_some() && !resolved.is_window && !resolved.is_aggregate {
-        return Err(crate::error::RawError::invalid(
-            format!(
+        return Err(crate::error::RawError::new(
+            AnalyzeError::WrongObjectType(format!(
                 "OVER specified, but {written_name} is not a window function nor an aggregate function"
-            ),
+            )),
             crate::error::SourceSpan::from_node_qname(func.location),
             None,
         )
@@ -255,12 +258,12 @@ fn check_no_nested_aggregates(
     for arg in &func.args {
         let kinds = detect_func_kinds(arg, snapshot);
         if kinds.has_aggregate {
-            return Err(AnalyzeError::Invalid(
+            return Err(AnalyzeError::GroupingError(
                 "aggregate function calls cannot be nested".into(),
             ));
         }
         if kinds.has_window {
-            return Err(AnalyzeError::Invalid(
+            return Err(AnalyzeError::GroupingError(
                 "aggregate function calls cannot contain window function calls".into(),
             ));
         }

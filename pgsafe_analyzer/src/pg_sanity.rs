@@ -22,8 +22,11 @@
 //!
 //! Error message contract: when both fail, our analyzer's message must
 //! *start with* PG's server-side message verbatim (the `DbError.message`
-//! field, ignoring SQLSTATE). Extra detail / hints after that prefix are
-//! fine; missing the prefix or diverging early is a hard panic.
+//! field). Extra detail / hints after that prefix are fine; missing the
+//! prefix or diverging early is a hard panic. Additionally, when the
+//! analyzer states an expected SQLSTATE for its error
+//! ([`AnalyzeError::sqlstate`]), it must match the code PG
+//! attached; errors with no stated code are compared on wording only.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +82,11 @@ pub enum DivergenceKind {
     AnalyzeAcceptedExecuted,
     /// Both rejected, but the analyzer's message doesn't start with PG's.
     ErrorPrefix,
+    /// Both rejected with the same message prefix, but the SQLSTATE the
+    /// analyzer's error variant carries ([`AnalyzeError::sqlstate`])
+    /// differs from the one PG attached — the analyzer classified the
+    /// error under the wrong variant.
+    SqlState,
 }
 
 impl std::fmt::Display for Divergence {
@@ -205,7 +213,15 @@ impl PgSanityServer {
             (Ok(()), Ok(())) => None,
             (Err(_), Err(_)) => {
                 let our_msg = format!("{}", our_result.as_ref().unwrap_err());
-                check_error_prefix(&our_msg, pg_result.as_ref().unwrap_err(), sql, "apply_sql")
+                // DDL errors are `DdlError`, outside `expected_sqlstate`'s
+                // domain — wording-only comparison here.
+                check_error_prefix(
+                    &our_msg,
+                    None,
+                    pg_result.as_ref().unwrap_err(),
+                    sql,
+                    "apply_sql",
+                )
             }
             (Ok(()), Err(e)) => {
                 // Treat protocol-level errors (no DbError → the postgres-rs
@@ -401,10 +417,11 @@ impl PgSanityServer {
                 }
                 None
             }
-            (Err(_), Err(_)) => {
-                let our_msg = format!("{}", our_result.as_ref().unwrap_err());
+            (Err(e), Err(_)) => {
+                let our_msg = format!("{e}");
                 check_error_prefix(
                     &our_msg,
+                    e.sqlstate(),
                     pg_result.as_ref().unwrap_err(),
                     analysis_sql,
                     "analyze",
@@ -469,9 +486,11 @@ impl PgSanityServer {
                         ),
                     }),
                     Err(exec_err) => {
-                        let our_msg = format!("{}", our_result.as_ref().unwrap_err());
+                        let our_err = our_result.as_ref().unwrap_err();
+                        let our_msg = format!("{our_err}");
                         check_error_prefix(
                             &our_msg,
+                            our_err.sqlstate(),
                             &exec_err,
                             analysis_sql,
                             "analyze (execute fallback)",
@@ -609,35 +628,54 @@ fn render_pg_error(e: &postgres::Error) -> String {
 
 /// Enforce the contract: the analyzer's error message must begin with the
 /// PG server-side message verbatim. Trailing detail (column names, hints)
-/// is allowed; the SQLSTATE on PG's side is intentionally ignored.
+/// is allowed. When the wording prefix holds *and* the analyzer states an
+/// expected SQLSTATE (`our_code`, from `pgmsg::expected_sqlstate`), the
+/// code must match PG's too; `our_code = None` means the analyzer makes no
+/// claim and only the wording is compared.
 ///
-/// Returns a [`Divergence`] when the analyzer's message doesn't begin with
-/// PG's server-side message, or `None` when the prefix contract holds. If PG
-/// didn't send a structured `DbError` (a protocol-level issue, not a real
-/// rejection) we can't compare wording meaningfully and return `None` — the
-/// outer success/failure invariant has already been checked by the caller.
+/// Returns a [`Divergence`] on either failure, or `None` when the contract
+/// holds. If PG didn't send a structured `DbError` (a protocol-level issue,
+/// not a real rejection) we can't compare meaningfully and return `None` —
+/// the outer success/failure invariant has already been checked by the
+/// caller.
 fn check_error_prefix(
     our_msg: &str,
+    our_code: Option<&'static str>,
     pg_err: &postgres::Error,
     sql: &str,
     kind: &str,
 ) -> Option<Divergence> {
     let db = pg_err.as_db_error()?;
     let pg_msg = db.message();
-    if our_msg.starts_with(pg_msg) {
-        return None;
+    if !our_msg.starts_with(pg_msg) {
+        return Some(Divergence {
+            kind: DivergenceKind::ErrorPrefix,
+            message: format!(
+                "pg_sanity: {kind} error must start with PG's message.\n\
+                 SQL:\n---\n{sql}\n---\n\
+                 PG (expected prefix): {pg_msg}\n\
+                 analyzer:             {our_msg}\n\
+                 PG (with SQLSTATE):   {}",
+                render_pg_error(pg_err),
+            ),
+        });
     }
-    Some(Divergence {
-        kind: DivergenceKind::ErrorPrefix,
-        message: format!(
-            "pg_sanity: {kind} error must start with PG's message.\n\
-             SQL:\n---\n{sql}\n---\n\
-             PG (expected prefix): {pg_msg}\n\
-             analyzer:             {our_msg}\n\
-             PG (with SQLSTATE):   {}",
-            render_pg_error(pg_err),
-        ),
-    })
+    if let Some(code) = our_code {
+        let pg_code = db.code().code();
+        if code != pg_code {
+            return Some(Divergence {
+                kind: DivergenceKind::SqlState,
+                message: format!(
+                    "pg_sanity: {kind} SQLSTATE mismatch (same message prefix).\n\
+                     SQL:\n---\n{sql}\n---\n\
+                     message:              {pg_msg}\n\
+                     analyzer (expected):  SQLSTATE {code}\n\
+                     PG:                   SQLSTATE {pg_code}",
+                ),
+            });
+        }
+    }
+    None
 }
 
 /// Render an analyzer [`Type`] into the same `schema.name[]?` shape that

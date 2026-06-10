@@ -304,7 +304,7 @@ fn aggregate_in_where_rejected() {
     // PG: `aggregate functions are not allowed in WHERE`.
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE COUNT(*) > 0"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "aggregate functions are not allowed in WHERE\n",
             "  ╭────\n",
@@ -323,7 +323,7 @@ fn aggregate_in_group_by_rejected() {
     // PG: `aggregate functions are not allowed in GROUP BY`.
     assert_analyze_err!(
         db.analyze("SELECT age FROM users GROUP BY COUNT(*)"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "aggregate functions are not allowed in GROUP BY\n",
             "  ╭────\n",
@@ -341,7 +341,7 @@ fn nested_aggregate_rejected() {
     // PG: `aggregate function calls cannot be nested`.
     assert_analyze_err!(
         db.analyze("SELECT SUM(COUNT(*)) FROM posts GROUP BY user_id"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         "aggregate function calls cannot be nested",
     );
 }
@@ -354,7 +354,7 @@ fn window_function_in_aggregate_argument_rejected() {
     // passes.
     assert_analyze_err!(
         db.analyze("SELECT SUM(ROW_NUMBER() OVER ()) FROM posts"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         "aggregate function calls cannot contain window function calls",
     );
 }
@@ -400,7 +400,7 @@ fn ungrouped_column_with_aggregate_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT count(*), age FROM users"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
             "  ╭────\n",
@@ -419,7 +419,7 @@ fn ungrouped_column_inside_expression_rejected() {
     // The offending column can be nested in an expression, not just bare.
     assert_analyze_err!(
         db.analyze("SELECT count(*), age + 1 FROM users"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
             "  ╭────\n",
@@ -438,7 +438,7 @@ fn ungrouped_column_with_non_pk_group_by_rejected() {
     // Grouping by `name` doesn't cover `age`.
     assert_analyze_err!(
         db.analyze("SELECT name, age FROM users GROUP BY name"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
             "  ╭────\n",
@@ -456,7 +456,7 @@ fn ungrouped_column_in_having_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users HAVING age > 0"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
             "  ╭────\n",
@@ -474,7 +474,7 @@ fn ungrouped_column_in_order_by_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users ORDER BY age"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::GroupingError(_),
         concat!(
             "column \"users.age\" must appear in the GROUP BY clause or be used in an aggregate function\n",
             "  ╭────\n",
@@ -527,7 +527,7 @@ fn non_boolean_having_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT count(*) FROM users HAVING age"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of HAVING must be type boolean, not type integer\n",
             "  ╭────\n",

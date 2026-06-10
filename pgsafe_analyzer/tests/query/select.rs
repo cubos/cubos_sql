@@ -43,7 +43,7 @@ fn limit_bool_literal_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT true"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of LIMIT must be type bigint, not type boolean\n",
             "  ╭────\n",
@@ -59,7 +59,7 @@ fn limit_text_column_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT name"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of LIMIT must be type bigint, not type text\n",
             "  ╭────\n",
@@ -75,7 +75,7 @@ fn limit_timestamptz_column_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users LIMIT created_at"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of LIMIT must be type bigint, not type timestamp with time zone\n",
             "  ╭────\n",
@@ -91,7 +91,7 @@ fn offset_bool_literal_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users OFFSET false"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of OFFSET must be type bigint, not type boolean\n",
             "  ╭────\n",
@@ -345,15 +345,14 @@ fn err_ambiguous_column_lists_candidate_tables() {
     let sql = "SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id";
     assert_analyze_err!(
         db.analyze(sql),
-        AnalyzeError::UndefinedColumn(_),
+        AnalyzeError::AmbiguousColumn(_),
         concat!(
             "column reference \"id\" is ambiguous (could be: u.id, p.id)\n",
             "  ╭────\n",
             "1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id\n",
             "  ·        ─┬\n",
-            "  ·         ╰─ column does not exist\n",
+            "  ·         ╰─ ambiguous reference\n",
             "  ╰────\n",
-            "  help: did you mean \"id\"?\n",
         ),
     );
 }
@@ -367,15 +366,14 @@ fn err_ambiguous_column_lists_three_candidates() {
                INNER JOIN comments c ON c.post_id = p.id";
     assert_analyze_err!(
         db.analyze(sql),
-        AnalyzeError::UndefinedColumn(_),
+        AnalyzeError::AmbiguousColumn(_),
         concat!(
             "column reference \"id\" is ambiguous (could be: u.id, p.id, c.id)\n",
             "  ╭────\n",
             "1 │ SELECT id FROM users u INNER JOIN posts p ON p.user_id = u.id INNER JOIN comments c ON c.post_id = p.id\n",
             "  ·        ─┬\n",
-            "  ·         ╰─ column does not exist\n",
+            "  ·         ╰─ ambiguous reference\n",
             "  ╰────\n",
-            "  help: did you mean \"id\"?\n",
         ),
     );
 }
@@ -835,22 +833,19 @@ function pg_catalog.nonexisting() does not exist
 #[test]
 fn undefined_column_ambiguous_lists_candidates() {
     // `id` exists in both `users` and `posts` — the diagnostic lists both
-    // qualified candidates in the message body. The hint still surfaces
-    // `did you mean "id"` because the suggester sees a perfect match (the
-    // column DOES exist, it just needs qualification) — acceptable noise
-    // until we tighten the hint logic for the ambiguous case.
+    // qualified candidates in the message body, carried by the dedicated
+    // `AmbiguousColumn` variant (SQLSTATE 42702, like PG).
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users u JOIN posts p ON p.user_id = u.id"),
-        AnalyzeError::UndefinedColumn(_),
+        AnalyzeError::AmbiguousColumn(_),
         "\
 column reference \"id\" is ambiguous (could be: u.id, p.id)
   ╭────
 1 │ SELECT id FROM users u JOIN posts p ON p.user_id = u.id
   ·        ─┬
-  ·         ╰─ column does not exist
+  ·         ╰─ ambiguous reference
   ╰────
-  help: did you mean \"id\"?
 ",
     );
 }

@@ -327,11 +327,11 @@ pub(crate) fn check_grouping(
             // Point the caret at the offending column reference and hint at the
             // fix — PG reports the same message but with only a cursor position.
             let span = crate::error::SourceSpan::from_node_qname(location);
-            return Err(crate::error::RawError::invalid(
-                format!(
+            return Err(crate::error::RawError::new(
+                AnalyzeError::GroupingError(format!(
                     "column \"{alias}.{col}\" must appear in the GROUP BY clause \
                      or be used in an aggregate function"
-                ),
+                )),
                 span,
                 Some(format!(
                     "add `{alias}.{col}` to the GROUP BY clause, or wrap it in an aggregate like max({col})"

@@ -24,7 +24,7 @@ fn where_int4_not_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE 42"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         "argument of WHERE must be type boolean, not type integer",
     );
 }
@@ -34,7 +34,7 @@ fn where_text_column_not_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of WHERE must be type boolean, not type text\n",
             "  ╭────\n",
@@ -51,7 +51,7 @@ fn where_int8_column_not_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT name FROM users WHERE id"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of WHERE must be type boolean, not type bigint\n",
             "  ╭────\n",
@@ -68,7 +68,7 @@ fn where_timestamptz_column_not_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE created_at"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of WHERE must be type boolean, not type timestamp with time zone\n",
             "  ╭────\n",

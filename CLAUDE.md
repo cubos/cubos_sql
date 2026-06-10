@@ -108,6 +108,14 @@ verbatim (extra trailing detail / hints are fine). This contract applies to
 queries with a **single** error: there, the analyzer must report the *same*
 error PG would.
 
+**SQLSTATE contract.** `AnalyzeError` variants map 1:1 to PG error codes via
+`AnalyzeError::sqlstate()` (a pure variant → code mapping — never derive a
+code from message text). When it returns `Some`, the oracle also asserts the
+code matches the live server's `DbError::code()`. New PG-verbatim wordings
+go through a `pgmsg` constructor that picks the variant carrying the right
+code; multi-code buckets (`Invalid`, `InvalidLiteral`, `TypeMismatch`)
+return `None` and are compared on wording only.
+
 When a query has **multiple simultaneous errors**, we deliberately do **not**
 require the analyzer to pick the *same* error PG reports first. PG's
 error-reporting order follows its own parse/transform sequence (it resolves an

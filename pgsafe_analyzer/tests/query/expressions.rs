@@ -197,7 +197,7 @@ fn nullif_incompatible_concrete_types_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x'::text) FROM users"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::UndefinedOperator(_),
         "operator does not exist: integer = text (NULLIF types integer and text cannot be matched)",
     );
 }
@@ -280,7 +280,7 @@ fn case_when_condition_must_be_boolean() {
     // analyzer previously discarded this check and accepted the query.
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN age THEN 1 ELSE 0 END FROM users"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of CASE/WHEN must be type boolean, not type integer\n",
             "  ╭────\n",
@@ -413,7 +413,7 @@ fn not_operand_must_be_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE NOT age"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of NOT must be type boolean, not type integer\n",
             "  ╭────\n",
@@ -430,7 +430,7 @@ fn and_operand_must_be_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE age AND true"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of AND must be type boolean, not type integer\n",
             "  ╭────\n",
@@ -447,7 +447,7 @@ fn or_operand_must_be_boolean() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT id FROM users WHERE name OR true"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of OR must be type boolean, not type text\n",
             "  ╭────\n",
@@ -466,7 +466,7 @@ fn not_operand_error_propagates_through_case_when() {
     // does not shadow it with its own boolean-condition wording.
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN NOT age THEN 1 ELSE 0 END FROM users"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of NOT must be type boolean, not type integer\n",
             "  ╭────\n",
@@ -713,7 +713,7 @@ fn case_with_incompatible_concrete_arms_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT CASE WHEN true THEN 1 ELSE 'x'::text END"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "CASE types text and integer cannot be matched\n",
             "  help: add an explicit cast so the branches share a type, e.g. `expr::integer`\n",
@@ -756,7 +756,7 @@ fn coalesce_with_incompatible_concrete_arms_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT COALESCE(1, 'x'::text)"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "COALESCE types integer and text cannot be matched\n",
             "  help: add an explicit cast so the branches share a type, e.g. `expr::text`\n",

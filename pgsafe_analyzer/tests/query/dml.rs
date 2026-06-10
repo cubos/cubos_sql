@@ -648,7 +648,7 @@ fn on_conflict_on_unknown_column_is_rejected() {
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
              ON CONFLICT (ghost) DO NOTHING",
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::UndefinedColumn(_),
         "column \"ghost\" does not exist (referenced in ON CONFLICT)",
     );
 }
@@ -1791,7 +1791,7 @@ fn delete_where_non_boolean_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("DELETE FROM users WHERE age"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of WHERE must be type boolean, not type integer\n",
             "  ╭────\n",
@@ -1808,7 +1808,7 @@ fn update_where_non_boolean_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("UPDATE users SET name = 'x' WHERE age"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::DatatypeMismatch(_),
         concat!(
             "argument of WHERE must be type boolean, not type integer\n",
             "  ╭────\n",

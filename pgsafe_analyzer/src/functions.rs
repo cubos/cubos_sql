@@ -126,13 +126,14 @@ pub(crate) fn resolve_function(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(undefined_function_error(
-                snapshot,
-                schema,
-                name,
-                format!("{qualified}({arg_list}) is a procedure"),
+            // PG classifies a procedure in an expression as wrong_object_type
+            // (42809), not undefined_function.
+            return Err(crate::error::RawError::new(
+                AnalyzeError::WrongObjectType(format!("{qualified}({arg_list}) is a procedure")),
                 span,
-            ));
+                Some("to call a procedure, use CALL".into()),
+            )
+            .finalize_implicit());
         }
         return Err(undefined_function_error(
             snapshot,

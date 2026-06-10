@@ -3,9 +3,11 @@
 //!
 //! Every message the analyzer can emit for a query PG would also reject
 //! must *start with* PG's server-side wording (see `pg_sanity`); these
-//! constructors define each wording exactly once, annotated with the
-//! SQLSTATE PostgreSQL uses, so the contract is greppable and a future
-//! oracle upgrade can compare SQLSTATEs too.
+//! constructors define each wording exactly once and build the
+//! [`AnalyzeError`] variant whose [`AnalyzeError::sqlstate`] matches the
+//! code PostgreSQL attaches, so both halves of the contract (wording
+//! prefix + SQLSTATE) are pinned in one place and cross-checked by the
+//! mirrored suite.
 //!
 //! Two families intentionally live elsewhere:
 //! - literal *input-syntax* messages (`malformed … literal`, out-of-range,
@@ -53,8 +55,8 @@ pub(crate) fn operator_is_not_unique(
     right: &str,
     span: Option<SourceSpan>,
 ) -> RawError {
-    RawError::invalid(
-        format!("operator is not unique: {left} {op} {right}"),
+    RawError::new(
+        AnalyzeError::AmbiguousFunction(format!("operator is not unique: {left} {op} {right}")),
         span,
         Some("add an explicit type cast to one side, e.g. `expr::int4`".into()),
     )
@@ -66,8 +68,10 @@ pub(crate) fn function_is_not_unique(
     arg_list: &str,
     span: Option<SourceSpan>,
 ) -> RawError {
-    RawError::invalid(
-        format!("function {qualified_name}({arg_list}) is not unique"),
+    RawError::new(
+        AnalyzeError::AmbiguousFunction(format!(
+            "function {qualified_name}({arg_list}) is not unique"
+        )),
         span,
         Some("add explicit type casts to the arguments to select one overload".into()),
     )
@@ -80,8 +84,10 @@ pub(crate) fn position_not_in_select_list(
     position: i64,
     span: Option<SourceSpan>,
 ) -> RawError {
-    RawError::invalid(
-        format!("{clause} position {position} is not in select list"),
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "{clause} position {position} is not in select list"
+        )),
         span,
         None,
     )
@@ -90,8 +96,10 @@ pub(crate) fn position_not_in_select_list(
 /// `for SELECT DISTINCT, ORDER BY expressions must appear in select list`
 /// — SQLSTATE 42P10.
 pub(crate) fn distinct_order_by_not_in_select_list(span: Option<SourceSpan>) -> RawError {
-    RawError::invalid(
-        "for SELECT DISTINCT, ORDER BY expressions must appear in select list".to_string(),
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list".to_string(),
+        ),
         span,
         None,
     )
@@ -100,8 +108,8 @@ pub(crate) fn distinct_order_by_not_in_select_list(span: Option<SourceSpan>) -> 
 /// `table name "u" specified more than once` — SQLSTATE 42712
 /// (`duplicate_alias`).
 pub(crate) fn duplicate_table_alias(alias: &str) -> RawError {
-    RawError::invalid(
-        format!("table name \"{alias}\" specified more than once"),
+    RawError::new(
+        AnalyzeError::DuplicateAlias(format!("table name \"{alias}\" specified more than once")),
         None,
         None,
     )
@@ -110,10 +118,10 @@ pub(crate) fn duplicate_table_alias(alias: &str) -> RawError {
 /// `table "t" has N columns available but M columns specified` — SQLSTATE
 /// 42P10: a FROM column-alias list longer than the relation's width.
 pub(crate) fn too_many_column_aliases(alias: &str, available: usize, specified: usize) -> RawError {
-    RawError::invalid(
-        format!(
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
             "table \"{alias}\" has {available} columns available but {specified} columns specified"
-        ),
+        )),
         None,
         None,
     )
@@ -122,8 +130,8 @@ pub(crate) fn too_many_column_aliases(alias: &str, available: usize, specified: 
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
 /// (`syntax_error`).
 pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawError {
-    RawError::invalid(
-        "VALUES lists must all be the same length".to_string(),
+    RawError::new(
+        AnalyzeError::SyntaxError("VALUES lists must all be the same length".to_string()),
         None,
         Some(format!(
             "the first row has {first_arity} column(s), a later row has {row_arity}"
@@ -134,8 +142,8 @@ pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawEr
 /// `window "w" does not exist` — SQLSTATE 42704 (`undefined_object`): a
 /// named-window reference with no matching WINDOW-clause definition.
 pub(crate) fn window_does_not_exist(name: &str) -> RawError {
-    RawError::invalid(
-        format!("window \"{name}\" does not exist"),
+    RawError::new(
+        AnalyzeError::UndefinedObject(format!("window \"{name}\" does not exist")),
         None,
         Some("define it in a WINDOW clause, e.g. `WINDOW w AS (ORDER BY …)`".into()),
     )
@@ -144,8 +152,10 @@ pub(crate) fn window_does_not_exist(name: &str) -> RawError {
 /// `column "x" specified in USING clause does not exist in left table`
 /// (or `right table`) — SQLSTATE 42703 (`undefined_column`).
 pub(crate) fn using_column_missing(column: &str, side: &str) -> RawError {
-    RawError::invalid(
-        format!("column \"{column}\" specified in USING clause does not exist in {side} table"),
+    RawError::new(
+        AnalyzeError::UndefinedColumn(format!(
+            "column \"{column}\" specified in USING clause does not exist in {side} table"
+        )),
         None,
         None,
     )
@@ -154,8 +164,10 @@ pub(crate) fn using_column_missing(column: &str, side: &str) -> RawError {
 /// `JOIN/USING types X and Y cannot be matched` — SQLSTATE 42804
 /// (`datatype_mismatch`).
 pub(crate) fn join_using_types_mismatch(left: &str, right: &str) -> RawError {
-    RawError::invalid(
-        format!("JOIN/USING types {left} and {right} cannot be matched"),
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
+            "JOIN/USING types {left} and {right} cannot be matched"
+        )),
         None,
         None,
     )
@@ -166,7 +178,7 @@ pub(crate) fn join_using_types_mismatch(left: &str, right: &str) -> RawError {
 /// PG reports the operator-lookup failure; the parenthesized tail is our
 /// extra detail (allowed by the prefix contract).
 pub(crate) fn nullif_types_mismatch(left: &str, right: &str) -> AnalyzeError {
-    AnalyzeError::Invalid(format!(
+    AnalyzeError::UndefinedOperator(format!(
         "operator does not exist: {left} = {right} \
          (NULLIF types {left} and {right} cannot be matched)"
     ))
@@ -183,8 +195,10 @@ pub(crate) fn types_cannot_be_matched(
     extra: &str,
     hint: Option<String>,
 ) -> RawError {
-    RawError::invalid(
-        format!("{construct} types {first} and {second} cannot be matched{extra}"),
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
+            "{construct} types {first} and {second} cannot be matched{extra}"
+        )),
         None,
         hint,
     )
@@ -193,8 +207,10 @@ pub(crate) fn types_cannot_be_matched(
 /// `each UNION query must have the same number of columns` (likewise
 /// INTERSECT / EXCEPT) — SQLSTATE 42601.
 pub(crate) fn set_op_column_count(op_label: &str, left: usize, right: usize) -> RawError {
-    RawError::invalid(
-        format!("each {op_label} query must have the same number of columns"),
+    RawError::new(
+        AnalyzeError::SyntaxError(format!(
+            "each {op_label} query must have the same number of columns"
+        )),
         None,
         Some(format!(
             "the left side produces {left} column(s), the right side {right}"
@@ -206,7 +222,7 @@ pub(crate) fn set_op_column_count(op_label: &str, left: usize, right: usize) -> 
 /// bare parameter as `T[]` when no such array type exists (T is itself an
 /// array).
 pub(crate) fn no_array_type_for(type_name: &str) -> AnalyzeError {
-    AnalyzeError::Invalid(format!(
+    AnalyzeError::UndefinedObject(format!(
         "could not find array type for data type {type_name}"
     ))
 }
@@ -220,14 +236,76 @@ pub(crate) fn recursive_query_column_type(
     seed_type: &str,
     overall_type: &str,
 ) -> RawError {
-    RawError::invalid(
-        format!(
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
             "recursive query \"{cte_name}\" column {column} has type {seed_type} in \
              non-recursive term but type {overall_type} overall"
-        ),
+        )),
         None,
         Some(format!(
             "cast the non-recursive term's column to {overall_type}"
         )),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every constructor must build a variant whose `sqlstate()` is the
+    /// code its rustdoc documents — keeps the constructors and the
+    /// variant → SQLSTATE mapping from drifting apart. The codes
+    /// themselves are validated against the live PG by the `pg_sanity`
+    /// suite.
+    #[test]
+    fn constructors_carry_their_documented_sqlstates() {
+        let cases: Vec<(AnalyzeError, &str)> = vec![
+            (
+                operator_does_not_exist("integer", "+", "point", None).kind,
+                "42883",
+            ),
+            (
+                operator_is_not_unique("unknown", "+", "unknown", None).kind,
+                "42725",
+            ),
+            (
+                function_is_not_unique("mod", "unknown, unknown", None).kind,
+                "42725",
+            ),
+            (
+                position_not_in_select_list("GROUP BY", 9, None).kind,
+                "42P10",
+            ),
+            (
+                position_not_in_select_list("ORDER BY", 9, None).kind,
+                "42P10",
+            ),
+            (distinct_order_by_not_in_select_list(None).kind, "42P10"),
+            (duplicate_table_alias("u").kind, "42712"),
+            (too_many_column_aliases("t", 1, 2).kind, "42P10"),
+            (values_lists_length(2, 1).kind, "42601"),
+            (window_does_not_exist("w").kind, "42704"),
+            (using_column_missing("id", "left").kind, "42703"),
+            (join_using_types_mismatch("integer", "point").kind, "42804"),
+            (nullif_types_mismatch("integer", "point"), "42883"),
+            (
+                types_cannot_be_matched("CASE", "integer", "point", "", None).kind,
+                "42804",
+            ),
+            (set_op_column_count("UNION", 2, 1).kind, "42601"),
+            (no_array_type_for("integer[]"), "42704"),
+            (
+                recursive_query_column_type("r", 1, "integer", "text").kind,
+                "42804",
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(
+                err.sqlstate(),
+                Some(want),
+                "constructor for {:?} should carry SQLSTATE {want}",
+                err.to_string().lines().next().unwrap_or(""),
+            );
+        }
+    }
 }

@@ -111,13 +111,27 @@ impl ParamCollector {
         indeterminate.dedup();
         for num in indeterminate {
             if self.indeterminate_locked.contains(&num) || !self.constraints.contains_key(&num) {
-                return Err(crate::error::RawError::indeterminate_type(
-                    format!("could not determine data type of parameter ${num}"),
+                // Same wording, two PG codes (verified on PG 18): when a
+                // locked param *also* had a use that deduced a type (the
+                // deductions conflict — `$1 IS NULL, $1 = 1`) PG reports
+                // `ambiguous_parameter` (42P08); with no competing
+                // deduction at all it's `indeterminate_datatype` (42P18).
+                let message = format!("could not determine data type of parameter ${num}");
+                let kind = if self.indeterminate_locked.contains(&num)
+                    && self.constraints.contains_key(&num)
+                {
+                    AnalyzeError::AmbiguousParameter(message)
+                } else {
+                    AnalyzeError::IndeterminateType(message)
+                };
+                return Err(crate::error::RawError::new(
+                    kind,
                     None,
                     Some(format!(
                         "add an explicit cast to the parameter, e.g. `${num}::int4`"
                     )),
                 )
+                .with_primary_label("type cannot be determined")
                 .finalize_implicit());
             }
         }

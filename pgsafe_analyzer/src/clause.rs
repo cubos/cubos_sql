@@ -135,11 +135,11 @@ pub(crate) fn coerce_clause_expr(
     let actual_pg = crate::ddl::util::format_type_for_message(ctx.snapshot, actual_oid);
     let span =
         crate::error::node_location(node).and_then(crate::error::SourceSpan::from_node_qname);
-    let raw = crate::error::RawError::invalid(
-        format!(
+    let raw = crate::error::RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
             "argument of {} must be type {goal_name}, not type {actual_pg}",
             kind.label()
-        ),
+        )),
         span,
         None,
     );
@@ -169,8 +169,10 @@ pub(crate) fn check_no_aggregates_or_windows(
         // other clauses there's no single rewrite, so just point at the call.
         let hint = (context == "WHERE")
             .then(|| "to filter on an aggregate, use a HAVING clause instead of WHERE".to_string());
-        return Err(crate::error::RawError::invalid(
-            format!("aggregate functions are not allowed in {context}"),
+        return Err(crate::error::RawError::new(
+            AnalyzeError::GroupingError(format!(
+                "aggregate functions are not allowed in {context}"
+            )),
             span,
             hint,
         )
@@ -181,8 +183,8 @@ pub(crate) fn check_no_aggregates_or_windows(
         let span = kinds
             .window_location
             .and_then(crate::error::SourceSpan::from_node_qname);
-        return Err(crate::error::RawError::invalid(
-            format!("window functions are not allowed in {context}"),
+        return Err(crate::error::RawError::new(
+            AnalyzeError::WindowingError(format!("window functions are not allowed in {context}")),
             span,
             None,
         )

@@ -300,12 +300,16 @@ impl Scope {
                 .chain(self.outer_sources.iter())
                 .any(|s| s.alias != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t));
             if aliased_away || self.shadowed_sources.iter().any(|s| s.alias == t) {
-                return Err(undefined_column_error(
-                    self,
-                    column,
-                    format!("invalid reference to FROM-clause entry for table \"{t}\""),
+                // PG classifies this as undefined_table (42P01): the entry
+                // exists but is not referencable from here.
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::UndefinedTable(format!(
+                        "invalid reference to FROM-clause entry for table \"{t}\""
+                    )),
                     span,
-                ));
+                    None,
+                )
+                .finalize_implicit());
             }
             // PG formats qualified missing columns through identifier
             // quoting rules (`column t.col does not exist`, but
@@ -340,12 +344,16 @@ impl Scope {
                     .map(|c| QualifiedName::new(&c.table_alias, column).to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Err(undefined_column_error(
-                    self,
-                    column,
-                    format!("column reference \"{column}\" is ambiguous (could be: {candidates})"),
+                // PG classifies this as ambiguous_column (42702).
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::AmbiguousColumn(format!(
+                        "column reference \"{column}\" is ambiguous (could be: {candidates})"
+                    )),
                     span,
-                ));
+                    None,
+                )
+                .with_primary_label("ambiguous reference")
+                .finalize_implicit());
             }
             if let Some(col) = matches.first() {
                 return Ok(col);

@@ -485,13 +485,12 @@ fn non_lateral_subquery_cannot_see_outer_scope() {
                FROM users u, (SELECT u.id * 2 AS double_id) s";
     assert_analyze_err!(
         db.analyze(sql),
-        AnalyzeError::UndefinedColumn(_),
+        AnalyzeError::UndefinedTable(_),
         concat!(
             "invalid reference to FROM-clause entry for table \"u\"\n",
             "  ╭────\n",
             "1 │ SELECT u.name, s.double_id FROM users u, (SELECT u.id * 2 AS double_id) s\n",
-            "  ·                                                  ──┬─\n",
-            "  ·                                                    ╰─ column does not exist\n",
+            "  ·                                                  ────\n",
             "  ╰────\n",
         ),
     );
