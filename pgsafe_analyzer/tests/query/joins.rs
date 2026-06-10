@@ -320,7 +320,15 @@ fn join_using_merges_columns_in_star_and_resolution() {
     let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         names,
-        ["id", "name", "age", "user_id", "title", "body", "published_at"]
+        [
+            "id",
+            "name",
+            "age",
+            "user_id",
+            "title",
+            "body",
+            "published_at"
+        ]
     );
     // Unqualified `id` resolves to the merged column — no ambiguity.
     db.analyze("SELECT id FROM users JOIN posts USING (id)")

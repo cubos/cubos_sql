@@ -448,9 +448,7 @@ fn merge_using_columns(
     for name in using_names {
         let Some((l_alias, l)) = find_col(left_start..left_end, name) else {
             return Err(crate::error::RawError::invalid(
-                format!(
-                    "column \"{name}\" specified in USING clause does not exist in left table"
-                ),
+                format!("column \"{name}\" specified in USING clause does not exist in left table"),
                 None,
                 None,
             )

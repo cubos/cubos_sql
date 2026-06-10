@@ -271,11 +271,10 @@ fn collate_on_array_of_collatable_element_accepted() {
     // element-wise): `tags COLLATE "C"` is valid; `nums COLLATE "C"` is
     // not, and the message names the array type.
     let mut db = PgCatalog::new().unwrap();
-    db.apply_sql("CREATE TABLE c2 (tags TEXT[], nums INT[]);").unwrap();
+    db.apply_sql("CREATE TABLE c2 (tags TEXT[], nums INT[]);")
+        .unwrap();
     db.analyze("SELECT tags COLLATE \"C\" FROM c2").unwrap();
-    let err = db
-        .analyze("SELECT nums COLLATE \"C\" FROM c2")
-        .unwrap_err();
+    let err = db.analyze("SELECT nums COLLATE \"C\" FROM c2").unwrap_err();
     assert!(
         err.to_string()
             .starts_with("collations are not supported by type integer[]"),

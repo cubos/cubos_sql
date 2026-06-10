@@ -238,8 +238,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         }
         if plain_distinct && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases) {
             return Err(crate::error::RawError::invalid(
-                "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-                    .to_string(),
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list".to_string(),
                 crate::error::node_location(inner)
                     .and_then(crate::error::SourceSpan::from_node_qname),
                 None,
