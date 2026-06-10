@@ -542,7 +542,7 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             literal_for(ty, rng)
         };
     }
-    match rng.random_range(0..12) {
+    match rng.random_range(0..13) {
         0 => {
             // Binary op.
             let op = OPERATORS[rng.random_range(0..OPERATORS.len())];
@@ -614,6 +614,14 @@ fn gen_expr(table: &Table, depth: u32, rng: &mut StdRng, np: &mut u32) -> String
             let lit = LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())];
             let ty = PROBE_TYPE_NAMES[rng.random_range(0..PROBE_TYPE_NAMES.len())];
             format!("('{}'::{})", lit.replace('\'', "''"), ty)
+        }
+        12 => {
+            // COLLATE decoration over a text-ish operand — sometimes on a
+            // non-string type or with a bogus collation name, both PG error
+            // paths the analyzer mirrors.
+            let col = random_col(table, rng);
+            let coll = ["\"C\"", "\"POSIX\"", "\"C\"", "\"nope\""][rng.random_range(0..4)];
+            format!("({} COLLATE {coll})", col.name)
         }
         7 => {
             // Type-aware comparison: a column against a literal — or a bare
@@ -793,10 +801,11 @@ fn pick_cols<'a>(cols: &[&'a Col], k: usize, rng: &mut StdRng) -> Vec<&'a Col> {
 fn gen_statement(rng: &mut StdRng) -> String {
     let np = &mut 0u32;
     match rng.random_range(0..100) {
-        0..=49 => gen_select(rng, np),
-        50..=60 => gen_set_op(rng, np),
-        61..=68 => gen_cte(rng, np),
-        69..=74 => gen_values_select(rng, np),
+        0..=46 => gen_select(rng, np),
+        47..=57 => gen_set_op(rng, np),
+        58..=66 => gen_cte(rng, np),
+        67..=72 => gen_values_select(rng, np),
+        73..=78 => gen_merge(rng, np),
         _ => gen_dml(rng, np),
     }
 }
@@ -869,7 +878,27 @@ fn gen_select(rng: &mut StdRng, np: &mut u32) -> String {
 
     if rng.random_bool(0.2) {
         let c = random_col(table, rng);
-        sql.push_str(&format!(" GROUP BY {}", c.name));
+        // Plain column, or the grouping-set family (ROLLUP/CUBE/GROUPING
+        // SETS incl. the empty set) — exercises grouping expansion and
+        // aggregate-nullability under partially-grouped rows.
+        match rng.random_range(0..6) {
+            0 => {
+                let c2 = random_col(table, rng);
+                sql.push_str(&format!(" GROUP BY ROLLUP ({}, {})", c.name, c2.name));
+            }
+            1 => {
+                let c2 = random_col(table, rng);
+                sql.push_str(&format!(" GROUP BY CUBE ({}, {})", c.name, c2.name));
+            }
+            2 => {
+                let c2 = random_col(table, rng);
+                sql.push_str(&format!(
+                    " GROUP BY GROUPING SETS (({}), ({}), ())",
+                    c.name, c2.name
+                ));
+            }
+            _ => sql.push_str(&format!(" GROUP BY {}", c.name)),
+        }
         // HAVING — sometimes an aggregate predicate (valid), sometimes an
         // arbitrary expression (exercises HAVING placement / boolean rules).
         if rng.random_bool(0.4) {
@@ -916,8 +945,27 @@ fn gen_window_call(table: &Table, rng: &mut StdRng, np: &mut u32) -> String {
         if rng.random_bool(0.5) {
             parts.push(format!("PARTITION BY {}", random_col(table, rng).name));
         }
-        if rng.random_bool(0.7) {
+        let has_order = rng.random_bool(0.7);
+        if has_order {
             parts.push(format!("ORDER BY {}", random_col(table, rng).name));
+            // Frame clauses (need an ORDER BY to be meaningful; RANGE with
+            // an offset additionally needs a sortable single key — the
+            // oracle judges). A $pN offset exercises frame-bound param
+            // typing (int8 for ROWS).
+            if rng.random_bool(0.3) {
+                parts.push(
+                    match rng.random_range(0..4) {
+                        0 => "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW".to_string(),
+                        1 => "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
+                            .to_string(),
+                        2 => format!(
+                            "ROWS BETWEEN ${} PRECEDING AND CURRENT ROW",
+                            next_param(np)
+                        ),
+                        _ => "ROWS 2 PRECEDING".to_string(),
+                    },
+                );
+            }
         }
         parts.join(" ")
     };
@@ -1006,12 +1054,109 @@ fn gen_set_op(rng: &mut StdRng, np: &mut u32) -> String {
     )
 }
 
-/// `WITH cte AS (<simple select>) SELECT * FROM cte`.
+/// `WITH …` statements: pass-through CTEs, RECURSIVE ones, data-modifying
+/// CTEs (`WITH x AS (DELETE … RETURNING …) SELECT …`), and a CTE feeding an
+/// INSERT.
 fn gen_cte(rng: &mut StdRng, np: &mut u32) -> String {
-    format!(
-        "WITH cte AS ({}) SELECT * FROM cte",
-        gen_simple_select(rng, np)
-    )
+    match rng.random_range(0..10) {
+        // Recursive CTE: numeric or text accumulation, sometimes with a
+        // param in the recursion bound.
+        0..=2 => {
+            let bound = if rng.random_bool(0.25) {
+                format!("${}", next_param(np))
+            } else {
+                rng.random_range(2..20).to_string()
+            };
+            if rng.random_bool(0.5) {
+                format!(
+                    "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL \
+                     SELECT n + 1 FROM r WHERE n < {bound}) SELECT * FROM r"
+                )
+            } else {
+                format!(
+                    "WITH RECURSIVE r AS (SELECT 'a'::text AS s, 1 AS n UNION ALL \
+                     SELECT s || 'x', n + 1 FROM r WHERE n < {bound}) SELECT s FROM r"
+                )
+            }
+        }
+        // Data-modifying CTE: the statement's rows come from a DML's
+        // RETURNING list.
+        3..=4 => {
+            let table = pick_table(rng);
+            match rng.random_range(0..2) {
+                0 => format!(
+                    "WITH moved AS (DELETE FROM {} WHERE {} RETURNING id) \
+                     SELECT count(*) FROM moved",
+                    table.name,
+                    gen_expr(table, 2, rng, np),
+                ),
+                _ => {
+                    let col = random_col(table, rng);
+                    format!(
+                        "WITH up AS (UPDATE {} SET {} = {} RETURNING id, {}) \
+                         SELECT * FROM up",
+                        table.name,
+                        col.name,
+                        lit_or_param(col.ty, rng, np),
+                        col.name,
+                    )
+                }
+            }
+        }
+        // WITH feeding a DML.
+        5 => format!(
+            "WITH src AS (SELECT id, name FROM users WHERE {}) \
+             INSERT INTO posts (user_id, title) SELECT id, name FROM src",
+            gen_expr(&TABLES[0], 2, rng, np),
+        ),
+        _ => format!(
+            "WITH cte AS ({}) SELECT * FROM cte",
+            gen_simple_select(rng, np)
+        ),
+    }
+}
+
+/// `MERGE INTO … USING … ON … WHEN [NOT] MATCHED …` — exercises the merge
+/// resolver: join-condition typing, per-action assignment coercion, the
+/// source relation's scope inside UPDATE SET / INSERT VALUES, and action
+/// conditions.
+fn gen_merge(rng: &mut StdRng, np: &mut u32) -> String {
+    // Fixed direction (posts ← users) so the ON join makes sense; the
+    // expressions inside perturb freely.
+    let mut sql = String::from("MERGE INTO posts p USING users u ON p.user_id = u.id");
+
+    let matched_cond = if rng.random_bool(0.3) {
+        format!(" AND {}", gen_expr(&TABLES[1], 1, rng, np))
+    } else {
+        String::new()
+    };
+    match rng.random_range(0..3) {
+        0 => {
+            // Skip col 0 (`id`, the identity PK).
+            let col = &TABLES[1].cols[rng.random_range(1..TABLES[1].cols.len())];
+            sql.push_str(&format!(
+                " WHEN MATCHED{matched_cond} THEN UPDATE SET {} = {}",
+                col.name,
+                lit_or_param(col.ty, rng, np),
+            ));
+        }
+        1 => sql.push_str(&format!(" WHEN MATCHED{matched_cond} THEN DELETE")),
+        _ => sql.push_str(&format!(" WHEN MATCHED{matched_cond} THEN DO NOTHING")),
+    }
+    if rng.random_bool(0.7) {
+        match rng.random_range(0..2) {
+            0 => sql.push_str(&format!(
+                " WHEN NOT MATCHED THEN INSERT (user_id, title) VALUES (u.id, {})",
+                if rng.random_bool(0.4) {
+                    format!("${}", next_param(np))
+                } else {
+                    "u.name".to_string()
+                },
+            )),
+            _ => sql.push_str(" WHEN NOT MATCHED THEN DO NOTHING"),
+        }
+    }
+    sql
 }
 
 // ── DML ──────────────────────────────────────────────────────────────────────
@@ -1592,6 +1737,17 @@ const SEEDS: &[&str] = &[
     "SELECT CASE WHEN active THEN $p1 ELSE age END FROM users",
     "SELECT $p1 UNION ALL SELECT age FROM users",
     "SELECT prefs -> $p1 FROM users",
+    // MERGE / recursive CTE / data-modifying CTE / window frames.
+    "MERGE INTO posts p USING users u ON p.user_id = u.id \
+     WHEN MATCHED THEN UPDATE SET views = 0 \
+     WHEN NOT MATCHED THEN INSERT (user_id, title) VALUES (u.id, u.name)",
+    "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) \
+     SELECT * FROM r",
+    "WITH moved AS (DELETE FROM posts WHERE views = 0 RETURNING id) \
+     SELECT count(*) FROM moved",
+    "SELECT sum(views) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM posts",
+    "SELECT st, count(*) FROM users GROUP BY ROLLUP (st)",
+    "SELECT name COLLATE \"C\" FROM users ORDER BY name COLLATE \"C\"",
     // Derived tables.
     "SELECT v.a FROM (VALUES (1, 'x'), (2, 'y')) AS v(a, b)",
     "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id)",
