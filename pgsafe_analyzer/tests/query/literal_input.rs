@@ -523,3 +523,57 @@ fn any_all_with_concrete_incompatible_sides_rejected() {
     db.analyze("SELECT id FROM t WHERE id = ANY(ARRAY[1, 2, 3])")
         .unwrap();
 }
+
+#[test]
+fn datetime_keywords_accepted() {
+    let db = setup();
+    for q in [
+        "SELECT 'now'::date AS v",
+        "SELECT ' Today '::timestamptz AS v",
+        "SELECT 'epoch'::timestamp AS v",
+        "SELECT '+infinity'::date AS v",
+        "SELECT '-Infinity'::timestamp AS v",
+        "SELECT 'allballs'::time AS v",
+        "SELECT 'now'::timetz AS v",
+        "SELECT 'infinity'::interval AS v",
+        // Digits / punctuation are accepted unchecked (conservative).
+        "SELECT '2024-01-01'::date AS v",
+        "SELECT '1 day'::interval AS v",
+        "SELECT 'now()'::date AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+#[test]
+fn datetime_bare_words_rejected() {
+    // Purely alphabetic tokens that aren't a special keyword are always
+    // `invalid input syntax` in PG's datetime lexer.
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT 'hello'::timestamptz"),
+        "invalid input syntax for type timestamp with time zone: \"hello\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'jan'::date"),
+        "invalid input syntax for type date: \"jan\""
+    );
+    // Keywords don't cross type families: time has no epoch/infinity, and
+    // interval has no today.
+    assert_first_line!(
+        db.analyze("SELECT 'epoch'::time"),
+        "invalid input syntax for type time: \"epoch\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'infinity'::time"),
+        "invalid input syntax for type time: \"infinity\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'today'::interval"),
+        "invalid input syntax for type interval: \"today\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'allballs'::timestamp"),
+        "invalid input syntax for type timestamp: \"allballs\""
+    );
+}

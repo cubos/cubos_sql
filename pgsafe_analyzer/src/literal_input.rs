@@ -186,24 +186,64 @@ pub(crate) fn validate(
                 _ => Ok(()),
             }
         }
-        // Types whose input functions are too complex to model but are known
-        // to reject the empty string (verified against PG 18). The message
-        // uses the input function's own type-name string, which differs from
-        // `format_type` for the timestamp family.
+        // Datetime family: the full input grammar is out of scope, but two
+        // slices are exactly checkable (verified against PG 18): the empty
+        // string, and purely alphabetic tokens — PG's datetime lexer only
+        // accepts those when they're one of the special keywords (`now`,
+        // `today`, `epoch`, `infinity`, …); any other bare word is
+        // `invalid input syntax`. Anything with digits or punctuation
+        // (which can route to *other* messages, e.g. `time zone "a.m." not
+        // recognized`, or be a valid value like `'now()'`) is accepted
+        // unchecked. The message uses the input function's own type-name
+        // string, which differs from `format_type` for the timestamp family.
+        name @ ("date" | "time" | "timetz" | "timestamp" | "timestamptz" | "interval") => {
+            let msg_name = match name {
+                "timetz" => "time with time zone",
+                "timestamptz" => "timestamp with time zone",
+                other => other,
+            };
+            let keywords: &[&str] = match name {
+                "time" | "timetz" => &["now", "allballs"],
+                "interval" => &["infinity"],
+                _ => &[
+                    "now",
+                    "today",
+                    "tomorrow",
+                    "yesterday",
+                    "epoch",
+                    "infinity",
+                ],
+            };
+            let trimmed = content
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_ascii_lowercase();
+            // `'+infinity'` / `'-infinity'` are valid wherever `infinity` is.
+            let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(&trimmed);
+            if keywords.contains(&unsigned) {
+                return Ok(());
+            }
+            let purely_alphabetic = !trimmed.is_empty()
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() || c.is_ascii_whitespace());
+            if trimmed.is_empty() || purely_alphabetic {
+                return Err(format!(
+                    "invalid input syntax for type {msg_name}: \"{content}\""
+                ));
+            }
+            Ok(())
+        }
+        // Network/geometric types whose input functions are too complex to
+        // model but are known to reject the empty string. (No alphabetic
+        // shortcut here: `'aabbccddeeff'::macaddr` is a valid MAC.)
         name @ ("macaddr" | "macaddr8" | "inet" | "cidr" | "point" | "lseg" | "box" | "path"
-        | "polygon" | "circle" | "line" | "date" | "time" | "timetz" | "timestamp"
-        | "timestamptz" | "interval") => {
+        | "polygon" | "circle" | "line") => {
             if content
                 .trim_matches(|c: char| c.is_ascii_whitespace())
                 .is_empty()
             {
-                let msg_name = match name {
-                    "timetz" => "time with time zone",
-                    "timestamptz" => "timestamp with time zone",
-                    other => other,
-                };
                 return Err(format!(
-                    "invalid input syntax for type {msg_name}: \"{content}\""
+                    "invalid input syntax for type {name}: \"{content}\""
                 ));
             }
             Ok(())
