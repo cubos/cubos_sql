@@ -965,3 +965,51 @@ fn any_param_against_domain_column_pins_base_array() {
         .unwrap();
     assert_params(&s, vec![p(array_of(text()))]);
 }
+
+#[test]
+fn bare_param_in_variadic_any_is_indeterminate() {
+    // `concat` takes VARIADIC "any" — PG cannot infer a bare $N there and
+    // fails prepare with `could not determine data type of parameter $1`.
+    let db = setup();
+    let err = db
+        .analyze("SELECT concat(name, $p1) FROM users")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not determine data type of parameter $1"),
+        "got: {err}"
+    );
+    // A pinned param is fine.
+    db.analyze("SELECT concat(name, $p1::text) FROM users")
+        .unwrap();
+}
+
+#[test]
+fn rows_frame_offset_param_is_bigint() {
+    // ROWS/GROUPS frame offsets are int8 in PG; a bare $N there must
+    // describe as bigint, not default to text.
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT sum(age) OVER (ORDER BY id ROWS BETWEEN $p1 PRECEDING AND CURRENT ROW) \
+             FROM users",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+}
+
+#[test]
+fn any_param_against_array_column_rejected_like_pg() {
+    // `nums = ANY($1)` would need an array-of-array to type the param —
+    // PG fails the lookup at prepare time.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t4 (nums INT[] NOT NULL);").unwrap();
+    let err = db
+        .analyze("SELECT 1 FROM t4 WHERE nums = ANY($p1)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not find array type for data type integer[]"),
+        "got: {err}"
+    );
+}

@@ -407,16 +407,31 @@ fn handle_any_all(
         .finalize_implicit());
     }
 
-    // left is concrete T, right is unknown → right must be T[].
-    if left_oid != oid::UNKNOWN
-        && right_oid == oid::UNKNOWN
-        // Operators resolve over the domain's *base* type, so a domain
-        // column pins the param to the base's array (`email_col = ANY($1)`
-        // → text[], matching PG's Describe), not the domain's.
-        && let Some(arr_oid) = snapshot.array_type_of(snapshot.unwrap_domain(left_oid))
-        && let Some(rexpr) = &expr.rexpr
-    {
-        swallow_unless_literal(infer_expr(rexpr, ctx, params, TypeGoal::implicit(arr_oid)))?;
+    // left is concrete T, right is unknown → right must be T[]. Operators
+    // resolve over the domain's *base* type, so a domain column pins the
+    // param to the base's array (`email_col = ANY($1)` → text[], matching
+    // PG's Describe), not the domain's. When T has no array type at all —
+    // T is itself an array; PG has no array-of-array — PG fails the same
+    // lookup with `could not find array type for data type integer[]`.
+    if left_oid != oid::UNKNOWN && right_oid == oid::UNKNOWN {
+        match snapshot.array_type_of(snapshot.unwrap_domain(left_oid)) {
+            Some(arr_oid) => {
+                if let Some(rexpr) = &expr.rexpr {
+                    swallow_unless_literal(infer_expr(
+                        rexpr,
+                        ctx,
+                        params,
+                        TypeGoal::implicit(arr_oid),
+                    ))?;
+                }
+            }
+            None => {
+                let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "could not find array type for data type {l}"
+                )));
+            }
+        }
     }
 
     // right is concrete T[], left is unknown → left must be the element type T.

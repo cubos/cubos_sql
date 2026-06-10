@@ -79,6 +79,7 @@ const BATTERY: &[&str] = &[
     "SELECT prefs @> $p1 FROM users",
     // window / aggregate arguments
     "SELECT lag(name, $p1) OVER (ORDER BY id) FROM users",
+    "SELECT sum(age) OVER (ORDER BY id ROWS BETWEEN $p1 PRECEDING AND CURRENT ROW) FROM users",
     "SELECT ntile($p1) OVER (ORDER BY id) FROM users",
     "SELECT string_agg(name, $p1) FROM users",
     "SELECT count(*) FILTER (WHERE $p1) FROM users",

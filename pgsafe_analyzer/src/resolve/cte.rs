@@ -59,6 +59,36 @@ pub(crate) fn analyze_cte(
             ));
         }
 
+        // PG fixes a recursive CTE's column types from the *non-recursive*
+        // term alone; if common-type resolution with the recursive term
+        // lands anywhere else, it errors rather than widening (SQLSTATE
+        // 42804): `recursive query "r" column 1 has type integer in
+        // non-recursive term but type numeric overall`.
+        for (i, (s, r)) in seed_cols.iter().zip(rec_cols.iter()).enumerate() {
+            if s.type_oid == oid::UNKNOWN || r.type_oid == oid::UNKNOWN {
+                continue;
+            }
+            let common = crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
+                .unwrap_or(s.type_oid);
+            if common != s.type_oid {
+                let seed_ty = crate::ddl::util::format_type_for_message(snapshot, s.type_oid);
+                let overall = crate::ddl::util::format_type_for_message(snapshot, common);
+                return Err(crate::error::RawError::invalid(
+                    format!(
+                        "recursive query \"{}\" column {} has type {seed_ty} in \
+                         non-recursive term but type {overall} overall",
+                        cte.ctename,
+                        i + 1,
+                    ),
+                    None,
+                    Some(format!(
+                        "cast the non-recursive term's column to {overall}"
+                    )),
+                )
+                .finalize_implicit());
+            }
+        }
+
         let mut unified: Vec<ScopeColumn> = seed_cols
             .into_iter()
             .zip(rec_cols)

@@ -477,3 +477,26 @@ fn internal_char_type_rendered_quoted_in_messages() {
         ),
     );
 }
+
+// ── Function-call-as-cast (FUNCDETAIL_COERCION) ─────────────────────────────
+
+#[test]
+fn type_name_call_acts_as_cast() {
+    // `float8(x)` / `text(x)` with no matching function are casts in PG.
+    let db = setup();
+    let s = db.analyze("SELECT float8(age) AS v FROM users").unwrap();
+    assert_cols(&s, vec![cn("v", float8())]);
+    let s = db.analyze("SELECT text(id) AS v FROM users").unwrap();
+    assert_cols(&s, vec![c("v", text())]);
+    let s = db
+        .analyze("SELECT pg_catalog.float8(name::int4) AS v FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("v", float8())]);
+    // Literal contents validate exactly like `'x'::float8` would.
+    let err = db.analyze("SELECT float8('x')").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("invalid input syntax for type double precision: \"x\""),
+        "got: {err}"
+    );
+}

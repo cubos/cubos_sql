@@ -249,14 +249,14 @@ pub(crate) fn check_grouping(
         return Ok(());
     }
 
-    // Grouped columns — bail out (lenient) on any non-plain-column entry.
+    // Grouped columns — recursing into GROUPING SETS / ROLLUP / CUBE: a
+    // column appearing in *any* grouping set satisfies the 42803 rule (rows
+    // from sets that omit it just carry NULL there). Bail out (lenient) on
+    // any non-plain-column leaf.
     let mut grouped_cols: HashSet<(String, String)> = HashSet::new();
     for g in &sel.group_clause {
-        match resolve_group_column(g, scope) {
-            Some(key) => {
-                grouped_cols.insert(key);
-            }
-            None => return Ok(()),
+        if !collect_grouped_columns(g, scope, &mut grouped_cols) {
+            return Ok(());
         }
     }
 
@@ -347,6 +347,31 @@ pub(crate) fn check_grouping(
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
 /// `(table_alias, column_name)` for a plain `ColumnRef`, or `None` for any
 /// other shape (expression, grouping set, select-list alias, …).
+/// Collect every plain column mentioned by a GROUP BY entry into `out`,
+/// descending through `GroupingSet` nodes (ROLLUP/CUBE/GROUPING SETS nest
+/// them; the empty set has no content and is trivially fine). Returns
+/// `false` when a leaf isn't a resolvable plain column — the caller then
+/// skips the whole check rather than risk a false 42803.
+fn collect_grouped_columns(
+    node: &protobuf::Node,
+    scope: &Scope,
+    out: &mut std::collections::HashSet<(String, String)>,
+) -> bool {
+    if let Some(node::Node::GroupingSet(gs)) = node.node.as_ref() {
+        return gs
+            .content
+            .iter()
+            .all(|inner| collect_grouped_columns(inner, scope, out));
+    }
+    match resolve_group_column(node, scope) {
+        Some(key) => {
+            out.insert(key);
+            true
+        }
+        None => false,
+    }
+}
+
 fn resolve_group_column(node: &protobuf::Node, scope: &Scope) -> Option<(String, String)> {
     let node::Node::ColumnRef(cr) = node.node.as_ref()? else {
         return None;

@@ -258,7 +258,7 @@ pub(crate) fn validate(
         // the empty string. (No alphabetic shortcut here:
         // `'aabbccddeeff'::macaddr` is a valid MAC.)
         name @ ("macaddr" | "macaddr8" | "inet" | "cidr" | "point" | "lseg" | "box" | "path"
-        | "polygon" | "circle" | "line" | "tid" | "xid" | "xid8" | "cid") => {
+        | "polygon" | "circle" | "line" | "tid" | "xid" | "xid8" | "cid" | "pg_lsn") => {
             if content
                 .trim_matches(|c: char| c.is_ascii_whitespace())
                 .is_empty()
@@ -603,7 +603,7 @@ fn validate_uuid(content: &str) -> Result<(), String> {
 
 /// Structural RFC 8259 validation, mirroring PG's `json_lex`/`parse_json`.
 /// `\u` escapes only check for 4 hex digits — the jsonb-only surrogate-pair
-/// and ` ` restrictions produce *different* PG messages and are
+/// and `\u0000` restrictions produce *different* PG messages and are
 /// deliberately not modeled (accepted). The message carries no content:
 /// PG emits a bare `invalid input syntax for type json` (the specifics go in
 /// the DETAIL field, which the prefix contract doesn't cover).

@@ -122,3 +122,25 @@ fn grouping_sets_with_having() {
         .unwrap();
     assert_cols(&s, vec![cn("region", text()), cn("total", int8())]);
 }
+
+#[test]
+fn ungrouped_column_with_rollup_rejected() {
+    // The 42803 rule applies through the grouping-set family: `amount`
+    // appears in no grouping set of ROLLUP(region), so projecting it bare
+    // must error.
+    let db = setup();
+    let err = db
+        .analyze("SELECT amount FROM sales GROUP BY ROLLUP (region)")
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "column \"sales.amount\" must appear in the GROUP BY clause or be used in an aggregate function"
+        ),
+        "got: {err}"
+    );
+    // Columns inside any set stay projectable.
+    db.analyze("SELECT region, count(*) FROM sales GROUP BY ROLLUP (region)")
+        .unwrap();
+    db.analyze("SELECT region, product FROM sales GROUP BY GROUPING SETS ((region), (product))")
+        .unwrap();
+}

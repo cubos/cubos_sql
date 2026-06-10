@@ -290,3 +290,27 @@ fn recursive_search_breadth_first_with_other_columns_intact() {
         .unwrap();
     assert_cols(&s, vec![c("id", int8()), cn("parent_id", int8())]);
 }
+
+#[test]
+fn recursive_term_type_must_match_non_recursive_term() {
+    // PG fixes the CTE's column types from the non-recursive term; a
+    // recursive term that would widen the type errors (42804).
+    let db = setup();
+    let err = db
+        .analyze(
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL \
+             SELECT n + 3.14 FROM r WHERE n < 5) SELECT * FROM r",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "recursive query \"r\" column 1 has type integer in non-recursive term but type numeric overall"
+        ),
+        "got: {err}"
+    );
+    db.analyze(
+        "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL \
+         SELECT n + 1 FROM r WHERE n < 5) SELECT * FROM r",
+    )
+    .unwrap();
+}

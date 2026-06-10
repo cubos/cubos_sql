@@ -43,14 +43,56 @@ pub(crate) fn infer_func_call(
     let args = collect_arg_types(func, ctx, params)?;
 
     // Resolve function with inferred arg types (UNKNOWN treated as wildcard).
-    let resolved = functions::resolve_function(
+    let resolved = match functions::resolve_function(
         snapshot,
         schema,
         name,
         &args.types,
         func.agg_star,
         crate::error::SourceSpan::from_node_qname(func.location),
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // PG's function-call-as-cast rule (func_get_detail →
+            // FUNCDETAIL_COERCION): a single-argument call whose name is a
+            // type name, with no matching function and a legal explicit
+            // cast path, is a cast — `float8(x)`, `text(123)`,
+            // `pg_catalog."numeric"(v)`. Modifier syntax (OVER, DISTINCT,
+            // FILTER, …) rules the interpretation out.
+            if func.args.len() == 1
+                && func.over.is_none()
+                && !func.agg_star
+                && !func.agg_distinct
+                && !func.agg_within_group
+                && func.agg_filter.is_none()
+                && func.agg_order.is_empty()
+                && let Some(te) = snapshot.resolve_type_by_name(schema, name)
+                && crate::coerce::can_cast_explicit(args.types[0], te.oid, snapshot)
+            {
+                let target = te.oid;
+                // Same literal-content validation an explicit cast performs.
+                if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
+                    && !ac.isnull
+                    && let Some(pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+                    && let Err(msg) = crate::literal_input::validate(&sv.sval, target, snapshot)
+                {
+                    let span = crate::error::node_location(&func.args[0])
+                        .and_then(crate::error::SourceSpan::from_node_token);
+                    return Err(
+                        crate::error::RawError::invalid_literal(msg, span).finalize_implicit()
+                    );
+                }
+                // A bare `$N` argument adopts the cast target, like `$N::T`.
+                if let Some(node::Node::ParamRef(p)) = func.args[0].node.as_ref()
+                    && params.get(p.number) == oid::UNKNOWN
+                {
+                    params.record(p.number, target);
+                }
+                return Ok(ExprType::scalar(target, args.nullable[0]));
+            }
+            return Err(e);
+        }
+    };
 
     if resolved.is_aggregate {
         check_no_nested_aggregates(func, snapshot)?;
@@ -79,6 +121,27 @@ pub(crate) fn infer_func_call(
             None,
         )
         .finalize_implicit());
+    }
+
+    // The pseudo-type `"any"` (plain and VARIADIC, e.g. `concat`,
+    // `format`, `jsonb_build_object`) gives PG nothing to infer a bare
+    // `$N` from — `concat(name, $1)` fails prepare with `could not
+    // determine data type of parameter $1`. Mirror the first-use lock.
+    const ANY_PSEUDO: PgTypeOid = PgTypeOid::from_raw(2276);
+    let declared_any = |i: usize| -> bool {
+        match resolved.arg_types.get(i) {
+            Some(&t) => t == ANY_PSEUDO,
+            // Past the declared list — only reachable for variadic
+            // matches, where the tail repeats the last declared type.
+            None => resolved.arg_types.last() == Some(&ANY_PSEUDO),
+        }
+    };
+    for (i, arg) in func.args.iter().enumerate() {
+        if declared_any(i)
+            && let Some(node::Node::ParamRef(p)) = arg.node.as_ref()
+        {
+            params.mark_indeterminate_locked(p.number);
+        }
     }
 
     // Pass 2: back-fill UNKNOWN args from the resolved signature.
@@ -223,6 +286,13 @@ fn backfill_func_args(
         if args.types[i] == oid::UNKNOWN
             && let Some(&expected) = resolved.arg_types.get(i)
             && expected != oid::UNKNOWN
+            // A pseudo-type slot (`"any"`, anyelement, …) is not a concrete
+            // coercion target — recording it would leak the pseudo OID into
+            // a param's type.
+            && ctx
+                .snapshot
+                .get_type(expected)
+                .is_none_or(|t| t.typtype != TypType::Pseudo)
         {
             // Speculative re-walk: ordinary failures are swallowed, but a
             // literal-content rejection is the parse-time error PG itself
@@ -294,11 +364,20 @@ fn walk_func_modifiers(
                 infer_expr(inner, ctx, params, TypeGoal::NONE)?;
             }
         }
+        // Frame offsets: ROWS / GROUPS offsets are int8 in PG (so a bare
+        // `$N` there describes as bigint); RANGE offsets take the ORDER BY
+        // key's "distance" type (interval for timestamps, …) — left
+        // unconstrained. Bits from parsenodes.h: ROWS 0x4, GROUPS 0x8.
+        let offset_goal = if over.frame_options & 0x4 != 0 || over.frame_options & 0x8 != 0 {
+            TypeGoal::implicit(oid::INT8)
+        } else {
+            TypeGoal::NONE
+        };
         if let Some(start) = &over.start_offset {
-            infer_expr(start, ctx, params, TypeGoal::NONE)?;
+            infer_expr(start, ctx, params, offset_goal.clone())?;
         }
         if let Some(end) = &over.end_offset {
-            infer_expr(end, ctx, params, TypeGoal::NONE)?;
+            infer_expr(end, ctx, params, offset_goal)?;
         }
     }
     Ok(())
