@@ -234,7 +234,24 @@ pub(crate) fn validate(
                     msg_name, content,
                 ));
             }
-            Ok(())
+            // PG's datetime tokenizer (`ParseDateTime`, datetime.c) accepts
+            // letters, digits, whitespace and the delimiter set used by
+            // dates/times/zones — any other character is an immediate
+            // DTERR_BAD_FORMAT, before field decoding even starts. (The
+            // alphabet includes `/` and `_` for zone names like
+            // `America/New_York`, `@` for the interval `ago` syntax, and
+            // `()` — `'now()'` is accepted.)
+            let tokenizer_ok = content.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || c.is_ascii_whitespace()
+                    || matches!(c, ':' | '+' | '-' | '/' | '.' | ',' | '@' | '_' | '(' | ')')
+            });
+            if !tokenizer_ok {
+                return Err(crate::pgmsg::invalid_input_syntax_for_type(
+                    msg_name, content,
+                ));
+            }
+            validate_datetime_token(&trimmed, name, msg_name, content)
         }
         // Internal statistics / parse-tree types whose input functions
         // unconditionally refuse input. The message string is the input
@@ -253,22 +270,18 @@ pub(crate) fn validate(
             };
             Err(format!("cannot accept a value of type {msg_name}"))
         }
-        // Network/geometric types — and the system identifier types — whose
-        // input functions are too complex to model but are known to reject
-        // the empty string. (No alphabetic shortcut here:
-        // `'aabbccddeeff'::macaddr` is a valid MAC.)
-        name @ ("macaddr" | "macaddr8" | "inet" | "cidr" | "point" | "lseg" | "box" | "path"
-        | "polygon" | "circle" | "line" | "tid" | "xid" | "xid8" | "cid" | "pg_lsn") => {
-            if content
-                .trim_matches(|c: char| c.is_ascii_whitespace())
-                .is_empty()
-            {
-                return Err(format!(
-                    "invalid input syntax for type {name}: \"{content}\""
-                ));
-            }
-            Ok(())
+        "bit" | "varbit" => validate_bit(content),
+        "money" => validate_money(content),
+        "inet" => validate_inet(content, false),
+        "cidr" => validate_inet(content, true),
+        "macaddr" => validate_macaddr(content, false),
+        "macaddr8" => validate_macaddr(content, true),
+        name @ ("point" | "lseg" | "box" | "path" | "polygon" | "circle" | "line") => {
+            validate_geometric(content, name)
         }
+        "tid" => validate_tid(content),
+        "pg_lsn" => validate_pg_lsn(content),
+        name @ ("xid" | "xid8" | "cid") => validate_xid(content, name),
         _ => Ok(()),
     }
 }
@@ -810,6 +823,668 @@ impl JsonParser<'_> {
     }
 }
 
+// ─── datetime single-token decoding ─────────────────────────────────────────
+
+/// Month names, day-of-week names, and the other alphabetic words PG's
+/// datetime decoder accepts glued to digits in a single token
+/// (`'15jan2024'::date`, `'2024-01-01t00:00:00z'` → token `00z`). An
+/// alphabetic run outside this set in a digit-bearing token is
+/// DTERR_BAD_FORMAT (`'42abc'`, `'0b101'`, `'1e3'`).
+const DATETIME_WORDS: &[&str] = &[
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "may",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "sept",
+    "oct",
+    "nov",
+    "dec",
+    "january",
+    "february",
+    "march",
+    "april",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "am",
+    "pm",
+    "t",
+    "z",
+    "j",
+    "bc",
+    "ad",
+    "mon",
+    "tue",
+    "tues",
+    "wed",
+    "weds",
+    "thu",
+    "thur",
+    "thurs",
+    "fri",
+    "sat",
+    "sun",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+];
+
+/// Decode the *single-token* shapes of the datetime input grammar — a value
+/// with no internal separators (`:`/`/`/`,`/whitespace/`@`/parens). Those
+/// shapes are small enough to model exactly (verified against PG 18 case by
+/// case); anything multi-field is accepted unchecked. `t` is the value
+/// trimmed and lowercased by the caller.
+fn validate_datetime_token(
+    t: &str,
+    name: &str,
+    msg_name: &str,
+    content: &str,
+) -> Result<(), String> {
+    let syntax = || crate::pgmsg::invalid_input_syntax_for_type(msg_name, content);
+    let range = || format!("date/time field value out of range: \"{content}\"");
+
+    // Multi-field values (separators present) are out of scope — accept.
+    if t.contains(|c: char| {
+        c.is_ascii_whitespace() || matches!(c, ':' | '/' | ',' | '@' | '(' | ')')
+    }) {
+        return Ok(());
+    }
+
+    // PG has no underscore anywhere in datetime values outside zone *names*
+    // (which always ride along a date/time field, i.e. a multi-field value).
+    if t.contains('_') {
+        return Err(syntax());
+    }
+
+    if name == "interval" {
+        let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+        if body.is_empty() {
+            return Err(syntax());
+        }
+        if body.chars().all(|c| c.is_ascii_digit()) {
+            // A bare number is seconds; int64 microseconds cap far below
+            // 19 digits of seconds.
+            if body.trim_start_matches('0').len() >= 19 {
+                return Err(format!("interval field value out of range: \"{content}\""));
+            }
+            return Ok(());
+        }
+        // Unit-suffixed forms (`1d`, `2h30m`) and decimals are valid;
+        // unknown unit letters are rejected by checking the alpha runs.
+        if t.starts_with(|c: char| c.is_ascii_digit()) && t.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            const INTERVAL_UNITS: &[&str] = &[
+                "us",
+                "ms",
+                "s",
+                "sec",
+                "secs",
+                "second",
+                "seconds",
+                "m",
+                "min",
+                "mins",
+                "minute",
+                "minutes",
+                "h",
+                "hr",
+                "hrs",
+                "hour",
+                "hours",
+                "d",
+                "day",
+                "days",
+                "w",
+                "week",
+                "weeks",
+                "mon",
+                "mons",
+                "month",
+                "months",
+                "y",
+                "yr",
+                "yrs",
+                "year",
+                "years",
+                "ago",
+                "c",
+                "cent",
+                "centuries",
+                "century",
+                "dec",
+                "decade",
+                "decades",
+                "mil",
+                "millennium",
+                "millennia",
+            ];
+            for run in alpha_runs(t) {
+                if !INTERVAL_UNITS.contains(&run) {
+                    return Err(syntax());
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // date / time / timetz / timestamp / timestamptz.
+    let is_time = matches!(name, "time" | "timetz");
+
+    // A sign-led number is a lone timezone displacement — never a complete
+    // value. PG distinguishes a displacement beyond ±15:59 (its tz limit).
+    if let Some(body) = t.strip_prefix('+') {
+        if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
+            let hh: u32 = match body.len() {
+                2 => body.parse().unwrap_or(0),
+                4 => body[..2].parse().unwrap_or(0),
+                _ => 0,
+            };
+            if hh >= 16 {
+                return Err(format!(
+                    "time zone displacement out of range: \"{content}\""
+                ));
+            }
+            return Err(syntax());
+        }
+        return Ok(());
+    }
+    if let Some(body) = t.strip_prefix('-') {
+        if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
+            return Err(syntax());
+        }
+        return Ok(());
+    }
+
+    // Pure digits: a single concatenated field.
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+        return if is_time {
+            decode_time_field(t, None).map_err(|oor| if oor { range() } else { syntax() })
+        } else {
+            decode_date_field(t).map_err(|oor| if oor { range() } else { syntax() })
+        };
+    }
+
+    // One decimal point: `hhmm.frac` / `hhmmss.frac` are valid times;
+    // everything else single-dotted is a syntax error. Two or more dots can
+    // be a DateStyle-dependent date (`1.2.3`) — accept.
+    let dots = t.matches('.').count();
+    if dots == 1
+        && let Some((int, frac)) = t.split_once('.')
+        && int.chars().all(|c| c.is_ascii_digit())
+        && frac.chars().all(|c| c.is_ascii_digit())
+    {
+        if is_time && matches!(int.len(), 4 | 6) && !frac.is_empty() {
+            return decode_time_field(int, Some(frac))
+                .map_err(|oor| if oor { range() } else { syntax() });
+        }
+        return Err(syntax());
+    }
+    if dots >= 2 {
+        return Ok(());
+    }
+
+    // Digit-led token with alphabetic runs: month/word forms are valid
+    // (`15jan2024`); unknown words are DTERR_BAD_FORMAT (`42abc`, `1e3`).
+    if t.starts_with(|c: char| c.is_ascii_digit()) && t.chars().any(|c| c.is_ascii_alphabetic()) {
+        for run in alpha_runs(t) {
+            if !DATETIME_WORDS.contains(&run) {
+                return Err(syntax());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The maximal alphabetic runs of a token (`15jan2024` → `["jan"]`).
+fn alpha_runs(t: &str) -> Vec<&str> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, c) in t.char_indices() {
+        if c.is_ascii_alphabetic() {
+            start.get_or_insert(i);
+        } else if let Some(s) = start.take() {
+            runs.push(&t[s..i]);
+        }
+    }
+    if let Some(s) = start {
+        runs.push(&t[s..]);
+    }
+    runs
+}
+
+/// `hhmm` / `hhmmss` concatenated time fields (PG `DecodeNumberField` +
+/// `ValidateTime`): minutes ≤ 59, seconds ≤ 60 (leap), and the total may
+/// not exceed 24:00:00. `Err(true)` = field value out of range,
+/// `Err(false)` = invalid syntax.
+fn decode_time_field(digits: &str, _frac: Option<&str>) -> Result<(), bool> {
+    let (hh, mm, ss) = match digits.len() {
+        4 => (&digits[..2], &digits[2..4], "0"),
+        6 => (&digits[..2], &digits[2..4], &digits[4..6]),
+        _ => return Err(false),
+    };
+    let (hh, mm, ss): (u64, u64, u64) = (
+        hh.parse().unwrap_or(0),
+        mm.parse().unwrap_or(0),
+        ss.parse().unwrap_or(0),
+    );
+    if mm > 59 || ss > 60 || hh * 3600 + mm * 60 + ss > 24 * 3600 {
+        return Err(true);
+    }
+    Ok(())
+}
+
+/// A lone concatenated date field (PG `DecodeNumber`/`DecodeNumberField`):
+/// 6 digits is `yymmdd`, 8 is `yyyymmdd` (month/day validated, leap years
+/// included); 1–2 digits could only start a date (syntax when it fits a
+/// month, otherwise field overflow); 3–5 digits never decode; 7 or ≥ 9
+/// digits overflow the field. `Err(true)` = out of range, `Err(false)` =
+/// invalid syntax.
+fn decode_date_field(digits: &str) -> Result<(), bool> {
+    fn valid_md(y: u32, m: u32, d: u32) -> bool {
+        if !(1..=12).contains(&m) || d == 0 {
+            return false;
+        }
+        let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+        let dim = match m {
+            2 => {
+                if leap {
+                    29
+                } else {
+                    28
+                }
+            }
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        d <= dim
+    }
+    match digits.len() {
+        1 | 2 => {
+            let v: u32 = digits.parse().unwrap_or(0);
+            Err(v > 12)
+        }
+        3..=5 => Err(false),
+        6 => {
+            let yy: u32 = digits[..2].parse().unwrap_or(0);
+            let y = if yy < 70 { 2000 + yy } else { 1900 + yy };
+            let m: u32 = digits[2..4].parse().unwrap_or(0);
+            let d: u32 = digits[4..6].parse().unwrap_or(0);
+            if valid_md(y, m, d) { Ok(()) } else { Err(true) }
+        }
+        8 => {
+            let y: u32 = digits[..4].parse().unwrap_or(0);
+            let m: u32 = digits[4..6].parse().unwrap_or(0);
+            let d: u32 = digits[6..8].parse().unwrap_or(0);
+            if valid_md(y, m, d) { Ok(()) } else { Err(true) }
+        }
+        _ => Err(true),
+    }
+}
+
+// ─── bit strings ────────────────────────────────────────────────────────────
+
+/// Mirrors `bit_in`/`varbit_in` (varbit.c): a leading `b`/`B` selects binary
+/// digits, `x`/`X` selects hex digits, anything else is parsed as binary
+/// from the first character. Whitespace is *not* trimmed (a space is just an
+/// invalid digit). Length-vs-typmod mismatches are a different error owned
+/// by the typmod layer and not modeled here.
+fn validate_bit(content: &str) -> Result<(), String> {
+    let (digits, hex) = match content.as_bytes().first() {
+        Some(b'b' | b'B') => (&content[1..], false),
+        Some(b'x' | b'X') => (&content[1..], true),
+        _ => (content, false),
+    };
+    for c in digits.chars() {
+        let ok = if hex {
+            c.is_ascii_hexdigit()
+        } else {
+            c == '0' || c == '1'
+        };
+        if !ok {
+            return Err(format!(
+                "\"{c}\" is not a valid {} digit",
+                if hex { "hexadecimal" } else { "binary" }
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ─── money ──────────────────────────────────────────────────────────────────
+
+/// Mirrors `cash_in` (cash.c) under the C locale's fallback symbols
+/// (`$` currency, `,` thousands, `.` decimal): optional whitespace, an
+/// optional `(` (negative) or sign, an optional `$` (sign also accepted
+/// after it), then digits with free-form `,` separators and at most one
+/// decimal point; trailing whitespace / `)` / `$` allowed. At least one
+/// digit is required. The range check only fires for magnitudes no int64
+/// cent count could hold (≥ 18 integer digits) — kept conservative.
+fn validate_money(content: &str) -> Result<(), String> {
+    let err = || crate::pgmsg::invalid_input_syntax_for_type("money", content);
+    let mut s = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if let Some(rest) = s.strip_prefix('(') {
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix(['+', '-']) {
+        s = rest;
+    }
+    s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if let Some(rest) = s.strip_prefix('$') {
+        s = rest;
+        if let Some(rest) = s.strip_prefix(['+', '-']) {
+            s = rest;
+        }
+    }
+    let mut int_digits = 0usize;
+    let mut any_digit = false;
+    let mut seen_dot = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {
+                any_digit = true;
+                if !seen_dot {
+                    int_digits += 1;
+                }
+            }
+            b',' if !seen_dot => {}
+            b'.' if !seen_dot => seen_dot = true,
+            _ => break,
+        }
+        i += 1;
+    }
+    // The empty string is a valid money input on PG 18 (parses as $0.00),
+    // so digits are only required once any non-money character appears.
+    if !any_digit && !s[i..].is_empty() {
+        return Err(err());
+    }
+    // Trailing: whitespace, `)`, and a trailing currency symbol are accepted.
+    if !s[i..]
+        .chars()
+        .all(|c| c.is_ascii_whitespace() || c == ')' || c == '$')
+    {
+        return Err(err());
+    }
+    if int_digits >= 18 {
+        return Err(format!(
+            "value \"{content}\" is out of range for type money"
+        ));
+    }
+    Ok(())
+}
+
+// ─── network types ──────────────────────────────────────────────────────────
+
+/// One IPv4 dotted-quad. `exact` requires all 4 octets (inet); cidr accepts
+/// the abbreviated 1–3 octet forms (`'10/8'::cidr`).
+fn valid_ipv4(s: &str, exact: bool) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() > 4 || (exact && parts.len() != 4) || parts.is_empty() {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty()
+            && p.len() <= 3
+            && p.chars().all(|c| c.is_ascii_digit())
+            && p.parse::<u16>().is_ok_and(|v| v <= 255)
+    })
+}
+
+/// IPv6 textual form: up to 8 hex groups of 1–4 digits, at most one `::`
+/// elision, optional dotted-quad in the last position.
+fn valid_ipv6(addr: &str) -> bool {
+    let (head, tail, elided) = match addr.find("::") {
+        Some(i) => (&addr[..i], &addr[i + 2..], true),
+        None => (addr, "", false),
+    };
+    // A second `::` is malformed.
+    if tail.contains("::") {
+        return false;
+    }
+    let side_groups = |s: &str, v4_allowed: bool| -> Option<u32> {
+        if s.is_empty() {
+            return Some(0);
+        }
+        let parts: Vec<&str> = s.split(':').collect();
+        let mut groups = 0u32;
+        for (i, p) in parts.iter().enumerate() {
+            if p.is_empty() {
+                return None;
+            }
+            if p.contains('.') {
+                if !v4_allowed || i != parts.len() - 1 || !valid_ipv4(p, true) {
+                    return None;
+                }
+                groups += 2;
+            } else if p.len() <= 4 && p.chars().all(|c| c.is_ascii_hexdigit()) {
+                groups += 1;
+            } else {
+                return None;
+            }
+        }
+        Some(groups)
+    };
+    let Some(head_groups) = side_groups(head, !elided) else {
+        return false;
+    };
+    let Some(tail_groups) = side_groups(tail, true) else {
+        return false;
+    };
+    let total = head_groups + tail_groups;
+    if elided { total <= 7 } else { total == 8 }
+}
+
+/// Mirrors `inet_in` / `cidr_in` (network.c): an IPv4 dotted-quad or an
+/// IPv6 address, with an optional `/bits` netmask (≤ 32 / ≤ 128). cidr also
+/// accepts the abbreviated IPv4 forms; the cidr "host bits set" check is a
+/// different error and not modeled (accepted).
+fn validate_inet(content: &str, is_cidr: bool) -> Result<(), String> {
+    let name = if is_cidr { "cidr" } else { "inet" };
+    let err = || format!("invalid input syntax for type {name}: \"{content}\"");
+    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (addr, mask) = match s.split_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (s, None),
+    };
+    let is_v6 = addr.contains(':');
+    if let Some(m) = mask {
+        let limit = if is_v6 { 128 } else { 32 };
+        if m.is_empty()
+            || !m.chars().all(|c| c.is_ascii_digit())
+            || m.parse::<u32>().is_ok_and(|v| v > limit)
+            || m.len() > 3
+        {
+            return Err(err());
+        }
+    }
+    let ok = if is_v6 {
+        valid_ipv6(addr)
+    } else {
+        valid_ipv4(addr, !is_cidr)
+    };
+    if ok { Ok(()) } else { Err(err()) }
+}
+
+/// Mirrors `macaddr_in` / `macaddr8_in` (mac.c / mac8.c) loosely: hex digits
+/// in groups separated by `:`, `-` or `.`; 12 digits total for macaddr, 12
+/// or 16 for macaddr8 (6-byte MACs expand via FF:FE). Separator *placement*
+/// is not modeled (PG's fixed sscanf formats are stricter) — accept-leaning.
+fn validate_macaddr(content: &str, is_mac8: bool) -> Result<(), String> {
+    let name = if is_mac8 { "macaddr8" } else { "macaddr" };
+    let err = || format!("invalid input syntax for type {name}: \"{content}\"");
+    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    let mut ndigits = 0usize;
+    for c in s.chars() {
+        if c.is_ascii_hexdigit() {
+            ndigits += 1;
+        } else if !matches!(c, ':' | '-' | '.') {
+            return Err(err());
+        }
+    }
+    let ok = ndigits == 12 || (is_mac8 && ndigits == 16);
+    if ok { Ok(()) } else { Err(err()) }
+}
+
+// ─── geometric types ────────────────────────────────────────────────────────
+
+/// Mirrors the geo_ops.c input functions loosely: tokenize the value into
+/// float coordinates (sign / digits / `.` / exponent; `nan` and
+/// `inf`/`infinity` are valid coordinates) amid the delimiter set
+/// `, ( ) [ ] < > { }` and whitespace, then check the coordinate *count*
+/// each shape requires. Delimiter placement is not modeled (accept-leaning):
+/// `'(1,2]'::point` passes here even though PG rejects it.
+fn validate_geometric(content: &str, name: &str) -> Result<(), String> {
+    let err = || format!("invalid input syntax for type {name}: \"{content}\"");
+    let mut nums = 0usize;
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_whitespace()
+            || matches!(c, ',' | '(' | ')' | '[' | ']' | '<' | '>' | '{' | '}')
+        {
+            i += 1;
+            continue;
+        }
+        // A coordinate: optional sign, then nan/inf[inity] or a decimal
+        // float with optional exponent.
+        let start = i;
+        if matches!(bytes[i], b'+' | b'-') {
+            i += 1;
+        }
+        let rest = &content[i..];
+        let lower = rest
+            .get(..8.min(rest.len()))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if lower.starts_with("infinity") {
+            i += 8;
+            nums += 1;
+            continue;
+        }
+        if lower.starts_with("inf") {
+            i += 3;
+            nums += 1;
+            continue;
+        }
+        if lower.starts_with("nan") {
+            i += 3;
+            nums += 1;
+            continue;
+        }
+        let mut any = false;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            any = true;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+                any = true;
+            }
+        }
+        if any && i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+            let mut j = i + 1;
+            if j < bytes.len() && matches!(bytes[j], b'+' | b'-') {
+                j += 1;
+            }
+            let mut exp_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+                exp_digit = true;
+            }
+            if exp_digit {
+                i = j;
+            }
+        }
+        if !any || i == start {
+            return Err(err());
+        }
+        nums += 1;
+    }
+    let count_ok = match name {
+        "point" => nums == 2,
+        "lseg" | "box" => nums == 4,
+        "circle" => nums == 3,
+        // `{A,B,C}` (3) or two points (4).
+        "line" => nums == 3 || nums == 4,
+        // One or more points.
+        "path" | "polygon" => nums >= 2 && nums.is_multiple_of(2),
+        _ => true,
+    };
+    if count_ok { Ok(()) } else { Err(err()) }
+}
+
+// ─── system identifier types ────────────────────────────────────────────────
+
+/// Mirrors `tidin` (tid.c): `(block,offset)` with two unsigned decimal
+/// numbers. Surrounding whitespace tolerated (accept-leaning).
+fn validate_tid(content: &str) -> Result<(), String> {
+    let err = || format!("invalid input syntax for type tid: \"{content}\"");
+    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    let inner = s
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .ok_or_else(err)?;
+    let (block, offset) = inner.split_once(',').ok_or_else(err)?;
+    for part in [block, offset] {
+        let p = part.trim_matches(|c: char| c.is_ascii_whitespace());
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+            return Err(err());
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors `pg_lsn_in`: `XXX/XXX` with 1–8 hex digits on each side.
+fn validate_pg_lsn(content: &str) -> Result<(), String> {
+    let err = || format!("invalid input syntax for type pg_lsn: \"{content}\"");
+    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (hi, lo) = s.split_once('/').ok_or_else(err)?;
+    for part in [hi, lo] {
+        if part.is_empty() || part.len() > 8 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(err());
+        }
+    }
+    Ok(())
+}
+
+/// `xid` / `xid8` / `cid` parse via strtoul-style rules on PG 18: decimal
+/// digits or a `0x` hex prefix (bare hex like `ff` is rejected), optional
+/// sign (the parse wraps like strtoul). No range check.
+fn validate_xid(content: &str, name: &str) -> Result<(), String> {
+    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    let mut digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let mut radix = 10;
+    if let Some(rest) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        digits = rest;
+        radix = 16;
+    }
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(format!(
+            "invalid input syntax for type {name}: \"{content}\""
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // Pure-string validators are testable without a catalog; the
@@ -945,6 +1620,152 @@ mod tests {
         ] {
             assert!(validate_json(bad).is_err(), "{bad:?} should be invalid");
         }
+    }
+
+    #[test]
+    fn bit_inputs() {
+        for ok in ["101", "x1F", "b101", "", "X0aF"] {
+            assert!(validate_bit(ok).is_ok(), "{ok:?} should be valid");
+        }
+        assert_eq!(
+            validate_bit("102").unwrap_err(),
+            "\"2\" is not a valid binary digit"
+        );
+        assert_eq!(
+            validate_bit("xFG").unwrap_err(),
+            "\"G\" is not a valid hexadecimal digit"
+        );
+        assert!(validate_bit(" 42 ").is_err());
+        assert!(validate_bit("NaN").is_err());
+    }
+
+    #[test]
+    fn money_inputs() {
+        for ok in [
+            "123",
+            "$123.45",
+            "-$1,000.00",
+            "($123)",
+            "$-123",
+            "  12  ",
+            "",
+        ] {
+            assert!(validate_money(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in ["hello", "(1,2]", "1.2.3"] {
+            assert!(validate_money(bad).is_err(), "{bad:?} should be invalid");
+        }
+        assert_eq!(
+            validate_money("9999999999999999999999").unwrap_err(),
+            "value \"9999999999999999999999\" is out of range for type money"
+        );
+    }
+
+    #[test]
+    fn inet_inputs() {
+        for ok in [
+            "192.168.0.1",
+            "192.168.0.1/24",
+            "::1",
+            "fe80::1/64",
+            "::ffff:192.168.0.1",
+            "1:2:3:4:5:6:7:8",
+        ] {
+            assert!(validate_inet(ok, false).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in [
+            "42",
+            "192.168",
+            "256.1.1.1",
+            "192.168.0.1/33",
+            "hello",
+            "1:2:3:4:5:6:7:8:9",
+            "1::2::3",
+        ] {
+            assert!(
+                validate_inet(bad, false).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        for ok in ["10/8", "10.1/16", "192.168.0.0/24"] {
+            assert!(
+                validate_inet(ok, true).is_ok(),
+                "{ok:?} should be valid cidr"
+            );
+        }
+        assert!(validate_inet("x/8", true).is_err());
+    }
+
+    #[test]
+    fn macaddr_inputs() {
+        for ok in [
+            "aa:bb:cc:dd:ee:ff",
+            "aa-bb-cc-dd-ee-ff",
+            "aabb.ccdd.eeff",
+            "aabbccddeeff",
+        ] {
+            assert!(
+                validate_macaddr(ok, false).is_ok(),
+                "{ok:?} should be valid"
+            );
+        }
+        for bad in ["aa:bb:cc:dd:ee", " 42 ", "hello", "zz:bb:cc:dd:ee:ff"] {
+            assert!(
+                validate_macaddr(bad, false).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        assert!(validate_macaddr("aa:bb:cc:dd:ee:ff:00:11", true).is_ok());
+        assert!(validate_macaddr("aa:bb:cc:dd:ee:ff", true).is_ok());
+    }
+
+    #[test]
+    fn geometric_inputs() {
+        for (ok, ty) in [
+            ("(1,2)", "point"),
+            ("1,2", "point"),
+            ("(NaN,NaN)", "point"),
+            ("(1.5e3,-2)", "point"),
+            ("((0,0),(1,1))", "box"),
+            ("[(0,0),(1,1)]", "lseg"),
+            ("<(0,0),5>", "circle"),
+            ("{1,2,3}", "line"),
+            ("((0,0),(1,1),(2,0))", "polygon"),
+            ("(1,2)", "path"),
+        ] {
+            assert!(
+                validate_geometric(ok, ty).is_ok(),
+                "{ok:?}::{ty} should be valid"
+            );
+        }
+        for (bad, ty) in [
+            ("3.14", "point"),
+            ("hello", "point"),
+            (" 42 ", "box"),
+            ("(1,2)", "lseg"),
+            ("(1,2)", "circle"),
+            ("{1,2}", "line"),
+            ("(1,2,3)", "path"),
+        ] {
+            assert!(
+                validate_geometric(bad, ty).is_err(),
+                "{bad:?}::{ty} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn system_id_inputs() {
+        assert!(validate_tid("(0,1)").is_ok());
+        assert!(validate_tid("(0)").is_err());
+        assert!(validate_tid("42").is_err());
+        assert!(validate_pg_lsn("0/0").is_ok());
+        assert!(validate_pg_lsn("AB/CDEF1234").is_ok());
+        assert!(validate_pg_lsn("0").is_err());
+        assert!(validate_pg_lsn("X/Y").is_err());
+        assert!(validate_xid("42", "xid").is_ok());
+        assert!(validate_xid("0x10", "xid").is_ok());
+        assert!(validate_xid("ff", "xid").is_err());
     }
 
     #[test]
