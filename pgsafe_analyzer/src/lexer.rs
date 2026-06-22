@@ -767,4 +767,205 @@ mod tests {
             .unwrap();
         assert_eq!(out.original_offset(post), orig);
     }
+
+    // ---- Comments ----
+    //
+    // PostgreSQL has two comment forms: line comments (`-- ...` to end of line)
+    // and block comments (`/* ... */`), and — unlike standard SQL — block
+    // comments *nest*. The lexer must (a) ignore `$name`/`$..` inside any
+    // comment, (b) preserve the comment text verbatim in the output SQL (so
+    // `pg_query` sees an equivalent statement), and (c) not treat comment
+    // markers as comments when they appear inside strings, dollar-quotes, or
+    // quoted identifiers (and vice-versa).
+
+    #[test]
+    fn line_comment_preserved_in_output() {
+        // No params: the comment text survives verbatim in the rewritten SQL.
+        let out = lex("SELECT 1 -- hello world\nFROM t").unwrap();
+        assert_eq!(out.sql, "SELECT 1 -- hello world\nFROM t");
+        assert!(out.params.is_empty());
+    }
+
+    #[test]
+    fn line_comment_at_eof_without_newline() {
+        // A line comment that runs to EOF (no closing newline) is valid, not an
+        // unclosed-token error.
+        let out = lex("SELECT 1 -- trailing comment").unwrap();
+        assert_eq!(out.sql, "SELECT 1 -- trailing comment");
+        assert!(out.params.is_empty());
+    }
+
+    #[test]
+    fn line_comment_ends_at_newline() {
+        // The newline closes the comment; a param on the next line is live.
+        let out = lex("SELECT 1 -- $ignored\n WHERE id = $id").unwrap();
+        assert_eq!(out.sql, "SELECT 1 -- $ignored\n WHERE id = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn comment_at_start_of_query() {
+        let out = lex("-- leading comment\nSELECT $id").unwrap();
+        assert_eq!(out.sql, "-- leading comment\nSELECT $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn multiple_line_comments() {
+        let out = lex("SELECT 1 -- $a\n-- $b\nWHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn block_comment_preserved_in_output() {
+        let out = lex("SELECT /* hello */ 1").unwrap();
+        assert_eq!(out.sql, "SELECT /* hello */ 1");
+        assert!(out.params.is_empty());
+    }
+
+    #[test]
+    fn block_comment_multiline() {
+        let out = lex("SELECT /* line one\n   line two */ 1 WHERE id = $id").unwrap();
+        assert_eq!(
+            out.sql,
+            "SELECT /* line one\n   line two */ 1 WHERE id = $1"
+        );
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn block_comment_between_tokens() {
+        // No surrounding whitespace required.
+        let out = lex("SELECT/* c */1").unwrap();
+        assert_eq!(out.sql, "SELECT/* c */1");
+        assert!(out.params.is_empty());
+    }
+
+    #[test]
+    fn nested_block_comment() {
+        let out = lex("SELECT /* a /* b */ c */ 1 WHERE id = $id").unwrap();
+        assert_eq!(out.sql, "SELECT /* a /* b */ c */ 1 WHERE id = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn deeply_nested_block_comment() {
+        let out = lex("SELECT /* 1 /* 2 /* 3 */ 2 */ 1 */ $id").unwrap();
+        assert_eq!(out.sql, "SELECT /* 1 /* 2 /* 3 */ 2 */ 1 */ $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn param_in_nested_block_comment_ignored() {
+        let out = lex("SELECT /* outer /* $inner */ $middle */ $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn unclosed_nested_block_comment_error() {
+        // Inner `*/` closes one level, leaving the outer `/*` open.
+        let err = lex("SELECT /* outer /* inner */").unwrap_err();
+        assert!(matches!(err, LexError::UnclosedBlockComment { .. }));
+    }
+
+    #[test]
+    fn spread_in_line_comment_ignored() {
+        let out = lex("INSERT INTO t -- $..items\nVALUES ($id)").unwrap();
+        assert!(out.spreads.is_empty());
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn spread_in_block_comment_ignored() {
+        let out = lex("INSERT INTO t /* $..items { a, b } */ VALUES ($id)").unwrap();
+        assert!(out.spreads.is_empty());
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    // ---- Comment markers that should NOT start a comment ----
+
+    #[test]
+    fn block_open_inside_line_comment_is_not_a_block() {
+        // `/*` inside a line comment is plain text; the newline still closes the
+        // line comment, and there is no dangling open block at EOF.
+        let out = lex("SELECT 1 -- /* not a block\nWHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn line_marker_inside_block_comment_is_ignored() {
+        // `--` inside a block comment does not change anything; `*/` still closes.
+        let out = lex("SELECT /* -- $x still in block */ 1 WHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn line_marker_inside_string_is_not_a_comment() {
+        let out = lex("SELECT '-- not a comment $x' WHERE id = $id").unwrap();
+        assert_eq!(out.sql, "SELECT '-- not a comment $x' WHERE id = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn block_marker_inside_string_is_not_a_comment() {
+        let out = lex("SELECT '/* not a comment $x */' WHERE id = $id").unwrap();
+        assert_eq!(out.sql, "SELECT '/* not a comment $x */' WHERE id = $1");
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn line_marker_inside_dollar_quote_is_not_a_comment() {
+        let out = lex("SELECT $$ -- $x not a comment $$ WHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn block_marker_inside_dollar_quote_is_not_a_comment() {
+        let out = lex("SELECT $$ /* $x not a comment */ $$ WHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn comment_markers_inside_quoted_identifier_are_not_comments() {
+        let out = lex("SELECT \"-- /* weird col */\" FROM t WHERE id = $id").unwrap();
+        assert_eq!(
+            out.sql,
+            "SELECT \"-- /* weird col */\" FROM t WHERE id = $1"
+        );
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn dollar_quote_marker_inside_line_comment_is_inert() {
+        // `$$` inside a line comment must not open a dollar-quote; the newline
+        // closes the comment and the following param stays live.
+        let out = lex("SELECT 1 -- $$ not a dollar quote\nWHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn string_marker_inside_block_comment_is_inert() {
+        // A lone `'` inside a block comment must not open a string literal — the
+        // `*/` still closes the comment and the trailing param stays live.
+        let out = lex("SELECT /* it's fine $x */ 1 WHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+    }
 }
