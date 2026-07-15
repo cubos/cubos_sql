@@ -42,7 +42,7 @@ use crate::config::Config;
 /// Changing its value is what forces Cargo to recompile the consuming crate
 /// (and thus re-run every `sql!`). The macro does not need to read it — the
 /// recompilation alone re-runs the macros from scratch.
-const FINGERPRINT_ENV: &str = "PGSAFE_MIGRATIONS_FINGERPRINT";
+const FINGERPRINT_ENV: &str = "TYPEDPG_MIGRATIONS_FINGERPRINT";
 
 /// Wire migration files into Cargo's change-detection so `sql!` is re-checked
 /// whenever they change.

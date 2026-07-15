@@ -116,7 +116,7 @@ struct RecordType {
     /// The PG type this struct represents — a [`Type::Composite`] or
     /// [`Type::AnonymousRecord`]. Used as the dedup key.
     pg_type: Type,
-    /// Generated struct name, e.g. `__PgsafeRecord0`.
+    /// Generated struct name, e.g. `__TypedpgRecord0`.
     ident: proc_macro2::Ident,
     /// Decomposed fields, in declaration order.
     fields: Vec<RecordField>,
@@ -178,7 +178,7 @@ impl RecordRegistry {
         if self.types.iter().any(|rt| &rt.pg_type == ty) {
             return;
         }
-        let ident = format_ident!("__PgsafeRecord{}", self.types.len());
+        let ident = format_ident!("__TypedpgRecord{}", self.types.len());
         self.types.push(RecordType {
             pg_type: ty.clone(),
             ident,
