@@ -14,13 +14,13 @@
 #   scripts/run-pg-sanity.sh --run-ignored all -E 'test(fuzz_analyze_against_pg)'
 #
 # Extra args are appended to the default
-# `--release --features pg_sanity -p pgsafe_analyzer` invocation — callers
+# `--release --features pg_sanity -p typedpg_analyzer` invocation — callers
 # only pass filters / extra nextest flags, never the boilerplate.
 
 set -euo pipefail
 
 PG_IMAGE="${PG_IMAGE:-postgres:18}"
-CONTAINER_NAME="pgsafe-pg-sanity-$$"
+CONTAINER_NAME="typedpg-pg-sanity-$$"
 PG_USER="postgres"
 PG_PASS="postgres"
 PG_DB="postgres"
@@ -81,4 +81,4 @@ echo "pg_sanity: running tests..."
 # Defaults always apply; extra args (filters, --run-ignored, -E …) are
 # appended. Repeating `-p`/`--features` from the command line is harmless —
 # cargo merges duplicates.
-cargo nextest run --release --features pg_sanity -p pgsafe_analyzer "$@"
+cargo nextest run --release --features pg_sanity -p typedpg_analyzer "$@"

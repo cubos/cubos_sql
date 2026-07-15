@@ -1,0 +1,21 @@
+[package]
+name = "typedpg_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Shared types between typedpg runtime and proc macro"
+keywords = ["postgres", "postgresql", "sql", "typedpg"]
+categories = ["database"]
+
+[dependencies]
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+sha2 = "0.11"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

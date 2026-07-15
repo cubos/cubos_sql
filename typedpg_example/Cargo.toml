@@ -1,0 +1,21 @@
+[package]
+name = "typedpg_example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+typedpg = { path = "../typedpg" }
+deadpool-postgres = "0.14"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+chrono = "0.4"
+
+# Same crate + features as the runtime dependency, so Cargo reuses the
+# compiled artifact instead of building it twice. `build.rs` calls
+# `typedpg::build::track_migrations()` to rebuild when migrations change.
+[build-dependencies]
+typedpg = { path = "../typedpg" }
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"

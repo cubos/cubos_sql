@@ -1791,135 +1791,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgsafe"
-version = "0.1.0"
-dependencies = [
- "bb8",
- "bb8-postgres",
- "bytes",
- "chrono",
- "deadpool-postgres",
- "libc",
- "md5",
- "pgsafe_core",
- "pgsafe_macros",
- "rust_decimal",
- "serde",
- "serde_json",
- "tempfile",
- "testcontainers",
- "testcontainers-modules",
- "thiserror 2.0.18",
- "tokio",
- "tokio-postgres",
- "uuid",
-]
-
-[[package]]
-name = "pgsafe_analyzer"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytes",
- "pg_query",
- "pgsafe_analyzer",
- "pgsafe_core",
- "postgres",
- "prost 0.13.5",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "serde_tuple",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "pgsafe_cli"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "dotenvy",
- "native-tls",
- "pgsafe",
- "pgsafe_core",
- "postgres-native-tls",
- "tokio",
- "tokio-postgres",
-]
-
-[[package]]
-name = "pgsafe_core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
-name = "pgsafe_e2e"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "deadpool-postgres",
- "libc",
- "pgsafe",
- "pgsafe_core",
- "pgvector",
- "rust_decimal",
- "serde",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-postgres",
- "uuid",
-]
-
-[[package]]
-name = "pgsafe_example"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "deadpool-postgres",
- "pgsafe",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "pgsafe_macros"
-version = "0.1.0"
-dependencies = [
- "pgsafe_analyzer",
- "pgsafe_core",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "sha2",
- "syn 2.0.118",
- "tempfile",
-]
-
-[[package]]
-name = "pgsafe_seed"
-version = "0.1.0"
-dependencies = [
- "pgsafe_analyzer",
- "postgres",
- "serde",
- "serde_json",
- "testcontainers",
- "testcontainers-modules",
-]
-
-[[package]]
 name = "pgvector"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3293,6 +3164,135 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "typedpg"
+version = "0.1.0"
+dependencies = [
+ "bb8",
+ "bb8-postgres",
+ "bytes",
+ "chrono",
+ "deadpool-postgres",
+ "libc",
+ "md5",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "typedpg_core",
+ "typedpg_macros",
+ "uuid",
+]
+
+[[package]]
+name = "typedpg_analyzer"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "pg_query",
+ "postgres",
+ "prost 0.13.5",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "serde_tuple",
+ "tempfile",
+ "thiserror 2.0.18",
+ "typedpg_analyzer",
+ "typedpg_core",
+]
+
+[[package]]
+name = "typedpg_cli"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dotenvy",
+ "native-tls",
+ "postgres-native-tls",
+ "tokio",
+ "tokio-postgres",
+ "typedpg",
+ "typedpg_core",
+]
+
+[[package]]
+name = "typedpg_core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "typedpg_e2e"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "deadpool-postgres",
+ "libc",
+ "pgvector",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-postgres",
+ "typedpg",
+ "typedpg_core",
+ "uuid",
+]
+
+[[package]]
+name = "typedpg_example"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "deadpool-postgres",
+ "serde",
+ "tokio",
+ "typedpg",
+]
+
+[[package]]
+name = "typedpg_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syn 2.0.118",
+ "tempfile",
+ "typedpg_analyzer",
+ "typedpg_core",
+]
+
+[[package]]
+name = "typedpg_seed"
+version = "0.1.0"
+dependencies = [
+ "postgres",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "typedpg_analyzer",
+]
 
 [[package]]
 name = "typenum"

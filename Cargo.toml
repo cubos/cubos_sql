@@ -1,12 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
-    "pgsafe",
-    "pgsafe_core",
-    "pgsafe_macros",
-    "pgsafe_analyzer",
-    "pgsafe_cli",
-    "pgsafe_example",
-    "pgsafe_e2e",
-    "pgsafe_seed",
+    "typedpg",
+    "typedpg_core",
+    "typedpg_macros",
+    "typedpg_analyzer",
+    "typedpg_cli",
+    "typedpg_example",
+    "typedpg_e2e",
+    "typedpg_seed",
 ]
+
+# Shared metadata inherited by the publishable crates via `<field>.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubos/typedpg"
+homepage = "https://github.com/cubos/typedpg"
+authors = ["Cubos"]

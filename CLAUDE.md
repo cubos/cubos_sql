@@ -12,12 +12,12 @@ than the extra build time costs).
 
 ```bash
 cargo build                                          # build all crates
-cargo build -p pgsafe                             # build specific crate
+cargo build -p typedpg                             # build specific crate
 cargo nextest run --release                          # all tests (no Docker needed)
-cargo nextest run --release -p pgsafe_core        # core crate only
-cargo nextest run --release -p pgsafe_macros      # macro crate only
-cargo nextest run --release -p pgsafe_analyzer    # analyzer crate only
-cargo nextest run --release -p pgsafe             # runtime crate only
+cargo nextest run --release -p typedpg_core        # core crate only
+cargo nextest run --release -p typedpg_macros      # macro crate only
+cargo nextest run --release -p typedpg_analyzer    # analyzer crate only
+cargo nextest run --release -p typedpg             # runtime crate only
 cargo nextest run --release --test migrate_integration  # integration tests (requires Docker)
 cargo nextest run --release test_name                # run a single test by name
 ```
@@ -28,13 +28,13 @@ Note: doctests are not supported by nextest — for those, fall back to `cargo t
 
 ## Regenerating `seed.json`
 
-Never hand-migrate `pgsafe_analyzer/src/seed.json` (e.g. with a Python
+Never hand-migrate `typedpg_analyzer/src/seed.json` (e.g. with a Python
 script) when changing catalog struct shapes. The seed loader tolerates empty
-or stale seeds — `pgsafe_seed` exports the catalog from a live PG via
+or stale seeds — `typedpg_seed` exports the catalog from a live PG via
 testcontainers and overwrites the file. Always regenerate by running:
 
 ```bash
-cargo run -p pgsafe_seed   # requires Docker; takes ~10 seconds
+cargo run -p typedpg_seed   # requires Docker; takes ~10 seconds
 ```
 
 Hand-rewriting the seed risks subtle FK drift (e.g. an old aggfinaltype
@@ -46,19 +46,19 @@ are expected).
 Workspace with crates:
 
 ```
-pgsafe_cli (binary: `cargo sql migrate up/down/status/create`)
-    └── pgsafe (runtime: Pool, Executor, migrate)
-            ├── pgsafe_core (shared config only — kept small so runtime does not pull pg_query)
-            └── pgsafe_macros (proc macro: sql!)
-                    ├── pgsafe_core
-                    └── pgsafe_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
+typedpg_cli (binary: `cargo typedpg migrate up/down/status/create`)
+    └── typedpg (runtime: Pool, Executor, migrate)
+            ├── typedpg_core (shared config only — kept small so runtime does not pull pg_query)
+            └── typedpg_macros (proc macro: sql!)
+                    ├── typedpg_core
+                    └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
 ```
 
 ### Compile-time pipeline (`sql!` macro)
 
 1. Parse macro input: `sql!(executor, "SQL with $params", name = value)`
-2. Lex SQL via `pgsafe_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
-3. Load config from `[package.metadata.pgsafe]` in consumer's `Cargo.toml`
+2. Lex SQL via `typedpg_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
+3. Load config from `[package.metadata.typedpg]` in consumer's `Cargo.toml`
 4. Build schema snapshot from seed + migrations via DDL interpreter (in-memory, no Docker)
 5. Static analysis: parse SQL with `pg_query`, resolve types and nullability against snapshot
 6. `codegen::generate()` — emit anonymous output struct, typed query builder, `.fetch_all()/.fetch_one()/.fetch_optional()/.execute()` methods
@@ -71,20 +71,20 @@ pgsafe_cli (binary: `cargo sql migrate up/down/status/create`)
 
 ## Configuration
 
-Users configure via `[package.metadata.pgsafe]` in their `Cargo.toml`:
+Users configure via `[package.metadata.typedpg]` in their `Cargo.toml`:
 
 ```toml
-[package.metadata.pgsafe.database]
+[package.metadata.typedpg.database]
 migrations = "./migrations"
 
-[package.metadata.pgsafe.migrations]
+[package.metadata.typedpg.migrations]
 table = "public._migrations"
 lock_id = 713705
 use_transaction = true
 
 # Single unified type map. The `sql!` macro infers the (de)serialization
 # strategy from each PG type's kind: JSONB domain, enum, composite, or scalar.
-[package.metadata.pgsafe.types]
+[package.metadata.typedpg.types]
 user_preferences = "crate::domains::UserPreferences"  # JSONB domain
 post_status = "crate::PostStatus"                     # enum
 "public.address" = "crate::Address"                   # composite type
@@ -97,9 +97,9 @@ The `sql!` macro is wired end-to-end with static analysis (no Docker needed at c
 ## Differential testing (`pg_sanity`) & the error-message contract
 
 The `pg_sanity` feature mirrors every `apply_sql` / `analyze` onto a real
-PostgreSQL and asserts they agree (see `pgsafe_analyzer/src/pg_sanity.rs`,
+PostgreSQL and asserts they agree (see `typedpg_analyzer/src/pg_sanity.rs`,
 run via `scripts/run-pg-sanity.sh`). A differential fuzzer
-(`pgsafe_analyzer/tests/fuzz.rs`, `#[ignore]`d) generates queries to surface
+(`typedpg_analyzer/tests/fuzz.rs`, `#[ignore]`d) generates queries to surface
 new disagreements automatically.
 
 **Error-message contract — single-error fidelity only.** When the analyzer
@@ -140,7 +140,7 @@ Never format a qualified PG identifier with `format!("{schema}.{name}")` or
 loses the round-trip guarantee — `"foo.bar".baz` and `foo."bar.baz"` would
 collide on a plain `format!`.
 
-Always use `pgsafe_core::QualifiedName::new(schema, name).to_string()`
+Always use `typedpg_core::QualifiedName::new(schema, name).to_string()`
 (or pass the `QualifiedName` directly to `format!("{}", qn)`). The
 `Display` impl handles the quoting and is the canonical way to render
 these names — including in error messages that must match PG verbatim.

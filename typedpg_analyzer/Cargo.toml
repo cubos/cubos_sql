@@ -1,0 +1,40 @@
+[package]
+name = "typedpg_analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Static SQL type and nullability analyzer for typedpg"
+keywords = ["postgres", "postgresql", "sql", "static-analysis", "types"]
+categories = ["database"]
+
+[features]
+internal = []
+# Cross-check every `apply_sql` / `analyze` call against a real PostgreSQL
+# server. Each `PgCatalog` creates its own scratch database inside the
+# shared cluster pointed to by `POSTGRES_URL` and tears it down on Drop.
+# Spin up the cluster + run tests via `scripts/run-pg-sanity.sh`.
+pg_sanity = ["dep:postgres", "dep:bytes"]
+
+[dependencies]
+typedpg_core = { path = "../typedpg_core", version = "0.1.0" }
+pg_query = "6"
+prost = "0.13"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_tuple = "1"
+thiserror = "2"
+postgres = { version = "0.19", optional = true }
+bytes = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+typedpg_analyzer = { path = ".", features = ["internal"] }
+# Used by the differential fuzzer (tests/fuzz.rs, only active under the
+# `pg_sanity` feature): pg_query to parse/mutate/deparse the AST, rand for
+# seeded query generation.
+pg_query = "6"
+rand = "0.10"
