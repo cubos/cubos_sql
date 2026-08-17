@@ -214,7 +214,7 @@ pub(crate) fn fuse(
 /// contract requires our message to *start with* PG's verbatim text, so for the
 /// `Parse` variant we return the inner string unwrapped; other variants keep
 /// their full `Display`.
-pub(crate) fn parse_error_message(e: &pg_query::Error) -> String {
+fn parse_error_message(e: &pg_query::Error) -> String {
     match e {
         pg_query::Error::Parse(msg) => msg.clone(),
         other => other.to_string(),

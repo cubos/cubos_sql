@@ -115,7 +115,7 @@ pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError
 }
 
 /// Dispatch a single parsed statement.
-pub(crate) fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
     match stmt {
         // ── Tables ──────────────────────────────────────────────────
         node::Node::CreateStmt(s) => tables::create_table(db, s),

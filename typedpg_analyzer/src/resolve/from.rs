@@ -193,7 +193,7 @@ pub(crate) fn process_from_item(
 ///
 /// Also honors `WITH ORDINALITY` by adding a trailing `ordinality BIGINT NOT NULL`
 /// column when the flag is set.
-pub(crate) fn process_range_function(
+fn process_range_function(
     rf: &protobuf::RangeFunction,
     scope: &mut Scope,
     snapshot: &PgCatalog,

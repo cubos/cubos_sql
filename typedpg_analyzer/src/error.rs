@@ -206,7 +206,11 @@ impl AnalyzeError {
     /// 42804/42846 depending on context) and for purely internal failures.
     /// The `pg_sanity` oracle compares this against the live server's
     /// `DbError::code()` whenever it is `Some`.
-    pub fn sqlstate(&self) -> Option<&'static str> {
+    ///
+    /// Only that oracle and the `pgmsg` unit tests consult it, so a plain
+    /// build legitimately has no caller.
+    #[cfg_attr(not(any(test, feature = "pg_sanity")), allow(dead_code))]
+    pub(crate) fn sqlstate(&self) -> Option<&'static str> {
         use AnalyzeError::*;
         match self {
             Lex(_) | Parse(_) | SyntaxError(_) => Some("42601"),
@@ -276,7 +280,7 @@ pub(crate) struct DiagContext<'a> {
 
 impl<'a> DiagContext<'a> {
     /// Render the given raw error into an `AnalyzeError` using this context.
-    pub(crate) fn render(&self, raw: RawError) -> AnalyzeError {
+    fn render(&self, raw: RawError) -> AnalyzeError {
         raw.into_analyze(self.sql_original, self.lex_output)
     }
 }
@@ -337,7 +341,7 @@ impl Drop for DiagContextGuard<'_> {
 
 /// Run `f` with the topmost `DiagContext` from TLS, or `None` if none is
 /// installed. The borrow guarantees the pointers in TLS are still valid.
-pub(crate) fn with_diag_ctx<R>(f: impl FnOnce(Option<DiagContext>) -> R) -> R {
+fn with_diag_ctx<R>(f: impl FnOnce(Option<DiagContext>) -> R) -> R {
     DIAG_TLS.with(|tls| {
         let slots = tls.borrow();
         match slots.last() {
@@ -371,7 +375,7 @@ impl SourceSpan {
     /// `sql` is the post-lex SQL (the same coordinate space `RangeVar.location`
     /// uses). Returns `None` if `start` is past end-of-input or doesn't begin
     /// with an identifier character.
-    pub(crate) fn at_qualified_name(sql: &str, start: usize) -> Option<Self> {
+    fn at_qualified_name(sql: &str, start: usize) -> Option<Self> {
         let end = scan_qualified_name(sql.as_bytes(), start)?;
         Some(Self::new(start, end))
     }
@@ -627,7 +631,7 @@ impl RawError {
     /// with no span information attached. Used by `?` for `LexError`,
     /// `std::io::Error`, `serde_json::Error`, and direct constructions of
     /// variants we have not migrated yet.
-    pub(crate) fn passthrough(e: AnalyzeError) -> Self {
+    fn passthrough(e: AnalyzeError) -> Self {
         Self {
             kind: e,
             primary: None,
@@ -843,7 +847,7 @@ impl RawError {
 
     /// Render using an optional context. When `ctx` is `None`, no snippet or
     /// hint is rendered and the variant is returned as-is.
-    pub(crate) fn finalize(self, ctx: Option<DiagContext>) -> AnalyzeError {
+    fn finalize(self, ctx: Option<DiagContext>) -> AnalyzeError {
         match ctx {
             Some(c) => c.render(self),
             None => self.kind,
@@ -861,7 +865,7 @@ impl RawError {
     ///
     /// `sql_original` is the SQL exactly as the user wrote it; `lex_output`
     /// provides the post-lex → original offset translation.
-    pub(crate) fn into_analyze(
+    fn into_analyze(
         self,
         sql_original: &str,
         lex_output: &crate::param::LexOutput,

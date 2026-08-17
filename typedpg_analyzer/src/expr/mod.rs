@@ -965,7 +965,7 @@ use sublink::*;
 /// each call against `pg_proc` (`prokind == 'a'`) — so extension-provided or
 /// user-defined aggregates are recognized too, not just a hardcoded builtin
 /// list.
-pub(crate) fn has_aggregate_target(target_list: &[protobuf::Node], snapshot: &PgCatalog) -> bool {
+fn has_aggregate_target(target_list: &[protobuf::Node], snapshot: &PgCatalog) -> bool {
     target_list.iter().any(|node| {
         if let Some(node::Node::ResTarget(res)) = node.node.as_ref()
             && let Some(val) = &res.val
@@ -988,7 +988,7 @@ pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
 }
 
 /// Resolve a TypeName to a type OID.
-pub(crate) fn resolve_type_name(
+fn resolve_type_name(
     type_name: Option<&protobuf::TypeName>,
     snapshot: &PgCatalog,
 ) -> Result<PgTypeOid, AnalyzeError> {

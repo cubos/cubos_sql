@@ -169,7 +169,7 @@ pub struct PgCatalog {
     pub(crate) pg_constraint: HashMap<PgConstraintOid, PgConstraint>,
     /// Keyed by `indexrelid` (the index's `pg_class.oid`).
     pub(crate) pg_index: HashMap<PgClassOid, PgIndex>,
-    pub(crate) pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
+    pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
     pub(crate) pg_collation: HashMap<PgCollationOid, PgCollation>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
@@ -192,7 +192,7 @@ pub struct PgCatalog {
     // ── Session state (non-PG) ──
     /// Namespace OIDs in search order (analog of PG's `search_path` GUC).
     pub(crate) search_path: Vec<PgNamespaceOid>,
-    pub(crate) next_oid: std::num::NonZeroU32,
+    next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
     /// cross-check `apply_sql` / `analyze` against a real PG protocol server.
@@ -201,7 +201,7 @@ pub struct PgCatalog {
     /// The outer `Arc` lets `Clone` share one server across catalog clones —
     /// only the macro caches a clone, and it never enables `pg_sanity`.
     #[cfg(feature = "pg_sanity")]
-    pub(crate) pg_sanity: Option<
+    pg_sanity: Option<
         std::sync::Arc<std::sync::OnceLock<std::sync::Mutex<crate::pg_sanity::PgSanityServer>>>,
     >,
 
@@ -210,7 +210,7 @@ pub struct PgCatalog {
     /// natively, so once an extension is in play the sanity check skips
     /// every later mirror call to avoid spurious panics.
     #[cfg(feature = "pg_sanity")]
-    pub(crate) pg_sanity_tainted: bool,
+    pg_sanity_tainted: bool,
 
     /// Per-catalog opt-out: tests that exercise behavior PG sanity can't
     /// validate (e.g. ON CONFLICT planner-level checks that the wire-level
@@ -218,11 +218,11 @@ pub struct PgCatalog {
     /// to silence the sanity check without giving up the compile-time
     /// analyzer assertion.
     #[cfg(feature = "pg_sanity")]
-    pub(crate) pg_sanity_skip: bool,
+    pg_sanity_skip: bool,
 }
 
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
-pub(crate) const USER_OID_START: u32 = 100_000;
+const USER_OID_START: u32 = 100_000;
 
 /// A relation and its columns — `(relname, [(attname, atttypid, attnotnull)])`
 /// — as surfaced by [`PgCatalog::iter_relations`] for the differential fuzzer.
@@ -232,11 +232,10 @@ pub type FuzzRelation = (String, Vec<(String, PgTypeOid, bool)>);
 /// `USER_OID_START` as a [`NonZeroU32`]. Validated at compile time so the
 /// `next_oid` counter can be a `NonZeroU32` from construction onward without
 /// a runtime check at each `alloc_oid` call.
-pub(crate) const USER_OID_START_NZ: std::num::NonZeroU32 =
-    match std::num::NonZeroU32::new(USER_OID_START) {
-        Some(v) => v,
-        None => panic!("USER_OID_START must be non-zero"),
-    };
+const USER_OID_START_NZ: std::num::NonZeroU32 = match std::num::NonZeroU32::new(USER_OID_START) {
+    Some(v) => v,
+    None => panic!("USER_OID_START must be non-zero"),
+};
 
 // ─── Construction ──────────────────────────────────────────────────────────
 
@@ -388,7 +387,7 @@ impl PgCatalog {
     /// Build an empty catalog (no seed). Reserved for the view-AST rewrite
     /// walker, which needs a placeholder handle when descending into
     /// subselects whose RangeVars are already fully qualified.
-    pub(crate) fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             pg_namespace: HashMap::new(),
             pg_type: HashMap::new(),
@@ -1190,15 +1189,6 @@ impl PgCatalog {
         self.pg_rewrite.values().find_map(|r| {
             (r.ev_class == view_oid && r.rulename == "_RETURN").then_some(&r.ev_action)
         })
-    }
-
-    /// Replace the SELECT body for a view (the `_RETURN` rule). Tests use
-    /// this to simulate a legacy snapshot whose `_RETURN` rule was never
-    /// populated.
-    #[cfg(any(test, feature = "internal"))]
-    pub fn clear_view_body(&mut self, view_oid: PgClassOid) {
-        self.pg_rewrite
-            .retain(|_, r| !(r.ev_class == view_oid && r.rulename == "_RETURN"));
     }
 
     /// Drop every `pg_index` row whose `indrelid` is `relid` and return the

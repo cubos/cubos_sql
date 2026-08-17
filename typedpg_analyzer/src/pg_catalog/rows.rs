@@ -491,18 +491,18 @@ pub struct PgClass {
 /// rule.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgRewrite {
-    pub oid: PgRewriteOid,
-    pub rulename: String,
+    pub(crate) oid: PgRewriteOid,
+    pub(crate) rulename: String,
     /// FK `pg_class.oid` — the relation the rule is attached to.
-    pub ev_class: PgClassOid,
-    pub ev_type: EvType,
-    pub ev_enabled: EvEnabled,
-    pub is_instead: bool,
+    pub(crate) ev_class: PgClassOid,
+    pub(crate) ev_type: EvType,
+    pub(crate) ev_enabled: EvEnabled,
+    pub(crate) is_instead: bool,
     /// Optional WHERE clause attached to the rule. Always `None` for
     /// views' `_RETURN`.
-    pub ev_qual: Option<SerializedAst>,
+    pub(crate) ev_qual: Option<SerializedAst>,
     /// The rule body. For views/matviews this is the SELECT AST.
-    pub ev_action: SerializedAst,
+    pub(crate) ev_action: SerializedAst,
 }
 
 /// Bundle of a protobuf-encoded `pg_query::Node` plus the per-name-slot
@@ -523,7 +523,7 @@ pub struct SerializedAst {
     #[serde(with = "serde_base64")]
     pub ast: Vec<u8>,
     /// One entry per name slot, walked in lockstep with the AST.
-    pub bindings: Vec<AstBinding>,
+    pub(crate) bindings: Vec<AstBinding>,
 }
 
 /// One resolved name slot in a stored view AST.
@@ -710,7 +710,7 @@ pub struct PgDepend {
 /// Serde adapter that encodes `Vec<u8>` as a base64 string in JSON while
 /// keeping it as a plain byte buffer in memory. Used by
 /// [`PgClass::relviewdef`] so view ASTs don't blow up the seed JSON.
-pub(crate) mod serde_base64 {
+mod serde_base64 {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 

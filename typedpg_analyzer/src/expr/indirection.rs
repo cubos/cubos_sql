@@ -238,10 +238,7 @@ pub(crate) fn infer_indirection(
 /// carrying named output columns (set when its producing expression was a
 /// FuncCall with `out_args`). Returns `None` if the ref doesn't resolve or
 /// the column isn't a record.
-pub(crate) fn column_ref_record_fields(
-    cr: &protobuf::ColumnRef,
-    scope: &Scope,
-) -> Option<Vec<RecordField>> {
+fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<Vec<RecordField>> {
     let parts = extract_string_fields(&cr.fields);
     let (table, column) = match parts.as_slice() {
         [col] => (None, col.as_str()),
@@ -257,7 +254,7 @@ pub(crate) fn column_ref_record_fields(
 /// return them so indirection steps can match against named output columns.
 /// Returns `Ok(None)` when the function has no out_args — the caller should
 /// fall back to generic composite/record handling.
-pub(crate) fn resolve_funccall_out_args(
+fn resolve_funccall_out_args(
     fc: &protobuf::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -311,7 +308,7 @@ pub(crate) fn resolve_funccall_out_args(
 /// composite-column accesses (`(c.col).field`, `((c).x).field`), pass
 /// `None` and the wording switches to PG's `column "f" not found in data
 /// type T`.
-pub(crate) fn resolve_composite_field(
+fn resolve_composite_field(
     current: &ExprType,
     field_name: &str,
     snapshot: &PgCatalog,
@@ -467,7 +464,7 @@ pub(crate) fn infer_array_expr(
 
 /// `arr[i]` — the result is an element of the array. Nullable because SQL
 /// subscripts out of bounds return NULL rather than erroring.
-pub(crate) fn resolve_array_element(
+fn resolve_array_element(
     current: &ExprType,
     snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {

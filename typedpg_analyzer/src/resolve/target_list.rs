@@ -222,7 +222,7 @@ pub(crate) fn analyze_values_lists(
 /// Look up the named output columns (TABLE/OUT args) of `fc`, if any.
 /// Used by the target-list walker so a `SELECT _pg_expandarray(…) AS x`
 /// records the field list on the produced column.
-pub(crate) fn resolve_funccall_record_fields(
+fn resolve_funccall_record_fields(
     fc: &protobuf::FuncCall,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -259,7 +259,7 @@ pub(crate) fn resolve_funccall_record_fields(
 }
 
 /// Try to infer a default column name from an expression (for unaliased columns).
-pub(crate) fn infer_column_name(node: &protobuf::Node) -> Option<String> {
+fn infer_column_name(node: &protobuf::Node) -> Option<String> {
     figure_colname(node).1
 }
 
@@ -275,7 +275,7 @@ pub(crate) fn infer_column_name(node: &protobuf::Node) -> Option<String> {
 /// argument produced a strong one, otherwise it falls back to the type name.
 /// The same rule lets `CASE … ELSE col END` be named after the `ELSE` branch
 /// and `arr[1]` after the subscripted array.
-pub(crate) fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
+fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
     let Some(inner) = node.node.as_ref() else {
         return (0, None);
     };
@@ -387,7 +387,7 @@ pub(crate) fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
 /// an explicit alias, else the target expression's own name). Returns strength
 /// `2` when the target has a name, `(0, None)` otherwise (the subquery is then
 /// `?column?`, exactly as a bare expression would be).
-pub(crate) fn sublink_target_colname(sl: &protobuf::SubLink) -> (i32, Option<String>) {
+fn sublink_target_colname(sl: &protobuf::SubLink) -> (i32, Option<String>) {
     let Some(node::Node::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
     else {
         return (0, None);

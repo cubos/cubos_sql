@@ -30,7 +30,7 @@ pub(crate) fn build_column(
 /// when the OID is the pseudo `record` type (typmod -1 in PG terms). When
 /// `shape` is `Some` and the OID is `record`, we build a `Type::AnonymousRecord`
 /// from the shape recursively. Otherwise falls through to the OID-only path.
-pub(crate) fn resolve_type_with_shape(
+fn resolve_type_with_shape(
     type_oid: PgTypeOid,
     typmod: Option<i32>,
     collation: Option<crate::oid::PgCollationOid>,
@@ -75,7 +75,7 @@ pub(crate) fn build_param_info(
 /// Resolve a [`PgCollationOid`] to a printable name, suppressing the
 /// database default ("default", oid 100). Used when materializing
 /// `Type::Basic` / `Type::Domain` from a column or expression site.
-pub(crate) fn collation_name(
+fn collation_name(
     collation: Option<crate::oid::PgCollationOid>,
     snapshot: &PgCatalog,
 ) -> Option<String> {
@@ -103,7 +103,7 @@ pub(crate) fn collation_name(
 /// expression site. When present, the database default ("default", oid
 /// 100) is suppressed and any other collation is rendered as its name on
 /// `Type::Basic` / `Type::Domain`.
-pub(crate) fn resolve_type(
+fn resolve_type(
     type_oid: PgTypeOid,
     typmod: Option<i32>,
     collation: Option<crate::oid::PgCollationOid>,
@@ -240,7 +240,7 @@ pub(crate) fn resolve_type(
     )))
 }
 
-pub(crate) fn parse_nullability_annotation(name: &str, auto_nullable: bool) -> (String, bool) {
+fn parse_nullability_annotation(name: &str, auto_nullable: bool) -> (String, bool) {
     // PG's placeholder column name `?column?` ends in `?` but isn't a
     // user-supplied nullability annotation — pass it through untouched.
     if name == "?column?" {

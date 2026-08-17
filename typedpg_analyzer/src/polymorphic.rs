@@ -10,17 +10,17 @@ use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 
 // Polymorphic pseudo-type OIDs (stable across PG versions).
-pub(crate) const ANYELEMENT: PgTypeOid = PgTypeOid::from_raw(2283);
-pub(crate) const ANYARRAY: PgTypeOid = PgTypeOid::from_raw(2277);
-pub(crate) const ANYNONARRAY: PgTypeOid = PgTypeOid::from_raw(2776);
-pub(crate) const ANYENUM: PgTypeOid = PgTypeOid::from_raw(3500);
-pub(crate) const ANYRANGE: PgTypeOid = PgTypeOid::from_raw(3831);
-pub(crate) const ANYMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4537);
-pub(crate) const ANYCOMPATIBLE: PgTypeOid = PgTypeOid::from_raw(5077);
-pub(crate) const ANYCOMPATIBLEARRAY: PgTypeOid = PgTypeOid::from_raw(5078);
-pub(crate) const ANYCOMPATIBLENONARRAY: PgTypeOid = PgTypeOid::from_raw(5079);
-pub(crate) const ANYCOMPATIBLERANGE: PgTypeOid = PgTypeOid::from_raw(5080);
-pub(crate) const ANYCOMPATIBLEMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4538);
+const ANYELEMENT: PgTypeOid = PgTypeOid::from_raw(2283);
+const ANYARRAY: PgTypeOid = PgTypeOid::from_raw(2277);
+const ANYNONARRAY: PgTypeOid = PgTypeOid::from_raw(2776);
+const ANYENUM: PgTypeOid = PgTypeOid::from_raw(3500);
+const ANYRANGE: PgTypeOid = PgTypeOid::from_raw(3831);
+const ANYMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4537);
+const ANYCOMPATIBLE: PgTypeOid = PgTypeOid::from_raw(5077);
+const ANYCOMPATIBLEARRAY: PgTypeOid = PgTypeOid::from_raw(5078);
+const ANYCOMPATIBLENONARRAY: PgTypeOid = PgTypeOid::from_raw(5079);
+const ANYCOMPATIBLERANGE: PgTypeOid = PgTypeOid::from_raw(5080);
+const ANYCOMPATIBLEMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4538);
 
 /// The concrete types a polymorphic call binds, one slot per pseudo-type
 /// family. Binding any slot derives the related ones where the catalog
@@ -174,7 +174,7 @@ pub(crate) fn substitute_polymorphic(
 /// int4 → int8). The `anycompatible*` family instead promotes through
 /// `select_common_type` and is not checked here. UNKNOWN actuals are
 /// always consistent — they're coerced to the resolved type afterwards.
-pub(crate) fn binding_consistent(
+fn binding_consistent(
     expected: PgTypeOid,
     actual: PgTypeOid,
     bindings: &PolyBindings,

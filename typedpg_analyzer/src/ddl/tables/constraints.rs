@@ -175,7 +175,7 @@ pub(crate) fn emit_constraints(
 /// both a constraint and an index, sharing one name. Mirror that so DROP
 /// COLUMN / DROP TABLE cascade through `pg_index` and `ON CONFLICT ON
 /// CONSTRAINT name` finds the index by its conname.
-pub(crate) fn emit_constraint_with_backing_index(
+fn emit_constraint_with_backing_index(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     conname: String,
@@ -237,7 +237,7 @@ pub(crate) fn emit_constraint_with_backing_index(
 /// - Target columns are covered exactly by a `PRIMARY KEY` or `UNIQUE`
 ///   constraint on the target relation.
 /// - Local and target column types match (after domain unwrapping).
-pub(crate) fn resolve_fk_target(
+fn resolve_fk_target(
     interp: &PgCatalog,
     c: &pg_query::protobuf::Constraint,
     relname: &str,
@@ -369,7 +369,7 @@ pub(crate) fn resolve_fk_target(
 
 /// Pick a constraint name: explicit one when supplied, otherwise the
 /// PG-style auto-generated form provided by the caller's closure.
-pub(crate) fn constraint_name(explicit: &str, fallback: impl FnOnce() -> String) -> String {
+fn constraint_name(explicit: &str, fallback: impl FnOnce() -> String) -> String {
     if explicit.is_empty() {
         fallback()
     } else {
@@ -833,7 +833,7 @@ pub(crate) fn add_constraint(
 /// and verify its result type is boolean. Used by ALTER TABLE ADD
 /// CONSTRAINT (the CREATE TABLE path uses [`validate_constraint_expressions`]
 /// which sees the full `CreateStmt` shape).
-pub(crate) fn validate_check_expression_for_table(
+fn validate_check_expression_for_table(
     interp: &PgCatalog,
     relid: PgClassOid,
     expr: &pg_query::protobuf::Node,

@@ -512,11 +512,7 @@ pub(crate) fn drop_column(
 /// inherits from `parent_oid`. Skips children that don't carry the column —
 /// they may have it locally or have already had it dropped earlier in the
 /// same operation.
-pub(crate) fn cascade_drop_column_to_children(
-    interp: &mut PgCatalog,
-    parent_oid: PgClassOid,
-    col_name: &str,
-) {
+fn cascade_drop_column_to_children(interp: &mut PgCatalog, parent_oid: PgClassOid, col_name: &str) {
     let direct_children: Vec<PgClassOid> = interp
         .pg_inherits
         .iter()
