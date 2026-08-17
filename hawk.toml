@@ -1,0 +1,24 @@
+# Configuration for `cargo hawk check`, which flags public items that no
+# product actually reaches.
+#
+# Hawk resolves callers inside this workspace, so it needs to be told what
+# ships. `typedpg_example`, `typedpg_e2e` and `typedpg_seed` are absent on
+# purpose: they are a sample app, the integration suite, and a maintainer
+# tool for regenerating `seed.json`, so nothing may stay public merely
+# because one of them uses it.
+#
+# There are deliberately no `[[override]]` entries. An item exposed for
+# library consumers has to prove it from outside the crate -- a doctest
+# does, since it compiles as a separate crate and so cannot see
+# `pub(crate)`. Anything that cannot be exercised that way should lose its
+# `pub` instead of being excused here.
+
+[[production]]
+package = "typedpg"
+lib = "typedpg"
+reason = "the runtime library, published to crates.io"
+
+[[production]]
+package = "typedpg_cli"
+bin = "cargo-typedpg"
+reason = "the `cargo typedpg` subcommand, published to crates.io"
