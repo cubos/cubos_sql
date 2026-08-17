@@ -109,6 +109,8 @@ where
         tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone + Send + Sync + 'static,
     <Tls as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::Stream: Send + Sync,
     <Tls as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::TlsConnect: Send,
+    <<Tls as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::TlsConnect as
+        tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
 {
     async fn query<'a>(
         &'a self,

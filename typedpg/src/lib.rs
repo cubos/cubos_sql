@@ -457,7 +457,7 @@ pub mod __private {
     pub use bytes;
     pub use tokio_postgres;
 
-    use bytes::{Buf, BufMut, BytesMut};
+    use bytes::{Buf, BytesMut};
     use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
     /// Bridge type for PostgreSQL enums.
@@ -556,8 +556,7 @@ pub mod __private {
     //
     // The `sql!` macro synthesizes a Rust struct for every composite column
     // and anonymous `ROW(...)` / subquery record it sees, and emits a manual
-    // `FromSql` impl that drives [`RecordReader`]. The `write_record_*`
-    // helpers implement the reverse direction for future use.
+    // `FromSql` impl that drives [`RecordReader`].
     // -----------------------------------------------------------------------
 
     /// Boxed error used across the record (de)serialization helpers.
@@ -573,19 +572,6 @@ pub mod __private {
             Kind::Composite(_) => true,
             Kind::Domain(inner) => record_accepts(inner),
             _ => *ty == Type::RECORD,
-        }
-    }
-
-    /// Resolve the ordered field list of a composite `ty`, unwrapping domains.
-    ///
-    /// Generated `ToSql` impls call this to learn each field's PG type — the
-    /// OID must be written inline into the wire format, and a per-field
-    /// `Type` is needed to encode the body.
-    pub fn composite_fields(ty: &Type) -> Result<&[tokio_postgres::types::Field], BoxError> {
-        match ty.kind() {
-            Kind::Composite(fields) => Ok(fields),
-            Kind::Domain(inner) => composite_fields(inner),
-            _ => Err(format!("expected a composite type, got `{ty}`").into()),
         }
     }
 
@@ -686,33 +672,6 @@ pub mod __private {
         }
     }
 
-    /// Write the leading `i32` field count of a record value.
-    pub fn write_record_header(out: &mut BytesMut, field_count: usize) -> Result<(), BoxError> {
-        let n = i32::try_from(field_count)
-            .map_err(|_| "record wire format: too many fields to encode")?;
-        out.put_i32(n);
-        Ok(())
-    }
-
-    /// Encode one composite field: its type OID followed by a length-prefixed
-    /// body, with a `-1` length signalling SQL NULL.
-    pub fn write_record_field<T: ToSql>(
-        field_ty: &Type,
-        value: &T,
-        out: &mut BytesMut,
-    ) -> Result<(), BoxError> {
-        out.put_u32(field_ty.oid());
-        let len_at = out.len();
-        out.put_i32(0); // length placeholder, backfilled below
-        let len = match value.to_sql(field_ty, out)? {
-            IsNull::Yes => -1,
-            IsNull::No => i32::try_from(out.len() - len_at - 4)
-                .map_err(|_| "record wire format: field body exceeds i32::MAX")?,
-        };
-        out[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
-        Ok(())
-    }
-
     #[cfg(test)]
     mod record_tests {
         use super::*;
@@ -797,23 +756,6 @@ pub mod __private {
             wire.extend_from_slice(&[0u8, 0]);
             let mut r = RecordReader::new(&wire).unwrap();
             assert!(r.read_field::<i32>().is_err());
-        }
-
-        #[test]
-        fn write_then_read_roundtrip() {
-            // Encode (int4, text, nullable int4 = NULL) field-by-field, then
-            // decode it back through RecordReader.
-            let mut out = BytesMut::new();
-            write_record_header(&mut out, 3).unwrap();
-            write_record_field(&Type::INT4, &42i32, &mut out).unwrap();
-            write_record_field(&Type::TEXT, &"hello".to_string(), &mut out).unwrap();
-            write_record_field(&Type::INT4, &Option::<i32>::None, &mut out).unwrap();
-
-            let mut r = RecordReader::new(&out).unwrap();
-            assert_eq!(r.read_field::<i32>().unwrap(), 42);
-            assert_eq!(r.read_field::<String>().unwrap(), "hello");
-            assert!(r.read_field::<Option<i32>>().unwrap().is_none());
-            r.finish(3).unwrap();
         }
 
         #[test]

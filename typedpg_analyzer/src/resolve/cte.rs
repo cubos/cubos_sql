@@ -195,7 +195,7 @@ pub(crate) fn analyze_cte(
 ///
 /// Without this, downstream `SELECT id, ord, is_cycle, path FROM cte`
 /// fails with `column "ord" does not exist`.
-pub(crate) fn append_search_cycle_columns(
+fn append_search_cycle_columns(
     cte: &protobuf::CommonTableExpr,
     cols: &mut Vec<ScopeColumn>,
     snapshot: &PgCatalog,
@@ -250,10 +250,7 @@ pub(crate) fn append_search_cycle_columns(
 /// Rename `cols` using the `aliascolnames` from `WITH name(col1, col2) AS …`
 /// if present. PG uses positional matching; if the CTE has fewer aliases
 /// than columns, the trailing columns keep their inner names.
-pub(crate) fn apply_cte_column_aliases(
-    cols: Vec<RawColumn>,
-    aliases: &[protobuf::Node],
-) -> Vec<RawColumn> {
+fn apply_cte_column_aliases(cols: Vec<RawColumn>, aliases: &[protobuf::Node]) -> Vec<RawColumn> {
     if aliases.is_empty() {
         return cols;
     }

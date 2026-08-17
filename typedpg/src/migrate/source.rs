@@ -5,6 +5,26 @@ use std::path::Path;
 ///
 /// Each migration corresponds to a `NNNN_description.sql` file, with an optional
 /// `NNNN_description.down.sql` companion for rollbacks.
+///
+/// # Example
+///
+/// `no_transaction` is not set by the caller — it is derived from the SQL, so
+/// a migration that must run outside a transaction says so in its own text:
+///
+/// ```rust
+/// use typedpg::migrate::MigrationSource;
+///
+/// let source = MigrationSource::from_embedded([
+///     (
+///         "0001_add_enum_value",
+///         "-- no-transaction\nALTER TYPE status ADD VALUE 'archived';",
+///         None,
+///     ),
+/// ])?;
+///
+/// assert!(source.migrations()[0].no_transaction);
+/// # Ok::<(), typedpg::Error>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct Migration {
     /// Numeric prefix extracted from the filename, e.g. `"0001"`.
@@ -157,21 +177,37 @@ impl MigrationSource {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use typedpg::migrate::MigrationSource;
     ///
+    /// // Given out of order on purpose: entries come back sorted by version.
     /// let source = MigrationSource::from_embedded([
-    ///     (
-    ///         "0001_create_users",
-    ///         "CREATE TABLE users (id SERIAL PRIMARY KEY);",
-    ///         None,
-    ///     ),
     ///     (
     ///         "0002_add_email",
     ///         "ALTER TABLE users ADD COLUMN email TEXT NOT NULL;",
     ///         Some("ALTER TABLE users DROP COLUMN email;"),
     ///     ),
-    /// ]).unwrap();
+    ///     (
+    ///         "0001_create_users",
+    ///         "CREATE TABLE users (id SERIAL PRIMARY KEY);",
+    ///         None,
+    ///     ),
+    /// ])?;
+    ///
+    /// let first = &source.migrations()[0];
+    /// assert_eq!(first.version, "0001");
+    /// assert_eq!(first.name, "0001_create_users");
+    /// assert_eq!(first.sql, "CREATE TABLE users (id SERIAL PRIMARY KEY);");
+    /// assert!(first.down_sql.is_none(), "0001 ships no rollback");
+    /// assert!(!first.no_transaction);
+    ///
+    /// let second = &source.migrations()[1];
+    /// assert_eq!(second.version, "0002");
+    /// assert_eq!(
+    ///     second.down_sql.as_deref(),
+    ///     Some("ALTER TABLE users DROP COLUMN email;"),
+    /// );
+    /// # Ok::<(), typedpg::Error>(())
     /// ```
     pub fn from_embedded<'a, I>(entries: I) -> Result<Self, crate::Error>
     where
@@ -207,6 +243,25 @@ impl MigrationSource {
     /// Finds a migration by its full name (e.g. `"0001_create_users"`).
     ///
     /// Returns `None` if no migration with that name exists in this source.
+    /// The name is the same key [`revert`](super::revert) takes and the one
+    /// recorded in the tracking table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use typedpg::migrate::MigrationSource;
+    ///
+    /// let source = MigrationSource::from_embedded([
+    ///     ("0001_create_users", "CREATE TABLE users (id SERIAL PRIMARY KEY);", None),
+    /// ])?;
+    ///
+    /// let found = source.find("0001_create_users").expect("just added");
+    /// assert_eq!(found.version, "0001");
+    ///
+    /// // Lookup is by full name, not by version prefix.
+    /// assert!(source.find("0001").is_none());
+    /// # Ok::<(), typedpg::Error>(())
+    /// ```
     pub fn find(&self, name: &str) -> Option<&Migration> {
         self.migrations.iter().find(|m| m.name == name)
     }

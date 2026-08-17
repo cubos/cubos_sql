@@ -431,7 +431,7 @@ fn check_window_refs(
 
 /// If `node` is a bare integer literal, return its value — GROUP BY / ORDER
 /// BY treat those as 1-based projection ordinals.
-pub(crate) fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
+fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
     if let Some(node::Node::AConst(ac)) = node.node.as_ref()
         && !ac.isnull
         && let Some(pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
@@ -493,7 +493,7 @@ fn sort_expr_in_select_list(
 /// nodes (`GROUPING SETS`/`ROLLUP`/`CUBE`) to reach the underlying
 /// expressions. The walk type-checks parameters and rejects aggregates /
 /// window calls inside the grouping expressions (PG forbids those too).
-pub(crate) fn walk_group_clause_node(
+fn walk_group_clause_node(
     group_node: &protobuf::Node,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -552,7 +552,7 @@ pub(crate) fn walk_group_clause_node(
 /// a bare identifier in those clauses may reference a select-list alias
 /// that isn't visible in the FROM scope. Any other error (type mismatch,
 /// undefined function, etc.) is left to propagate.
-pub(crate) fn is_select_alias_reference(
+fn is_select_alias_reference(
     node: &protobuf::Node,
     aliases: &std::collections::HashSet<String>,
     err: &AnalyzeError,

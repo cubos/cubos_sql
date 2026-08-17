@@ -328,7 +328,7 @@ fn resolve_view_now(
 }
 
 /// Encode a single AST node as protobuf bytes.
-pub(crate) fn encode_ast(node: &protobuf::Node) -> Vec<u8> {
+fn encode_ast(node: &protobuf::Node) -> Vec<u8> {
     use prost::Message;
     let mut buf = Vec::with_capacity(256);
     node.encode(&mut buf).ok();
@@ -408,12 +408,12 @@ struct FromSource {
 /// are derived from the bindings as a side-effect.
 #[derive(Default)]
 pub(crate) struct BindingWalker {
-    pub(crate) bindings: Vec<AstBinding>,
+    bindings: Vec<AstBinding>,
 }
 
 impl BindingWalker {
     #[cfg(any(test, feature = "internal"))]
-    pub(crate) fn walk(&mut self, node: &protobuf::Node, snapshot: &PgCatalog) {
+    fn walk(&mut self, node: &protobuf::Node, snapshot: &PgCatalog) {
         let scope_stack: Vec<Vec<FromSource>> = Vec::new();
         self.walk_node(node, snapshot, &scope_stack);
     }

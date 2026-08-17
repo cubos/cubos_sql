@@ -101,7 +101,7 @@ impl PgCatalog {
     /// Iterate over `relname`s for tables/views/sequences visible in
     /// `schema` (or in the search path when `schema` is `None`). Used to
     /// produce "did you mean ..." hints for `UndefinedTable`.
-    pub fn visible_relnames<'a>(
+    pub(crate) fn visible_relnames<'a>(
         &'a self,
         schema: Option<&'a str>,
     ) -> impl Iterator<Item = &'a str> + 'a {
@@ -138,13 +138,13 @@ impl PgCatalog {
     /// canonical `_<name>` array; legacy types like `oidvector` /
     /// `int2vector` share `typelem` with `oid`/`int2` but are not pointed
     /// to by anyone's `typarray`, so they're correctly excluded.
-    pub fn array_type_of(&self, element_oid: PgTypeOid) -> Option<PgTypeOid> {
+    pub(crate) fn array_type_of(&self, element_oid: PgTypeOid) -> Option<PgTypeOid> {
         self.pg_type.get(&element_oid).and_then(|t| t.typarray)
     }
 
     /// Unwrap domains to their base type OID (capped at 32 levels to avoid
     /// pathological cycles in malformed catalogs).
-    pub fn unwrap_domain(&self, oid: PgTypeOid) -> PgTypeOid {
+    pub(crate) fn unwrap_domain(&self, oid: PgTypeOid) -> PgTypeOid {
         let mut current = oid;
         for _ in 0..32 {
             match self.pg_type.get(&current) {
@@ -162,7 +162,7 @@ impl PgCatalog {
     /// `typname` of the first domain that forbids NULLs, or `None` if no
     /// domain in the chain has the constraint. Capped at 32 hops, same as
     /// [`unwrap_domain`], to stay safe against malformed catalogs.
-    pub fn domain_not_null_name(&self, oid: PgTypeOid) -> Option<&str> {
+    pub(crate) fn domain_not_null_name(&self, oid: PgTypeOid) -> Option<&str> {
         let mut current = oid;
         for _ in 0..32 {
             let t = self.pg_type.get(&current)?;
@@ -180,7 +180,7 @@ impl PgCatalog {
 
     /// True when the type chain forces non-nullable semantics on the column,
     /// independent of `pg_attribute.attnotnull`.
-    pub fn type_is_not_null(&self, oid: PgTypeOid) -> bool {
+    pub(crate) fn type_is_not_null(&self, oid: PgTypeOid) -> bool {
         self.domain_not_null_name(oid).is_some()
     }
 
@@ -190,7 +190,7 @@ impl PgCatalog {
     /// looking for a `typtypmod` to inherit. This way `CREATE DOMAIN d AS
     /// varchar(20); CREATE TABLE t (x d)` produces a column with the right
     /// length even though `parse_column_def` left `atttypmod = None`.
-    pub fn effective_typmod(&self, oid: PgTypeOid, atttypmod: Option<i32>) -> Option<i32> {
+    pub(crate) fn effective_typmod(&self, oid: PgTypeOid, atttypmod: Option<i32>) -> Option<i32> {
         if atttypmod.is_some() {
             return atttypmod;
         }
@@ -211,7 +211,7 @@ impl PgCatalog {
 
     /// Subtype of a range type (`pg_range.rngsubtype`): `tstzrange` →
     /// `timestamptz`. `None` when `oid` is not a range type.
-    pub fn range_subtype(&self, range_oid: PgTypeOid) -> Option<PgTypeOid> {
+    pub(crate) fn range_subtype(&self, range_oid: PgTypeOid) -> Option<PgTypeOid> {
         self.pg_range.get(&range_oid).map(|r| r.rngsubtype)
     }
 
@@ -219,14 +219,14 @@ impl PgCatalog {
     /// (`pg_range.rngmultitypid`): `tstzrange` → `tstzmultirange`. `None`
     /// for non-range types and for user-defined ranges created by the DDL
     /// interpreter (which doesn't build companion multiranges yet).
-    pub fn multirange_of_range(&self, range_oid: PgTypeOid) -> Option<PgTypeOid> {
+    pub(crate) fn multirange_of_range(&self, range_oid: PgTypeOid) -> Option<PgTypeOid> {
         self.pg_range.get(&range_oid).and_then(|r| r.rngmultitypid)
     }
 
     /// The range type a multirange is built over (reverse of
     /// [`Self::multirange_of_range`]; linear scan — `pg_range` has a few
     /// dozen rows).
-    pub fn range_of_multirange(&self, multirange_oid: PgTypeOid) -> Option<PgTypeOid> {
+    pub(crate) fn range_of_multirange(&self, multirange_oid: PgTypeOid) -> Option<PgTypeOid> {
         self.pg_range
             .values()
             .find(|r| r.rngmultitypid == Some(multirange_oid))
@@ -237,7 +237,7 @@ impl PgCatalog {
     /// analyzer needs to pick a concrete type for an expression whose inputs
     /// are all UNKNOWN (string-category literals default to `text`, numeric
     /// literals to `numeric`, etc.).
-    pub fn preferred_type_in_category(&self, category: TypCategory) -> Option<PgTypeOid> {
+    pub(crate) fn preferred_type_in_category(&self, category: TypCategory) -> Option<PgTypeOid> {
         self.pg_type
             .values()
             .find(|t| t.typcategory == category && t.typispreferred)
@@ -297,7 +297,7 @@ impl PgCatalog {
     /// Iterate over type names visible from `schema` (or the search path
     /// when `schema` is `None`). Used for `did you mean` hints on
     /// `UndefinedType`.
-    pub fn visible_type_names<'a>(
+    pub(crate) fn visible_type_names<'a>(
         &'a self,
         schema: Option<&'a str>,
     ) -> impl Iterator<Item = &'a str> + 'a {
@@ -311,7 +311,7 @@ impl PgCatalog {
             })
     }
 
-    pub fn visible_function_names<'a>(
+    pub(crate) fn visible_function_names<'a>(
         &'a self,
         schema: Option<&'a str>,
     ) -> impl Iterator<Item = &'a str> + 'a {
@@ -376,7 +376,7 @@ impl PgCatalog {
     /// exactness/preferred-type tiebreaks), then
     /// [`Self::operator_polymorphic_step`] (pseudo-type signatures), then
     /// [`Self::operator_unknown_step`] (UNKNOWN-operand resolution).
-    pub fn find_operator_detailed(
+    pub(crate) fn find_operator_detailed(
         &self,
         name: &str,
         left_oid: Option<PgTypeOid>,
@@ -837,7 +837,7 @@ impl PgCatalog {
 
     /// Find one attribute of a relation by name. Linear scan over the
     /// relation's attributes (typically a handful).
-    pub fn attribute_by_name(&self, relid: PgClassOid, name: &str) -> Option<&PgAttribute> {
+    pub(crate) fn attribute_by_name(&self, relid: PgClassOid, name: &str) -> Option<&PgAttribute> {
         self.attributes_of(relid).iter().find(|a| a.attname == name)
     }
 
@@ -886,7 +886,7 @@ impl PgCatalog {
 
     /// All catalog objects an extension created (deptype=Extension,
     /// refclassid=PG_EXTENSION_RELID). Yields `(classid, objid)`.
-    pub fn extension_objects(
+    pub(crate) fn extension_objects(
         &self,
         ext_oid: PgExtensionOid,
     ) -> impl Iterator<Item = (PgClassOid, crate::oid::PgGenericOid)> + '_ {
@@ -918,18 +918,11 @@ impl PgCatalog {
 
     /// Iterate all `pg_depend` rows in the catalog. Reserved for the
     /// CASCADE walker in `ddl/drop.rs`.
-    pub fn iter_pg_depend(&self) -> impl Iterator<Item = &PgDepend> + '_ {
+    pub(crate) fn iter_pg_depend(&self) -> impl Iterator<Item = &PgDepend> + '_ {
         self.pg_depend.iter()
     }
 
     // ── Internal-feature accessors (tests + internal feature) ───────────
-
-    #[cfg(any(test, feature = "internal"))]
-    pub fn pg_namespace(
-        &self,
-    ) -> &std::collections::HashMap<PgNamespaceOid, crate::pg_catalog::PgNamespace> {
-        &self.pg_namespace
-    }
 
     #[cfg(any(test, feature = "internal"))]
     pub fn pg_type(&self) -> &std::collections::HashMap<PgTypeOid, PgType> {
@@ -939,16 +932,6 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn pg_class(&self) -> &std::collections::HashMap<PgClassOid, PgClass> {
         &self.pg_class
-    }
-
-    #[cfg(any(test, feature = "internal"))]
-    pub fn pg_class_mut(&mut self) -> &mut std::collections::HashMap<PgClassOid, PgClass> {
-        &mut self.pg_class
-    }
-
-    #[cfg(any(test, feature = "internal"))]
-    pub fn pg_attribute(&self) -> &std::collections::HashMap<PgClassOid, Vec<PgAttribute>> {
-        &self.pg_attribute
     }
 
     #[cfg(any(test, feature = "internal"))]
@@ -1008,25 +991,6 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn pg_cast(&self) -> &std::collections::HashMap<crate::oid::PgCastOid, PgCast> {
         &self.pg_cast
-    }
-
-    #[cfg(any(test, feature = "internal"))]
-    pub fn pg_extension(
-        &self,
-    ) -> &std::collections::HashMap<crate::oid::PgExtensionOid, crate::pg_catalog::PgExtension>
-    {
-        &self.pg_extension
-    }
-
-    #[cfg(any(test, feature = "internal"))]
-    pub fn pg_depend(&self) -> &[PgDepend] {
-        &self.pg_depend
-    }
-
-    /// Current `search_path` namespace OIDs, in order.
-    #[cfg(any(test, feature = "internal"))]
-    pub fn search_path(&self) -> &[PgNamespaceOid] {
-        &self.search_path
     }
 }
 

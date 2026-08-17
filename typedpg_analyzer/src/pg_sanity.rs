@@ -83,7 +83,7 @@ pub enum DivergenceKind {
     /// Both rejected, but the analyzer's message doesn't start with PG's.
     ErrorPrefix,
     /// Both rejected with the same message prefix, but the SQLSTATE the
-    /// analyzer's error variant carries ([`AnalyzeError::sqlstate`])
+    /// analyzer's error variant carries (`AnalyzeError::sqlstate`)
     /// differs from the one PG attached — the analyzer classified the
     /// error under the wrong variant.
     SqlState,

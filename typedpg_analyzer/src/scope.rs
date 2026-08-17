@@ -135,7 +135,7 @@ pub(crate) fn undefined_dml_column_error(
 /// "invalid reference to FROM-clause entry"). `column` is the bare column
 /// name used for the "did you mean" suggestion; `scope` is searched for
 /// candidate column names.
-pub(crate) fn undefined_column_error(
+fn undefined_column_error(
     scope: &Scope,
     column: &str,
     message: String,

@@ -84,7 +84,7 @@ pub(crate) fn infer_column_ref(
 /// underlying relation. The composite is the per-table `TypeEntry` that
 /// `create_table` registers alongside the table — same OID that a call site
 /// like `row_to_json(alias.*)` would see at runtime.
-pub(crate) fn infer_star_ref(
+fn infer_star_ref(
     col_ref: &protobuf::ColumnRef,
     scope: &Scope,
     snapshot: &PgCatalog,

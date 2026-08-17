@@ -61,7 +61,7 @@ use crate::qualified_name::{ParseQualifiedNameError, QualifiedName};
 pub struct Config {
     /// Database-related settings (migrations path).
     #[serde(default)]
-    pub database: DatabaseConfig,
+    pub(crate) database: DatabaseConfig,
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
     #[serde(default)]
     pub migrations: MigrationsConfig,
@@ -69,12 +69,12 @@ pub struct Config {
     /// type path. The `sql!` macro infers the (de)serialization contract from
     /// the PostgreSQL type's kind — see the module docs.
     #[serde(default)]
-    pub types: HashMap<String, String>,
+    types: HashMap<String, String>,
     /// Named database configurations for multi-database support.
     /// Each key maps to a complete database configuration.
     /// Used with `sql!(db = name, ...)` syntax.
     #[serde(default)]
-    pub databases: HashMap<String, DatabaseEntry>,
+    pub(crate) databases: HashMap<String, DatabaseEntry>,
 }
 
 /// A named database entry for multi-database support.
@@ -85,13 +85,13 @@ pub struct Config {
 pub struct DatabaseEntry {
     /// Database-related settings (migrations path).
     #[serde(default)]
-    pub database: DatabaseConfig,
+    pub(crate) database: DatabaseConfig,
     /// Migration runner settings (tracking table, lock ID, transaction behavior).
     #[serde(default)]
-    pub migrations: MigrationsConfig,
+    migrations: MigrationsConfig,
     /// Unified type mappings.
     #[serde(default)]
-    pub types: HashMap<String, String>,
+    types: HashMap<String, String>,
 }
 
 /// Database-related configuration.
@@ -103,13 +103,13 @@ pub struct DatabaseConfig {
     /// Default: `"./migrations"`. If the directory does not exist, it is treated
     /// as having zero migrations.
     #[serde(default = "DatabaseConfig::default_migrations")]
-    pub migrations: PathBuf,
+    migrations: PathBuf,
     /// Additional migration directories from other crates to include at compile
     /// time. These are used only for static analysis and type checking — they are
     /// NOT executed by the runtime migration runner.
     /// Paths are relative to the project root or absolute.
     #[serde(default)]
-    pub extra_migrations: Vec<PathBuf>,
+    extra_migrations: Vec<PathBuf>,
 }
 
 impl Default for DatabaseConfig {
@@ -129,12 +129,12 @@ impl DatabaseConfig {
     /// Resolve the migrations path relative to a base directory.
     ///
     /// Absolute paths are returned unchanged; relative paths are joined onto `base`.
-    pub fn migrations_dir(&self, base: &Path) -> PathBuf {
+    pub(crate) fn migrations_dir(&self, base: &Path) -> PathBuf {
         resolve_against(&self.migrations, base)
     }
 
     /// Resolve the extra (compile-time-only) migration paths relative to a base directory.
-    pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
+    pub(crate) fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
         self.extra_migrations
             .iter()
             .map(|p| resolve_against(p, base))
@@ -373,12 +373,6 @@ impl Config {
         self.database.migrations_dir(base)
     }
 
-    /// Resolve extra migration paths relative to a base directory.
-    /// These are migration directories from other crates, used only at compile time.
-    pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
-        self.database.extra_migrations_dirs(base)
-    }
-
     /// Resolve configuration for a specific database.
     ///
     /// - `None` returns the default (top-level) config.
@@ -412,8 +406,13 @@ impl Config {
 /// into [`QualifiedName`]s. Bare names in Cargo.toml default to the `public` schema.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig<'a> {
-    pub database: &'a DatabaseConfig,
-    pub migrations: &'a MigrationsConfig,
+    database: &'a DatabaseConfig,
+    /// Per-database migration runner settings. Resolved and carried here for
+    /// completeness, but no consumer reads it yet: the migration runner is
+    /// driven by the CLI off the top-level [`Config::migrations`], which has
+    /// no `db = name` selector.
+    #[allow(dead_code)]
+    migrations: &'a MigrationsConfig,
     /// Unified type map keyed by qualified PG type name. The `sql!` macro
     /// infers the (de)serialization strategy from each type's kind.
     pub types: HashMap<QualifiedName, String>,

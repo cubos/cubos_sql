@@ -119,7 +119,7 @@ pub(crate) fn analyze_merge(
     Ok((columns, None))
 }
 
-pub(crate) fn walk_merge_when_clause(
+fn walk_merge_when_clause(
     when: &protobuf::MergeWhenClause,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,

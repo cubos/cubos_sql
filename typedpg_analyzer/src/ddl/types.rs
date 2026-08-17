@@ -498,7 +498,7 @@ fn array_name(base_name: &str) -> String {
 
 /// Register an array type (`_name`) for a base type, and back-link the
 /// element type's `typarray` to it so `array_type_of(element)` resolves.
-pub(crate) fn register_array_type(
+fn register_array_type(
     interp: &mut PgCatalog,
     nsoid: PgNamespaceOid,
     base_name: &str,
