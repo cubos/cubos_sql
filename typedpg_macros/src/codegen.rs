@@ -455,6 +455,7 @@ fn record_struct_path(ty: &Type, registry: &RecordRegistry) -> Result<syn::Type,
         )
     })?;
     Ok(syn::Type::Path(syn::TypePath {
+        attrs: Vec::new(),
         qself: None,
         path: ident.clone().into(),
     }))
