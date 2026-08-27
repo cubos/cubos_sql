@@ -3305,7 +3305,7 @@ dependencies = [
  "bytes",
  "pg_query",
  "postgres",
- "prost 0.13.5",
+ "prost 0.14.4",
  "rand 0.10.2",
  "serde",
  "serde_json",
